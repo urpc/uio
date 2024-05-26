@@ -87,10 +87,6 @@ func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
 		b.bufList = append(b.bufList, buffer)
 	}
 
-	if nn := b.Len(); nn > 1024*1024 {
-		panic("缓冲区积攒了超过1M的数据，可能是发送流程有问题")
-	}
-
 	return
 }
 

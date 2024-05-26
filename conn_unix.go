@@ -26,14 +26,14 @@ import (
 )
 
 func (fc *fdConn) SetLinger(secs int) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 	return socket.SetLinger(fc.fd, secs)
 }
 
 func (fc *fdConn) SetNoDelay(nodelay bool) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 
@@ -45,28 +45,28 @@ func (fc *fdConn) SetNoDelay(nodelay bool) error {
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 	return socket.SetRecvBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetWriteBuffer(size int) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 	return socket.SetSendBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetKeepAlive(keepalive bool) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 	return socket.SetKeepAlive(fc.fd, keepalive)
 }
 
 func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
-	if 0 == fc.opened {
+	if 0 != fc.closed {
 		return fc.err
 	}
 	return socket.SetKeepAlivePeriod(fc.fd, secs)
@@ -74,19 +74,22 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 
 func (fc *fdConn) Write(b []byte) (int, error) {
 	fc.mux.Lock()
-	defer fc.mux.Unlock()
 
-	if 0 == fc.opened {
+	if 0 != fc.closed {
+		fc.mux.Unlock()
 		return 0, fc.err
 	}
 
 	if !fc.outbound.Empty() {
+		defer fc.mux.Unlock()
 		return fc.outbound.Write(b)
 	}
 
 	writeSize, err := unix.Write(fc.fd, b)
 	if err != nil {
 		if !errors.Is(err, unix.EAGAIN) {
+			fc.mux.Unlock()
+			fc.events.delConn(fc, err)
 			return 0, err
 		}
 		// ignore: EAGAIN
@@ -95,11 +98,11 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 
 	if writeSize != len(b) {
 		n, _ := fc.outbound.Write(b[writeSize:])
-		//fmt.Println("write to outbound:", writeSize, "+", n, "/", len(b), ",total:", fc.outbound.Len(), ", modWrite")
-		err = fc.events.workers[fc.loopIdx].modWrite(fc.fd)
+		err = fc.loop.modWrite(fc.fd)
 
 		writeSize += n
 	}
 
+	fc.mux.Unlock()
 	return writeSize, err
 }

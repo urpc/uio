@@ -25,12 +25,13 @@ import (
 )
 
 type Events struct {
-	master      *eventLoop     // serving listener
-	workers     []*eventLoop   // serving connection
-	connections []*fdConn      // all connections
-	acceptor    *acceptor      // connection acceptor
-	waitGroup   sync.WaitGroup // wait for all eventLoop exit on shutdown
-	running     int32          // running state
+	master      *eventLoop      // serving listener
+	workers     []*eventLoop    // serving connection
+	connections map[int]*fdConn // all connections
+	acceptor    *acceptor       // connection acceptor
+	waitGroup   sync.WaitGroup  // wait for all eventLoop exit on shutdown
+	running     int32           // running state
+	mux         sync.Mutex
 
 	// Pollers is set up to start the given number of event-loop goroutine.
 	Pollers int
@@ -47,10 +48,6 @@ type Events struct {
 	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
 	// The default value is 64KB.
 	MaxBufferSize int
-
-	// MaxOpenFiles is the maximum number of sockets.
-	// The default value is (1_000_000 + 1024)
-	MaxOpenFiles int
 
 	// OnOpen fires when a new connection has been opened.
 	OnOpen func(c Conn)
@@ -71,9 +68,6 @@ func (ev *Events) Serve() (err error) {
 	defer func() {
 		// close loops.
 		_ = ev.Close(err)
-
-		// waiting for all event-loop exited.
-		ev.waitGroup.Wait()
 	}()
 
 	// init configs.
@@ -103,20 +97,12 @@ func (ev *Events) Close(err error) error {
 		return nil // not running
 	}
 
-	// close all listeners
-	ev.acceptor.close()
+	ev.mux.Lock()
+	defer ev.mux.Unlock()
 
 	// stop main poller
 	if nil != ev.master {
 		_ = ev.master.Close()
-	}
-
-	// close all connections
-	for idx, fc := range ev.connections {
-		if nil != fc {
-			ev.delConn(fc, err)
-			ev.connections[idx] = nil
-		}
 	}
 
 	// close all worker pollers
@@ -125,6 +111,18 @@ func (ev *Events) Close(err error) error {
 			_ = worker.Close()
 			ev.workers[idx] = nil
 		}
+	}
+
+	// waiting for all event-loop exited.
+	ev.waitGroup.Wait()
+
+	// close all listeners
+	ev.acceptor.close()
+
+	// close all connections
+	for fd, fc := range ev.connections {
+		ev.closeConn(fc, err)
+		delete(ev.connections, fd)
 	}
 
 	return nil
@@ -140,11 +138,7 @@ func (ev *Events) initConfig() error {
 		ev.MaxBufferSize = 1024 * 64
 	}
 
-	if ev.MaxOpenFiles <= 0 {
-		ev.MaxOpenFiles = 1_000_000 + 1024
-	}
-
-	ev.connections = make([]*fdConn, ev.MaxOpenFiles)
+	ev.connections = make(map[int]*fdConn, 4096)
 	return nil
 }
 
@@ -189,22 +183,24 @@ func (ev *Events) initListeners() (err error) {
 }
 
 func (ev *Events) getConn(fd int) *fdConn {
+	ev.mux.Lock()
+	defer ev.mux.Unlock()
 	return ev.connections[fd]
 }
 
-func (ev *Events) getLoop(idx int) *eventLoop {
-	return ev.workers[idx]
-}
-
-func (ev *Events) selectLoop(fd int) int {
-	return fd % len(ev.workers)
+func (ev *Events) selectLoop(fd int) *eventLoop {
+	return ev.workers[fd%len(ev.workers)]
 }
 
 func (ev *Events) addConn(fdc *fdConn) error {
+
+	ev.mux.Lock()
+	ev.connections[fdc.fd] = fdc
+	ev.mux.Unlock()
+
 	// register to poller
-	if err := ev.getLoop(fdc.loopIdx).addRead(fdc.fd); err != nil {
-		_ = syscall.Close(fdc.fd)
-		fdc.fd = -1
+	if err := fdc.loop.addRead(fdc.fd); err != nil {
+		ev.delConn(fdc, err)
 		return err
 	}
 
@@ -213,22 +209,34 @@ func (ev *Events) addConn(fdc *fdConn) error {
 		ev.OnOpen(fdc)
 	}
 
-	// mark opened
-	fdc.opened = 1
-	ev.connections[fdc.fd] = fdc
 	return nil
 }
 
-func (ev *Events) delConn(fdc *fdConn, err error) {
-	if atomic.CompareAndSwapInt32(&fdc.opened, 1, 0) {
-		fdc.err = err
-		ev.connections[fdc.fd] = nil
+func (ev *Events) closeConn(fdc *fdConn, err error) {
+	// store close reason
+	fdc.err = err
 
-		if nil != ev.OnClose {
-			ev.OnClose(fdc, err)
-		}
-		_ = syscall.Close(fdc.fd)
-		fdc.fd = -1
+	if nil != ev.OnClose {
+		ev.OnClose(fdc, err)
+	}
+
+	fdc.mux.Lock()
+	defer fdc.mux.Unlock()
+	// close socket and release resource.
+	_ = syscall.Close(fdc.fd)
+	fdc.outbound.Reset()
+	fdc.inbound.Reset()
+	fdc.inboundTail = nil
+}
+
+func (ev *Events) delConn(fdc *fdConn, err error) {
+	if atomic.CompareAndSwapInt32(&fdc.closed, 0, 1) {
+
+		ev.mux.Lock()
+		delete(ev.connections, fdc.fd)
+		ev.mux.Unlock()
+
+		ev.closeConn(fdc, err)
 	}
 }
 
@@ -237,6 +245,7 @@ func (ev *Events) onData(fdc *fdConn) error {
 		return ev.OnData(fdc)
 	}
 	// discard all received bytes if not set OnData.
+	//
 	_, _ = fdc.Discard(-1)
 	return nil
 }

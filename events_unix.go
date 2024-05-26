@@ -19,6 +19,7 @@
 package uio
 
 import (
+	"fmt"
 	"net"
 	"syscall"
 
@@ -45,6 +46,7 @@ func (ev *Events) Dial(network, addr string) (Conn, error) {
 	}
 
 	if err = syscall.SetNonblock(nfd, true); nil != err {
+		fmt.Println("close fd:", nfd)
 		_ = syscall.Close(nfd)
 		return nil, err
 	}
@@ -53,7 +55,7 @@ func (ev *Events) Dial(network, addr string) (Conn, error) {
 		fd:         nfd,
 		localAddr:  lAddr,
 		remoteAddr: rAddr,
-		loopIdx:    ev.selectLoop(nfd),
+		loop:       ev.selectLoop(nfd),
 		events:     ev,
 	}
 

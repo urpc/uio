@@ -81,9 +81,8 @@ function go_bench() {
 
   $limit_cpu_server $2 --port "$4" --loops "$5" &
 
-  echo "Warming up for 1 seconds..."
+  # waiting for server startup...
   sleep 1
-  echo ""
 
   echo "--- BENCHMARK START ---"
   printf "*** %d connections, %d seconds, packet size: %d bytes, server cpu core: 0-%d, client cpu core: %d-%d\n" "$conn_num" "$test_duration" "$packet_size" "$server_cpu_num" "${client_cpu_num}" "$((total_cpu_num - 1))"
@@ -95,7 +94,7 @@ function go_bench() {
   echo ""
 }
 
-#go_bench "EVIO" bin/echo-evio-server echo-evio.go 7001 8
-#go_bench "GNET" bin/echo-gnet-server echo-gnet.go 7002 8
+go_bench "EVIO" bin/echo-evio-server echo-evio.go 7001 8
+go_bench "GNET" bin/echo-gnet-server echo-gnet.go 7002 8
 go_bench "NBIO" bin/echo-nbio-server echo-nbio.go 7003 8
 go_bench "UIO" bin/echo-uio-server echo-uio.go 7004 8

@@ -20,6 +20,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
@@ -104,9 +105,9 @@ type fdConn struct {
 	fd          int                     // connection fd
 	localAddr   net.Addr                // local address
 	remoteAddr  net.Addr                // remote address
-	loopIdx     int                     // event loop
+	loop        *eventLoop              // event loop
 	events      *Events                 // events
-	opened      int32                   // opened event fired
+	closed      int32                   // closed flag
 	err         error                   // close error
 	ctx         interface{}             // user-defined data
 	mux         sync.Mutex              // outbound buffer mutex
@@ -122,17 +123,16 @@ func (fc *fdConn) SetContext(ctx interface{}) { fc.ctx = ctx }
 
 func (fc *fdConn) WriteTo(w io.Writer) (n int64, err error) {
 	if !fc.inbound.Empty() {
-		if n, err = fc.inbound.WriteTo(w); nil != err {
-			return
-		}
+		n, err = fc.inbound.WriteTo(w)
 	}
 
-	if 0 != len(fc.inboundTail) {
+	if nil == err && 0 != len(fc.inboundTail) {
 		var sz int
 		sz, err = w.Write(fc.inboundTail)
 		n += int64(sz)
 		fc.inboundTail = fc.inboundTail[sz:]
 	}
+
 	return
 }
 
@@ -205,7 +205,9 @@ func (fc *fdConn) Discard(n int) (int, error) {
 }
 
 func (fc *fdConn) Close() error {
-	fc.events.delConn(fc, io.ErrUnexpectedEOF)
+	if 0 == atomic.LoadInt32(&fc.closed) {
+		fc.events.delConn(fc, io.ErrUnexpectedEOF)
+	}
 	return nil
 }
 

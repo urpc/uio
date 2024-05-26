@@ -36,49 +36,58 @@ type NetPoller struct {
 }
 
 func NewNetPoller() (*NetPoller, error) {
-	fd, err := unix.EpollCreate1(0)
+	fd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
 	}
 	return &NetPoller{epfd: fd}, nil
 }
 
-func (ev *NetPoller) AddRead(fd int) error {
-	event := unix.EpollEvent{
-		Fd:     int32(fd),
-		Events: readEvents | errorEvents,
-	}
+func (ev *NetPoller) AddReadWrite(fd int) error {
 	return unix.EpollCtl(
 		ev.epfd,
 		unix.EPOLL_CTL_ADD,
 		fd,
-		&event,
+		&unix.EpollEvent{
+			Fd:     int32(fd),
+			Events: readEvents | writeEvents | errorEvents,
+		},
+	)
+}
+
+func (ev *NetPoller) AddRead(fd int) error {
+	return unix.EpollCtl(
+		ev.epfd,
+		unix.EPOLL_CTL_ADD,
+		fd,
+		&unix.EpollEvent{
+			Fd:     int32(fd),
+			Events: readEvents | errorEvents,
+		},
 	)
 }
 
 func (ev *NetPoller) ModRead(fd int) error {
-	event := unix.EpollEvent{
-		Fd:     int32(fd),
-		Events: readEvents | errorEvents,
-	}
 	return unix.EpollCtl(
 		ev.epfd,
 		unix.EPOLL_CTL_MOD,
 		fd,
-		&event,
+		&unix.EpollEvent{
+			Fd:     int32(fd),
+			Events: readEvents | errorEvents,
+		},
 	)
 }
 
 func (ev *NetPoller) ModWrite(fd int) error {
-	event := unix.EpollEvent{
-		Fd:     int32(fd),
-		Events: readEvents | writeEvents | errorEvents,
-	}
 	return unix.EpollCtl(
 		ev.epfd,
 		unix.EPOLL_CTL_MOD,
 		fd,
-		&event,
+		&unix.EpollEvent{
+			Fd:     int32(fd),
+			Events: writeEvents | errorEvents,
+		},
 	)
 }
 
@@ -104,8 +113,7 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 			return err
 		}
 
-		for i := 0; i < n; i++ {
-			var event = &events[i]
+		for _, event := range events[:n] {
 
 			if 0 != (event.Events & writeEvents) {
 				if err = handler.OnWrite(ev, int(event.Fd)); nil != err {

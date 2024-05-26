@@ -57,33 +57,35 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 			return nil
 		}
 
-		nfd, sa, err := syscall.Accept(fd)
-		if nil != err {
-			if errors.Is(err, syscall.EAGAIN) {
-				return nil
+		for {
+			nfd, sa, err := syscall.Accept(fd)
+			if nil != err {
+				switch {
+				case errors.Is(err, syscall.EINTR):
+					continue
+				case errors.Is(err, syscall.EAGAIN):
+					return nil
+				default:
+					return err
+				}
 			}
-			return err
-		}
 
-		if err = syscall.SetNonblock(nfd, true); err != nil {
-			_ = syscall.Close(nfd)
-			return err
-		}
+			if err = syscall.SetNonblock(nfd, true); err != nil {
+				fmt.Println("close fd:", nfd)
+				_ = syscall.Close(nfd)
+				return err
+			}
 
-		if nfd >= len(ld.events.connections) {
-			_ = syscall.Close(nfd)
-			return nil
-		}
+			fdc := &fdConn{
+				fd:         nfd,
+				localAddr:  l.laddr,
+				remoteAddr: socket.SockaddrToAddr(sa, false),
+				loop:       ld.events.selectLoop(nfd),
+				events:     ld.events,
+			}
 
-		fdc := &fdConn{
-			fd:         nfd,
-			localAddr:  l.laddr,
-			remoteAddr: socket.SockaddrToAddr(sa, false),
-			loopIdx:    ld.events.selectLoop(nfd),
-			events:     ld.events,
+			return ld.events.addConn(fdc)
 		}
-
-		return ld.events.addConn(fdc)
 	}
 
 	panic("unknown fd")

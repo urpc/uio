@@ -54,17 +54,11 @@ func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
 
 	fdc := el.events.getConn(fd)
 
-	if fdc == nil || 0 == fdc.opened {
+	if fdc == nil || 0 != fdc.closed {
 		return nil
 	}
 
 	fdc.mux.Lock()
-
-	var sendBytes int
-
-	/*defer func() {
-		fmt.Println("Epoll.OnWrite: ", sendBytes)
-	}()*/
 
 	for !fdc.outbound.Empty() {
 		// writeable buffer
@@ -89,7 +83,6 @@ func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
 
 		// commit read offset.
 		fdc.outbound.Discard(sent)
-		sendBytes += sent
 	}
 
 	defer fdc.mux.Unlock()
@@ -102,7 +95,7 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
 
 	fdc := el.events.getConn(fd)
 
-	if fdc == nil || 0 == fdc.opened {
+	if fdc == nil || 0 != fdc.closed {
 		return nil
 	}
 
@@ -134,8 +127,6 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
 		fdc.inboundTail = fdc.inboundTail[:0]
 	}
 
-	//fmt.Println("Epoll.OnRead:", n, ",AvailableWriteBytes:", fdc.AvailableWriteBytes())
-
 	return nil
 }
 
@@ -145,4 +136,8 @@ func (el *eventLoop) addRead(fd int) error {
 
 func (el *eventLoop) modWrite(fd int) error {
 	return el.poller.ModWrite(fd)
+}
+
+func (el *eventLoop) addReadWrite(fd int) error {
+	return el.poller.AddReadWrite(fd)
 }

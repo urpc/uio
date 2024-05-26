@@ -45,6 +45,19 @@ func NewNetPoller() (*NetPoller, error) {
 	return &NetPoller{kqfd: fd}, nil
 }
 
+func (ev *NetPoller) AddReadWrite(fd int) error {
+	_, err := unix.Kevent(
+		ev.kqfd,
+		[]unix.Kevent_t{
+			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
+			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
+		},
+		nil,
+		nil,
+	)
+	return err
+}
+
 func (ev *NetPoller) AddRead(fd int) error {
 	_, err := unix.Kevent(
 		ev.kqfd,
@@ -62,6 +75,7 @@ func (ev *NetPoller) ModRead(fd int) error {
 		ev.kqfd,
 		[]unix.Kevent_t{
 			{Ident: uint64(fd), Flags: unix.EV_DELETE, Filter: writeEvents},
+			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
 		},
 		nil,
 		nil,
@@ -73,7 +87,7 @@ func (ev *NetPoller) ModWrite(fd int) error {
 	_, err := unix.Kevent(
 		ev.kqfd,
 		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
+			{Ident: uint64(fd), Flags: unix.EV_DELETE, Filter: readEvents},
 			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
 		},
 		nil,
