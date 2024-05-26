@@ -17,7 +17,6 @@
 package uio
 
 import (
-	"errors"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -25,13 +24,11 @@ import (
 )
 
 type Events struct {
-	master      *eventLoop      // serving listener
-	workers     []*eventLoop    // serving connection
-	connections map[int]*fdConn // all connections
-	acceptor    *acceptor       // connection acceptor
-	waitGroup   sync.WaitGroup  // wait for all eventLoop exit on shutdown
-	running     int32           // running state
-	mux         sync.Mutex
+	master    *eventLoop     // serving listener
+	workers   []*eventLoop   // serving connection
+	acceptor  *acceptor      // connection acceptor
+	waitGroup sync.WaitGroup // wait for all eventLoop exit on shutdown
+	mux       sync.Mutex
 
 	// Pollers is set up to start the given number of event-loop goroutine.
 	Pollers int
@@ -61,14 +58,51 @@ type Events struct {
 
 func (ev *Events) Serve() (err error) {
 
-	if !atomic.CompareAndSwapInt32(&ev.running, 0, 1) {
-		return errors.New("already running")
-	}
-
 	defer func() {
 		// close loops.
 		_ = ev.Close(err)
 	}()
+
+	// initialize events
+	if err = ev.initEvents(); nil != err {
+		return err
+	}
+
+	// serve listener
+	ev.waitGroup.Add(1)
+	defer ev.waitGroup.Done()
+	return ev.master.Serve(ev.LockOSThread, ev.acceptor)
+}
+
+func (ev *Events) Close(err error) error {
+	ev.mux.Lock()
+	defer ev.mux.Unlock()
+
+	// stop main poller
+	if nil != ev.master {
+		_ = ev.master.Close(err)
+	}
+
+	// close all worker pollers
+	for idx, worker := range ev.workers {
+		if nil != worker {
+			_ = worker.Close(err)
+			ev.workers[idx] = nil
+		}
+	}
+
+	// waiting for all event-loop exited.
+	ev.waitGroup.Wait()
+
+	// close all listeners
+	ev.acceptor.close()
+
+	return nil
+}
+
+func (ev *Events) initEvents() (err error) {
+	ev.mux.Lock()
+	defer ev.mux.Unlock()
 
 	// init configs.
 	if err = ev.initConfig(); nil != err {
@@ -85,46 +119,6 @@ func (ev *Events) Serve() (err error) {
 		return err
 	}
 
-	// serve listener
-	ev.waitGroup.Add(1)
-	defer ev.waitGroup.Done()
-	return ev.master.Serve(ev.LockOSThread, ev.acceptor)
-}
-
-func (ev *Events) Close(err error) error {
-
-	if !atomic.CompareAndSwapInt32(&ev.running, 1, 0) {
-		return nil // not running
-	}
-
-	ev.mux.Lock()
-	defer ev.mux.Unlock()
-
-	// stop main poller
-	if nil != ev.master {
-		_ = ev.master.Close()
-	}
-
-	// close all worker pollers
-	for idx, worker := range ev.workers {
-		if nil != worker {
-			_ = worker.Close()
-			ev.workers[idx] = nil
-		}
-	}
-
-	// waiting for all event-loop exited.
-	ev.waitGroup.Wait()
-
-	// close all listeners
-	ev.acceptor.close()
-
-	// close all connections
-	for fd, fc := range ev.connections {
-		ev.closeConn(fc, err)
-		delete(ev.connections, fd)
-	}
-
 	return nil
 }
 
@@ -138,7 +132,6 @@ func (ev *Events) initConfig() error {
 		ev.MaxBufferSize = 1024 * 64
 	}
 
-	ev.connections = make(map[int]*fdConn, 4096)
 	return nil
 }
 
@@ -182,60 +175,45 @@ func (ev *Events) initListeners() (err error) {
 	return nil
 }
 
-func (ev *Events) getConn(fd int) *fdConn {
-	ev.mux.Lock()
-	defer ev.mux.Unlock()
-	return ev.connections[fd]
-}
-
 func (ev *Events) selectLoop(fd int) *eventLoop {
 	return ev.workers[fd%len(ev.workers)]
 }
 
 func (ev *Events) addConn(fdc *fdConn) error {
 
-	ev.mux.Lock()
-	ev.connections[fdc.fd] = fdc
-	ev.mux.Unlock()
-
-	// register to poller
-	if err := fdc.loop.addRead(fdc.fd); err != nil {
-		ev.delConn(fdc, err)
-		return err
-	}
-
 	// fire on-open event callback
 	if nil != ev.OnOpen {
 		ev.OnOpen(fdc)
+	}
+
+	// register to poller
+	if err := fdc.loop.addConn(fdc); err != nil {
+		ev.delConn(fdc, err)
+		return err
 	}
 
 	return nil
 }
 
 func (ev *Events) closeConn(fdc *fdConn, err error) {
-	// store close reason
-	fdc.err = err
-
-	if nil != ev.OnClose {
-		ev.OnClose(fdc, err)
-	}
 
 	fdc.mux.Lock()
-	defer fdc.mux.Unlock()
 	// close socket and release resource.
 	_ = syscall.Close(fdc.fd)
 	fdc.outbound.Reset()
 	fdc.inbound.Reset()
 	fdc.inboundTail = nil
+	fdc.err = err
+	fdc.mux.Unlock()
+
+	if nil != ev.OnClose {
+		ev.OnClose(fdc, err)
+	}
 }
 
 func (ev *Events) delConn(fdc *fdConn, err error) {
 	if atomic.CompareAndSwapInt32(&fdc.closed, 0, 1) {
-
-		ev.mux.Lock()
-		delete(ev.connections, fdc.fd)
-		ev.mux.Unlock()
-
+		fdc.loop.delConn(fdc)
 		ev.closeConn(fdc, err)
 	}
 }

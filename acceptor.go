@@ -101,7 +101,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	}
 	ld.listeners[l.fd] = l
 
-	return ld.events.master.addRead(l.fd)
+	return ld.events.master.listen(l.fd)
 }
 
 func (ld *acceptor) closeListener(l *listener) {

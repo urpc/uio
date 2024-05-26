@@ -20,20 +20,21 @@ package uio
 
 import (
 	"errors"
+	"sync/atomic"
 
 	"github.com/urpc/uio/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
 func (fc *fdConn) SetLinger(secs int) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 	return socket.SetLinger(fc.fd, secs)
 }
 
 func (fc *fdConn) SetNoDelay(nodelay bool) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 
@@ -45,28 +46,28 @@ func (fc *fdConn) SetNoDelay(nodelay bool) error {
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 	return socket.SetRecvBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetWriteBuffer(size int) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 	return socket.SetSendBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetKeepAlive(keepalive bool) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 	return socket.SetKeepAlive(fc.fd, keepalive)
 }
 
 func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
 	return socket.SetKeepAlivePeriod(fc.fd, secs)
@@ -75,7 +76,7 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 func (fc *fdConn) Write(b []byte) (int, error) {
 	fc.mux.Lock()
 
-	if 0 != fc.closed {
+	if 0 != atomic.LoadInt32(&fc.closed) {
 		fc.mux.Unlock()
 		return 0, fc.err
 	}
@@ -98,7 +99,7 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 
 	if writeSize != len(b) {
 		n, _ := fc.outbound.Write(b[writeSize:])
-		err = fc.loop.modWrite(fc.fd)
+		err = fc.loop.modWrite(fc)
 
 		writeSize += n
 	}

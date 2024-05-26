@@ -19,16 +19,19 @@ package uio
 import (
 	"errors"
 	"io"
+	"sync/atomic"
 	"syscall"
 
+	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/urpc/uio/internal/poller"
 	"golang.org/x/sys/unix"
 )
 
 type eventLoop struct {
-	events *Events
-	poller *poller.NetPoller
-	buffer []byte
+	events      *Events
+	poller      *poller.NetPoller
+	buffer      []byte
+	connections cmap.ConcurrentMap[int, *fdConn] // map[int]*fdConn // all connections
 }
 
 func newEventLoop(events *Events) (*eventLoop, error) {
@@ -36,7 +39,16 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 	if nil != err {
 		return nil, err
 	}
-	return &eventLoop{events: events, poller: p, buffer: make([]byte, events.MaxBufferSize)}, nil
+
+	return &eventLoop{
+			events: events,
+			poller: p,
+			buffer: make([]byte, events.MaxBufferSize),
+			connections: cmap.NewWithCustomShardingFunction[int, *fdConn](func(key int) uint32 {
+				return uint32(key)
+			}),
+		},
+		nil
 }
 
 func (el *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) error {
@@ -46,15 +58,20 @@ func (el *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) error
 	return el.poller.Serve(lockOSThread, handler)
 }
 
-func (el *eventLoop) Close() error {
+func (el *eventLoop) Close(err error) error {
+	// close all connections
+	el.connections.IterCb(func(fd int, fc *fdConn) {
+		el.events.closeConn(fc, err)
+	})
+	el.connections.Clear()
 	return el.poller.Close()
 }
 
 func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
 
-	fdc := el.events.getConn(fd)
+	fdc := el.getConn(fd)
 
-	if fdc == nil || 0 != fdc.closed {
+	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
 		return nil
 	}
 
@@ -93,9 +110,9 @@ func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
 
 func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
 
-	fdc := el.events.getConn(fd)
+	fdc := el.getConn(fd)
 
-	if fdc == nil || 0 != fdc.closed {
+	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
 		return nil
 	}
 
@@ -130,14 +147,32 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
 	return nil
 }
 
-func (el *eventLoop) addRead(fd int) error {
+func (el *eventLoop) getConn(fd int) *fdConn {
+	if fc, ok := el.connections.Get(fd); ok {
+		return fc
+	}
+	return nil
+}
+
+func (el *eventLoop) listen(fd int) error {
 	return el.poller.AddRead(fd)
 }
 
-func (el *eventLoop) modWrite(fd int) error {
-	return el.poller.ModWrite(fd)
+func (el *eventLoop) delConn(fdc *fdConn) {
+	el.connections.Remove(fdc.fd)
 }
 
-func (el *eventLoop) addReadWrite(fd int) error {
-	return el.poller.AddReadWrite(fd)
+func (el *eventLoop) addConn(fdc *fdConn) error {
+	if el.connections.SetIfAbsent(fdc.fd, fdc) {
+		return el.poller.AddRead(fdc.fd)
+	}
+	panic("uio: duplicate connection to add")
+}
+
+func (el *eventLoop) modWrite(fdc *fdConn) error {
+	return el.poller.ModWrite(fdc.fd)
+}
+
+func (el *eventLoop) addReadWrite(fdc *fdConn) error {
+	return el.poller.AddReadWrite(fdc.fd)
 }
