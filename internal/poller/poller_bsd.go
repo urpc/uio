@@ -19,6 +19,7 @@
 package poller
 
 import (
+	"errors"
 	"runtime"
 	"sync/atomic"
 	"time"
