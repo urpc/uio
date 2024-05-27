@@ -19,19 +19,20 @@ package uio
 import (
 	"errors"
 	"io"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
-	cmap "github.com/orcaman/concurrent-map/v2"
 	"github.com/urpc/uio/internal/poller"
 	"golang.org/x/sys/unix"
 )
 
 type eventLoop struct {
-	events      *Events
-	poller      *poller.NetPoller
-	buffer      []byte
-	connections cmap.ConcurrentMap[int, *fdConn] // map[int]*fdConn // all connections
+	events *Events
+	poller *poller.NetPoller
+	buffer []byte
+	fdMap  map[int]*fdConn // all connections
+	mux    sync.Mutex      // fdMap locker
 }
 
 func newEventLoop(events *Events) (*eventLoop, error) {
@@ -44,9 +45,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 			events: events,
 			poller: p,
 			buffer: make([]byte, events.MaxBufferSize),
-			connections: cmap.NewWithCustomShardingFunction[int, *fdConn](func(key int) uint32 {
-				return uint32(key)
-			}),
+			fdMap:  make(map[int]*fdConn, 1024),
 		},
 		nil
 }
@@ -59,11 +58,14 @@ func (el *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) error
 }
 
 func (el *eventLoop) Close(err error) error {
+	el.mux.Lock()
+	defer el.mux.Unlock()
+
 	// close all connections
-	el.connections.IterCb(func(fd int, fc *fdConn) {
-		el.events.closeConn(fc, err)
-	})
-	el.connections.Clear()
+	for fd, fdc := range el.fdMap {
+		delete(el.fdMap, fd)
+		el.events.closeConn(fdc, err)
+	}
 	return el.poller.Close()
 }
 
@@ -148,10 +150,9 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
 }
 
 func (el *eventLoop) getConn(fd int) *fdConn {
-	if fc, ok := el.connections.Get(fd); ok {
-		return fc
-	}
-	return nil
+	el.mux.Lock()
+	defer el.mux.Unlock()
+	return el.fdMap[fd]
 }
 
 func (el *eventLoop) listen(fd int) error {
@@ -159,14 +160,16 @@ func (el *eventLoop) listen(fd int) error {
 }
 
 func (el *eventLoop) delConn(fdc *fdConn) {
-	el.connections.Remove(fdc.fd)
+	el.mux.Lock()
+	defer el.mux.Unlock()
+	delete(el.fdMap, fdc.fd)
 }
 
 func (el *eventLoop) addConn(fdc *fdConn) error {
-	if el.connections.SetIfAbsent(fdc.fd, fdc) {
-		return el.poller.AddRead(fdc.fd)
-	}
-	panic("uio: duplicate connection to add")
+	el.mux.Lock()
+	defer el.mux.Unlock()
+	el.fdMap[fdc.fd] = fdc
+	return el.poller.AddRead(fdc.fd)
 }
 
 func (el *eventLoop) modWrite(fdc *fdConn) error {
