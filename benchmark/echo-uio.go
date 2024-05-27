@@ -16,16 +16,15 @@ func main() {
 
 	var events uio.Events
 	events.Pollers = loops
-	events.Addrs = append(events.Addrs, fmt.Sprintf("tcp://:%d", port))
+	events.Addrs = []string{fmt.Sprintf("tcp://:%d", port)}
 	events.OnData = func(c uio.Conn) error {
 		_, _ = c.WriteTo(c)
 		return nil
 	}
 
-	fmt.Printf("echo server with loop=%d is listening on %s\n", loops, events.Addrs[0])
+	fmt.Printf("uio echo server with loop=%d is listening on %s\n", events.Pollers, events.Addrs[0])
 
 	if err := events.Serve(); nil != err {
-		panic(fmt.Errorf("ultraio server exit, error: %v", err))
+		panic(fmt.Errorf("uio server exit, error: %v", err))
 	}
-
 }

@@ -15,16 +15,16 @@ func main() {
 	flag.IntVar(&loops, "loops", 0, "server loops")
 	flag.Parse()
 
+	// nbio 默认数量为 runtime.NumCPU() / 4
+	// 如果未指定时强制统一为 runtime.NumCPU() 确保与其他框架一致
 	if loops <= 0 {
 		loops = runtime.NumCPU()
 	}
 
 	engine := nbio.NewEngine(nbio.Config{
-		Network:                      "tcp",
-		Addrs:                        []string{fmt.Sprintf(":%d", port)},
-		MaxWriteBufferSize:           64 * 1024 * 1024,
-		NPoller:                      loops,
-		MaxConnReadTimesPerEventLoop: 1,
+		Network: "tcp",
+		Addrs:   []string{fmt.Sprintf(":%d", port)},
+		NPoller: loops,
 	})
 
 	engine.OnData(func(c *nbio.Conn, data []byte) {
