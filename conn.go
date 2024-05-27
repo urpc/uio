@@ -17,12 +17,16 @@
 package uio
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/socket"
+	"golang.org/x/sys/unix"
 )
 
 // Conn is an interface of underlying connection.
@@ -114,6 +118,10 @@ type fdConn struct {
 	outbound    bytebuf.CompositeBuffer // outbound buffer
 	inbound     bytebuf.CompositeBuffer // inbound buffer
 	inboundTail []byte                  // inbound tail buffer
+	isUdp       bool                    // is udp server or udp client
+	rUdpAddr    syscall.Sockaddr        // remote udp address
+	udpSvr      *fdConn                 // owner udp server
+	udpConns    map[string]*fdConn      // child udp connections
 }
 
 func (fc *fdConn) LocalAddr() net.Addr        { return fc.localAddr }
@@ -205,9 +213,51 @@ func (fc *fdConn) Discard(n int) (int, error) {
 }
 
 func (fc *fdConn) Close() error {
-	if 0 == atomic.LoadInt32(&fc.closed) {
-		fc.events.delConn(fc, io.ErrUnexpectedEOF)
+	if 0 != atomic.LoadInt32(&fc.closed) {
+		return nil
 	}
+
+	var closeReason = io.ErrUnexpectedEOF
+
+	if fc.isUdp {
+		// udp child connection
+		if nil != fc.udpSvr {
+			rAddr := fc.remoteAddr.String()
+
+			fc.udpSvr.mux.Lock()
+			defer fc.udpSvr.mux.Unlock()
+
+			delete(fc.udpSvr.udpConns, rAddr)
+
+			if onClose := fc.events.OnClose; nil != onClose {
+				onClose(fc, closeReason)
+			}
+
+			return nil
+		}
+
+		// udp server
+		if nil != fc.udpConns {
+			fc.mux.Lock()
+			defer fc.mux.Unlock()
+
+			for addr, fdc := range fc.udpConns {
+				delete(fc.udpConns, addr)
+
+				if onClose := fc.events.OnClose; nil != onClose {
+					onClose(fdc, closeReason)
+				}
+			}
+
+			fc.loop.delConn(fc)
+			return nil
+		}
+
+		// udp client connection.
+		//
+	}
+
+	fc.events.delConn(fc, closeReason)
 	return nil
 }
 
@@ -220,4 +270,152 @@ func (fc *fdConn) AvailableWriteBytes() int {
 	defer fc.mux.Unlock()
 
 	return fc.outbound.Len()
+}
+
+func (fc *fdConn) fireReadEvent() error {
+	if fc.isUdp {
+		return fc.onRecvUDP()
+	}
+	return fc.onRead()
+}
+
+func (fc *fdConn) fireWriteEvent() error {
+	if fc.isUdp {
+		panic("udp connection dont need fireWriteEvent")
+	}
+	return fc.onWrite()
+}
+
+func (fc *fdConn) onSentUDP(b []byte) (int, error) {
+
+	// dialed udp client
+	if nil == fc.rUdpAddr {
+		return syscall.Write(fc.fd, b)
+	}
+
+	// child udp connection
+	if err := syscall.Sendto(fc.fd, b, 0, fc.rUdpAddr); nil != err {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (fc *fdConn) onRecvUDP() error {
+	buffer := fc.loop.getBuffer()
+
+	n, sa, err := syscall.Recvfrom(fc.fd, buffer, 0)
+	if nil != err {
+		return err
+	}
+
+	// udp connection
+	var udpConn = fc
+
+	// udp server
+	if nil != fc.udpConns {
+		remoteAddr := socket.SockaddrToAddr(sa, true)
+		rAddr := remoteAddr.String()
+		conn, ok := fc.udpConns[rAddr]
+		if !ok {
+			conn = &fdConn{
+				fd:         fc.fd,
+				localAddr:  fc.localAddr,
+				remoteAddr: remoteAddr,
+				loop:       fc.loop,
+				events:     fc.events,
+				isUdp:      true,
+				rUdpAddr:   sa,
+				udpSvr:     fc,
+				udpConns:   nil, // udp connection always nil
+			}
+
+			// save child connection.
+			fc.mux.Lock()
+			fc.udpConns[rAddr] = conn
+			fc.mux.Unlock()
+
+			// fire udp on-open event.
+			if onOpen := fc.events.OnOpen; nil != onOpen {
+				onOpen(conn)
+			}
+		}
+
+		udpConn = conn
+	}
+
+	udpConn.inboundTail = buffer[:n]
+	err = fc.events.onData(udpConn)
+
+	// drop unread udp packet.
+	_, _ = udpConn.Discard(-1)
+	return err
+}
+
+func (fc *fdConn) onRead() error {
+
+	buffer := fc.loop.getBuffer()
+
+	// read data from fd
+	n, err := unix.Read(fc.fd, buffer)
+	if 0 == n || err != nil {
+		if nil != err && errors.Is(err, syscall.EAGAIN) {
+			return nil
+		}
+		// remote closed
+		if nil == err {
+			err = io.EOF
+		}
+		fc.events.delConn(fc, err)
+		return nil
+	}
+
+	fc.inboundTail = buffer[:n]
+
+	// fire data callback.
+	if err = fc.events.onData(fc); nil != err {
+		fc.events.delConn(fc, err)
+		return nil
+	}
+
+	// append tail bytes to inbound buffer
+	if len(fc.inboundTail) > 0 {
+		_, _ = fc.inbound.Write(fc.inboundTail)
+		fc.inboundTail = fc.inboundTail[:0]
+	}
+
+	return nil
+}
+
+func (fc *fdConn) onWrite() error {
+	fc.mux.Lock()
+
+	for !fc.outbound.Empty() {
+		// writeable buffer
+		data := fc.outbound.Peek(fc.loop.getBuffer())
+
+		if 0 == len(data) {
+			panic("uio: buffer is too small")
+		}
+
+		// write buffer to fd.
+		sent, err := unix.Write(fc.fd, data)
+		if nil != err {
+			fc.mux.Unlock()
+
+			if errors.Is(err, syscall.EAGAIN) {
+				return nil
+			}
+
+			fc.events.delConn(fc, err)
+			return nil
+		}
+
+		// commit read offset.
+		fc.outbound.Discard(sent)
+	}
+
+	defer fc.mux.Unlock()
+
+	// outbound buffer is empty.
+	return fc.loop.modRead(fc)
 }

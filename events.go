@@ -78,6 +78,9 @@ func (ev *Events) Close(err error) error {
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
 
+	// close all listeners
+	ev.acceptor.close()
+
 	// stop main poller
 	if nil != ev.master {
 		_ = ev.master.Close(err)
@@ -93,9 +96,6 @@ func (ev *Events) Close(err error) error {
 
 	// waiting for all event-loop exited.
 	ev.waitGroup.Wait()
-
-	// close all listeners
-	ev.acceptor.close()
 
 	return nil
 }
@@ -163,6 +163,7 @@ func (ev *Events) initListeners() (err error) {
 
 	ev.acceptor = &acceptor{
 		listeners: make(map[int]*listener, len(ev.Addrs)),
+		loop:      ev.master,
 		events:    ev,
 	}
 

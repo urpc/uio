@@ -31,16 +31,18 @@ import (
 )
 
 type listener struct {
-	fd    int            // fd
-	addr  string         // address
-	laddr net.Addr       // local listen address
-	ln    net.Listener   // tcp/unix listener
-	udp   net.PacketConn // udp endpoint
-	file  *os.File       // file
+	fd         int            // fd
+	addr       string         // address
+	laddr      net.Addr       // local listen address
+	ln         net.Listener   // tcp/unix listener
+	file       *os.File       // file
+	udp        net.PacketConn // udp endpoint
+	udpSvrConn *fdConn        // udp server
 }
 
 type acceptor struct {
 	listeners map[int]*listener
+	loop      *eventLoop
 	events    *Events
 }
 
@@ -51,10 +53,9 @@ func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) error {
 func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 	if l, ok := ld.listeners[fd]; ok {
 
+		// udp server incoming
 		if l.udp != nil {
-			// udp 收取消息
-			//syscall.Recvfrom(l.fd, udpBuffer, 0)
-			return nil
+			return ld.onReadUDP(l)
 		}
 
 		for {
@@ -101,10 +102,26 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	}
 	ld.listeners[l.fd] = l
 
-	return ld.events.master.listen(l.fd)
+	if l.udp != nil {
+		l.udpSvrConn = &fdConn{
+			fd:        l.fd,
+			localAddr: l.laddr,
+			loop:      ld.loop,
+			events:    ld.events,
+			isUdp:     true,
+			udpConns:  make(map[string]*fdConn),
+		}
+		return ld.loop.addConn(l.udpSvrConn)
+	}
+
+	return ld.loop.listen(l.fd)
 }
 
 func (ld *acceptor) closeListener(l *listener) {
+	if l.udpSvrConn != nil {
+		_ = l.udpSvrConn.Close()
+		l.udpSvrConn = nil
+	}
 	if l.fd > 0 {
 		_ = syscall.Close(l.fd)
 		l.fd = -1
@@ -208,4 +225,14 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 
 	l.fd = int(l.file.Fd())
 	return &l, syscall.SetNonblock(l.fd, true)
+}
+
+func (ld *acceptor) onReadUDP(l *listener) error {
+
+	udpSvrConn := ld.loop.getConn(l.fd)
+	if nil == udpSvrConn {
+		return errors.New("no such udp server")
+	}
+
+	return udpSvrConn.fireReadEvent()
 }

@@ -81,6 +81,11 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 		return 0, fc.err
 	}
 
+	if fc.isUdp {
+		fc.mux.Unlock()
+		return fc.onSentUDP(b)
+	}
+
 	if !fc.outbound.Empty() {
 		defer fc.mux.Unlock()
 		return fc.outbound.Write(b)

@@ -17,14 +17,10 @@
 package uio
 
 import (
-	"errors"
-	"io"
 	"sync"
 	"sync/atomic"
-	"syscall"
 
 	"github.com/urpc/uio/internal/poller"
-	"golang.org/x/sys/unix"
 )
 
 type eventLoop struct {
@@ -70,83 +66,23 @@ func (el *eventLoop) Close(err error) error {
 }
 
 func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
-
 	fdc := el.getConn(fd)
-
 	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
 		return nil
 	}
-
-	fdc.mux.Lock()
-
-	for !fdc.outbound.Empty() {
-		// writeable buffer
-		data := fdc.outbound.Peek(el.buffer)
-
-		if 0 == len(data) {
-			panic("uio: buffer is too small")
-		}
-
-		// write buffer to fd.
-		sent, err := unix.Write(fd, data)
-		if nil != err {
-			fdc.mux.Unlock()
-
-			if errors.Is(err, syscall.EAGAIN) {
-				return nil
-			}
-
-			el.events.delConn(fdc, err)
-			return nil
-		}
-
-		// commit read offset.
-		fdc.outbound.Discard(sent)
-	}
-
-	defer fdc.mux.Unlock()
-
-	// outbound buffer is empty.
-	return ep.ModRead(fd)
+	return fdc.fireWriteEvent()
 }
 
 func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
-
 	fdc := el.getConn(fd)
-
 	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
 		return nil
 	}
+	return fdc.fireReadEvent()
+}
 
-	// read data from fd
-	n, err := unix.Read(fd, el.buffer)
-	if 0 == n || err != nil {
-		if nil != err && errors.Is(err, syscall.EAGAIN) {
-			return nil
-		}
-		// remote closed
-		if nil == err {
-			err = io.EOF
-		}
-		el.events.delConn(fdc, err)
-		return nil
-	}
-
-	fdc.inboundTail = el.buffer[:n]
-
-	// fire data callback.
-	if err = el.events.onData(fdc); nil != err {
-		el.events.delConn(fdc, err)
-		return nil
-	}
-
-	// append tail bytes to inbound buffer
-	if len(fdc.inboundTail) > 0 {
-		_, _ = fdc.inbound.Write(fdc.inboundTail)
-		fdc.inboundTail = fdc.inboundTail[:0]
-	}
-
-	return nil
+func (el *eventLoop) getBuffer() []byte {
+	return el.buffer
 }
 
 func (el *eventLoop) getConn(fd int) *fdConn {
@@ -170,6 +106,10 @@ func (el *eventLoop) addConn(fdc *fdConn) error {
 	defer el.mux.Unlock()
 	el.fdMap[fdc.fd] = fdc
 	return el.poller.AddRead(fdc.fd)
+}
+
+func (el *eventLoop) modRead(fdc *fdConn) error {
+	return el.poller.ModRead(fdc.fd)
 }
 
 func (el *eventLoop) modWrite(fdc *fdConn) error {

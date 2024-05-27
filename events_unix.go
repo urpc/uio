@@ -19,16 +19,47 @@
 package uio
 
 import (
-	"fmt"
 	"net"
+	"net/url"
+	"strings"
 	"syscall"
 
 	"github.com/urpc/uio/internal/socket"
 )
 
-func (ev *Events) Dial(network, addr string) (Conn, error) {
+// Dial connects to the address on the named network.
+//
+// Known networks are "tcp", "tcp4" (IPv4-only), "tcp6" (IPv6-only),
+// "udp", "udp4" (IPv4-only), "udp6" (IPv6-only), "ip", "ip4"
+// (IPv4-only), "ip6" (IPv6-only), "unix", "unixgram" and
+// "unixpacket".
+//
+// Examples:
+//
+//	Dial("tcp://golang.org:http")
+//	Dial("tcp://192.0.2.1:http")
+//	Dial("tcp://198.51.100.1:80")
+//	Dial("udp://[2001:db8::1]:domain")
+//	Dial("udp://[fe80::1%lo0]:53")
+//	Dial("tcp://:80")
+//	Dial("unix:///path/your/unix.sock")
+func (ev *Events) Dial(addr string) (Conn, error) {
 
-	conn, err := net.Dial(network, addr)
+	if !strings.Contains(addr, "://") {
+		addr = "tcp://" + addr
+	}
+
+	u, err := url.Parse(addr)
+	if nil != err {
+		return nil, err
+	}
+
+	var address = u.Host
+	if u.Scheme == "unix" || u.Scheme == "unixgram" || u.Scheme == "unixpacket" {
+		address = u.Path
+	}
+
+	conn, err := net.Dial(u.Scheme, address)
 	if nil != err {
 		return nil, err
 	}
@@ -46,7 +77,6 @@ func (ev *Events) Dial(network, addr string) (Conn, error) {
 	}
 
 	if err = syscall.SetNonblock(nfd, true); nil != err {
-		fmt.Println("close fd:", nfd)
 		_ = syscall.Close(nfd)
 		return nil, err
 	}
@@ -57,6 +87,7 @@ func (ev *Events) Dial(network, addr string) (Conn, error) {
 		remoteAddr: rAddr,
 		loop:       ev.selectLoop(nfd),
 		events:     ev,
+		isUdp:      "udp" == u.Scheme || "udp4" == u.Scheme || "udp6" == u.Scheme,
 	}
 
 	if err = ev.addConn(fdc); nil != err {
