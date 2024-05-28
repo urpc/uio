@@ -98,24 +98,25 @@ func (el *eventLoop) listen(fd int) error {
 func (el *eventLoop) delConn(fdc *fdConn) {
 	el.mux.Lock()
 	defer el.mux.Unlock()
-	delete(el.fdMap, fdc.fd)
+	delete(el.fdMap, fdc.Fd())
 }
 
 func (el *eventLoop) addConn(fdc *fdConn) error {
 	el.mux.Lock()
-	defer el.mux.Unlock()
-	el.fdMap[fdc.fd] = fdc
-	return el.poller.AddRead(fdc.fd)
+	fd := fdc.Fd()
+	el.fdMap[fd] = fdc
+	el.mux.Unlock()
+	return el.poller.AddRead(fd)
 }
 
 func (el *eventLoop) modRead(fdc *fdConn) error {
-	return el.poller.ModRead(fdc.fd)
+	return el.poller.ModRead(fdc.Fd())
 }
 
 func (el *eventLoop) modWrite(fdc *fdConn) error {
-	return el.poller.ModWrite(fdc.fd)
+	return el.poller.ModWrite(fdc.Fd())
 }
 
-func (el *eventLoop) addReadWrite(fdc *fdConn) error {
-	return el.poller.AddReadWrite(fdc.fd)
+func (el *eventLoop) modReadWrite(fdc *fdConn) error {
+	return el.poller.ModReadWrite(fdc.Fd())
 }

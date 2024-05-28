@@ -20,7 +20,6 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"syscall"
 )
 
 type Events struct {
@@ -45,6 +44,14 @@ type Events struct {
 	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
 	// The default value is 64KB.
 	MaxBufferSize int
+
+	// Read events are always registered, which will improve program performance in most cases,
+	// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
+	// in the absence of intervention may lead to service memory depletion.
+	// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
+	// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
+	// The default value is false.
+	FullDuplex bool
 
 	// OnOpen fires when a new connection has been opened.
 	OnOpen func(c Conn)
@@ -162,9 +169,8 @@ func (ev *Events) initLoops() (err error) {
 func (ev *Events) initListeners() (err error) {
 
 	ev.acceptor = &acceptor{
-		listeners: make(map[int]*listener, len(ev.Addrs)),
-		loop:      ev.master,
-		events:    ev,
+		loop:   ev.master,
+		events: ev,
 	}
 
 	for _, addr := range ev.Addrs {
@@ -198,15 +204,10 @@ func (ev *Events) addConn(fdc *fdConn) error {
 
 func (ev *Events) closeConn(fdc *fdConn, err error) {
 
-	fdc.mux.Lock()
 	// close socket and release resource.
-	_ = syscall.Close(fdc.fd)
-	fdc.outbound.Reset()
-	fdc.inbound.Reset()
-	fdc.inboundTail = nil
-	fdc.err = err
-	fdc.mux.Unlock()
+	fdc.fdClose(err)
 
+	// fire on-close event.
 	if nil != ev.OnClose {
 		ev.OnClose(fdc, err)
 	}

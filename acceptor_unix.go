@@ -1,3 +1,5 @@
+//go:build linux || darwin || netbsd || freebsd || openbsd || dragonfly
+
 /*
  * Copyright 2024 the urpc project
  *
@@ -31,13 +33,13 @@ import (
 )
 
 type listener struct {
-	fd         int            // fd
-	addr       string         // address
-	laddr      net.Addr       // local listen address
-	ln         net.Listener   // tcp/unix listener
-	file       *os.File       // file
-	udp        net.PacketConn // udp endpoint
-	udpSvrConn *fdConn        // udp server
+	fd     int            // fd
+	addr   string         // address
+	laddr  net.Addr       // local listen address
+	ln     net.Listener   // tcp/unix listener
+	file   *os.File       // file
+	udp    net.PacketConn // udp endpoint
+	udpSvr *fdConn        // udp server
 }
 
 type acceptor struct {
@@ -77,13 +79,12 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 				return err
 			}
 
-			fdc := &fdConn{
-				fd:         nfd,
-				localAddr:  l.laddr,
-				remoteAddr: socket.SockaddrToAddr(sa, false),
-				loop:       ld.events.selectLoop(nfd),
-				events:     ld.events,
-			}
+			fdc := &fdConn{}
+			fdc.fd = nfd
+			fdc.events = ld.events
+			fdc.loop = ld.events.selectLoop(nfd)
+			fdc.localAddr = l.laddr
+			fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
 
 			return ld.events.addConn(fdc)
 		}
@@ -93,6 +94,10 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 }
 
 func (ld *acceptor) addListen(addr string) (err error) {
+	if nil == ld.listeners {
+		ld.listeners = make(map[int]*listener)
+	}
+
 	var l *listener
 	if l, err = ld.listen(addr, ld.events.ReusePort); nil != err {
 		if nil != l {
@@ -103,24 +108,23 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	ld.listeners[l.fd] = l
 
 	if l.udp != nil {
-		l.udpSvrConn = &fdConn{
-			fd:        l.fd,
-			localAddr: l.laddr,
-			loop:      ld.loop,
-			events:    ld.events,
-			isUdp:     true,
-			udpConns:  make(map[string]*fdConn),
-		}
-		return ld.loop.addConn(l.udpSvrConn)
+		l.udpSvr = &fdConn{}
+		l.udpSvr.fd = l.fd
+		l.udpSvr.loop = ld.loop
+		l.udpSvr.events = ld.events
+		l.udpSvr.isUdp = true
+		l.udpSvr.udpConns = make(map[string]*fdConn)
+
+		return ld.loop.addConn(l.udpSvr)
 	}
 
 	return ld.loop.listen(l.fd)
 }
 
 func (ld *acceptor) closeListener(l *listener) {
-	if l.udpSvrConn != nil {
-		_ = l.udpSvrConn.Close()
-		l.udpSvrConn = nil
+	if l.udpSvr != nil {
+		_ = l.udpSvr.Close()
+		l.udpSvr = nil
 	}
 	if l.fd > 0 {
 		_ = syscall.Close(l.fd)

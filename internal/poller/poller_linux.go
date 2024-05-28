@@ -91,6 +91,18 @@ func (ev *NetPoller) ModWrite(fd int) error {
 	)
 }
 
+func (ev *NetPoller) ModReadWrite(fd int) error {
+	return unix.EpollCtl(
+		ev.epfd,
+		unix.EPOLL_CTL_MOD,
+		fd,
+		&unix.EpollEvent{
+			Fd:     int32(fd),
+			Events: readEvents | writeEvents | errorEvents,
+		},
+	)
+}
+
 func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 
 	if lockOSThread {

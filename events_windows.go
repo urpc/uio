@@ -1,5 +1,3 @@
-//go:build linux || darwin || netbsd || freebsd || openbsd || dragonfly
-
 /*
  * Copyright 2024 the urpc project
  *
@@ -22,9 +20,6 @@ import (
 	"net"
 	"net/url"
 	"strings"
-	"syscall"
-
-	"github.com/urpc/uio/internal/socket"
 )
 
 // Dial connects to the address on the named network.
@@ -67,28 +62,19 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 	lAddr := conn.LocalAddr()
 	rAddr := conn.RemoteAddr()
 
-	nfd, err := socket.DupNetConn(conn)
-
-	// close old fd
-	_ = conn.Close()
-
-	if nil != err {
-		return nil, err // dup failed
-	}
-
-	if err = syscall.SetNonblock(nfd, true); nil != err {
-		_ = syscall.Close(nfd)
-		return nil, err
-	}
-
 	fdc := &fdConn{}
-	fdc.fd = nfd
+
+	if udpConn, ok := conn.(*net.UDPConn); ok {
+		fdc.udp = udpConn
+	} else {
+		fdc.conn = conn
+	}
+
 	fdc.ctx = ctx
 	fdc.localAddr = lAddr
 	fdc.remoteAddr = rAddr
 	fdc.events = ev
-	fdc.loop = ev.selectLoop(nfd)
-	fdc.isUdp = "udp" == u.Scheme || "udp4" == u.Scheme || "udp6" == u.Scheme
+	fdc.loop = ev.selectLoop(fdc.Fd())
 
 	if err = ev.addConn(fdc); nil != err {
 		return nil, err

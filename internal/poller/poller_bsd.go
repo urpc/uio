@@ -97,6 +97,19 @@ func (ev *NetPoller) ModWrite(fd int) error {
 	return err
 }
 
+func (ev *NetPoller) ModReadWrite(fd int) error {
+	_, err := unix.Kevent(
+		ev.kqfd,
+		[]unix.Kevent_t{
+			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
+			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
+		},
+		nil,
+		nil,
+	)
+	return err
+}
+
 func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 
 	if lockOSThread {
