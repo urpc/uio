@@ -94,6 +94,11 @@ type Conn interface {
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.ReadWriteCloser
 
+	// StringWriter
+	// it's not concurrency-safe.
+	// Notice: non-blocking interface, should not be used as you use std.
+	io.StringWriter
+
 	// WriterTo
 	// it's not concurrency-safe.
 	// Notice: non-blocking interface, should not be used as you use std.

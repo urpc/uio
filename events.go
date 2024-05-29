@@ -20,7 +20,11 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+
+	"github.com/urpc/uio/internal/bytebuf"
 )
+
+type CompositeBuffer = bytebuf.CompositeBuffer
 
 type Events struct {
 	master    *eventLoop     // serving listener
@@ -94,10 +98,10 @@ func (ev *Events) Close(err error) error {
 	}
 
 	// close all worker pollers
-	for idx, worker := range ev.workers {
+	for _, worker := range ev.workers {
 		if nil != worker {
 			_ = worker.Close(err)
-			ev.workers[idx] = nil
+			//ev.workers[idx] = nil
 		}
 	}
 

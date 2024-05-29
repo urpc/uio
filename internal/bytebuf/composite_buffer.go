@@ -58,9 +58,14 @@ func (b *CompositeBuffer) Available() (bytes int) {
 
 // Reset resets the buffer to be empty,
 // but it retains the underlying storage for use by future writes.
-// Reset is the same as [Buffer.Truncate](0).
 func (b *CompositeBuffer) Reset() {
 	b.removeRange(len(b.bufList))
+}
+
+// Close resets the buffer to be empty, Close is the same as CompositeBuffer.Reset
+func (b *CompositeBuffer) Close() error {
+	b.Reset()
+	return nil
 }
 
 // Write appends the contents of p to the buffer, growing the buffer as
@@ -83,6 +88,33 @@ func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
 	if sz := len(p); sz > 0 {
 		buffer := getBuffer(sz)
 		wn, _ := buffer.Write(p)
+		n += wn
+		b.bufList = append(b.bufList, buffer)
+	}
+
+	return
+}
+
+// WriteString appends the contents of s to the buffer, growing the buffer as
+// needed. The return value n is the length of s; err is always nil.
+func (b *CompositeBuffer) WriteString(s string) (n int, err error) {
+	if 0 == len(s) {
+		return 0, nil
+	}
+
+	if sz := len(b.bufList); sz > 0 {
+		last := b.bufList[sz-1]
+		if space := last.Available(); space > 0 {
+			wn := min(space, len(s))
+			_, _ = last.WriteString(s[:wn])
+			n += wn
+			s = s[wn:]
+		}
+	}
+
+	if sz := len(s); sz > 0 {
+		buffer := getBuffer(sz)
+		wn, _ := buffer.WriteString(s)
 		n += wn
 		b.bufList = append(b.bufList, buffer)
 	}

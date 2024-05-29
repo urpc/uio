@@ -21,8 +21,10 @@ package uio
 import (
 	"errors"
 	"io"
+	"reflect"
 	"sync/atomic"
 	"syscall"
+	"unsafe"
 
 	"github.com/urpc/uio/internal/socket"
 	"golang.org/x/sys/unix"
@@ -86,6 +88,17 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 		return fc.err
 	}
 	return socket.SetKeepAlivePeriod(fc.fd, secs)
+}
+
+func (fc *fdConn) WriteString(s string) (n int, err error) {
+	var sh = (*reflect.StringHeader)(unsafe.Pointer(&s))
+
+	var data []byte
+	var bh = (*reflect.SliceHeader)(unsafe.Pointer(&data))
+	bh.Data = sh.Data
+	bh.Len = sh.Len
+	bh.Cap = sh.Len
+	return fc.Write(data)
 }
 
 func (fc *fdConn) Write(b []byte) (int, error) {

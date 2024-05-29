@@ -20,9 +20,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unsafe"
 )
 
 var errUnsupported = fmt.Errorf("unsupported method")
@@ -118,6 +120,17 @@ func (fc *fdConn) SetWriteBuffer(size int) error {
 		return tcpConn.SetWriteBuffer(size)
 	}
 	return errUnsupported
+}
+
+func (fc *fdConn) WriteString(s string) (n int, err error) {
+	var sh = (*reflect.StringHeader)(unsafe.Pointer(&s))
+
+	var data []byte
+	var bh = (*reflect.SliceHeader)(unsafe.Pointer(&data))
+	bh.Data = sh.Data
+	bh.Len = sh.Len
+	bh.Cap = sh.Len
+	return fc.Write(data)
 }
 
 func (fc *fdConn) Write(p []byte) (n int, err error) {
