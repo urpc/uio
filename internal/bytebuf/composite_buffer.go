@@ -95,6 +95,17 @@ func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
 	return
 }
 
+// WriteByte appends the byte c to the buffer, growing the buffer as needed.
+// The returned error is always nil, but is included to match [bufio.Writer]'s
+// WriteByte.
+func (b *CompositeBuffer) WriteByte(c byte) error {
+	var data [1]byte
+	data[0] = c
+
+	_, err := b.Write(data[:])
+	return err
+}
+
 // WriteString appends the contents of s to the buffer, growing the buffer as
 // needed. The return value n is the length of s; err is always nil.
 func (b *CompositeBuffer) WriteString(s string) (n int, err error) {

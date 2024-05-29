@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/antlabs/httparser"
 	"github.com/urpc/uio"
@@ -34,7 +35,7 @@ var emptyRequest = http.Request{}
 
 var bufWriterPool = sync.Pool{
 	New: func() interface{} {
-		return bufio.NewWriter(nil)
+		return bufio.NewWriterSize(nil, 1024)
 	},
 }
 
@@ -363,6 +364,20 @@ func (h *httpResponseWriter) writeFastResponse(request *http.Request, w response
 
 		if nil == h.header || h.header.Get("Content-Type") == "" {
 			if _, err := w.WriteString("Content-Type: text/plain; charset=utf-8\r\n"); err != nil {
+				return err
+			}
+		}
+
+		if nil == h.header || h.header.Get("Date") == "" {
+			if _, err := w.WriteString("Date: "); err != nil {
+				return err
+			}
+
+			if _, err := w.WriteString(time.Now().Format(time.RFC1123)); err != nil {
+				return err
+			}
+
+			if _, err := w.WriteString("\r\n"); err != nil {
 				return err
 			}
 		}
