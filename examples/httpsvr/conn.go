@@ -133,6 +133,7 @@ func (hc *httpConn) ServeHTTP(c uio.Conn, handler http.Handler) error {
 
 	return nil
 }
+
 func (hc *httpConn) parseHttpRequest(c uio.Conn) (r *http.Request, err error) {
 
 	// 获取当前已接受但是未处理的数据
@@ -191,7 +192,7 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 	request.RemoteAddr = c.RemoteAddr().String()
 	request.Close = shouldClose(request.ProtoMajor, request.ProtoMinor, request.Header, false)
 
-	// 回写结果
+	// 准备响应收集容器
 	writer := &httpResponseWriter{
 		protoMajor: request.ProtoMajor,
 		protoMinor: request.ProtoMinor,
@@ -201,12 +202,12 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 	handler.ServeHTTP(writer, request)
 
 	// 丢弃未读取的body数据
-	if nil != request.Body {
+	if nil != request.Body && request.Body != http.NoBody {
 		_, _ = io.Copy(io.Discard, request.Body)
 		_ = request.Body.Close()
 	}
 
-	// 准备响应
+	// 收集响应
 	response := writer.response()
 	response.Request = request
 
@@ -214,7 +215,7 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 	bw := bufWriterPool.Get().(*bufio.Writer)
 	bw.Reset(c)
 
-	// 回写结果
+	// 回写响应
 	if err = response.Write(bw); nil == err {
 		err = bw.Flush()
 	}
