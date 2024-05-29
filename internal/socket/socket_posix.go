@@ -30,8 +30,17 @@ import (
 //
 // The default is true (no delay), meaning that data is
 // sent as soon as possible after a Write.
-func SetNoDelay(fd, nodelay int) error {
-	return os.NewSyscallError("setsockopt", unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, nodelay))
+func SetNoDelay(fd int, nodelay bool) error {
+	var op = 0
+	if nodelay {
+		op = 1
+	}
+	return os.NewSyscallError("setsockopt", unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, op))
+}
+
+// SetNonblock set this socket to use non-blocking mode or block mode.
+func SetNonblock(fd int, nonblocking bool) error {
+	return os.NewSyscallError("setnonblock", unix.SetNonblock(fd, nonblocking))
 }
 
 // SetRecvBuffer sets the size of the operating system's

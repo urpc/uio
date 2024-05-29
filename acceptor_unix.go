@@ -26,20 +26,24 @@ import (
 	"os"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/libp2p/go-reuseport"
 	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 )
 
+const defaultTCPKeepAlive = 15 * time.Second
+
 type listener struct {
-	fd     int            // fd
-	addr   string         // address
-	laddr  net.Addr       // local listen address
-	ln     net.Listener   // tcp/unix listener
-	file   *os.File       // file
-	udp    net.PacketConn // udp endpoint
-	udpSvr *fdConn        // udp server
+	network string         // network protocol
+	fd      int            // fd
+	addr    string         // address
+	laddr   net.Addr       // local listen address
+	ln      net.Listener   // tcp/unix listener
+	file    *os.File       // file
+	udp     net.PacketConn // udp endpoint
+	udpSvr  *fdConn        // udp server
 }
 
 type acceptor struct {
@@ -73,10 +77,15 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 				}
 			}
 
-			if err = syscall.SetNonblock(nfd, true); err != nil {
-				fmt.Println("close fd:", nfd)
+			if err = socket.SetNonblock(nfd, true); err != nil {
 				_ = syscall.Close(nfd)
 				return err
+			}
+
+			if strings.HasPrefix(l.network, "tcp") {
+				_ = socket.SetNoDelay(nfd, true)
+				_ = socket.SetKeepAlive(nfd, true)
+				_ = socket.SetKeepAlivePeriod(nfd, int(defaultTCPKeepAlive/time.Second))
 			}
 
 			fdc := &fdConn{}
@@ -228,6 +237,7 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 	}
 
 	l.fd = int(l.file.Fd())
+	l.network = u.Scheme
 	return &l, syscall.SetNonblock(l.fd, true)
 }
 

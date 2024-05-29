@@ -54,12 +54,7 @@ func (fc *fdConn) SetNoDelay(nodelay bool) error {
 	if 0 != atomic.LoadInt32(&fc.closed) {
 		return fc.err
 	}
-
-	var op = 0
-	if nodelay {
-		op = 1
-	}
-	return socket.SetNoDelay(fc.fd, op)
+	return socket.SetNoDelay(fc.fd, nodelay)
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {

@@ -88,7 +88,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 	fdc.remoteAddr = rAddr
 	fdc.events = ev
 	fdc.loop = ev.selectLoop(nfd)
-	fdc.isUdp = "udp" == u.Scheme || "udp4" == u.Scheme || "udp6" == u.Scheme
+	fdc.isUdp = strings.HasPrefix(u.Scheme, "udp")
 
 	if err = ev.addConn(fdc); nil != err {
 		return nil, err

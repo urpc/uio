@@ -1,12 +1,28 @@
+/*
+ * Copyright 2024 the urpc project
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      https://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 package main
 
 import (
 	"bufio"
-	"bytes"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/antlabs/httparser"
 	"github.com/urpc/uio"
@@ -14,6 +30,12 @@ import (
 )
 
 var emptyRequest = http.Request{}
+
+var bufWriterPool = sync.Pool{
+	New: func() interface{} {
+		return bufio.NewWriter(nil)
+	},
+}
 
 type httpConn struct {
 	parser     *httparser.Parser
@@ -70,9 +92,9 @@ func newHttpConn() *httpConn {
 		Body: func(p *httparser.Parser, buf []byte) {
 			//fmt.Printf("%s", buf)
 			// Content-Length 或者chunked数据包
-			var bodyBuffer bytes.Buffer
+			var bodyBuffer uio.CompositeBuffer
 			bodyBuffer.Write(buf)
-			hConn.request.Body = io.NopCloser(&bodyBuffer)
+			hConn.request.Body = &bodyBuffer
 		},
 		MessageComplete: func(p *httparser.Parser) {
 			// 消息解析结束
@@ -102,14 +124,22 @@ func (hc *httpConn) ServeHTTP(c uio.Conn, handler http.Handler) error {
 	}
 
 	if nil != request {
+		// fallback to default server mux
+		if nil == handler {
+			handler = http.DefaultServeMux
+		}
 		return hc.handleRequest(c, request, handler)
 	}
 
 	return nil
 }
 func (hc *httpConn) parseHttpRequest(c uio.Conn) (r *http.Request, err error) {
+
+	// 获取当前已接受但是未处理的数据
+	buffer := c.Peek(hc.buffer)
+
 	// 解析http数据
-	parsedBytes, err := hc.parser.Execute(hc.setting, c.Peek(hc.buffer))
+	parsedBytes, err := hc.parser.Execute(hc.setting, buffer)
 	if nil != err {
 		return nil, err
 	}
@@ -167,9 +197,6 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 		protoMinor: request.ProtoMinor,
 	}
 
-	// 回收缓存
-	defer writer.body.Reset()
-
 	// 处理请求
 	handler.ServeHTTP(writer, request)
 
@@ -183,46 +210,18 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 	response := writer.response()
 	response.Request = request
 
-	// 直接写数据到连接
-	// wrk测试结果:  CPU 占用 ~3%
-	//	$./wrk -t 1 -c 1 -d 10 --latency http://127.0.0.1:8080/
-	//		Running 10s test @ http://127.0.0.1:8080/
-	//		  1 threads and 1 connections
-	//		  Thread Stats   Avg      Stdev     Max   +/- Stdev
-	//		    Latency    49.78ms    3.53ms  60.00ms   98.51%
-	//		    Req/Sec    20.00      1.41    30.00     98.02%
-	//		  Latency Distribution
-	//		     50%   50.00ms
-	//		     75%   50.01ms
-	//		     90%   50.04ms
-	//		     99%   50.23ms
-	//		  202 requests in 10.10s, 20.73KB read
-	//		Requests/sec:     20.00
-	//		Transfer/sec:      2.05KB
-	//err = response.Write(c)
+	// 使用bufio包装一下降低系统调用次数以提高性能
+	bw := bufWriterPool.Get().(*bufio.Writer)
+	bw.Reset(c)
 
-	// 使用bufio包装一下发送
-	// wrk测试结果: CPU 占用 ~14%
-	//
-	//  $ ./wrk -t 1 -c 1 -d 10 --latency http://127.0.0.1:8080/
-	//     Running 10s test @ http://127.0.0.1:8080/
-	//     1 threads and 1 connections
-	//     Thread Stats   Avg      Stdev     Max   +/- Stdev
-	//     Latency    37.45us   35.29us   1.50ms   95.53%
-	//     	Req/Sec    29.85k     1.24k   32.04k    74.26%
-	//     	Latency Distribution
-	//     50%   28.00us
-	//     75%   35.00us
-	//     90%   46.00us
-	//     99%  219.00us
-	//     299923 requests in 10.10s, 30.03MB read
-	//     Requests/sec:  29696.81
-	//     Transfer/sec:      2.97MB
-
-	bw := bufio.NewWriter(c)
+	// 回写结果
 	if err = response.Write(bw); nil == err {
 		err = bw.Flush()
 	}
+
+	// 用完回收
+	bw.Reset(nil)
+	bufWriterPool.Put(bw)
 
 	return err
 }
