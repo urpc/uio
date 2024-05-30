@@ -16,6 +16,13 @@
 
 package socket
 
+import (
+	"errors"
+	"os"
+
+	"golang.org/x/sys/unix"
+)
+
 // SetKeepAlivePeriod sets whether the operating system should send
 // keep-alive messages on the connection and sets period between keep-alive's.
 func SetKeepAlivePeriod(fd, secs int) error {

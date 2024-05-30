@@ -68,6 +68,24 @@ func (b *CompositeBuffer) Close() error {
 	return nil
 }
 
+// Writev appends the contents of vec to the buffer, growing the buffer as
+// needed. The return value n is the length of vec; err is always nil.
+func (b *CompositeBuffer) Writev(vec [][]byte) (n int, err error) {
+	if 0 == len(vec) {
+		return 0, nil
+	}
+
+	for _, buf := range vec {
+		sent, err := b.Write(buf)
+		n += sent
+		if err != nil {
+			return n, err
+		}
+	}
+
+	return
+}
+
 // Write appends the contents of p to the buffer, growing the buffer as
 // needed. The return value n is the length of p; err is always nil.
 func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
@@ -239,6 +257,20 @@ func (b *CompositeBuffer) Peek(p []byte) []byte {
 	}
 
 	return p[:off]
+}
+
+// PeekVec returns the [][]bytes without advancing the buffer.
+func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
+	if 0 == len(b.bufList) {
+		return
+	}
+
+	for _, buf := range b.bufList {
+		dst = append(dst, buf.Bytes())
+		length += buf.Len()
+	}
+
+	return dst, length
 }
 
 // Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.

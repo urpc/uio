@@ -17,10 +17,9 @@
 package main
 
 import (
-	"fmt"
 	"net/http"
 
-	"github.com/urpc/uio"
+	"github.com/urpc/uio/examples/uhttp"
 )
 
 func main() {
@@ -39,30 +38,5 @@ func main() {
 
 	// 使用事件循环方案
 	// wrk -t 1 -c 10 -d 10 --latency http://127.0.0.1:8080/
-	ListenAndServe(":8080", nil)
-}
-
-func ListenAndServe(addr string, handler http.Handler) error {
-
-	var events uio.Events
-	events.Addrs = []string{addr}
-	events.OnOpen = func(c uio.Conn) {
-		//fmt.Println("connection opened:", c.RemoteAddr())
-		c.SetContext(newHttpConn(c.RemoteAddr().String()))
-	}
-
-	events.OnData = func(c uio.Conn) error {
-		hConn := c.Context().(*httpConn)
-		return hConn.ServeHTTP(c, handler)
-	}
-
-	events.OnClose = func(c uio.Conn, err error) {
-		//fmt.Println("connection closed:", c.RemoteAddr(), err)
-	}
-
-	if err := events.Serve(); nil != err {
-		fmt.Println("server exited with error:", err)
-		return err
-	}
-	return nil
+	uhttp.ListenAndServe(":8080", nil)
 }

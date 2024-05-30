@@ -21,7 +21,6 @@ package uio
 import (
 	"errors"
 	"io"
-	"reflect"
 	"sync/atomic"
 	"syscall"
 	"unsafe"
@@ -85,18 +84,19 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 	return socket.SetKeepAlivePeriod(fc.fd, secs)
 }
 
-func (fc *fdConn) WriteString(s string) (n int, err error) {
-	var sh = (*reflect.StringHeader)(unsafe.Pointer(&s))
+func (fc *fdConn) WriteByte(b byte) error {
+	var bb [1]byte
+	bb[0] = b
+	_, err := fc.Write(bb[:])
+	return err
+}
 
-	var data []byte
-	var bh = (*reflect.SliceHeader)(unsafe.Pointer(&data))
-	bh.Data = sh.Data
-	bh.Len = sh.Len
-	bh.Cap = sh.Len
+func (fc *fdConn) WriteString(s string) (n int, err error) {
+	var data = unsafe.Slice(unsafe.StringData(s), len(s))
 	return fc.Write(data)
 }
 
-func (fc *fdConn) Write(b []byte) (int, error) {
+func (fc *fdConn) Write(b []byte) (n int, err error) {
 	fc.mux.Lock()
 
 	if 0 != atomic.LoadInt32(&fc.closed) {
@@ -109,9 +109,28 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 		return fc.onSendUDP(b)
 	}
 
-	if !fc.outbound.Empty() {
-		defer fc.mux.Unlock()
-		return fc.outbound.Write(b)
+	bufferedThreshold := fc.events.WriteBufferedThreshold
+	writeBuffered := bufferedThreshold > 0 && len(b) < bufferedThreshold
+
+	if !fc.outbound.Empty() || writeBuffered {
+		// write to outbound buffer.
+		if n, err = fc.outbound.Write(b); nil != err {
+			fc.mux.Unlock()
+			return n, err
+		}
+
+		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
+		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
+			// If there is an error in flush, the connection will be closed.
+			if err = fc.flush(true); nil != err {
+				fc.mux.Unlock()
+				fc.events.delConn(fc, err)
+				return 0, err
+			}
+		}
+
+		fc.mux.Unlock()
+		return
 	}
 
 	writeSize, err := unix.Write(fc.fd, b)
@@ -127,6 +146,7 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 
 	if writeSize != len(b) {
 		n, _ := fc.outbound.Write(b[writeSize:])
+		writeSize += n
 
 		// Read events are always registered, which will improve program performance in most cases,
 		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
@@ -138,17 +158,188 @@ func (fc *fdConn) Write(b []byte) (int, error) {
 		} else {
 			err = fc.loop.modWrite(fc)
 		}
-
-		writeSize += n
 	}
 
 	fc.mux.Unlock()
 	return writeSize, err
 }
 
+func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
+	fc.mux.Lock()
+
+	if 0 != atomic.LoadInt32(&fc.closed) {
+		fc.mux.Unlock()
+		return 0, fc.err
+	}
+
+	if fc.isUdp {
+		fc.mux.Unlock()
+		return 0, errUnsupported
+	}
+
+	var totalBytes int
+	for _, b := range vec {
+		totalBytes += len(b)
+	}
+
+	bufferedThreshold := fc.events.WriteBufferedThreshold
+	writeBuffered := bufferedThreshold > 0 && totalBytes < bufferedThreshold
+
+	if !fc.outbound.Empty() || writeBuffered {
+		// write to outbound buffer.
+		if n, err = fc.outbound.Writev(vec); nil != err {
+			fc.mux.Unlock()
+			return n, err
+		}
+
+		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
+		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
+			// If there is an error in flush, the connection will be closed.
+			if err = fc.flush(true); nil != err {
+				fc.mux.Unlock()
+				fc.events.delConn(fc, err)
+				return 0, err
+			}
+		}
+
+		fc.mux.Unlock()
+		return
+	}
+
+	// invoke writev() syscall.
+	writeSize, err := unix.Writev(fc.fd, vec)
+	if err != nil {
+		if !errors.Is(err, unix.EAGAIN) {
+			fc.mux.Unlock()
+			fc.events.delConn(fc, err)
+			return 0, err
+		}
+		// ignore: EAGAIN
+		writeSize, err = 0, nil
+	}
+
+	// trim vec buffer.
+	if writeSize < totalBytes {
+		var skipBytes int
+		var skipIdx = -1
+		var skipOffset = -1
+		for i, b := range vec {
+			sz := min(len(b), writeSize-skipBytes)
+			if skipBytes += sz; skipBytes >= writeSize {
+				if sz == len(b) {
+					skipIdx = i + 1
+				} else {
+					skipIdx = i
+					skipOffset = sz
+				}
+				break
+			}
+		}
+
+		if -1 != skipIdx {
+			if vec = vec[skipIdx:]; len(vec) > 0 {
+				vec[0] = vec[0][skipOffset:]
+			}
+		}
+	} else {
+		// all vec write success.
+		vec = nil
+	}
+
+	// remain bytes write to outbound buffer.
+	if len(vec) > 0 {
+		n, _ := fc.outbound.Writev(vec)
+		writeSize += n
+
+		// Read events are always registered, which will improve program performance in most cases,
+		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
+		// in the absence of intervention may lead to service memory depletion.
+		// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
+		// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
+		if fc.events.FullDuplex {
+			err = fc.loop.modReadWrite(fc)
+		} else {
+			err = fc.loop.modWrite(fc)
+		}
+	}
+
+	fc.mux.Unlock()
+	return writeSize, err
+}
+
+func (fc *fdConn) Flush() (err error) {
+
+	fc.mux.Lock()
+
+	// connection closed.
+	if 0 != atomic.LoadInt32(&fc.closed) {
+		fc.mux.Unlock()
+		return fc.err
+	}
+
+	// write outbound buffer.
+	if !fc.outbound.Empty() {
+		err = fc.flush(true)
+	}
+
+	fc.mux.Unlock()
+
+	if nil != err {
+		fc.events.delConn(fc, err)
+	}
+	return
+}
+
+func (fc *fdConn) flush(opEvent bool) error {
+
+	// udp unsupported.
+	if fc.isUdp {
+		return nil // nothing to do.
+	}
+
+	var vecBuf [16][]byte
+
+	for !fc.outbound.Empty() {
+		// peek writeable vec bytes.
+		vec, _ := fc.outbound.PeekVec(vecBuf[:0])
+		// invoke writev() syscall.
+		writeSize, err := socket.Writev(fc.fd, vec)
+		if nil != err {
+			if !errors.Is(err, unix.EAGAIN) {
+				return err
+			}
+			// ignore: EAGAIN
+			writeSize, err = 0, nil
+			break
+		}
+
+		// commit write offset.
+		fc.outbound.Discard(writeSize)
+	}
+
+	var err error
+	if opEvent && !fc.outbound.Empty() {
+		// Read events are always registered, which will improve program performance in most cases,
+		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
+		// in the absence of intervention may lead to service memory depletion.
+		// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
+		// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
+		if fc.events.FullDuplex {
+			err = fc.loop.modReadWrite(fc)
+		} else {
+			err = fc.loop.modWrite(fc)
+		}
+	}
+
+	return err
+}
+
 func (fc *fdConn) fdClose(err error) {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
+
+	// try flush outbound buffer.
+	_ = fc.flush(false)
 
 	// close socket and release resource.
 	_ = syscall.Close(fc.fd)
@@ -316,6 +507,11 @@ func (fc *fdConn) onRead() error {
 	if len(fc.inboundTail) > 0 {
 		_, _ = fc.inbound.Write(fc.inboundTail)
 		fc.inboundTail = fc.inboundTail[:0]
+	}
+
+	// try flush outbound buffer.
+	if fc.events.WriteBufferedThreshold > 0 {
+		_ = fc.Flush()
 	}
 
 	return nil

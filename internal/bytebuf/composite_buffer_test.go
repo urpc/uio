@@ -581,3 +581,208 @@ func BenchmarkBuffer(b *testing.B) {
 		}
 	})
 }
+
+func TestCompositeBuffer_PeekVec(t *testing.T) {
+
+	tests := []struct {
+		name       string
+		bufList    []*Buffer
+		wantVec    [][]byte
+		wantLength int
+	}{
+		{
+			name:       "test0",
+			bufList:    []*Buffer{},
+			wantVec:    nil,
+			wantLength: 0,
+		},
+		{
+			name:       "test1",
+			bufList:    []*Buffer{NewBufferString("hello")},
+			wantVec:    [][]byte{[]byte("hello")},
+			wantLength: 5,
+		},
+		{
+			name:       "test2",
+			bufList:    []*Buffer{NewBufferString("hello"), NewBufferString(" "), NewBufferString("world!")},
+			wantVec:    [][]byte{[]byte("hello"), []byte(" "), []byte("world!")},
+			wantLength: 12,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &CompositeBuffer{
+				bufList: tt.bufList,
+			}
+			gotVec, gotLength := b.PeekVec(nil)
+			if !reflect.DeepEqual(gotVec, tt.wantVec) {
+				t.Errorf("PeekVec() gotVec = %v, want %v", gotVec, tt.wantVec)
+			}
+			if gotLength != tt.wantLength {
+				t.Errorf("PeekVec() gotLength = %v, want %v", gotLength, tt.wantLength)
+			}
+		})
+	}
+}
+
+func TestCompositeBuffer_WriteString(t *testing.T) {
+	type args struct {
+		s string
+	}
+	tests := []struct {
+		name    string
+		bufList []*Buffer
+		args    args
+		wantN   int
+		wantErr bool
+	}{
+		{
+			name:    "test0",
+			bufList: []*Buffer{},
+			args:    args{s: "hello"},
+			wantN:   5,
+			wantErr: false,
+		},
+		{
+			name:    "test1",
+			bufList: []*Buffer{NewBufferString("hello")},
+			args:    args{s: " world!"},
+			wantN:   7,
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &CompositeBuffer{
+				bufList: tt.bufList,
+			}
+			gotN, err := b.WriteString(tt.args.s)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("WriteString() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if gotN != tt.wantN {
+				t.Errorf("WriteString() gotN = %v, want %v", gotN, tt.wantN)
+			}
+		})
+	}
+}
+
+func TestCompositeBuffer_WriteByte(t *testing.T) {
+	type fields struct {
+		bufList []*Buffer
+	}
+	type args struct {
+		c byte
+	}
+	tests := []struct {
+		name    string
+		bufList []*Buffer
+		args    args
+		wantErr bool
+	}{
+		{
+			name:    "test0",
+			bufList: []*Buffer{},
+			args:    args{c: 'h'},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &CompositeBuffer{
+				bufList: tt.bufList,
+			}
+			if err := b.WriteByte(tt.args.c); (err != nil) != tt.wantErr {
+				t.Errorf("WriteByte() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestCompositeBuffer_Writev(t *testing.T) {
+	type args struct {
+		vec [][]byte
+	}
+	tests := []struct {
+		name    string
+		bufList []*Buffer
+		args    args
+		wantN   int
+		wantErr bool
+	}{
+		{
+			name:    "test0",
+			bufList: []*Buffer{},
+			args:    args{vec: [][]byte{}},
+			wantN:   0,
+			wantErr: false,
+		},
+		{
+			name:    "test1",
+			bufList: []*Buffer{},
+			args:    args{vec: [][]byte{[]byte("hello")}},
+			wantN:   5,
+			wantErr: false,
+		},
+		{
+			name:    "test2",
+			bufList: []*Buffer{},
+			args:    args{vec: [][]byte{[]byte("hello"), []byte(" "), []byte("world!")}},
+			wantN:   12,
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &CompositeBuffer{
+				bufList: tt.bufList,
+			}
+			gotN, err := b.Writev(tt.args.vec)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Writev() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if gotN != tt.wantN {
+				t.Errorf("Writev() gotN = %v, want %v", gotN, tt.wantN)
+			}
+		})
+	}
+}
+
+func TestCompositeBuffer_Close(t *testing.T) {
+	tests := []struct {
+		name    string
+		bufList []*Buffer
+		wantErr bool
+	}{
+		{
+			name:    "test0",
+			bufList: []*Buffer{},
+			wantErr: false,
+		},
+		{
+			name:    "test1",
+			bufList: []*Buffer{NewBufferString("1234")},
+			wantErr: false,
+		},
+		{
+			name:    "test2",
+			bufList: []*Buffer{NewBufferString("1234"), NewBufferString("567"), NewBufferString("890")},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &CompositeBuffer{
+				bufList: tt.bufList,
+			}
+			if err := b.Close(); (err != nil) != tt.wantErr {
+				t.Errorf("Close() error = %v, wantErr %v", err, tt.wantErr)
+			}
+			if !b.Empty() || b.Len() != 0 {
+				t.Errorf("Close() got = %v, want %v", b.Len(), 0)
+			}
+		})
+	}
+}

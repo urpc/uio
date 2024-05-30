@@ -1,4 +1,4 @@
-module examples
+module github.com/urpc/uio/examples
 
 go 1.21.0
 

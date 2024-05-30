@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -82,28 +83,41 @@ type Conn interface {
 	// it's not concurrency-safe.
 	Discard(n int) (int, error)
 
-	// AvailableReadBytes returns a receive buffer data length.
+	// InboundBuffered returns a inbound buffer data length.
 	// it's not concurrency-safe.
-	AvailableReadBytes() int
+	InboundBuffered() int
 
-	// AvailableWriteBytes returns a send buffer data length.
-	AvailableWriteBytes() int
-
-	// ReadWriteCloser
-	// it's not concurrency-safe.
-	// Notice: non-blocking interface, should not be used as you use std.
-	io.ReadWriteCloser
-
-	// StringWriter
-	// it's not concurrency-safe.
-	// Notice: non-blocking interface, should not be used as you use std.
-	io.StringWriter
+	// OutboundBuffered returns a outbound buffer data length.
+	OutboundBuffered() int
 
 	// WriterTo
 	// it's not concurrency-safe.
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.WriterTo
+
+	// ReadWriteCloser
+	// Read() it's not concurrency-safe.
+	// Notice: non-blocking interface, should not be used as you use std.
+	io.ReadWriteCloser
+
+	// ByteWriter
+	// Notice: non-blocking interface, should not be used as you use std.
+	io.ByteWriter
+
+	// StringWriter
+	// Notice: non-blocking interface, should not be used as you use std.
+	io.StringWriter
+
+	// Writev "writev"-like batch write optimization.
+	// Notice: non-blocking interface, should not be used as you use std.
+	Writev(vec [][]byte) (int, error)
+
+	// Flush writes any buffered data to the underlying connection.
+	// Notice: non-blocking interface, should not be used as you use std.
+	Flush() error
 }
+
+var errUnsupported = fmt.Errorf("unsupported method")
 
 type commonConn struct {
 	events      *Events                 // events
@@ -207,13 +221,12 @@ func (fc *commonConn) Discard(n int) (int, error) {
 	return n, nil
 }
 
-func (fc *commonConn) AvailableReadBytes() int {
+func (fc *commonConn) InboundBuffered() int {
 	return fc.inbound.Len() + len(fc.inboundTail)
 }
 
-func (fc *commonConn) AvailableWriteBytes() int {
+func (fc *commonConn) OutboundBuffered() int {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
-
 	return fc.outbound.Len()
 }

@@ -17,17 +17,13 @@
 package uio
 
 import (
-	"fmt"
 	"io"
 	"net"
-	"reflect"
 	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 )
-
-var errUnsupported = fmt.Errorf("unsupported method")
 
 type fdConn struct {
 	commonConn
@@ -122,14 +118,15 @@ func (fc *fdConn) SetWriteBuffer(size int) error {
 	return errUnsupported
 }
 
-func (fc *fdConn) WriteString(s string) (n int, err error) {
-	var sh = (*reflect.StringHeader)(unsafe.Pointer(&s))
+func (fc *fdConn) WriteByte(b byte) error {
+	var bb [1]byte
+	bb[0] = b
+	_, err := fc.Write(bb[:])
+	return err
+}
 
-	var data []byte
-	var bh = (*reflect.SliceHeader)(unsafe.Pointer(&data))
-	bh.Data = sh.Data
-	bh.Len = sh.Len
-	bh.Cap = sh.Len
+func (fc *fdConn) WriteString(s string) (n int, err error) {
+	var data = unsafe.Slice(unsafe.StringData(s), len(s))
 	return fc.Write(data)
 }
 
@@ -143,6 +140,25 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	}
 
 	return fc.conn.Write(p)
+}
+
+func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
+	if 0 != atomic.LoadInt32(&fc.closed) {
+		return 0, fc.err
+	}
+
+	if fc.udp != nil {
+		return 0, errUnsupported
+	}
+
+	var buffers = net.Buffers(vec)
+	writeSize, err := buffers.WriteTo(fc.conn)
+	return int(writeSize), err
+}
+
+func (fc *fdConn) Flush() error {
+	// net.TcpConn dont require flush.
+	return nil
 }
 
 func (fc *fdConn) Close() error {

@@ -4,15 +4,14 @@ program_name=$0
 
 function print_usage {
     echo ""
-    echo "Usage: $program_name [connections] [duration] [size]"
+    echo "Usage: $program_name [connections] [duration]"
     echo ""
     echo "connections:  Connections to keep open to the destinations"
     echo "duration:     Exit after the specified amount of time"
-    echo "size:         single packet size for benchmark"
     echo ""
     echo "--- EXAMPLE ---"
     echo ""
-    echo "$program_name 1000 30 1024"
+    echo "$program_name 1000 30"
     echo ""
     exit 1
 }
@@ -59,48 +58,49 @@ trap cleanup EXIT
 
 mkdir -p bin
 
-eval "$(pkill -9 echo-evio || printf "")"
-eval "$(pkill -9 echo-gnet || printf "")"
-eval "$(pkill -9 echo-uio || printf "")"
-eval "$(pkill -9 echo-nbio || printf "")"
+eval "$(pkill -9 http-std || printf "")"
+eval "$(pkill -9 http-nbio || printf "")"
+eval "$(pkill -9 http-uio || printf "")"
 
 conn_num=$1
 test_duration=$2
-packet_size=$3
-packet=$(LC_ALL=C bash -c "< /dev/urandom tr -dc a-zA-Z0-9 | fold -w $packet_size | head -n 1")
+#packet_size=$3
+#packet=$(LC_ALL=C bash -c "< /dev/urandom tr -dc a-zA-Z0-9 | fold -w $packet_size | head -n 1")
 
-echo "--- ECHO PACKET ---"
-echo "$packet"
-echo ""
+#echo "--- ECHO PACKET ---"
+#echo "$packet"
+#echo ""
 
 function go_bench() {
+  echo "--- HTTP BENCH ---"
   echo "--- $1 ---"
   echo ""
-  if [[ "$1" == "GNET" ]]; then
-    go build -tags=poll_opt -gcflags="-l=4" -ldflags="-s -w" -o "$2" "$3"
-  else
-    go build -gcflags="-l=4" -ldflags="-s -w" -o "$2" "$3"
-  fi
 
+  echo "compiling server...$1"
+  go build -gcflags="-l=4" -ldflags="-s -w" -o "$2" "$3"
+
+  echo "starting server...$1"
   $limit_cpu_server $2 --port "$4" --loops "$5" &
 
   # waiting for server startup...
   sleep 1
 
   echo "--- BENCHMARK START ---"
-  printf "*** %d connections, %d seconds, packet size: %d bytes, server cpu core: 0-%d, client cpu core: %d-%d\n" "$conn_num" "$test_duration" "$packet_size" "$server_cpu_num" "${client_cpu_num}" "$((total_cpu_num - 1))"
+  printf "*** %d connections, %d seconds, server cpu core: 0-%d, client cpu core: %d-%d\n" "$conn_num" "$test_duration" "$server_cpu_num" "$client_cpu_num" "$((total_cpu_num - 1))"
   echo ""
   
-  $limit_cpu_client tcpkali --workers "$client_cpu_num" --connections "$conn_num" --connect-rate "$conn_num" --duration "$test_duration"'s' -m "$packet" 127.0.0.1:"$4"
+  $limit_cpu_client wrk -H 'Host: 127.0.0.1' -H 'Accept: text/plain,text/html;q=0.9,application/xhtml+xml;q=0.9,application/xml;q=0.8,*/*;q=0.7' -H 'Connection: keep-alive' --latency -d $test_duration -c $conn_num -t $client_cpu_num http://127.0.0.1:$4/
   echo ""
   echo "--- BENCHMARK DONE ---"
   echo ""
+
+  # kill server
+  eval "$(pkill -9 "$1" || printf "")"
 
   # waiting for server cleanup...
   sleep 1
 }
 
-#go_bench "EVIO" bin/echo-evio-server echo-evio.go 7001 $server_cpu_num
-#go_bench "GNET" bin/echo-gnet-server echo-gnet.go 7002 $server_cpu_num
-#go_bench "NBIO" bin/echo-nbio-server echo-nbio.go 7003 $server_cpu_num
-go_bench "UIO" bin/echo-uio-server echo-uio.go 7004 $server_cpu_num
+go_bench "http-std" bin/http-std-server http-std.go 7001 $server_cpu_num
+go_bench "http-nbio" bin/http-nbio-server http-nbio.go 7002 $server_cpu_num
+go_bench "http-uio" bin/http-uio-server http-uio.go 7003 $server_cpu_num

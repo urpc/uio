@@ -3,9 +3,10 @@ package main
 import (
 	"flag"
 	"fmt"
+	"net/http"
 	"runtime"
 
-	"github.com/lesismal/nbio"
+	"github.com/lesismal/nbio/nbhttp"
 )
 
 func main() {
@@ -15,28 +16,30 @@ func main() {
 	flag.IntVar(&loops, "loops", 0, "server loops")
 	flag.Parse()
 
-	// nbio 默认数量为 runtime.NumCPU() / 4
 	// 如果未指定时强制统一为 runtime.NumCPU() 确保与其他框架一致
 	if loops <= 0 {
 		loops = runtime.NumCPU()
 	}
 
-	engine := nbio.NewEngine(nbio.Config{
+	mux := &http.ServeMux{}
+	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
+		writer.Write([]byte("hello world!"))
+	})
+
+	svr := nbhttp.NewEngine(nbhttp.Config{
 		Network: "tcp",
-		Addrs:   []string{fmt.Sprintf(":%d", port)},
+		Addrs:   []string{fmt.Sprintf("localhost:%d", port)},
+		Handler: mux,
 		NPoller: loops,
 	})
+	//svr.Execute = func(f func()) { f() }
 
-	engine.OnData(func(c *nbio.Conn, data []byte) {
-		c.Write(data)
-	})
-
-	err := engine.Start()
+	err := svr.Start()
 	if err != nil {
 		fmt.Printf("nbio.Start failed: %v\n", err)
 		return
 	}
-	defer engine.Stop()
+	defer svr.Stop()
 
 	<-make(chan int)
 }

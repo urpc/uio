@@ -49,7 +49,14 @@ type Events struct {
 	// The default value is 64KB.
 	MaxBufferSize int
 
-	// Read events are always registered, which will improve program performance in most cases,
+	// WriteBufferedThreshold enabled when value is greater than 0, writes will go into the outbound buffer instead of attempting to send them out immediately,
+	// unless the outbound buffer reaches the threshold or the flush function is manually called.
+	//
+	// If you have multiple Write call requirements, opening it will improve write performance because it reduces the number of system calls by merging multiple write operations to improve performance.
+	// The default value is 0.
+	WriteBufferedThreshold int
+
+	// FullDuplex read events are always registered, which will improve program performance in most cases,
 	// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
 	// in the absence of intervention may lead to service memory depletion.
 	// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
@@ -141,6 +148,10 @@ func (ev *Events) initConfig() error {
 
 	if ev.MaxBufferSize <= 0 {
 		ev.MaxBufferSize = 1024 * 64
+	}
+
+	if ev.WriteBufferedThreshold > 0 && ev.WriteBufferedThreshold < 1024 {
+		ev.WriteBufferedThreshold = 1024
 	}
 
 	return nil
