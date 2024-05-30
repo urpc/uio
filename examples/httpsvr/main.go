@@ -48,7 +48,7 @@ func ListenAndServe(addr string, handler http.Handler) error {
 	events.Addrs = []string{addr}
 	events.OnOpen = func(c uio.Conn) {
 		//fmt.Println("connection opened:", c.RemoteAddr())
-		c.SetContext(newHttpConn())
+		c.SetContext(newHttpConn(c.RemoteAddr().String()))
 	}
 
 	events.OnData = func(c uio.Conn) error {

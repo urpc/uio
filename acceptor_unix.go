@@ -99,7 +99,7 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
 		}
 	}
 
-	panic("unknown fd")
+	return nil
 }
 
 func (ld *acceptor) addListen(addr string) (err error) {

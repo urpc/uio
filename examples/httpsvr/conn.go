@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/antlabs/httparser"
@@ -33,13 +34,41 @@ import (
 
 var emptyRequest = http.Request{}
 
+var timeValue atomic.Value
+var timeRFC1123Value atomic.Value
+
 var bufWriterPool = sync.Pool{
 	New: func() interface{} {
 		return bufio.NewWriterSize(nil, 1024)
 	},
 }
 
+func init() {
+
+	// 初始化
+	timeValue.Store(time.Now())
+	timeRFC1123Value.Store(time.Now().Format(time.RFC1123))
+
+	// 每秒刷新时间
+	// HTTP 服务器通常不需要精确时间，秒级刷新足以
+	go func() {
+		var ticker = time.NewTicker(time.Second)
+		defer ticker.Stop()
+
+		var timeBuf [64]byte
+
+		for t := range ticker.C {
+			timeBytes := t.AppendFormat(timeBuf[:0], time.RFC1123)
+
+			timeValue.Store(t)
+			timeRFC1123Value.Store(string(timeBytes))
+		}
+	}()
+
+}
+
 type httpConn struct {
+	remoteAddr string
 	parser     *httparser.Parser
 	setting    *httparser.Setting
 	buffer     []byte
@@ -48,12 +77,13 @@ type httpConn struct {
 	finished   bool
 }
 
-func newHttpConn() *httpConn {
+func newHttpConn(remoteAddr string) *httpConn {
 
 	hConn := &httpConn{
-		parser:  httparser.New(httparser.REQUEST),
-		buffer:  make([]byte, 1024),
-		request: &http.Request{},
+		remoteAddr: remoteAddr,
+		parser:     httparser.New(httparser.REQUEST),
+		buffer:     make([]byte, 1024),
+		request:    &http.Request{},
 	}
 
 	hConn.setting = &httparser.Setting{
@@ -191,13 +221,13 @@ func (hc *httpConn) handleRequest(c uio.Conn, request *http.Request, handler htt
 		request.URL.Scheme = ""
 	}
 
-	request.RemoteAddr = c.RemoteAddr().String()
+	request.RemoteAddr = hc.remoteAddr
 	request.Close = shouldClose(request.ProtoMajor, request.ProtoMinor, request.Header, false)
 
 	// 准备响应收集容器
 	writer := &httpResponseWriter{
-		protoMajor: request.ProtoMajor,
-		protoMinor: request.ProtoMinor,
+		protoMajor: byte(request.ProtoMajor),
+		protoMinor: byte(request.ProtoMinor),
 	}
 
 	// 处理请求
@@ -237,7 +267,7 @@ type responseWriter interface {
 }
 
 type httpResponseWriter struct {
-	protoMajor, protoMinor int
+	protoMajor, protoMinor byte
 	statusCode             int
 	header                 http.Header
 	body                   uio.CompositeBuffer
@@ -273,8 +303,8 @@ func (h *httpResponseWriter) writeStdResponse(request *http.Request, w responseW
 	}
 
 	resp := &http.Response{
-		ProtoMajor:    h.protoMajor,
-		ProtoMinor:    h.protoMinor,
+		ProtoMajor:    int(h.protoMajor),
+		ProtoMinor:    int(h.protoMinor),
 		StatusCode:    h.statusCode,
 		Header:        header,
 		Body:          &h.body,
@@ -305,7 +335,7 @@ func (h *httpResponseWriter) writeFastResponse(request *http.Request, w response
 			return err
 		}
 
-		if err := w.WriteByte('0' + byte(h.protoMajor)); nil != err {
+		if err := w.WriteByte('0' + h.protoMajor); nil != err {
 			return err
 		}
 
@@ -313,7 +343,7 @@ func (h *httpResponseWriter) writeFastResponse(request *http.Request, w response
 			return err
 		}
 
-		if err := w.WriteByte('0' + byte(h.protoMinor)); nil != err {
+		if err := w.WriteByte('0' + h.protoMinor); nil != err {
 			return err
 		}
 
@@ -373,7 +403,8 @@ func (h *httpResponseWriter) writeFastResponse(request *http.Request, w response
 				return err
 			}
 
-			if _, err := w.WriteString(time.Now().Format(time.RFC1123)); err != nil {
+			var timeRFC1123 = timeRFC1123Value.Load().(string)
+			if _, err := w.WriteString(timeRFC1123); err != nil {
 				return err
 			}
 
