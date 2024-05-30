@@ -163,18 +163,18 @@ func (fc *commonConn) Peek(b []byte) []byte {
 		return nil
 	}
 
-	if 0 == inboundTailLen {
-		return fc.inbound.Peek(b)
+	if 0 == inboundLen {
+		n := min(len(b), len(fc.inboundTail))
+		return fc.inboundTail[:n]
 	}
 
 	data := fc.inbound.Peek(b)
-	n := len(data)
-	if n < len(b) {
-		sz := copy(b[n:], fc.inboundTail)
-		n += sz
+	if n := len(data); n < len(b) {
+		n += copy(b[n:], fc.inboundTail)
+		return b[:n]
 	}
 
-	return b[:n]
+	return data
 }
 
 func (fc *commonConn) Discard(n int) (int, error) {
