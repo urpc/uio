@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
@@ -74,6 +75,20 @@ type Conn interface {
 	// SetWriteBuffer sets the size of the operating system's
 	// transmit buffer associated with the connection.
 	SetWriteBuffer(size int) error
+
+	// SetDeadline sets deadline for both read and write.
+	// If it is time.Zero, SetDeadline will clear the deadlines.
+	SetDeadline(t time.Time) error
+
+	// SetReadDeadline sets the deadline for future Read calls.
+	// When the user doesn't update the deadline and the deadline exceeds,
+	// the connection will be closed.
+	// If it is time.Zero, SetReadDeadline will clear the deadline.
+	SetReadDeadline(t time.Time) error
+
+	// SetWriteDeadline sets the deadline for future data writing.
+	// If it is time.Zero, SetReadDeadline will clear the deadline.
+	SetWriteDeadline(t time.Time) error
 
 	// Peek returns the next len(b) bytes without advancing the inbound buffer.
 	// it's not concurrency-safe.
@@ -133,10 +148,13 @@ type commonConn struct {
 	inboundTail []byte                  // inbound tail buffer
 }
 
-func (fc *commonConn) LocalAddr() net.Addr        { return fc.localAddr }
-func (fc *commonConn) RemoteAddr() net.Addr       { return fc.remoteAddr }
-func (fc *commonConn) Context() interface{}       { return fc.ctx }
-func (fc *commonConn) SetContext(ctx interface{}) { fc.ctx = ctx }
+func (fc *commonConn) LocalAddr() net.Addr                { return fc.localAddr }
+func (fc *commonConn) RemoteAddr() net.Addr               { return fc.remoteAddr }
+func (fc *commonConn) Context() interface{}               { return fc.ctx }
+func (fc *commonConn) SetContext(ctx interface{})         { fc.ctx = ctx }
+func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
+func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
+func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
 
 func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
 	if !fc.inbound.Empty() {

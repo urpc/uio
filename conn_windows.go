@@ -31,6 +31,7 @@ type fdConn struct {
 	udp      net.PacketConn
 	udpSvr   *fdConn
 	udpConns map[string]*fdConn
+	writeSig chan struct{}
 }
 
 func (fc *fdConn) Fd() int {
@@ -139,7 +140,16 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		return fc.udp.WriteTo(p, fc.remoteAddr)
 	}
 
-	return fc.conn.Write(p)
+	fc.mux.Lock()
+	n, err = fc.outbound.Write(p)
+	fc.mux.Unlock()
+
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
+	}
+
+	return
 }
 
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
@@ -151,13 +161,27 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, errUnsupported
 	}
 
-	var buffers = net.Buffers(vec)
-	writeSize, err := buffers.WriteTo(fc.conn)
-	return int(writeSize), err
+	fc.mux.Lock()
+	n, err = fc.outbound.Writev(vec)
+	fc.mux.Unlock()
+
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
+	}
+
+	return
 }
 
 func (fc *fdConn) Flush() error {
-	// net.TcpConn dont require flush.
+	if 0 != atomic.LoadInt32(&fc.closed) {
+		return fc.err
+	}
+
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
+	}
 	return nil
 }
 
@@ -220,10 +244,54 @@ func (fc *fdConn) fdClose(err error) {
 	fc.inbound.Reset()
 	fc.inboundTail = nil
 	fc.err = err
+
+	// close write signal.
+	close(fc.writeSig)
 }
 
 func (fc *fdConn) fireWriteEvent() error {
-	return errUnsupported
+	if nil == fc.conn {
+		return errUnsupported
+	}
+
+	go func() {
+		var writeBuffer = make([]byte, 1024)
+		for {
+			select {
+			case _, ok := <-fc.writeSig:
+				if !ok {
+					return
+				}
+
+				fc.mux.Lock()
+				if fc.outbound.Empty() {
+					fc.mux.Unlock()
+					continue
+				}
+
+				data := fc.outbound.Peek(writeBuffer)
+				fc.mux.Unlock()
+
+				for {
+					n, err := fc.conn.Write(data)
+					if nil != err {
+						fc.events.delConn(fc, err)
+						return
+					}
+
+					// write success.
+					_ = n
+					break
+				}
+
+				fc.mux.Lock()
+				fc.outbound.Discard(len(data))
+				fc.mux.Unlock()
+			}
+		}
+	}()
+
+	return nil
 }
 
 func (fc *fdConn) fireReadEvent() error {
@@ -237,7 +305,7 @@ func (fc *fdConn) fireReadEvent() error {
 			n, err := fc.conn.Read(buffer)
 			if nil != err {
 				fc.events.delConn(fc, err)
-				break
+				return
 			}
 
 			fc.inboundTail = buffer[:n]
@@ -253,6 +321,7 @@ func (fc *fdConn) fireReadEvent() error {
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
 			}
+
 		}
 	}()
 

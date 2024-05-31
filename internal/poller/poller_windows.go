@@ -38,6 +38,7 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 			return nil
 		case fd := <-ev.ev:
 			_ = handler.OnRead(ev, fd)
+			_ = handler.OnWrite(ev, fd)
 		}
 	}
 

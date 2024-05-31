@@ -74,12 +74,15 @@ type Events struct {
 	OnClose func(c Conn, err error)
 }
 
-func (ev *Events) Serve() (err error) {
+func (ev *Events) Serve(addrs ...string) (err error) {
 
 	defer func() {
 		// close loops.
 		_ = ev.Close(err)
 	}()
+
+	// append listen address.
+	ev.Addrs = append(ev.Addrs, addrs...)
 
 	// initialize events
 	if err = ev.initEvents(); nil != err {
