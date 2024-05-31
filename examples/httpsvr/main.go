@@ -24,19 +24,12 @@ import (
 
 func main() {
 
-	// 注册标准库http处理函数
+	// register http handler to http.DefaultServeMux
 	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		//fmt.Println("handle request:", request.URL.Path, request.RemoteAddr, time.Now().String())
 		writer.Write([]byte("hello world!"))
 	})
 
-	// 使用标准库方案
-	// wrk -t 1 -c 10 -d 10 --latency http://127.0.0.1:8081/
-	go func() {
-		http.ListenAndServe(":8081", nil)
-	}()
-
-	// 使用事件循环方案
-	// wrk -t 1 -c 10 -d 10 --latency http://127.0.0.1:8080/
+	// serve uhttp server.
 	uhttp.ListenAndServe(":8080", nil)
 }

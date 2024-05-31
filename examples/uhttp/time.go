@@ -25,12 +25,11 @@ var timeValue atomic.Value
 var timeRFC1123Value atomic.Value
 
 func init() {
-	// 初始化
+	// init time.
 	timeValue.Store(time.Now())
 	timeRFC1123Value.Store(string(appendTime(nil, time.Now())))
 
-	// 每秒刷新时间
-	// HTTP 服务器通常不需要精确时间，秒级刷新足以
+	// every second to flush the time.
 	go func() {
 		var ticker = time.NewTicker(time.Second)
 		defer ticker.Stop()

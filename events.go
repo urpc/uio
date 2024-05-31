@@ -76,10 +76,10 @@ type Events struct {
 	// OnClose fires when a connection has been closed.
 	OnClose func(c Conn, err error)
 
-	// OnInbound when any data read by a socket, it triggers the inbound event.
+	// OnInbound when any bytes read by a socket, it triggers the inbound event.
 	OnInbound func(c Conn, readBytes int)
 
-	// OnOutbound when any data write by a socket, it triggers the outbound event.
+	// OnOutbound when any bytes write to a socket, it triggers the outbound event.
 	OnOutbound func(c Conn, writeBytes int)
 }
 

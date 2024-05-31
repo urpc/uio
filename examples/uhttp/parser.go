@@ -47,7 +47,6 @@ func resetHttpResponseWriter(writer *httpResponseWriter) *httpResponseWriter {
 
 var httpParserSettings = &httparser.Setting{
 	MessageBegin: func(p *httparser.Parser) {
-		//解析器开始工作
 		//fmt.Printf("begin\n")
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request = resetHttpRequest(hConn.request)
@@ -55,13 +54,12 @@ var httpParserSettings = &httparser.Setting{
 		hConn.finished = false
 	},
 	URL: func(p *httparser.Parser, buf []byte) {
-		//url数据
 		//fmt.Printf("url->%s\n", buf)
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request.RequestURI = string(buf)
 	},
 	Status: func(p *httparser.Parser, buf []byte) {
-		// 响应包才需要用到
+		// response only
 	},
 	HeaderField: func(p *httparser.Parser, buf []byte) {
 		// http header field
@@ -81,12 +79,11 @@ var httpParserSettings = &httparser.Setting{
 		hConn.lastHeader = ""
 	},
 	HeadersComplete: func(p *httparser.Parser) {
-		// http header解析结束
 		//fmt.Printf("header complete\n")
 	},
 	Body: func(p *httparser.Parser, buf []byte) {
 		//fmt.Printf("%s", buf)
-		// Content-Length 或者chunked数据包
+		// Content-Length or chunked data
 		var bodyBuffer uio.CompositeBuffer
 		bodyBuffer.Write(buf)
 
@@ -94,7 +91,6 @@ var httpParserSettings = &httparser.Setting{
 		hConn.request.Body = &bodyBuffer
 	},
 	MessageComplete: func(p *httparser.Parser) {
-		// 消息解析结束
 		//fmt.Printf("\n")
 		var sb strings.Builder
 		sb.WriteString("HTTP/")

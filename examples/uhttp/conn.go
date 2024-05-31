@@ -87,21 +87,21 @@ func (hc *HttpConn) ServeHTTP(handler http.Handler) error {
 
 func (hc *HttpConn) parseHttpRequest() (r *http.Request, err error) {
 
-	// 获取当前已接受但是未处理的数据
+	// peek unread bytes from inbound buffer.
 	buffer := hc.conn.Peek(hc.buffer)
 
-	// 解析http数据
+	// parse http request.
 	parsedBytes, err := hc.parser.Execute(httpParserSettings, buffer)
 	if nil != err {
 		return nil, err
 	}
 
-	// 成功解析部分或者全部数据
+	// advance parsed bytes offset.
 	if parsedBytes > 0 {
 		_, _ = hc.conn.Discard(parsedBytes)
 	}
 
-	// 成功解析一个请求
+	// finished parse http request.
 	if hc.finished {
 		request := hc.request
 		rawurl := request.RequestURI
@@ -129,16 +129,16 @@ func (hc *HttpConn) parseHttpRequest() (r *http.Request, err error) {
 			request.URL.Scheme = ""
 		}
 
-		// 填充一些必要信息
+		// fill remote addr and close flag.
 		request.RemoteAddr = hc.remoteAddr
 		request.Close = shouldClose(request.ProtoMajor, request.ProtoMinor, request.Header, false)
 
-		// 重置状态，为下一个请求做准备
+		// reset parser state for next request.
 		hc.parser.Reset()
 		return request, nil
 	}
 
-	// 数据包不全，等待下一轮继续解析
+	// wait for more bytes to continue.
 	return nil, nil
 }
 
@@ -152,30 +152,30 @@ func (hc *HttpConn) Handle(handler http.Handler) (err error) {
 	hc.writer.protoMajor = byte(hc.request.ProtoMajor)
 	hc.writer.protoMinor = byte(hc.request.ProtoMinor)
 
-	// 处理请求
+	// handle request.
 	handler.ServeHTTP(hc.writer, hc.request)
 
-	// 丢弃未读取的body数据
+	// drop any unread http body data.
 	if nil != hc.request.Body && hc.request.Body != http.NoBody {
 		_, _ = io.Copy(io.Discard, hc.request.Body)
 		_ = hc.request.Body.Close()
 	}
 
-	// 使用bufio包装一下降低系统调用次数以提高性能
+	// merge multi write to one.
 	bw := bufWriterPool.Get().(*bufio.Writer)
 	bw.Reset(hc.conn)
 
-	// 回写响应: 使用高性能版
+	// write response: fast version.
 	if err = hc.writer.writeFastResponse(hc.request, bw); nil == err {
 		err = bw.Flush()
 	}
 
-	// 回写响应: 使用标准库版
+	// write response: std version.
 	//if err = hc.writer.writeStdResponse(request, bw); nil == err {
 	//	err = bw.Flush()
 	//}
 
-	// 用完回收
+	// reset and put to buffer pool.
 	bw.Reset(nil)
 	bufWriterPool.Put(bw)
 
