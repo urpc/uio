@@ -34,15 +34,18 @@ type Events struct {
 	mux       sync.Mutex
 
 	// Pollers is set up to start the given number of event-loop goroutine.
+	// The default value is runtime.NumCPU().
 	Pollers int
 
 	// Addrs is the listening addr list for a server.
 	Addrs []string
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
+	// The default value is false.
 	ReusePort bool
 
 	// LockOSThread is used to determine whether each I/O event-loop is associated to an OS thread.
+	// The default value is false.
 	LockOSThread bool
 
 	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
@@ -72,6 +75,12 @@ type Events struct {
 
 	// OnClose fires when a connection has been closed.
 	OnClose func(c Conn, err error)
+
+	// OnInbound when any data read by a socket, it triggers the inbound event.
+	OnInbound func(c Conn, readBytes int)
+
+	// OnOutbound when any data write by a socket, it triggers the outbound event.
+	OnOutbound func(c Conn, writeBytes int)
 }
 
 func (ev *Events) Serve(addrs ...string) (err error) {
@@ -246,4 +255,16 @@ func (ev *Events) onData(fdc *fdConn) error {
 	//
 	_, _ = fdc.Discard(-1)
 	return nil
+}
+
+func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
+	if readBytes > 0 && ev.OnInbound != nil {
+		ev.OnInbound(fdc, readBytes)
+	}
+}
+
+func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
+	if writeBytes > 0 && ev.OnOutbound != nil {
+		ev.OnOutbound(fdc, writeBytes)
+	}
 }

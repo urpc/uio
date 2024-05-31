@@ -120,16 +120,19 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 		}
 
 		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
+		var socketWriteBytes int
 		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
 			// If there is an error in flush, the connection will be closed.
-			if err = fc.flush(true); nil != err {
+			if socketWriteBytes, err = fc.flush(true); nil != err {
 				fc.mux.Unlock()
+				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 				fc.events.delConn(fc, err)
 				return 0, err
 			}
 		}
 
 		fc.mux.Unlock()
+		fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 		return
 	}
 
@@ -143,6 +146,8 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 		// ignore: EAGAIN
 		writeSize, err = 0, nil
 	}
+
+	socketWriteBytes := writeSize
 
 	if writeSize != len(b) {
 		n, _ := fc.outbound.Write(b[writeSize:])
@@ -161,6 +166,7 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 	}
 
 	fc.mux.Unlock()
+	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 	return writeSize, err
 }
 
@@ -193,16 +199,19 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		}
 
 		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
+		var socketWriteBytes int
 		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
 			// If there is an error in flush, the connection will be closed.
-			if err = fc.flush(true); nil != err {
+			if socketWriteBytes, err = fc.flush(true); nil != err {
 				fc.mux.Unlock()
+				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 				fc.events.delConn(fc, err)
 				return 0, err
 			}
 		}
 
 		fc.mux.Unlock()
+		fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 		return
 	}
 
@@ -217,6 +226,8 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		// ignore: EAGAIN
 		writeSize, err = 0, nil
 	}
+
+	socketWriteBytes := writeSize
 
 	// trim vec buffer.
 	if writeSize < totalBytes {
@@ -264,6 +275,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	fc.mux.Unlock()
+	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 	return writeSize, err
 }
 
@@ -278,11 +290,13 @@ func (fc *fdConn) Flush() (err error) {
 	}
 
 	// write outbound buffer.
+	var socketWriteBytes int
 	if !fc.outbound.Empty() {
-		err = fc.flush(true)
+		socketWriteBytes, err = fc.flush(true)
 	}
 
 	fc.mux.Unlock()
+	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 
 	if nil != err {
 		fc.events.delConn(fc, err)
@@ -290,23 +304,23 @@ func (fc *fdConn) Flush() (err error) {
 	return
 }
 
-func (fc *fdConn) flush(opEvent bool) error {
+func (fc *fdConn) flush(opEvent bool) (socketWriteBytes int, err error) {
 
 	// udp unsupported.
 	if fc.isUdp {
-		return nil // nothing to do.
+		return 0, nil // nothing to do.
 	}
 
 	var vecBuf [16][]byte
-
 	for !fc.outbound.Empty() {
 		// peek writeable vec bytes.
 		vec, _ := fc.outbound.PeekVec(vecBuf[:0])
 		// invoke writev() syscall.
-		writeSize, err := socket.Writev(fc.fd, vec)
+		var writeSize int
+		writeSize, err = socket.Writev(fc.fd, vec)
 		if nil != err {
 			if !errors.Is(err, unix.EAGAIN) {
-				return err
+				return socketWriteBytes, err
 			}
 			// ignore: EAGAIN
 			writeSize, err = 0, nil
@@ -315,9 +329,9 @@ func (fc *fdConn) flush(opEvent bool) error {
 
 		// commit write offset.
 		fc.outbound.Discard(writeSize)
+		socketWriteBytes += writeSize
 	}
 
-	var err error
 	if opEvent && !fc.outbound.Empty() {
 		// Read events are always registered, which will improve program performance in most cases,
 		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
@@ -331,7 +345,7 @@ func (fc *fdConn) flush(opEvent bool) error {
 		}
 	}
 
-	return err
+	return socketWriteBytes, err
 }
 
 func (fc *fdConn) fdClose(err error) {
@@ -339,7 +353,7 @@ func (fc *fdConn) fdClose(err error) {
 	defer fc.mux.Unlock()
 
 	// try flush outbound buffer.
-	_ = fc.flush(false)
+	_, _ = fc.flush(false)
 
 	// close socket and release resource.
 	_ = syscall.Close(fc.fd)
@@ -497,6 +511,9 @@ func (fc *fdConn) onRead() error {
 
 	fc.inboundTail = buffer[:n]
 
+	// trigger on any bytes received.
+	fc.events.onSocketBytesRead(fc, n)
+
 	// fire data callback.
 	if err = fc.events.onData(fc); nil != err {
 		fc.events.delConn(fc, err)
@@ -520,6 +537,7 @@ func (fc *fdConn) onRead() error {
 func (fc *fdConn) onWrite() error {
 	fc.mux.Lock()
 
+	var totalWriteBytes int
 	for !fc.outbound.Empty() {
 		// writeable buffer
 		data := fc.outbound.Peek(fc.loop.getBuffer())
@@ -532,21 +550,27 @@ func (fc *fdConn) onWrite() error {
 		sent, err := unix.Write(fc.fd, data)
 		if nil != err {
 			fc.mux.Unlock()
+			// trigger on any bytes write.
+			fc.events.onSocketBytesWrite(fc, totalWriteBytes)
 
 			if errors.Is(err, syscall.EAGAIN) {
 				return nil
 			}
-
 			fc.events.delConn(fc, err)
 			return nil
 		}
+
+		// count of write bytes.
+		totalWriteBytes += sent
 
 		// commit read offset.
 		fc.outbound.Discard(sent)
 	}
 
-	defer fc.mux.Unlock()
-
+	fc.mux.Unlock()
+	// trigger on any bytes write.
+	fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+	
 	// outbound buffer is empty.
 	return fc.loop.modRead(fc)
 }

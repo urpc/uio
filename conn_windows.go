@@ -268,25 +268,41 @@ func (fc *fdConn) fireWriteEvent() error {
 					fc.mux.Unlock()
 					continue
 				}
-
-				data := fc.outbound.Peek(writeBuffer)
 				fc.mux.Unlock()
 
+				var totalWriteBytes int
 				for {
+					fc.mux.Lock()
+					data := fc.outbound.Peek(writeBuffer)
+					fc.mux.Unlock()
+
+					// no more outbound bytes.
+					if 0 == len(data) {
+						break
+					}
+
 					n, err := fc.conn.Write(data)
 					if nil != err {
+						if totalWriteBytes > 0 {
+							// trigger outbound event.
+							fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+						}
+						// close on error.
 						fc.events.delConn(fc, err)
 						return
 					}
 
+					// mark outbound read offset.
+					fc.mux.Lock()
+					fc.outbound.Discard(n)
+					fc.mux.Unlock()
+
 					// write success.
-					_ = n
-					break
+					totalWriteBytes += n
 				}
 
-				fc.mux.Lock()
-				fc.outbound.Discard(len(data))
-				fc.mux.Unlock()
+				// trigger outbound event.
+				fc.events.onSocketBytesWrite(fc, totalWriteBytes)
 			}
 		}
 	}()
@@ -304,14 +320,19 @@ func (fc *fdConn) fireReadEvent() error {
 		for {
 			n, err := fc.conn.Read(buffer)
 			if nil != err {
+				// close on error.
 				fc.events.delConn(fc, err)
 				return
 			}
 
 			fc.inboundTail = buffer[:n]
 
+			// trigger inbound event.
+			fc.events.onSocketBytesRead(fc, n)
+
 			// fire data callback.
 			if err = fc.events.onData(fc); nil != err {
+				// close on error.
 				fc.events.delConn(fc, err)
 				break
 			}
@@ -371,8 +392,9 @@ func (fc *fdConn) listenUDP() error {
 			udpConn = conn
 		}
 
-		// fire udp on-data event.
 		udpConn.inboundTail = buffer[:n]
+
+		// fire udp on-data event.
 		err = fc.events.onData(udpConn)
 
 		// drop unread udp packet.
