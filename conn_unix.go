@@ -207,7 +207,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	// invoke writev() syscall.
-	writeSize, err := unix.Writev(fc.fd, vec)
+	writeSize, err := socket.Writev(fc.fd, vec)
 	if err != nil {
 		if !errors.Is(err, unix.EAGAIN) {
 			fc.mux.Unlock()
