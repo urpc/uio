@@ -7,6 +7,7 @@ import (
 	"runtime"
 
 	"github.com/lesismal/nbio/nbhttp"
+	"github.com/lesismal/nbio/taskpool"
 )
 
 func main() {
@@ -26,13 +27,15 @@ func main() {
 		writer.Write([]byte("hello world!"))
 	})
 
+	taskPool := taskpool.New(runtime.NumCPU()*1024, 1024*64)
+
 	svr := nbhttp.NewEngine(nbhttp.Config{
 		Network: "tcp",
 		Addrs:   []string{fmt.Sprintf("localhost:%d", port)},
 		Handler: mux,
 		NPoller: loops,
 	})
-	//svr.Execute = func(f func()) { f() }
+	svr.Execute = taskPool.Go
 
 	err := svr.Start()
 	if err != nil {

@@ -59,6 +59,7 @@ trap cleanup EXIT
 mkdir -p bin
 
 eval "$(pkill -9 http-std || printf "")"
+eval "$(pkill -9 http-ghttp || printf "")"
 eval "$(pkill -9 http-nbio || printf "")"
 eval "$(pkill -9 http-uio || printf "")"
 
@@ -94,7 +95,7 @@ function go_bench() {
   echo "--- BENCHMARK DONE ---"
   echo ""
 
-  # kill server
+  echo "kill server...$1"
   eval "$(pkill -9 "$1" || printf "")"
 
   # waiting for server cleanup...
@@ -102,5 +103,6 @@ function go_bench() {
 }
 
 go_bench "http-std" bin/http-std-server http-std.go 7001 $server_cpu_num
-go_bench "http-nbio" bin/http-nbio-server http-nbio.go 7002 $server_cpu_num
-go_bench "http-uio" bin/http-uio-server http-uio.go 7003 $server_cpu_num
+go_bench "http-ghttp" bin/http-ghttp-server http-ghttp.go 7002 $server_cpu_num
+go_bench "http-nbio" bin/http-nbio-server http-nbio.go 7003 $server_cpu_num
+go_bench "http-uio" bin/http-uio-server http-uio.go 7004 $server_cpu_num

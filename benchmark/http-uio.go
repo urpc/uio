@@ -23,12 +23,12 @@ func main() {
 		loops = runtime.NumCPU()
 	}
 
-	var mux = &http.ServeMux{}
+	mux := &http.ServeMux{}
 	mux.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Write([]byte("hello world!"))
 	})
 
-	var taskPool = taskpool.New(runtime.NumCPU()*1024, 1024*64)
+	taskPool := taskpool.New(runtime.NumCPU()*1024, 1024*64)
 
 	var events uio.Events
 	events.Pollers = loops
