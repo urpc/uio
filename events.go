@@ -19,7 +19,6 @@ package uio
 import (
 	"runtime"
 	"sync"
-	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
@@ -131,6 +130,7 @@ func (ev *Events) Close(err error) error {
 }
 
 func (ev *Events) initEvents() (err error) {
+
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
 
@@ -222,7 +222,7 @@ func (ev *Events) addConn(fdc *fdConn) error {
 
 	// register to poller
 	if err := fdc.loop.addConn(fdc); err != nil {
-		ev.delConn(fdc, err)
+		ev.closeConn(fdc, err)
 		return err
 	}
 
@@ -232,18 +232,11 @@ func (ev *Events) addConn(fdc *fdConn) error {
 func (ev *Events) closeConn(fdc *fdConn, err error) {
 
 	// close socket and release resource.
-	fdc.fdClose(err)
-
-	// fire on-close event.
-	if nil != ev.OnClose {
-		ev.OnClose(fdc, err)
-	}
-}
-
-func (ev *Events) delConn(fdc *fdConn, err error) {
-	if atomic.CompareAndSwapInt32(&fdc.closed, 0, 1) {
-		fdc.loop.delConn(fdc)
-		ev.closeConn(fdc, err)
+	if fdc.fdClose(err) {
+		// fire on-close event.
+		if nil != ev.OnClose {
+			ev.OnClose(fdc, err)
+		}
 	}
 }
 

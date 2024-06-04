@@ -17,6 +17,7 @@
 package poller
 
 type EventHandler interface {
-	OnWrite(ep *NetPoller, fd int) error
-	OnRead(ep *NetPoller, fd int) error
+	OnWrite(ep *NetPoller, fd int)
+	OnRead(ep *NetPoller, fd int)
+	OnClose(ep *NetPoller, err error)
 }

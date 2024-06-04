@@ -19,7 +19,6 @@ package uio
 import (
 	"io"
 	"net"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -28,19 +27,23 @@ import (
 type fdConn struct {
 	commonConn
 	conn     net.Conn
-	udp      net.PacketConn
+	udp      *net.UDPConn
 	udpSvr   *fdConn
 	udpConns map[string]*fdConn
 	writeSig chan struct{}
 }
 
 func (fc *fdConn) Fd() int {
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		return -1
+	var rc syscall.Conn
+
+	if fc.udp != nil {
+		rc = net.PacketConn(fc.udp).(syscall.Conn)
+	} else {
+		rc = fc.conn.(syscall.Conn)
 	}
 
-	sc, err := fc.conn.(syscall.Conn).SyscallConn()
-	if nil != err {
+	sc, err := rc.SyscallConn()
+	if err != nil {
 		return -1
 	}
 
@@ -53,7 +56,7 @@ func (fc *fdConn) Fd() int {
 }
 
 func (fc *fdConn) SetLinger(secs int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -63,7 +66,7 @@ func (fc *fdConn) SetLinger(secs int) error {
 }
 
 func (fc *fdConn) SetNoDelay(nodelay bool) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -73,7 +76,7 @@ func (fc *fdConn) SetNoDelay(nodelay bool) error {
 }
 
 func (fc *fdConn) SetKeepAlive(keepalive bool) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -83,7 +86,7 @@ func (fc *fdConn) SetKeepAlive(keepalive bool) error {
 }
 
 func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -100,7 +103,7 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -110,7 +113,7 @@ func (fc *fdConn) SetReadBuffer(size int) error {
 }
 
 func (fc *fdConn) SetWriteBuffer(size int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
@@ -132,17 +135,31 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 }
 
 func (fc *fdConn) Write(p []byte) (n int, err error) {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+
+	fc.mux.Lock()
+	defer fc.mux.Unlock()
+
+	if 0 != fc.closed {
 		return 0, fc.err
 	}
 
 	if fc.udp != nil {
-		return fc.udp.WriteTo(p, fc.remoteAddr)
+
+		if nil == fc.udpSvr && nil == fc.udpConns {
+			// connected udp client.
+			n, err = fc.udp.Write(p)
+		} else {
+			// udp child connection.
+			n, err = fc.udp.WriteTo(p, fc.remoteAddr)
+		}
+
+		if n > 0 {
+			fc.events.onSocketBytesWrite(fc, n)
+		}
+		return
 	}
 
-	fc.mux.Lock()
 	n, err = fc.outbound.Write(p)
-	fc.mux.Unlock()
 
 	select {
 	case fc.writeSig <- struct{}{}:
@@ -153,7 +170,10 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 }
 
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	fc.mux.Lock()
+	defer fc.mux.Unlock()
+
+	if 0 != fc.closed {
 		return 0, fc.err
 	}
 
@@ -161,10 +181,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, errUnsupported
 	}
 
-	fc.mux.Lock()
 	n, err = fc.outbound.Writev(vec)
-	fc.mux.Unlock()
-
 	select {
 	case fc.writeSig <- struct{}{}:
 	default:
@@ -174,7 +191,10 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 }
 
 func (fc *fdConn) Flush() error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	fc.mux.Lock()
+	defer fc.mux.Unlock()
+
+	if 0 != fc.closed {
 		return fc.err
 	}
 
@@ -182,15 +202,24 @@ func (fc *fdConn) Flush() error {
 	case fc.writeSig <- struct{}{}:
 	default:
 	}
+
 	return nil
 }
 
 func (fc *fdConn) Close() error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		return nil
+	return fc.closeWithError(io.ErrUnexpectedEOF)
+}
+
+func (fc *fdConn) closeWithError(err error) error {
+	if fc.IsClosed() {
+		return fc.err
 	}
 
-	var closeReason = io.ErrUnexpectedEOF
+	fc.mux.Lock()
+	if 0 != fc.closed {
+		fc.mux.Unlock()
+		return fc.err
+	}
 
 	if nil != fc.udp {
 		// udp child connection
@@ -200,29 +229,33 @@ func (fc *fdConn) Close() error {
 			fc.udpSvr.mux.Lock()
 			defer fc.udpSvr.mux.Unlock()
 
+			fc.closed = 1
+			fc.err = err
 			delete(fc.udpSvr.udpConns, rAddr)
 
 			if onClose := fc.events.OnClose; nil != onClose {
-				onClose(fc, closeReason)
+				onClose(fc, err)
 			}
 
+			fc.mux.Unlock()
 			return nil
 		}
 
 		// udp server
 		if nil != fc.udpConns {
-			fc.mux.Lock()
-			defer fc.mux.Unlock()
-
 			for addr, fdc := range fc.udpConns {
 				delete(fc.udpConns, addr)
 
 				if onClose := fc.events.OnClose; nil != onClose {
-					onClose(fdc, closeReason)
+					onClose(fdc, err)
 				}
 			}
 
-			fc.loop.delConn(fc)
+			fc.closed = 1
+			fc.err = err
+			fc.mux.Unlock()
+
+			fc.fdClose(err)
 			return nil
 		}
 
@@ -230,28 +263,47 @@ func (fc *fdConn) Close() error {
 		//
 	}
 
-	fc.events.closeConn(fc, io.ErrUnexpectedEOF)
+	fc.mux.Unlock()
+	fc.events.closeConn(fc, err)
 	return nil
 }
 
-func (fc *fdConn) fdClose(err error) {
+func (fc *fdConn) fdClose(err error) bool {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
 
+	if fc.closed != 0 {
+		return false
+	}
+
+	// delete connection fd-mapping.
+	fc.loop.delConn(fc)
+
 	// close socket and release resource.
-	_ = fc.conn.Close()
+	switch {
+	case nil != fc.conn:
+		_ = fc.conn.Close()
+	case nil != fc.udp:
+		_ = fc.udp.Close()
+	}
+
 	fc.outbound.Reset()
 	fc.inbound.Reset()
 	fc.inboundTail = nil
 	fc.err = err
+	fc.closed = 1
 
 	// close write signal.
-	close(fc.writeSig)
+	if nil != fc.writeSig {
+		close(fc.writeSig)
+	}
+
+	return true
 }
 
 func (fc *fdConn) fireWriteEvent() error {
 	if nil == fc.conn {
-		return errUnsupported
+		return nil // udp client nothing to do.
 	}
 
 	go func() {
@@ -288,7 +340,7 @@ func (fc *fdConn) fireWriteEvent() error {
 							fc.events.onSocketBytesWrite(fc, totalWriteBytes)
 						}
 						// close on error.
-						fc.events.delConn(fc, err)
+						fc.events.closeConn(fc, err)
 						return
 					}
 
@@ -311,38 +363,71 @@ func (fc *fdConn) fireWriteEvent() error {
 }
 
 func (fc *fdConn) fireReadEvent() error {
-	if nil == fc.conn {
-		return errUnsupported
+
+	// udp client
+	if nil != fc.udp {
+		go func() {
+			var buffer = make([]byte, fc.events.MaxBufferSize)
+			for {
+				n, _, err := fc.udp.ReadFrom(buffer)
+				if nil != err {
+					// close on error.
+					fc.events.closeConn(fc, err)
+					return
+				}
+
+				fc.inboundTail = buffer[:n]
+
+				// trigger inbound event.
+				fc.events.onSocketBytesRead(fc, n)
+
+				// fire data callback.
+				if err = fc.events.onData(fc); nil != err {
+					// close on error.
+					fc.events.closeConn(fc, err)
+					break
+				}
+
+				// drop unread udp packet.
+				_, _ = fc.Discard(-1)
+			}
+		}()
+
+		return nil
 	}
 
+	// tcp connection.
 	go func() {
 		var buffer = make([]byte, 1024)
 		for {
 			n, err := fc.conn.Read(buffer)
 			if nil != err {
 				// close on error.
-				fc.events.delConn(fc, err)
+				fc.events.closeConn(fc, err)
 				return
 			}
 
+			// fire data callback.
 			fc.inboundTail = buffer[:n]
 
 			// trigger inbound event.
 			fc.events.onSocketBytesRead(fc, n)
 
-			// fire data callback.
 			if err = fc.events.onData(fc); nil != err {
 				// close on error.
-				fc.events.delConn(fc, err)
+				fc.events.closeConn(fc, err)
 				break
 			}
 
-			// append tail bytes to inbound buffer
 			if len(fc.inboundTail) > 0 {
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
 			}
 
+			// try flush outbound buffer.
+			if fc.events.WriteBufferedThreshold > 0 {
+				_ = fc.Flush()
+			}
 		}
 	}()
 
@@ -356,43 +441,40 @@ func (fc *fdConn) listenUDP() error {
 	for {
 		n, addr, err := fc.udp.ReadFrom(buffer)
 		if nil != err {
+			_ = fc.closeWithError(err)
 			return err
 		}
-
-		// udp connection
-		var udpConn = fc
 
 		// remote address.
 		var rAddr = addr.String()
 
 		// udp server
-		if nil != fc.udpConns {
-			conn, ok := fc.udpConns[rAddr]
-			if !ok {
-				conn = &fdConn{}
-				conn.udp = fc.udp
-				conn.localAddr = fc.localAddr
-				conn.remoteAddr = addr
-				conn.loop = fc.loop
-				conn.events = fc.events
-				conn.udpSvr = fc
-				conn.udpConns = nil // udp connection always nil
+		udpConn, ok := fc.udpConns[rAddr]
+		if !ok {
+			udpConn = &fdConn{}
+			udpConn.udp = fc.udp
+			udpConn.localAddr = fc.localAddr
+			udpConn.remoteAddr = addr
+			udpConn.loop = fc.loop
+			udpConn.events = fc.events
+			udpConn.udpSvr = fc
+			udpConn.udpConns = nil // udp connection always nil
 
-				// save child connection.
-				fc.mux.Lock()
-				fc.udpConns[rAddr] = conn
-				fc.mux.Unlock()
+			// save child connection.
+			fc.mux.Lock()
+			fc.udpConns[rAddr] = udpConn
+			fc.mux.Unlock()
 
-				// fire udp on-open event.
-				if onOpen := fc.events.OnOpen; nil != onOpen {
-					onOpen(conn)
-				}
+			// fire udp on-open event.
+			if onOpen := fc.events.OnOpen; nil != onOpen {
+				onOpen(udpConn)
 			}
-
-			udpConn = conn
 		}
 
 		udpConn.inboundTail = buffer[:n]
+
+		// trigger inbound event
+		fc.events.onSocketBytesRead(udpConn, n)
 
 		// fire udp on-data event.
 		err = fc.events.onData(udpConn)
@@ -401,15 +483,8 @@ func (fc *fdConn) listenUDP() error {
 		_, _ = udpConn.Discard(-1)
 
 		if nil != err {
-			// delete child connection.
-			fc.mux.Lock()
-			delete(fc.udpConns, rAddr)
-			fc.mux.Unlock()
-
-			// fire udp on-close event.
-			if onClose := fc.events.OnClose; nil != onClose {
-				onClose(udpConn, err)
-			}
+			// close udp connection
+			_ = udpConn.closeWithError(err)
 		}
 	}
 }

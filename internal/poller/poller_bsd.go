@@ -36,6 +36,7 @@ const (
 type NetPoller struct {
 	kqfd   int
 	closed int32
+	err    error
 }
 
 func NewNetPoller() (*NetPoller, error) {
@@ -129,11 +130,8 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 		case n == 0 || (n < 0 && errors.Is(err, unix.EINTR)):
 			continue
 		case nil != err:
-			if 0 != atomic.LoadInt32(&ev.closed) {
-				return nil
-			}
-			_ = ev.Close()
-			return err
+			handler.OnClose(ev, ev.err)
+			return ev.err
 		}
 
 		for i := 0; i < n; i++ {
@@ -141,22 +139,17 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 
 			switch {
 			case event.Filter == writeEvents:
-				if err = handler.OnWrite(ev, int(event.Ident)); nil != err {
-					_ = ev.Close()
-					return err
-				}
+				handler.OnWrite(ev, int(event.Ident))
 			case event.Filter == readEvents || (0 != event.Flags&errorEvents):
-				if err = handler.OnRead(ev, int(event.Ident)); nil != err {
-					_ = ev.Close()
-					return err
-				}
+				handler.OnRead(ev, int(event.Ident))
 			}
 		}
 	}
 }
 
-func (ev *NetPoller) Close() error {
+func (ev *NetPoller) Close(err error) error {
 	if atomic.CompareAndSwapInt32(&ev.closed, 0, 1) {
+		ev.err = err
 		return unix.Close(ev.kqfd)
 	}
 	return nil

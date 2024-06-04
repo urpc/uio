@@ -18,7 +18,6 @@ package uio
 
 import (
 	"sync"
-	"sync/atomic"
 
 	"github.com/urpc/uio/internal/poller"
 )
@@ -46,6 +45,40 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		nil
 }
 
+func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) {
+	fdc := el.getConn(fd)
+	if fdc == nil || fdc.IsClosed() {
+		return
+	}
+
+	if err := fdc.fireWriteEvent(); nil != err {
+		el.events.closeConn(fdc, err)
+	}
+}
+
+func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) {
+	fdc := el.getConn(fd)
+	if fdc == nil || fdc.IsClosed() {
+		return
+	}
+
+	if err := fdc.fireReadEvent(); nil != err {
+		el.events.closeConn(fdc, err)
+	}
+}
+
+func (el *eventLoop) OnClose(ep *poller.NetPoller, err error) {
+	el.mux.Lock()
+	fdMap := el.fdMap
+	el.fdMap = make(map[int]*fdConn)
+	el.mux.Unlock()
+
+	// close all connections
+	for _, fdc := range fdMap {
+		el.events.closeConn(fdc, err)
+	}
+}
+
 func (el *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) error {
 	if nil == handler {
 		handler = el
@@ -54,31 +87,7 @@ func (el *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) error
 }
 
 func (el *eventLoop) Close(err error) error {
-	el.mux.Lock()
-	defer el.mux.Unlock()
-
-	// close all connections
-	for fd, fdc := range el.fdMap {
-		delete(el.fdMap, fd)
-		el.events.closeConn(fdc, err)
-	}
-	return el.poller.Close()
-}
-
-func (el *eventLoop) OnWrite(ep *poller.NetPoller, fd int) error {
-	fdc := el.getConn(fd)
-	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
-		return nil
-	}
-	return fdc.fireWriteEvent()
-}
-
-func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) error {
-	fdc := el.getConn(fd)
-	if fdc == nil || 0 != atomic.LoadInt32(&fdc.closed) {
-		return nil
-	}
-	return fdc.fireReadEvent()
+	return el.poller.Close(err)
 }
 
 func (el *eventLoop) getBuffer() []byte {
@@ -99,6 +108,7 @@ func (el *eventLoop) delConn(fdc *fdConn) {
 	el.mux.Lock()
 	defer el.mux.Unlock()
 	delete(el.fdMap, fdc.Fd())
+	// close socket, fd auto removed.
 }
 
 func (el *eventLoop) addConn(fdc *fdConn) error {

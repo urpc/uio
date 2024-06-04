@@ -21,7 +21,6 @@ package uio
 import (
 	"errors"
 	"io"
-	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -43,42 +42,42 @@ func (fc *fdConn) Fd() int {
 }
 
 func (fc *fdConn) SetLinger(secs int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetLinger(fc.fd, secs)
 }
 
 func (fc *fdConn) SetNoDelay(nodelay bool) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetNoDelay(fc.fd, nodelay)
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetRecvBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetWriteBuffer(size int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetSendBuffer(fc.fd, size)
 }
 
 func (fc *fdConn) SetKeepAlive(keepalive bool) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetKeepAlive(fc.fd, keepalive)
 }
 
 func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
+	if fc.IsClosed() {
 		return fc.err
 	}
 	return socket.SetKeepAlivePeriod(fc.fd, secs)
@@ -97,12 +96,11 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 }
 
 func (fc *fdConn) Write(b []byte) (n int, err error) {
-	fc.mux.Lock()
-
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		fc.mux.Unlock()
+	if fc.IsClosed() {
 		return 0, fc.err
 	}
+
+	fc.mux.Lock()
 
 	if fc.isUdp {
 		fc.mux.Unlock()
@@ -126,7 +124,7 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 			if socketWriteBytes, err = fc.flush(true); nil != err {
 				fc.mux.Unlock()
 				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-				fc.events.delConn(fc, err)
+				fc.events.closeConn(fc, err)
 				return 0, err
 			}
 		}
@@ -140,7 +138,7 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 	if err != nil {
 		if !errors.Is(err, unix.EAGAIN) {
 			fc.mux.Unlock()
-			fc.events.delConn(fc, err)
+			fc.events.closeConn(fc, err)
 			return 0, err
 		}
 		// ignore: EAGAIN
@@ -171,12 +169,11 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 }
 
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
-	fc.mux.Lock()
-
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		fc.mux.Unlock()
+	if fc.IsClosed() {
 		return 0, fc.err
 	}
+
+	fc.mux.Lock()
 
 	if fc.isUdp {
 		fc.mux.Unlock()
@@ -205,7 +202,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 			if socketWriteBytes, err = fc.flush(true); nil != err {
 				fc.mux.Unlock()
 				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-				fc.events.delConn(fc, err)
+				fc.events.closeConn(fc, err)
 				return 0, err
 			}
 		}
@@ -220,7 +217,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	if err != nil {
 		if !errors.Is(err, unix.EAGAIN) {
 			fc.mux.Unlock()
-			fc.events.delConn(fc, err)
+			fc.events.closeConn(fc, err)
 			return 0, err
 		}
 		// ignore: EAGAIN
@@ -280,14 +277,11 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 }
 
 func (fc *fdConn) Flush() (err error) {
-
-	fc.mux.Lock()
-
-	// connection closed.
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		fc.mux.Unlock()
+	if fc.IsClosed() {
 		return fc.err
 	}
+
+	fc.mux.Lock()
 
 	// write outbound buffer.
 	var socketWriteBytes int
@@ -299,7 +293,7 @@ func (fc *fdConn) Flush() (err error) {
 	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
 
 	if nil != err {
-		fc.events.delConn(fc, err)
+		fc.events.closeConn(fc, err)
 	}
 	return
 }
@@ -348,12 +342,19 @@ func (fc *fdConn) flush(opEvent bool) (socketWriteBytes int, err error) {
 	return socketWriteBytes, err
 }
 
-func (fc *fdConn) fdClose(err error) {
+func (fc *fdConn) fdClose(err error) bool {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
 
+	if fc.closed != 0 {
+		return false
+	}
+
 	// try flush outbound buffer.
 	_, _ = fc.flush(false)
+
+	// delete connection fd-mapping.
+	fc.loop.delConn(fc)
 
 	// close socket and release resource.
 	_ = syscall.Close(fc.fd)
@@ -361,14 +362,25 @@ func (fc *fdConn) fdClose(err error) {
 	fc.inbound.Reset()
 	fc.inboundTail = nil
 	fc.err = err
+	fc.closed = 1
+
+	return true
 }
 
 func (fc *fdConn) Close() error {
-	if 0 != atomic.LoadInt32(&fc.closed) {
-		return nil
+	return fc.closeWithError(io.ErrUnexpectedEOF)
+}
+
+func (fc *fdConn) closeWithError(err error) error {
+	if fc.IsClosed() {
+		return fc.err
 	}
 
-	var closeReason = io.ErrUnexpectedEOF
+	fc.mux.Lock()
+	if 0 != fc.closed {
+		fc.mux.Unlock()
+		return fc.err
+	}
 
 	if fc.isUdp {
 		// udp child connection
@@ -378,29 +390,32 @@ func (fc *fdConn) Close() error {
 			fc.udpSvr.mux.Lock()
 			defer fc.udpSvr.mux.Unlock()
 
+			fc.closed = 1
+			fc.err = err
 			delete(fc.udpSvr.udpConns, rAddr)
 
 			if onClose := fc.events.OnClose; nil != onClose {
-				onClose(fc, closeReason)
+				onClose(fc, err)
 			}
 
+			fc.mux.Unlock()
 			return nil
 		}
 
 		// udp server
 		if nil != fc.udpConns {
-			fc.mux.Lock()
-			defer fc.mux.Unlock()
-
 			for addr, fdc := range fc.udpConns {
 				delete(fc.udpConns, addr)
-
 				if onClose := fc.events.OnClose; nil != onClose {
-					onClose(fdc, closeReason)
+					onClose(fdc, err)
 				}
 			}
 
-			fc.loop.delConn(fc)
+			fc.closed = 1
+			fc.err = err
+			fc.mux.Unlock()
+
+			fc.fdClose(err)
 			return nil
 		}
 
@@ -408,8 +423,10 @@ func (fc *fdConn) Close() error {
 		//
 	}
 
-	fc.events.delConn(fc, closeReason)
+	fc.mux.Unlock()
+	fc.events.closeConn(fc, err)
 	return nil
+
 }
 
 func (fc *fdConn) fireReadEvent() error {
@@ -426,17 +443,22 @@ func (fc *fdConn) fireWriteEvent() error {
 	return fc.onWrite()
 }
 
-func (fc *fdConn) onSendUDP(b []byte) (int, error) {
+func (fc *fdConn) onSendUDP(b []byte) (n int, err error) {
 
 	// dialed udp client
 	if nil == fc.rUdpAddr {
-		return syscall.Write(fc.fd, b)
+		n, err = syscall.Write(fc.fd, b)
+		if n > 0 {
+			fc.events.onSocketBytesWrite(fc, n)
+		}
+		return
 	}
 
 	// child udp connection
-	if err := syscall.Sendto(fc.fd, b, 0, fc.rUdpAddr); nil != err {
+	if err = syscall.Sendto(fc.fd, b, 0, fc.rUdpAddr); nil != err {
 		return 0, err
 	}
+	fc.events.onSocketBytesWrite(fc, len(b))
 	return len(b), nil
 }
 
@@ -445,6 +467,7 @@ func (fc *fdConn) onRecvUDP() error {
 
 	n, sa, err := syscall.Recvfrom(fc.fd, buffer, 0)
 	if nil != err {
+		_ = fc.closeWithError(err)
 		return err
 	}
 
@@ -484,11 +507,21 @@ func (fc *fdConn) onRecvUDP() error {
 
 	// fire udp on-data event.
 	udpConn.inboundTail = buffer[:n]
+
+	// trigger inbound event.
+	fc.events.onSocketBytesRead(udpConn, n)
+
 	err = fc.events.onData(udpConn)
 
 	// drop unread udp packet.
 	_, _ = udpConn.Discard(-1)
-	return err
+
+	if nil != err {
+		// close udp connection
+		_ = udpConn.closeWithError(err)
+	}
+
+	return nil
 }
 
 func (fc *fdConn) onRead() error {
@@ -505,7 +538,7 @@ func (fc *fdConn) onRead() error {
 		if nil == err {
 			err = io.EOF
 		}
-		fc.events.delConn(fc, err)
+		fc.events.closeConn(fc, err)
 		return nil
 	}
 
@@ -516,7 +549,7 @@ func (fc *fdConn) onRead() error {
 
 	// fire data callback.
 	if err = fc.events.onData(fc); nil != err {
-		fc.events.delConn(fc, err)
+		fc.events.closeConn(fc, err)
 		return nil
 	}
 
@@ -556,7 +589,7 @@ func (fc *fdConn) onWrite() error {
 			if errors.Is(err, syscall.EAGAIN) {
 				return nil
 			}
-			fc.events.delConn(fc, err)
+			fc.events.closeConn(fc, err)
 			return nil
 		}
 
@@ -570,7 +603,7 @@ func (fc *fdConn) onWrite() error {
 	fc.mux.Unlock()
 	// trigger on any bytes write.
 	fc.events.onSocketBytesWrite(fc, totalWriteBytes)
-	
+
 	// outbound buffer is empty.
 	return fc.loop.modRead(fc)
 }

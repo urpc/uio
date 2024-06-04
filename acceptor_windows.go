@@ -22,6 +22,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-reuseport"
@@ -36,20 +37,28 @@ type listener struct {
 }
 
 type acceptor struct {
+	mux       sync.Mutex
 	listeners map[string]*listener
 	loop      *eventLoop
 	events    *Events
 }
 
-func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) error {
+func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) {
 	panic("implement me")
 }
 
-func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
+func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) {
 	panic("implement me")
+}
+
+func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
+	ld.close()
 }
 
 func (ld *acceptor) addListen(addr string) (err error) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+
 	if nil == ld.listeners {
 		ld.listeners = make(map[string]*listener)
 	}
@@ -68,7 +77,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
-		l.udpSvr.udp = l.udp
+		l.udpSvr.udp = l.udp.(*net.UDPConn)
 		l.udpSvr.udpConns = make(map[string]*fdConn)
 
 		go l.udpSvr.listenUDP()
@@ -149,7 +158,7 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 		return nil, fmt.Errorf("unsupported protocol: %s", u.Scheme)
 	}
 
-	return &l, nil
+	return &l, err
 }
 
 func (ld *acceptor) closeListener(l *listener) {
@@ -159,23 +168,23 @@ func (ld *acceptor) closeListener(l *listener) {
 		}
 
 		_ = l.ln.Close()
-		l.ln = nil
 	}
 
 	if l.udpSvr != nil {
 		_ = l.udpSvr.Close()
-		l.udpSvr = nil
 	}
 
 	if l.udp != nil {
 		_ = l.udp.Close()
-		l.udp = nil
 	}
 }
 
 func (ld *acceptor) close() {
-	for fd, l := range ld.listeners {
-		delete(ld.listeners, fd)
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+
+	for addr, l := range ld.listeners {
+		delete(ld.listeners, addr)
 		ld.closeListener(l)
 	}
 }

@@ -21,6 +21,7 @@ import "fmt"
 type NetPoller struct {
 	ev     chan int
 	closed chan struct{}
+	err    error
 }
 
 func NewNetPoller() (*NetPoller, error) {
@@ -35,19 +36,20 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 	for {
 		select {
 		case <-ev.closed:
-			return nil
+			handler.OnClose(ev, ev.err)
+			return ev.err
 		case fd := <-ev.ev:
-			_ = handler.OnRead(ev, fd)
-			_ = handler.OnWrite(ev, fd)
+			handler.OnRead(ev, fd)
+			handler.OnWrite(ev, fd)
 		}
 	}
-
 }
 
-func (ev *NetPoller) Close() error {
+func (ev *NetPoller) Close(err error) error {
 	select {
 	case <-ev.closed:
 	default:
+		ev.err = err
 		close(ev.closed)
 	}
 	return nil

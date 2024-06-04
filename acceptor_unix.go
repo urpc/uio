@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -47,62 +48,76 @@ type listener struct {
 }
 
 type acceptor struct {
+	mux       sync.Mutex
 	listeners map[int]*listener
 	loop      *eventLoop
 	events    *Events
 }
 
-func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) error {
+func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) {
 	panic("unreachable here")
 }
 
-func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) error {
-	if l, ok := ld.listeners[fd]; ok {
+func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) {
+	ld.mux.Lock()
+	l, ok := ld.listeners[fd]
+	ld.mux.Unlock()
 
-		// udp server incoming
-		if l.udp != nil {
-			return ld.onReadUDP(l)
-		}
+	if ok {
+		_ = ld.accept(ep, l)
+	}
+}
 
-		for {
-			nfd, sa, err := syscall.Accept(fd)
-			if nil != err {
-				switch {
-				case errors.Is(err, syscall.EINTR):
-					continue
-				case errors.Is(err, syscall.EAGAIN):
-					return nil
-				default:
-					return err
-				}
-			}
+func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
+	ld.close()
+}
 
-			if err = socket.SetNonblock(nfd, true); err != nil {
-				_ = syscall.Close(nfd)
-				return err
-			}
+func (ld *acceptor) accept(ep *poller.NetPoller, l *listener) error {
 
-			if strings.HasPrefix(l.network, "tcp") {
-				_ = socket.SetNoDelay(nfd, true)
-				_ = socket.SetKeepAlive(nfd, true)
-				_ = socket.SetKeepAlivePeriod(nfd, int(defaultTCPKeepAlive/time.Second))
-			}
-
-			fdc := &fdConn{}
-			fdc.fd = nfd
-			fdc.events = ld.events
-			fdc.loop = ld.events.selectLoop(nfd)
-			fdc.localAddr = l.laddr
-			fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
-
-			return ld.events.addConn(fdc)
-		}
+	// udp server incoming
+	if l.udp != nil {
+		return ld.onReadUDP(l)
 	}
 
-	return nil
+	for {
+		nfd, sa, err := syscall.Accept(l.fd)
+		if nil != err {
+			switch {
+			case errors.Is(err, syscall.EINTR):
+				continue
+			case errors.Is(err, syscall.EAGAIN):
+				return nil
+			default:
+				return err
+			}
+		}
+
+		if err = socket.SetNonblock(nfd, true); err != nil {
+			_ = syscall.Close(nfd)
+			return err
+		}
+
+		if strings.HasPrefix(l.network, "tcp") {
+			_ = socket.SetNoDelay(nfd, true)
+			_ = socket.SetKeepAlive(nfd, true)
+			_ = socket.SetKeepAlivePeriod(nfd, int(defaultTCPKeepAlive/time.Second))
+		}
+
+		fdc := &fdConn{}
+		fdc.fd = nfd
+		fdc.events = ld.events
+		fdc.loop = ld.events.selectLoop(nfd)
+		fdc.localAddr = l.laddr
+		fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
+
+		return ld.events.addConn(fdc)
+	}
 }
 
 func (ld *acceptor) addListen(addr string) (err error) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+
 	if nil == ld.listeners {
 		ld.listeners = make(map[int]*listener)
 	}
@@ -133,15 +148,12 @@ func (ld *acceptor) addListen(addr string) (err error) {
 func (ld *acceptor) closeListener(l *listener) {
 	if l.udpSvr != nil {
 		_ = l.udpSvr.Close()
-		l.udpSvr = nil
 	}
 	if l.fd > 0 {
 		_ = syscall.Close(l.fd)
-		l.fd = -1
 	}
 	if l.file != nil {
 		_ = l.file.Close()
-		l.file = nil
 	}
 	if l.ln != nil {
 		if _, ok := l.ln.(*net.UnixListener); ok {
@@ -149,16 +161,17 @@ func (ld *acceptor) closeListener(l *listener) {
 		}
 
 		_ = l.ln.Close()
-		l.ln = nil
 	}
 
 	if l.udp != nil {
 		_ = l.udp.Close()
-		l.udp = nil
 	}
 }
 
 func (ld *acceptor) close() {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+
 	for fd, l := range ld.listeners {
 		delete(ld.listeners, fd)
 		ld.closeListener(l)
