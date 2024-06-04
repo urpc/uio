@@ -55,7 +55,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 	}
 
 	var address = u.Host
-	if u.Scheme == "unix" || u.Scheme == "unixgram" || u.Scheme == "unixpacket" {
+	if strings.HasPrefix(u.Scheme, "unix") {
 		address = u.Path
 	}
 
