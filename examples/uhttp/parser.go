@@ -46,28 +46,28 @@ func resetHttpResponseWriter(writer *httpResponseWriter) *httpResponseWriter {
 }
 
 var httpParserSettings = &httparser.Setting{
-	MessageBegin: func(p *httparser.Parser) {
+	MessageBegin: func(p *httparser.Parser, _ int) {
 		//fmt.Printf("begin\n")
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request = resetHttpRequest(hConn.request)
 		hConn.writer = resetHttpResponseWriter(hConn.writer)
 		hConn.finished = false
 	},
-	URL: func(p *httparser.Parser, buf []byte) {
+	URL: func(p *httparser.Parser, buf []byte, _ int) {
 		//fmt.Printf("url->%s\n", buf)
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request.RequestURI = string(buf)
 	},
-	Status: func(p *httparser.Parser, buf []byte) {
+	Status: func(p *httparser.Parser, buf []byte, _ int) {
 		// response only
 	},
-	HeaderField: func(p *httparser.Parser, buf []byte) {
+	HeaderField: func(p *httparser.Parser, buf []byte, _ int) {
 		// http header field
 		// fmt.Printf("header field:%s\n", buf)
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.lastHeader = string(buf)
 	},
-	HeaderValue: func(p *httparser.Parser, buf []byte) {
+	HeaderValue: func(p *httparser.Parser, buf []byte, _ int) {
 		// http header value
 		//fmt.Printf("header value:%s\n", buf)
 		hConn := p.GetUserData().(*HttpConn)
@@ -78,10 +78,10 @@ var httpParserSettings = &httparser.Setting{
 		}
 		hConn.lastHeader = ""
 	},
-	HeadersComplete: func(p *httparser.Parser) {
+	HeadersComplete: func(p *httparser.Parser, _ int) {
 		//fmt.Printf("header complete\n")
 	},
-	Body: func(p *httparser.Parser, buf []byte) {
+	Body: func(p *httparser.Parser, buf []byte, _ int) {
 		//fmt.Printf("%s", buf)
 		// Content-Length or chunked data
 		var bodyBuffer uio.CompositeBuffer
@@ -90,7 +90,7 @@ var httpParserSettings = &httparser.Setting{
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request.Body = &bodyBuffer
 	},
-	MessageComplete: func(p *httparser.Parser) {
+	MessageComplete: func(p *httparser.Parser, _ int) {
 		//fmt.Printf("\n")
 		var sb strings.Builder
 		sb.WriteString("HTTP/")
