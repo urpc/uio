@@ -26,7 +26,7 @@ import (
 func ListenAndServe(addr string, handler http.Handler) error {
 
 	var events uio.Events
-	events.Addrs = []string{addr}
+
 	events.OnOpen = func(c uio.Conn) {
 		//fmt.Println("connection opened:", c.RemoteAddr())
 		c.SetContext(NewHttpConn(c, nil))
@@ -41,9 +41,10 @@ func ListenAndServe(addr string, handler http.Handler) error {
 		//fmt.Println("connection closed:", c.RemoteAddr(), err)
 	}
 
-	if err := events.Serve(); nil != err {
+	if err := events.Serve(addr); nil != err {
 		fmt.Println("server exited with error:", err)
 		return err
 	}
+	
 	return nil
 }

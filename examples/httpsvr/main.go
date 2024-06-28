@@ -19,7 +19,7 @@ package main
 import (
 	"net/http"
 
-	"github.com/urpc/uio/examples/uhttp"
+	"github.com/urpc/uio/examples/httpsvr/uhttp"
 )
 
 func main() {
