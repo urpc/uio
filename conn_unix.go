@@ -100,12 +100,11 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 		return 0, fc.err
 	}
 
-	fc.mux.Lock()
-
 	if fc.isUdp {
-		fc.mux.Unlock()
 		return fc.onSendUDP(b)
 	}
+
+	fc.mux.Lock()
 
 	bufferedThreshold := fc.events.WriteBufferedThreshold
 	writeBuffered := bufferedThreshold > 0 && len(b) < bufferedThreshold
@@ -173,12 +172,11 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, fc.err
 	}
 
-	fc.mux.Lock()
-
 	if fc.isUdp {
-		fc.mux.Unlock()
 		return 0, errUnsupported
 	}
+
+	fc.mux.Lock()
 
 	var totalBytes int
 	for _, b := range vec {
@@ -346,7 +344,7 @@ func (fc *fdConn) fdClose(err error) bool {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
 
-	if fc.closed != 0 {
+	if fc.IsClosed() {
 		return false
 	}
 
@@ -426,7 +424,6 @@ func (fc *fdConn) closeWithError(err error) error {
 	fc.mux.Unlock()
 	fc.events.closeConn(fc, err)
 	return nil
-
 }
 
 func (fc *fdConn) fireReadEvent() error {

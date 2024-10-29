@@ -64,7 +64,7 @@ func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) {
 	ld.mux.Unlock()
 
 	if ok {
-		_ = ld.accept(ep, l)
+		_ = ld.accept(l)
 	}
 }
 
@@ -72,7 +72,7 @@ func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
 	ld.close()
 }
 
-func (ld *acceptor) accept(ep *poller.NetPoller, l *listener) error {
+func (ld *acceptor) accept(l *listener) error {
 
 	// udp server incoming
 	if l.udp != nil {
@@ -82,14 +82,10 @@ func (ld *acceptor) accept(ep *poller.NetPoller, l *listener) error {
 	for {
 		nfd, sa, err := syscall.Accept(l.fd)
 		if nil != err {
-			switch {
-			case errors.Is(err, syscall.EINTR):
-				continue
-			case errors.Is(err, syscall.EAGAIN):
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 				return nil
-			default:
-				return err
 			}
+			return err
 		}
 
 		if err = socket.SetNonblock(nfd, true); err != nil {

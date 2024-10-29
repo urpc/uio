@@ -19,6 +19,7 @@ package uio
 import (
 	"io"
 	"net"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -135,13 +136,12 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 }
 
 func (fc *fdConn) Write(p []byte) (n int, err error) {
+	if fc.IsClosed() {
+		return 0, fc.err
+	}
 
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
-
-	if 0 != fc.closed {
-		return 0, fc.err
-	}
 
 	if fc.udp != nil {
 
@@ -173,7 +173,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
 
-	if 0 != fc.closed {
+	if fc.IsClosed() {
 		return 0, fc.err
 	}
 
@@ -191,10 +191,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 }
 
 func (fc *fdConn) Flush() error {
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
-
-	if 0 != fc.closed {
+	if fc.IsClosed() {
 		return fc.err
 	}
 
@@ -211,13 +208,8 @@ func (fc *fdConn) Close() error {
 }
 
 func (fc *fdConn) closeWithError(err error) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
 
-	fc.mux.Lock()
-	if 0 != fc.closed {
-		fc.mux.Unlock()
+	if fc.IsClosed() {
 		return fc.err
 	}
 
@@ -228,21 +220,26 @@ func (fc *fdConn) closeWithError(err error) error {
 
 			fc.udpSvr.mux.Lock()
 			defer fc.udpSvr.mux.Unlock()
+			// 从udp映射表移除记录
+			delete(fc.udpSvr.udpConns, rAddr)
 
+			fc.mux.Lock()
 			fc.closed = 1
 			fc.err = err
-			delete(fc.udpSvr.udpConns, rAddr)
+
+			// 确保回调完成后释放锁
+			defer fc.mux.Unlock()
 
 			if onClose := fc.events.OnClose; nil != onClose {
 				onClose(fc, err)
 			}
 
-			fc.mux.Unlock()
 			return nil
 		}
 
 		// udp server
 		if nil != fc.udpConns {
+			fc.mux.Lock()
 			for addr, fdc := range fc.udpConns {
 				delete(fc.udpConns, addr)
 
@@ -251,11 +248,8 @@ func (fc *fdConn) closeWithError(err error) error {
 				}
 			}
 
-			fc.closed = 1
-			fc.err = err
+			fc.fdCloseNoLock(err)
 			fc.mux.Unlock()
-
-			fc.fdClose(err)
 			return nil
 		}
 
@@ -263,7 +257,6 @@ func (fc *fdConn) closeWithError(err error) error {
 		//
 	}
 
-	fc.mux.Unlock()
 	fc.events.closeConn(fc, err)
 	return nil
 }
@@ -271,8 +264,12 @@ func (fc *fdConn) closeWithError(err error) error {
 func (fc *fdConn) fdClose(err error) bool {
 	fc.mux.Lock()
 	defer fc.mux.Unlock()
+	return fc.fdCloseNoLock(err)
+}
 
-	if fc.closed != 0 {
+func (fc *fdConn) fdCloseNoLock(err error) bool {
+
+	if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
 		return false
 	}
 
@@ -291,7 +288,6 @@ func (fc *fdConn) fdClose(err error) bool {
 	fc.inbound.Reset()
 	fc.inboundTail = nil
 	fc.err = err
-	fc.closed = 1
 
 	// close write signal.
 	if nil != fc.writeSig {

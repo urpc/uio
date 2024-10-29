@@ -21,6 +21,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
@@ -157,9 +158,7 @@ func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupporte
 func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
 
 func (fc *commonConn) IsClosed() bool {
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
-	return 0 != fc.closed
+	return 0 != atomic.LoadInt32(&fc.closed)
 }
 
 func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
