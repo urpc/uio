@@ -1,4 +1,4 @@
-//go:build linux || darwin || netbsd || freebsd || openbsd || dragonfly
+//go:build (linux || darwin || netbsd || freebsd || openbsd || dragonfly) && !stdio
 
 /*
  * Copyright 2024 the urpc project

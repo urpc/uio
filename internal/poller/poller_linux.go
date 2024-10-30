@@ -1,3 +1,5 @@
+//go:build linux && !stdio
+
 /*
  * Copyright 2024 the urpc project
  *

@@ -1,3 +1,5 @@
+//go:build windows || stdio
+
 /*
  * Copyright 2024 the urpc project
  *
@@ -16,7 +18,10 @@
 
 package poller
 
-import "fmt"
+import (
+	"fmt"
+	"runtime"
+)
 
 type NetPoller struct {
 	ev     chan int
@@ -32,6 +37,11 @@ func NewNetPoller() (*NetPoller, error) {
 }
 
 func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
+
+	if lockOSThread {
+		runtime.LockOSThread()
+		defer runtime.UnlockOSThread()
+	}
 
 	for {
 		select {

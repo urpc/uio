@@ -1,3 +1,5 @@
+//go:build windows || stdio
+
 /*
  * Copyright 2024 the urpc project
  *
