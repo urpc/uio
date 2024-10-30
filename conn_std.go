@@ -21,6 +21,7 @@ package uio
 import (
 	"io"
 	"net"
+	"runtime"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -299,136 +300,179 @@ func (fc *fdConn) fdCloseNoLock(err error) bool {
 	return true
 }
 
+func (fc *fdConn) writeLoop() {
+	var writeBuffer = make([]byte, 1024)
+	for {
+		select {
+		case _, ok := <-fc.writeSig:
+			if !ok {
+				return
+			}
+
+			fc.mux.Lock()
+			if fc.outbound.Empty() {
+				fc.mux.Unlock()
+				continue
+			}
+			fc.mux.Unlock()
+
+			var totalWriteBytes int
+			for {
+				fc.mux.Lock()
+				data := fc.outbound.Peek(writeBuffer)
+				fc.mux.Unlock()
+
+				// no more outbound bytes.
+				if 0 == len(data) {
+					break
+				}
+
+				n, err := fc.conn.Write(data)
+				if nil != err {
+					if totalWriteBytes > 0 {
+						// trigger outbound event.
+						fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+					}
+					// close on error.
+					fc.events.closeConn(fc, err)
+					return
+				}
+
+				// mark outbound read offset.
+				fc.mux.Lock()
+				fc.outbound.Discard(n)
+				fc.mux.Unlock()
+
+				// write success.
+				totalWriteBytes += n
+			}
+
+			// trigger outbound event.
+			fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+		}
+	}
+}
+
+func (fc *fdConn) writevLoop() {
+	var writeBuffers = make([][]byte, 0, 128)
+	for {
+		select {
+		case _, ok := <-fc.writeSig:
+			if !ok {
+				return
+			}
+
+			fc.mux.Lock()
+			buffers, size := fc.outbound.PeekVec(writeBuffers[:0])
+			if 0 == size {
+				fc.mux.Unlock()
+				break
+			}
+
+			netBuffers := net.Buffers(buffers)
+			totalWriteBytes, err := netBuffers.WriteTo(fc.conn)
+
+			if nil != err {
+				fc.mux.Unlock()
+				if totalWriteBytes > 0 {
+					// trigger outbound event.
+					fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+				}
+				// close on error.
+				fc.events.closeConn(fc, err)
+				return
+			}
+			fc.outbound.Discard(int(totalWriteBytes))
+			fc.mux.Unlock()
+
+			// trigger outbound event.
+			fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+		}
+	}
+}
+
+func (fc *fdConn) readUDPLoop() {
+	var buffer = make([]byte, fc.events.MaxBufferSize)
+	for {
+		n, _, err := fc.udp.ReadFrom(buffer)
+		if nil != err {
+			// close on error.
+			fc.events.closeConn(fc, err)
+			return
+		}
+
+		fc.inboundTail = buffer[:n]
+
+		// trigger inbound event.
+		fc.events.onSocketBytesRead(fc, n)
+
+		// fire data callback.
+		if err = fc.events.onData(fc); nil != err {
+			// close on error.
+			fc.events.closeConn(fc, err)
+			break
+		}
+
+		// drop unread udp packet.
+		_, _ = fc.Discard(-1)
+	}
+}
+
+func (fc *fdConn) readLoop() {
+	var buffer = make([]byte, 1024)
+	for {
+		n, err := fc.conn.Read(buffer)
+		if nil != err {
+			// close on error.
+			fc.events.closeConn(fc, err)
+			return
+		}
+
+		// fire data callback.
+		fc.inboundTail = buffer[:n]
+
+		// trigger inbound event.
+		fc.events.onSocketBytesRead(fc, n)
+
+		if err = fc.events.onData(fc); nil != err {
+			// close on error.
+			fc.events.closeConn(fc, err)
+			break
+		}
+
+		if len(fc.inboundTail) > 0 {
+			_, _ = fc.inbound.Write(fc.inboundTail)
+			fc.inboundTail = fc.inboundTail[:0]
+		}
+
+		// try flush outbound buffer.
+		if fc.events.WriteBufferedThreshold > 0 {
+			_ = fc.Flush()
+		}
+	}
+}
+
 func (fc *fdConn) fireWriteEvent() error {
 	if nil == fc.conn {
 		return nil // udp client nothing to do.
 	}
 
-	go func() {
-		var writeBuffer = make([]byte, 1024)
-		for {
-			select {
-			case _, ok := <-fc.writeSig:
-				if !ok {
-					return
-				}
-
-				fc.mux.Lock()
-				if fc.outbound.Empty() {
-					fc.mux.Unlock()
-					continue
-				}
-				fc.mux.Unlock()
-
-				var totalWriteBytes int
-				for {
-					fc.mux.Lock()
-					data := fc.outbound.Peek(writeBuffer)
-					fc.mux.Unlock()
-
-					// no more outbound bytes.
-					if 0 == len(data) {
-						break
-					}
-
-					n, err := fc.conn.Write(data)
-					if nil != err {
-						if totalWriteBytes > 0 {
-							// trigger outbound event.
-							fc.events.onSocketBytesWrite(fc, totalWriteBytes)
-						}
-						// close on error.
-						fc.events.closeConn(fc, err)
-						return
-					}
-
-					// mark outbound read offset.
-					fc.mux.Lock()
-					fc.outbound.Discard(n)
-					fc.mux.Unlock()
-
-					// write success.
-					totalWriteBytes += n
-				}
-
-				// trigger outbound event.
-				fc.events.onSocketBytesWrite(fc, totalWriteBytes)
-			}
-		}
-	}()
+	if runtime.GOOS != "windows" {
+		go fc.writevLoop()
+	} else {
+		go fc.writeLoop()
+	}
 
 	return nil
 }
 
 func (fc *fdConn) fireReadEvent() error {
-
 	// udp client
 	if nil != fc.udp {
-		go func() {
-			var buffer = make([]byte, fc.events.MaxBufferSize)
-			for {
-				n, _, err := fc.udp.ReadFrom(buffer)
-				if nil != err {
-					// close on error.
-					fc.events.closeConn(fc, err)
-					return
-				}
-
-				fc.inboundTail = buffer[:n]
-
-				// trigger inbound event.
-				fc.events.onSocketBytesRead(fc, n)
-
-				// fire data callback.
-				if err = fc.events.onData(fc); nil != err {
-					// close on error.
-					fc.events.closeConn(fc, err)
-					break
-				}
-
-				// drop unread udp packet.
-				_, _ = fc.Discard(-1)
-			}
-		}()
-
-		return nil
+		go fc.readUDPLoop()
+	} else {
+		go fc.readLoop()
 	}
-
-	// tcp connection.
-	go func() {
-		var buffer = make([]byte, 1024)
-		for {
-			n, err := fc.conn.Read(buffer)
-			if nil != err {
-				// close on error.
-				fc.events.closeConn(fc, err)
-				return
-			}
-
-			// fire data callback.
-			fc.inboundTail = buffer[:n]
-
-			// trigger inbound event.
-			fc.events.onSocketBytesRead(fc, n)
-
-			if err = fc.events.onData(fc); nil != err {
-				// close on error.
-				fc.events.closeConn(fc, err)
-				break
-			}
-
-			if len(fc.inboundTail) > 0 {
-				_, _ = fc.inbound.Write(fc.inboundTail)
-				fc.inboundTail = fc.inboundTail[:0]
-			}
-
-			// try flush outbound buffer.
-			if fc.events.WriteBufferedThreshold > 0 {
-				_ = fc.Flush()
-			}
-		}
-	}()
-
 	return nil
 }
 

@@ -88,3 +88,31 @@ func SetLinger(fd, secs int) error {
 	}
 	return unix.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER, &l)
 }
+
+func DupNetConn(conn net.Conn) (int, error) {
+	sc, ok := conn.(interface {
+		SyscallConn() (syscall.RawConn, error)
+	})
+	if !ok {
+		return 0, errors.New("RawConn Unsupported")
+	}
+	rc, err := sc.SyscallConn()
+	if err != nil {
+		return 0, errors.New("RawConn Unsupported")
+	}
+
+	var newFd int
+	errCtrl := rc.Control(func(fd uintptr) {
+		newFd, err = syscall.Dup(int(fd))
+	})
+
+	if errCtrl != nil {
+		return 0, errCtrl
+	}
+
+	if err != nil {
+		return 0, err
+	}
+
+	return newFd, nil
+}

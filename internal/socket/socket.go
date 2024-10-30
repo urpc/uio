@@ -17,7 +17,6 @@
 package socket
 
 import (
-	"errors"
 	"net"
 	"syscall"
 )
@@ -63,32 +62,4 @@ func SockaddrToAddr(sa syscall.Sockaddr, udpAddr bool) net.Addr {
 		addr = &net.UnixAddr{Net: "unix", Name: sa.Name}
 	}
 	return addr
-}
-
-func DupNetConn(conn net.Conn) (int, error) {
-	sc, ok := conn.(interface {
-		SyscallConn() (syscall.RawConn, error)
-	})
-	if !ok {
-		return 0, errors.New("RawConn Unsupported")
-	}
-	rc, err := sc.SyscallConn()
-	if err != nil {
-		return 0, errors.New("RawConn Unsupported")
-	}
-
-	var newFd int
-	errCtrl := rc.Control(func(fd uintptr) {
-		newFd, err = syscall.Dup(int(fd))
-	})
-
-	if errCtrl != nil {
-		return 0, errCtrl
-	}
-
-	if err != nil {
-		return 0, err
-	}
-
-	return newFd, nil
 }
