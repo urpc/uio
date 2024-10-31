@@ -19,6 +19,8 @@
 package socket
 
 import (
+	"errors"
+	"net"
 	"os"
 	"syscall"
 
