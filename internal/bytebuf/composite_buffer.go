@@ -265,6 +265,10 @@ func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
 		return
 	}
 
+	if nil == dst && len(b.bufList) > 0 {
+		dst = make([][]byte, 0, len(b.bufList))
+	}
+
 	for _, buf := range b.bufList {
 		dst = append(dst, buf.Bytes())
 		length += buf.Len()

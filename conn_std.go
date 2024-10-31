@@ -35,6 +35,7 @@ type fdConn struct {
 	udpSvr   *fdConn
 	udpConns map[string]*fdConn
 	writeSig chan struct{}
+	closeSig chan struct{}
 }
 
 func (fc *fdConn) Fd() int {
@@ -143,9 +144,6 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		return 0, fc.err
 	}
 
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
-
 	if fc.udp != nil {
 
 		if nil == fc.udpSvr && nil == fc.udpConns {
@@ -162,10 +160,18 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		return
 	}
 
+	fc.mux.Lock()
 	n, err = fc.outbound.Write(p)
+	fc.mux.Unlock()
+
+	if nil != err {
+		// unreachable here.
+		return
+	}
 
 	select {
 	case fc.writeSig <- struct{}{}:
+	//case <-fc.closeSig:
 	default:
 	}
 
@@ -173,8 +179,6 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 }
 
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
 
 	if fc.IsClosed() {
 		return 0, fc.err
@@ -184,9 +188,18 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, errUnsupported
 	}
 
+	fc.mux.Lock()
 	n, err = fc.outbound.Writev(vec)
+	fc.mux.Unlock()
+
+	if nil != err {
+		// unreachable here.
+		return
+	}
+
 	select {
 	case fc.writeSig <- struct{}{}:
+	//case <-fc.closeSig:
 	default:
 	}
 
@@ -198,9 +211,34 @@ func (fc *fdConn) Flush() error {
 		return fc.err
 	}
 
-	select {
-	case fc.writeSig <- struct{}{}:
-	default:
+	fc.mux.Lock()
+	buffers, size := fc.outbound.PeekVec(nil)
+	if 0 == size {
+		fc.mux.Unlock()
+		return nil
+	}
+
+	netBuffers := net.Buffers(buffers)
+	totalWriteBytes, err := netBuffers.WriteTo(fc.conn)
+
+	if nil != err {
+		fc.mux.Unlock()
+		if totalWriteBytes > 0 {
+			// trigger outbound event.
+			fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+		}
+		// close on error.
+		fc.events.closeConn(fc, err)
+		return err
+	}
+	fc.outbound.Discard(int(totalWriteBytes))
+	fc.mux.Unlock()
+
+	// trigger outbound event.
+	fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+
+	if totalWriteBytes < int64(size) {
+		return io.ErrShortWrite
 	}
 
 	return nil
@@ -276,6 +314,12 @@ func (fc *fdConn) fdCloseNoLock(err error) bool {
 		return false
 	}
 
+	// save close reason
+	fc.err = err
+
+	// notify send/write loop connection will be closed.
+	close(fc.closeSig)
+
 	// delete connection fd-mapping.
 	fc.loop.delConn(fc)
 
@@ -290,31 +334,17 @@ func (fc *fdConn) fdCloseNoLock(err error) bool {
 	fc.outbound.Reset()
 	fc.inbound.Reset()
 	fc.inboundTail = nil
-	fc.err = err
-
-	// close write signal.
-	if nil != fc.writeSig {
-		close(fc.writeSig)
-	}
 
 	return true
 }
 
 func (fc *fdConn) writeLoop() {
-	var writeBuffer = make([]byte, 1024)
+	var writeBuffer = make([]byte, 4096)
 	for {
 		select {
-		case _, ok := <-fc.writeSig:
-			if !ok {
-				return
-			}
-
-			fc.mux.Lock()
-			if fc.outbound.Empty() {
-				fc.mux.Unlock()
-				continue
-			}
-			fc.mux.Unlock()
+		case <-fc.closeSig:
+			return
+		case <-fc.writeSig:
 
 			var totalWriteBytes int
 			for {
@@ -348,7 +378,9 @@ func (fc *fdConn) writeLoop() {
 			}
 
 			// trigger outbound event.
-			fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+			if totalWriteBytes > 0 {
+				fc.events.onSocketBytesWrite(fc, totalWriteBytes)
+			}
 		}
 	}
 }
@@ -357,10 +389,9 @@ func (fc *fdConn) writevLoop() {
 	var writeBuffers = make([][]byte, 0, 128)
 	for {
 		select {
-		case _, ok := <-fc.writeSig:
-			if !ok {
-				return
-			}
+		case <-fc.closeSig:
+			return
+		case <-fc.writeSig:
 
 			fc.mux.Lock()
 			buffers, size := fc.outbound.PeekVec(writeBuffers[:0])
@@ -369,6 +400,7 @@ func (fc *fdConn) writevLoop() {
 				break
 			}
 
+			// writev syscall
 			netBuffers := net.Buffers(buffers)
 			totalWriteBytes, err := netBuffers.WriteTo(fc.conn)
 
@@ -386,7 +418,9 @@ func (fc *fdConn) writevLoop() {
 			fc.mux.Unlock()
 
 			// trigger outbound event.
-			fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+			if totalWriteBytes > 0 {
+				fc.events.onSocketBytesWrite(fc, int(totalWriteBytes))
+			}
 		}
 	}
 }

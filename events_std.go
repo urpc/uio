@@ -78,6 +78,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 	fdc.events = ev
 	fdc.loop = ev.selectLoop(fdc.Fd())
 	fdc.writeSig = make(chan struct{}, 1)
+	fdc.closeSig = make(chan struct{})
 
 	if err = ev.addConn(fdc); nil != err {
 		return nil, err
