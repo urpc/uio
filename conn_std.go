@@ -339,7 +339,7 @@ func (fc *fdConn) fdCloseNoLock(err error) bool {
 }
 
 func (fc *fdConn) writeLoop() {
-	var writeBuffer = make([]byte, 4096)
+	var writeBuffer = make([]byte, fc.events.MaxBufferSize)
 	for {
 		select {
 		case <-fc.closeSig:
@@ -453,7 +453,7 @@ func (fc *fdConn) readUDPLoop() {
 }
 
 func (fc *fdConn) readLoop() {
-	var buffer = make([]byte, 1024)
+	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
 		n, err := fc.conn.Read(buffer)
 		if nil != err {

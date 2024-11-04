@@ -48,7 +48,7 @@ type Events struct {
 	LockOSThread bool
 
 	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
-	// The default value is 64KB.
+	// The default value is 4KB.
 	MaxBufferSize int
 
 	// WriteBufferedThreshold enabled when value is greater than 0, writes will go into the outbound buffer instead of attempting to send them out immediately,
@@ -159,7 +159,7 @@ func (ev *Events) initConfig() error {
 	}
 
 	if ev.MaxBufferSize <= 0 {
-		ev.MaxBufferSize = 1024 * 64
+		ev.MaxBufferSize = 1024 * 4
 	}
 
 	if ev.WriteBufferedThreshold > 0 && ev.WriteBufferedThreshold < 1024 {
