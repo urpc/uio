@@ -332,8 +332,9 @@ func (fc *fdConn) fdCloseNoLock(err error) bool {
 	}
 
 	fc.outbound.Reset()
-	fc.inbound.Reset()
-	fc.inboundTail = nil
+	// warning: data race
+	//fc.inbound.Reset()
+	//fc.inboundTail = nil
 
 	return true
 }

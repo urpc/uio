@@ -356,11 +356,14 @@ func (fc *fdConn) fdClose(err error) bool {
 
 	// close socket and release resource.
 	_ = syscall.Close(fc.fd)
-	fc.outbound.Reset()
-	fc.inbound.Reset()
-	fc.inboundTail = nil
+
 	fc.err = err
 	fc.closed = 1
+
+	fc.outbound.Reset()
+	// warning: data race
+	//fc.inbound.Reset()
+	//fc.inboundTail = nil
 
 	return true
 }
