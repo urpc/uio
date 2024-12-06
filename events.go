@@ -169,6 +169,7 @@ func (ev *Events) initConfig() error {
 	return nil
 }
 
+//go:norace
 func (ev *Events) initLoops() (err error) {
 
 	// create main loop
@@ -177,17 +178,19 @@ func (ev *Events) initLoops() (err error) {
 	}
 
 	ev.workers = make([]*eventLoop, ev.Pollers)
-	for i := 0; i < ev.Pollers; i++ {
-		if ev.workers[i], err = newEventLoop(ev); nil != err {
+	for idx := range ev.workers {
+		if ev.workers[idx], err = newEventLoop(ev); nil != err {
 			return err
 		}
+	}
 
+	for _, worker := range ev.workers {
 		ev.waitGroup.Add(1)
 
-		go func(i int) {
+		go func(worker *eventLoop) {
 			defer ev.waitGroup.Done()
-			ev.workers[i].Serve(ev.LockOSThread, nil)
-		}(i)
+			worker.Serve(ev.LockOSThread, nil)
+		}(worker)
 	}
 
 	return nil
@@ -209,6 +212,7 @@ func (ev *Events) initListeners() (err error) {
 	return nil
 }
 
+//go:norace
 func (ev *Events) selectLoop(fd int) *eventLoop {
 	return ev.workers[fd%len(ev.workers)]
 }
