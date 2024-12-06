@@ -80,15 +80,15 @@ type Events struct {
 
 	// OnOutbound when any bytes write to a socket, it triggers the outbound event.
 	OnOutbound func(c Conn, writeBytes int)
+
+	// OnStart it triggers on the server initialized.
+	OnStart func(ev *Events)
+
+	// OnStop it triggers on the server closed.
+	OnStop func(ev *Events)
 }
 
 func (ev *Events) Serve(addrs ...string) (err error) {
-
-	defer func() {
-		// close loops.
-		_ = ev.Close(err)
-	}()
-
 	// append listen address.
 	ev.Addrs = append(ev.Addrs, addrs...)
 
@@ -97,6 +97,18 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		return err
 	}
 
+	// trigger OnStart event.
+	if ev.OnStart != nil {
+		ev.OnStart(ev)
+	}
+
+	defer func() {
+		// trigger OnStop event.
+		if ev.OnStop != nil {
+			ev.OnStop(ev)
+		}
+	}()
+
 	// serve listener
 	ev.waitGroup.Add(1)
 	defer ev.waitGroup.Done()
@@ -104,24 +116,8 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 }
 
 func (ev *Events) Close(err error) error {
-	ev.mux.Lock()
-	defer ev.mux.Unlock()
-
-	// close all listeners
-	ev.acceptor.close()
-
-	// stop main poller
-	if nil != ev.master {
-		_ = ev.master.Close(err)
-	}
-
-	// close all worker pollers
-	for _, worker := range ev.workers {
-		if nil != worker {
-			_ = worker.Close(err)
-			//ev.workers[idx] = nil
-		}
-	}
+	// close events.
+	ev.closeEvents(err)
 
 	// waiting for all event-loop exited.
 	ev.waitGroup.Wait()
@@ -150,6 +146,27 @@ func (ev *Events) initEvents() (err error) {
 	}
 
 	return nil
+}
+
+func (ev *Events) closeEvents(err error) {
+	ev.mux.Lock()
+	defer ev.mux.Unlock()
+
+	// close all listeners
+	ev.acceptor.close()
+
+	// stop main poller
+	if nil != ev.master {
+		_ = ev.master.Close(err)
+	}
+
+	// close all worker pollers
+	for _, worker := range ev.workers {
+		if nil != worker {
+			_ = worker.Close(err)
+			//ev.workers[idx] = nil
+		}
+	}
 }
 
 func (ev *Events) initConfig() error {

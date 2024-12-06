@@ -18,6 +18,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"os/signal"
 
 	"github.com/urpc/uio"
 )
@@ -29,13 +31,22 @@ func main() {
 	events.OnOpen = func(c uio.Conn) {
 		fmt.Println("connection opened:", c.RemoteAddr())
 	}
+
 	events.OnData = func(c uio.Conn) error {
 		_, err := c.WriteTo(c)
 		return err
 	}
+
 	events.OnClose = func(c uio.Conn, err error) {
 		fmt.Println("connection closed:", c.RemoteAddr())
 	}
+
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, os.Interrupt, os.Kill)
+		s := <-sig
+		events.Close(fmt.Errorf("received signal: %v", s))
+	}()
 
 	if err := events.Serve(":9527"); nil != err {
 		fmt.Println("server exited with error:", err)
