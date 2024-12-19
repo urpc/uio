@@ -186,7 +186,6 @@ func (ev *Events) initConfig() error {
 	return nil
 }
 
-//go:norace
 func (ev *Events) initLoops() (err error) {
 
 	// create main loop
@@ -229,7 +228,6 @@ func (ev *Events) initListeners() (err error) {
 	return nil
 }
 
-//go:norace
 func (ev *Events) selectLoop(fd int) *eventLoop {
 	return ev.workers[fd%len(ev.workers)]
 }
