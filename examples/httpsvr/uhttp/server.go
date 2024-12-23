@@ -26,15 +26,16 @@ import (
 func ListenAndServe(addr string, handler http.Handler) error {
 
 	var events uio.Events
+	//events.FullDuplex = true
 
 	events.OnOpen = func(c uio.Conn) {
 		//fmt.Println("connection opened:", c.RemoteAddr())
-		c.SetContext(NewHttpConn(c, nil))
+		c.SetContext(NewHttpConn(c, handler))
 	}
 
 	events.OnData = func(c uio.Conn) error {
 		hConn := c.Context().(*HttpConn)
-		return hConn.ServeHTTP(handler)
+		return hConn.ServeHTTP()
 	}
 
 	events.OnClose = func(c uio.Conn, err error) {
@@ -45,6 +46,6 @@ func ListenAndServe(addr string, handler http.Handler) error {
 		fmt.Println("server exited with error:", err)
 		return err
 	}
-	
+
 	return nil
 }

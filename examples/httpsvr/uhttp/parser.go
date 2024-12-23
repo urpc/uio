@@ -18,10 +18,12 @@ package uhttp
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/antlabs/httparser"
 	"github.com/urpc/uio"
+	"golang.org/x/net/http/httpguts"
 )
 
 var emptyRequest = http.Request{}
@@ -40,7 +42,7 @@ func resetHttpResponseWriter(writer *httpResponseWriter) *httpResponseWriter {
 	writer.protoMajor = 0
 	writer.protoMinor = 0
 	writer.statusCode = 0
-	writer.body.Reset()
+	writer.headerWritten = false
 	clear(writer.header)
 	return writer
 }
@@ -51,7 +53,6 @@ var httpParserSettings = &httparser.Setting{
 		hConn := p.GetUserData().(*HttpConn)
 		hConn.request = resetHttpRequest(hConn.request)
 		hConn.writer = resetHttpResponseWriter(hConn.writer)
-		hConn.finished = false
 	},
 	URL: func(p *httparser.Parser, buf []byte, _ int) {
 		//fmt.Printf("url->%s\n", buf)
@@ -103,7 +104,33 @@ var httpParserSettings = &httparser.Setting{
 		hConn.request.Proto = sb.String()
 		hConn.request.ProtoMajor = int(p.Major)
 		hConn.request.ProtoMinor = int(p.Minor)
-		hConn.finished = true
+
+		// CONNECT requests are used two different ways, and neither uses a full URL:
+		// The standard use is to tunnel HTTPS through an HTTP proxy.
+		// It looks like "CONNECT www.google.com:443 HTTP/1.1", and the parameter is
+		// just the authority section of a URL. This information should go in req.URL.Host.
+		//
+		// The net/rpc package also uses CONNECT, but there the parameter is a path
+		// that starts with a slash. It can be parsed with the regular URL parser,
+		// and the path will end up in req.URL.Path, where it needs to be in order for
+		// RPC to work.
+		rawurl := hConn.request.RequestURI
+		justAuthority := hConn.request.Method == "CONNECT" && !strings.HasPrefix(rawurl, "/")
+		if justAuthority {
+			rawurl = "http://" + rawurl
+		}
+
+		hConn.request.URL, _ = url.ParseRequestURI(rawurl)
+
+		if justAuthority {
+			// Strip the bogus "http://" back off.
+			hConn.request.URL.Scheme = ""
+		}
+
+		// fill remote addr and close flag.
+		hConn.request.RemoteAddr = hConn.remoteAddr
+		hConn.request.Close = shouldClose(hConn.request.ProtoMajor, hConn.request.ProtoMinor, hConn.request.Header, false)
+		hConn.Handle()
 	},
 }
 
@@ -120,4 +147,25 @@ var methods = map[httparser.Method]string{
 
 func getMethod(m httparser.Method) string {
 	return methods[m]
+}
+
+// Determine whether to hang up after sending a request and body, or
+// receiving a response and body
+// 'header' is the request headers.
+func shouldClose(major, minor int, header http.Header, removeCloseHeader bool) bool {
+	if major < 1 {
+		return true
+	}
+
+	conv := header["Connection"]
+	hasClose := httpguts.HeaderValuesContainsToken(conv, "close")
+	if major == 1 && minor == 0 {
+		return hasClose || !httpguts.HeaderValuesContainsToken(conv, "keep-alive")
+	}
+
+	if hasClose && removeCloseHeader {
+		header.Del("Connection")
+	}
+
+	return hasClose
 }
