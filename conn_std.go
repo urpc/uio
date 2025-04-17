@@ -248,6 +248,10 @@ func (fc *fdConn) Close() error {
 	return fc.closeWithError(io.ErrUnexpectedEOF)
 }
 
+func (fc *fdConn) CloseWith(err error) error {
+	return fc.closeWithError(err)
+}
+
 func (fc *fdConn) closeWithError(err error) error {
 
 	if fc.IsClosed() {

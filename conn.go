@@ -131,6 +131,9 @@ type Conn interface {
 	// Flush writes any buffered data to the underlying connection.
 	// Notice: non-blocking interface, should not be used as you use std.
 	Flush() error
+
+	// CloseWith close the connection with error.
+	CloseWith(err error) error
 }
 
 var errUnsupported = fmt.Errorf("unsupported method")
