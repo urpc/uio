@@ -19,15 +19,28 @@ package uio
 import (
 	"sync"
 
+	"github.com/urpc/uio/internal/fdmap"
 	"github.com/urpc/uio/internal/poller"
 )
+
+var unixFdMap *fdmap.Map[fdConn]
+var unixFdMapOnce sync.Once
+
+func newFdMap() *fdmap.Map[fdConn] {
+	if fdmap.UseSingleInstance {
+		unixFdMapOnce.Do(func() {
+			unixFdMap = fdmap.NewMap[fdConn]()
+		})
+		return unixFdMap
+	}
+	return fdmap.NewMap[fdConn]()
+}
 
 type eventLoop struct {
 	events *Events
 	poller *poller.NetPoller
 	buffer []byte
-	fdMap  map[int]*fdConn // all connections
-	mux    sync.Mutex      // fdMap locker
+	fdMap  *fdmap.Map[fdConn]
 }
 
 func newEventLoop(events *Events) (*eventLoop, error) {
@@ -40,7 +53,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 			events: events,
 			poller: p,
 			buffer: make([]byte, events.MaxBufferSize),
-			fdMap:  make(map[int]*fdConn, 1024),
+			fdMap:  newFdMap(),
 		},
 		nil
 }
@@ -68,14 +81,11 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) {
 }
 
 func (el *eventLoop) OnClose(ep *poller.NetPoller, err error) {
-	el.mux.Lock()
-	fdMap := el.fdMap
-	el.fdMap = make(map[int]*fdConn)
-	el.mux.Unlock()
-
-	// close all connections
-	for _, fdc := range fdMap {
-		el.events.closeConn(fdc, err)
+	for fd, fdc := range el.fdMap.Range() {
+		if fdc.loop == el {
+			el.fdMap.Delete(fd)
+			el.events.closeConn(fdc, err)
+		}
 	}
 }
 
@@ -95,9 +105,7 @@ func (el *eventLoop) getBuffer() []byte {
 }
 
 func (el *eventLoop) getConn(fd int) *fdConn {
-	el.mux.Lock()
-	defer el.mux.Unlock()
-	return el.fdMap[fd]
+	return el.fdMap.Get(fd)
 }
 
 func (el *eventLoop) listen(fd int) error {
@@ -105,17 +113,13 @@ func (el *eventLoop) listen(fd int) error {
 }
 
 func (el *eventLoop) delConn(fdc *fdConn) {
-	el.mux.Lock()
-	defer el.mux.Unlock()
-	delete(el.fdMap, fdc.Fd())
 	// close socket, fd auto removed.
+	el.fdMap.Delete(fdc.Fd())
 }
 
 func (el *eventLoop) addConn(fdc *fdConn) error {
-	el.mux.Lock()
 	fd := fdc.Fd()
-	el.fdMap[fd] = fdc
-	el.mux.Unlock()
+	el.fdMap.Put(fd, fdc)
 	return el.poller.AddRead(fd)
 }
 
