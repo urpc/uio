@@ -608,6 +608,11 @@ func (fc *fdConn) onWrite() error {
 	// trigger on any bytes write.
 	fc.events.onSocketBytesWrite(fc, totalWriteBytes)
 
+	// read events are always registered in FullDuplex mode.
+	if fc.events.FullDuplex {
+		return nil
+	}
+
 	// outbound buffer is empty.
 	return fc.loop.modRead(fc)
 }
