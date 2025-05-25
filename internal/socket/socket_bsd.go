@@ -19,6 +19,7 @@
 package socket
 
 import (
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -34,7 +35,7 @@ func Writev(fd int, vec [][]byte) (int, error) {
 	case 0:
 		return 0, nil
 	case 1:
-		return unix.Write(fd, vec[0])
+		return syscall.Write(fd, vec[0])
 	default:
 		iovecs := make([]unix.Iovec, 0, minIovec)
 		iovecs = appendBytes(iovecs, vec)

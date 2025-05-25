@@ -25,7 +25,6 @@ import (
 	"unsafe"
 
 	"github.com/urpc/uio/internal/socket"
-	"golang.org/x/sys/unix"
 )
 
 type fdConn struct {
@@ -133,9 +132,9 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 		return
 	}
 
-	writeSize, err := unix.Write(fc.fd, b)
+	writeSize, err := syscall.Write(fc.fd, b)
 	if err != nil {
-		if !errors.Is(err, unix.EAGAIN) {
+		if !errors.Is(err, syscall.EAGAIN) {
 			fc.mux.Unlock()
 			fc.events.closeConn(fc, err)
 			return 0, err
@@ -213,7 +212,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	// invoke writev() syscall.
 	writeSize, err := socket.Writev(fc.fd, vec)
 	if err != nil {
-		if !errors.Is(err, unix.EAGAIN) {
+		if !errors.Is(err, syscall.EAGAIN) {
 			fc.mux.Unlock()
 			fc.events.closeConn(fc, err)
 			return 0, err
@@ -311,7 +310,7 @@ func (fc *fdConn) flush(opEvent bool) (socketWriteBytes int, err error) {
 		var writeSize int
 		writeSize, err = socket.Writev(fc.fd, vec)
 		if nil != err {
-			if !errors.Is(err, unix.EAGAIN) {
+			if !errors.Is(err, syscall.EAGAIN) {
 				return socketWriteBytes, err
 			}
 			// ignore: EAGAIN
@@ -533,7 +532,7 @@ func (fc *fdConn) onRead() error {
 	buffer := fc.loop.getBuffer()
 
 	// read data from fd
-	n, err := unix.Read(fc.fd, buffer)
+	n, err := syscall.Read(fc.fd, buffer)
 	if 0 == n || err != nil {
 		if nil != err && errors.Is(err, syscall.EAGAIN) {
 			return nil
@@ -584,7 +583,7 @@ func (fc *fdConn) onWrite() error {
 		}
 
 		// write buffer to fd.
-		sent, err := unix.Write(fc.fd, data)
+		sent, err := syscall.Write(fc.fd, data)
 		if nil != err {
 			fc.mux.Unlock()
 			// trigger on any bytes write.

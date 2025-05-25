@@ -43,7 +43,7 @@ func Writev(fd int, iov [][]byte) (int, error) {
 	case 0:
 		return 0, nil
 	case 1:
-		return unix.Write(fd, iov[0])
+		return syscall.Write(fd, iov[0])
 	default:
 		return unix.Writev(fd, iov)
 	}

@@ -2,7 +2,6 @@ package pool
 
 import (
 	"sync"
-	"sync/atomic"
 )
 
 // Pool contains logic of reusing objects distinguishable by size in generic
@@ -11,10 +10,6 @@ type Pool[T any] struct {
 	pool     []sync.Pool
 	size     func(int) int
 	stepSize int
-	get      int32
-	put      int32
-	miss     int32
-	hit      int32
 }
 
 // New creates new Pool that reuses objects which size
@@ -45,14 +40,10 @@ func New[T any](max int) *Pool[T] {
 func (p *Pool[T]) Get(size int) (T, int) {
 	n := p.size(size)
 
-	atomic.AddInt32(&p.get, 1)
-
 	if idx := (n - 1) / p.stepSize; idx < len(p.pool) {
 		if v := p.pool[idx].Get(); v != nil {
-			atomic.AddInt32(&p.hit, 1)
 			return v.(T), n
 		}
-		atomic.AddInt32(&p.miss, 1)
 	}
 
 	var zero T
@@ -64,8 +55,6 @@ func (p *Pool[T]) Put(x T, size int) {
 	if size < p.stepSize {
 		return
 	}
-
-	atomic.AddInt32(&p.put, 1)
 
 	if idx := (size - 1) / p.stepSize; idx < len(p.pool) {
 		p.pool[idx].Put(x)
