@@ -531,9 +531,17 @@ func (fc *fdConn) onRead() error {
 
 	buffer := fc.loop.getBuffer()
 
+	fc.mux.Lock()
+
+	if 0 != fc.closed {
+		fc.mux.Unlock()
+		return fc.err
+	}
+
 	// read data from fd
 	n, err := syscall.Read(fc.fd, buffer)
 	if 0 == n || err != nil {
+		fc.mux.Unlock()
 		if nil != err && errors.Is(err, syscall.EAGAIN) {
 			return nil
 		}
@@ -546,6 +554,8 @@ func (fc *fdConn) onRead() error {
 	}
 
 	fc.inboundTail = buffer[:n]
+
+	fc.mux.Unlock()
 
 	// trigger on any bytes received.
 	fc.events.onSocketBytesRead(fc, n)
