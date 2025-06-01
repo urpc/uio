@@ -134,7 +134,7 @@ func (fc *fdConn) Write(b []byte) (n int, err error) {
 
 	writeSize, err := syscall.Write(fc.fd, b)
 	if err != nil {
-		if !errors.Is(err, syscall.EAGAIN) {
+		if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
 			fc.mux.Unlock()
 			fc.events.closeConn(fc, err)
 			return 0, err
@@ -212,7 +212,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	// invoke writev() syscall.
 	writeSize, err := socket.Writev(fc.fd, vec)
 	if err != nil {
-		if !errors.Is(err, syscall.EAGAIN) {
+		if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
 			fc.mux.Unlock()
 			fc.events.closeConn(fc, err)
 			return 0, err
@@ -310,7 +310,7 @@ func (fc *fdConn) flush(opEvent bool) (socketWriteBytes int, err error) {
 		var writeSize int
 		writeSize, err = socket.Writev(fc.fd, vec)
 		if nil != err {
-			if !errors.Is(err, syscall.EAGAIN) {
+			if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
 				return socketWriteBytes, err
 			}
 			// ignore: EAGAIN
@@ -531,50 +531,56 @@ func (fc *fdConn) onRead() error {
 
 	buffer := fc.loop.getBuffer()
 
-	fc.mux.Lock()
+	for {
 
-	if 0 != fc.closed {
-		fc.mux.Unlock()
-		return fc.err
-	}
+		fc.mux.Lock()
+		if 0 != fc.closed {
+			fc.mux.Unlock()
+			return fc.err
+		}
 
-	// read data from fd
-	n, err := syscall.Read(fc.fd, buffer)
-	if 0 == n || err != nil {
+		// read data from fd
+		n, err := syscall.Read(fc.fd, buffer)
 		fc.mux.Unlock()
-		if nil != err && errors.Is(err, syscall.EAGAIN) {
+
+		if 0 == n || err != nil {
+			if nil != err && (errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
+				return nil
+			}
+			// remote closed
+			if nil == err {
+				err = io.EOF
+			}
+			fc.events.closeConn(fc, err)
 			return nil
 		}
-		// remote closed
-		if nil == err {
-			err = io.EOF
+
+		fc.inboundTail = buffer[:n]
+
+		// trigger on any bytes received.
+		fc.events.onSocketBytesRead(fc, n)
+
+		// fire data callback.
+		if err = fc.events.onData(fc); nil != err {
+			fc.events.closeConn(fc, err)
+			return nil
 		}
-		fc.events.closeConn(fc, err)
-		return nil
-	}
 
-	fc.inboundTail = buffer[:n]
+		// append tail bytes to inbound buffer
+		if len(fc.inboundTail) > 0 {
+			_, _ = fc.inbound.Write(fc.inboundTail)
+			fc.inboundTail = fc.inboundTail[:0]
+		}
 
-	fc.mux.Unlock()
+		// try flush outbound buffer.
+		if fc.events.WriteBufferedThreshold > 0 {
+			_ = fc.Flush()
+		}
 
-	// trigger on any bytes received.
-	fc.events.onSocketBytesRead(fc, n)
-
-	// fire data callback.
-	if err = fc.events.onData(fc); nil != err {
-		fc.events.closeConn(fc, err)
-		return nil
-	}
-
-	// append tail bytes to inbound buffer
-	if len(fc.inboundTail) > 0 {
-		_, _ = fc.inbound.Write(fc.inboundTail)
-		fc.inboundTail = fc.inboundTail[:0]
-	}
-
-	// try flush outbound buffer.
-	if fc.events.WriteBufferedThreshold > 0 {
-		_ = fc.Flush()
+		// there is no more data to read.
+		if n < len(buffer) {
+			break
+		}
 	}
 
 	return nil
@@ -599,7 +605,7 @@ func (fc *fdConn) onWrite() error {
 			// trigger on any bytes write.
 			fc.events.onSocketBytesWrite(fc, totalWriteBytes)
 
-			if errors.Is(err, syscall.EAGAIN) {
+			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 				return nil
 			}
 			fc.events.closeConn(fc, err)
