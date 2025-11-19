@@ -136,7 +136,7 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 				eventMask |= WriteEvents
 			}
 
-			handler.OnEvent(&ev, int(event.Fd), eventMask)
+			handler.OnEvent(ev, int(event.Fd), eventMask)
 		}
 
 	}
