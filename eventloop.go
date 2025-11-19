@@ -80,6 +80,27 @@ func (el *eventLoop) OnRead(ep *poller.NetPoller, fd int) {
 	}
 }
 
+func (el *eventLoop) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
+	fdc := el.getConn(fd)
+	if fdc == nil || fdc.IsClosed() {
+		return
+	}
+
+	if 0 != events&poller.WriteEvents {
+		if err := fdc.fireWriteEvent(); nil != err {
+			el.events.closeConn(fdc, err)
+			return
+		}
+	}
+
+	if 0 != events&poller.ReadEvents {
+		if err := fdc.fireReadEvent(); nil != err {
+			el.events.closeConn(fdc, err)
+			return
+		}
+	}
+}
+
 func (el *eventLoop) OnClose(ep *poller.NetPoller, err error) {
 	for fd, fdc := range el.fdMap.Range() {
 		if fdc.loop == el {

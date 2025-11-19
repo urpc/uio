@@ -49,8 +49,7 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 			handler.OnClose(ev, ev.err)
 			return ev.err
 		case fd := <-ev.ev:
-			handler.OnRead(ev, fd)
-			handler.OnWrite(ev, fd)
+			handler.OnEvent(ev, fd, ReadEvents|WriteEvents)
 		}
 	}
 }

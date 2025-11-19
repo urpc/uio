@@ -45,11 +45,7 @@ type acceptor struct {
 	events    *Events
 }
 
-func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) {
-	panic("implement me")
-}
-
-func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) {
+func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
 	panic("implement me")
 }
 

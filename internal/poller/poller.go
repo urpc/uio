@@ -16,8 +16,17 @@
 
 package poller
 
+// Events is a bitmask for read/write/error events. Poller implementations
+// may pass these to OnEvent callback to handle multiple events
+// in a single call (avoids double Get/dispatch for read+write).
+type Events uint32
+
+const (
+	ReadEvents Events = 1 << iota
+	WriteEvents
+)
+
 type EventHandler interface {
-	OnWrite(ep *NetPoller, fd int)
-	OnRead(ep *NetPoller, fd int)
+	OnEvent(ep *NetPoller, fd int, events Events)
 	OnClose(ep *NetPoller, err error)
 }

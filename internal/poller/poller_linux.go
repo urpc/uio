@@ -126,13 +126,17 @@ func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 		}
 
 		for _, event := range events[:n] {
-			if 0 != (event.Events & writeEvents) {
-				handler.OnWrite(ev, int(event.Fd))
-			}
+			var eventMask Events
 
 			if 0 != (event.Events & (readEvents | errorEvents)) {
-				handler.OnRead(ev, int(event.Fd))
+				eventMask |= ReadEvents
 			}
+
+			if 0 != (event.Events & writeEvents) {
+				eventMask |= WriteEvents
+			}
+
+			handler.OnEvent(&ev, int(event.Fd), eventMask)
 		}
 
 	}

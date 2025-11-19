@@ -54,17 +54,20 @@ type acceptor struct {
 	events    *Events
 }
 
-func (ld *acceptor) OnWrite(ep *poller.NetPoller, fd int) {
-	panic("unreachable here")
-}
+func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
 
-func (ld *acceptor) OnRead(ep *poller.NetPoller, fd int) {
-	ld.mux.Lock()
-	l, ok := ld.listeners[fd]
-	ld.mux.Unlock()
+	if 0 != events&poller.ReadEvents {
+		ld.mux.Lock()
+		l, ok := ld.listeners[fd]
+		ld.mux.Unlock()
 
-	if ok {
-		_ = ld.accept(l)
+		if ok {
+			_ = ld.accept(l)
+		}
+	}
+
+	if 0 != events&poller.WriteEvents {
+		panic("unreachable here")
 	}
 }
 
