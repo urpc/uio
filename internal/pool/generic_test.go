@@ -29,3 +29,24 @@ func TestGenericPoolGet(t *testing.T) {
 		})
 	}
 }
+
+func TestGenericPoolPut(t *testing.T) {
+	p := New[*int](65536)
+	value := 42
+	p.Put(&value, 1024)
+	got, size := p.Get(10)
+	if size != 1024 {
+		t.Fatalf("Get size after Put = %d, want 1024", size)
+	}
+	// sync.Pool may discard cached values at any garbage collection.
+	if got != nil && *got != value {
+		t.Fatalf("Get after Put = %d, want %d or nil", *got, value)
+	}
+
+	// Objects below the pool's minimum bucket are intentionally not retained.
+	discardingPool := New[*int](65536)
+	discardingPool.Put(&value, 1)
+	if got, _ := discardingPool.Get(1); got != nil {
+		t.Fatal("Put accepted an undersized bucket")
+	}
+}

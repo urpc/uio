@@ -105,6 +105,15 @@ func TestIsPowerOfTwo(t *testing.T) {
 	}
 }
 
+func TestIdentityAndMin(t *testing.T) {
+	if Identity(7) != 7 {
+		t.Fatal("Identity changed its input")
+	}
+	if Min(2, 3) != 2 || Min(3, 2) != 2 || Min(2, 2) != 2 {
+		t.Fatal("Min returned an unexpected value")
+	}
+}
+
 func TestFillBits(t *testing.T) {
 	for _, test := range []struct {
 		in  int
