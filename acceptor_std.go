@@ -20,6 +20,7 @@ package uio
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -46,7 +47,6 @@ type acceptor struct {
 }
 
 func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
-	panic("implement me")
 }
 
 func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
@@ -75,6 +75,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
+		l.udpSvr.internal = true
 		l.udpSvr.udp = l.udp.(*net.UDPConn)
 		l.udpSvr.udpConns = make(map[string]*fdConn)
 
@@ -105,7 +106,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			fdc := &fdConn{}
 			fdc.conn = conn
 			fdc.events = ld.events
-			fdc.loop = ld.events.selectLoop(fdc.Fd())
+			fdc.loop = ld.events.selectWorker(fdc.Fd())
 			fdc.localAddr = conn.LocalAddr()
 			fdc.remoteAddr = conn.RemoteAddr()
 			fdc.writeSig = make(chan struct{}, 1)
@@ -170,7 +171,7 @@ func (ld *acceptor) closeListener(l *listener) {
 	}
 
 	if l.udpSvr != nil {
-		_ = l.udpSvr.Close()
+		l.udpSvr.closeOnLoop(io.ErrUnexpectedEOF)
 	}
 
 	if l.udp != nil {
@@ -180,10 +181,10 @@ func (ld *acceptor) closeListener(l *listener) {
 
 func (ld *acceptor) close() {
 	ld.mux.Lock()
-	defer ld.mux.Unlock()
-
-	for addr, l := range ld.listeners {
-		delete(ld.listeners, addr)
+	listeners := ld.listeners
+	ld.listeners = nil
+	ld.mux.Unlock()
+	for _, l := range listeners {
 		ld.closeListener(l)
 	}
 }

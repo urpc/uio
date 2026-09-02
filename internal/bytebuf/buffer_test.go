@@ -354,6 +354,31 @@ func TestWriteAppend(t *testing.T) {
 	}
 }
 
+func TestCommitWriteAfterPartialRead(t *testing.T) {
+	buffer := NewBuffer(make([]byte, 0, 16))
+	_, _ = buffer.WriteString("abcdef")
+	read := make([]byte, 2)
+	if n, err := buffer.Read(read); err != nil || n != len(read) {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	available := buffer.AvailableBuffer()
+	copy(available[:3], "XYZ")
+	buffer.CommitWrite(3)
+	if got := string(buffer.Bytes()); got != "cdefXYZ" {
+		t.Fatalf("Bytes = %q, want cdefXYZ", got)
+	}
+}
+
+func TestCommitWriteRejectsBeyondAvailable(t *testing.T) {
+	buffer := NewBuffer(make([]byte, 3, 4))
+	defer func() {
+		if recover() == nil {
+			t.Fatal("CommitWrite beyond Available did not panic")
+		}
+	}()
+	buffer.CommitWrite(buffer.Available() + 1)
+}
+
 func TestRuneIO(t *testing.T) {
 	const NRune = 1000
 	// Built a test slice while we write the data

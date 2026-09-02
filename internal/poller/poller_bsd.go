@@ -1,26 +1,11 @@
 //go:build (darwin || netbsd || freebsd || openbsd || dragonfly) && !stdio
 
-/*
- * Copyright 2024 the urpc project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package poller
 
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,127 +19,269 @@ const (
 )
 
 type NetPoller struct {
-	kqfd   int
-	closed int32
-	err    error
+	kqfd      int
+	wakeRead  int
+	wakeWrite int
+
+	mu        sync.Mutex // protects interests, waiters, and descriptor lifetime
+	interests map[int]Interest
+	waiters   int // includes readiness-event conversion after kevent
+
+	closed      atomic.Bool
+	closeReason atomic.Pointer[error]
+	releaseOnce sync.Once
+	rawEvents   [1024]unix.Kevent_t
 }
 
 func NewNetPoller() (*NetPoller, error) {
-	fd, err := unix.Kqueue()
-	if nil != err {
+	kqfd, err := unix.Kqueue()
+	if err != nil {
 		return nil, err
 	}
-	return &NetPoller{kqfd: fd}, nil
+	waker := make([]int, 2)
+	if err = unix.Pipe(waker); err != nil {
+		_ = unix.Close(kqfd)
+		return nil, err
+	}
+	for _, fd := range waker {
+		unix.CloseOnExec(fd)
+		if err = unix.SetNonblock(fd, true); err != nil {
+			_ = unix.Close(waker[0])
+			_ = unix.Close(waker[1])
+			_ = unix.Close(kqfd)
+			return nil, err
+		}
+	}
+	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1], interests: make(map[int]Interest)}
+	if err = poller.change(waker[0], readEvents, unix.EV_ADD); err != nil {
+		poller.release()
+		return nil, err
+	}
+	return poller, nil
 }
 
-func (ev *NetPoller) AddReadWrite(fd int) error {
-	_, err := unix.Kevent(
-		ev.kqfd,
-		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
-		},
-		nil,
-		nil,
-	)
+func (poller *NetPoller) Watch(fd int, want Interest) error {
+	if want == 0 {
+		return errInvalidInterest
+	}
+	if poller.closed.Load() {
+		return poller.closedError()
+	}
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed.Load() {
+		return poller.closedError()
+	}
+	previous := poller.interests[fd]
+	if previous == want {
+		return nil
+	}
+	if previous&Readable != 0 && want&Readable == 0 {
+		if err := poller.deleteFilter(fd, readEvents); err != nil {
+			return err
+		}
+	}
+	if previous&Writable != 0 && want&Writable == 0 {
+		if err := poller.deleteFilter(fd, writeEvents); err != nil {
+			return err
+		}
+	}
+	if previous&Readable == 0 && want&Readable != 0 {
+		if err := poller.change(fd, readEvents, unix.EV_ADD); err != nil {
+			return err
+		}
+	}
+	if previous&Writable == 0 && want&Writable != 0 {
+		if err := poller.change(fd, writeEvents, unix.EV_ADD); err != nil {
+			return err
+		}
+	}
+	poller.interests[fd] = want
+	return nil
+}
+
+func (poller *NetPoller) Unwatch(fd int) error {
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	previous := poller.interests[fd]
+	// Clear the shadow even when DELETE reports that the filter is already gone.
+	delete(poller.interests, fd)
+	if poller.closed.Load() {
+		return nil
+	}
+	var errs []error
+	if previous&Readable != 0 {
+		errs = append(errs, poller.deleteFilter(fd, readEvents))
+	}
+	if previous&Writable != 0 {
+		errs = append(errs, poller.deleteFilter(fd, writeEvents))
+	}
+	return errors.Join(errs...)
+}
+
+func (poller *NetPoller) change(fd int, filter, flags int64) error {
+	event := makeKevent(fd, filter, flags)
+	_, err := unix.Kevent(poller.kqfd, []unix.Kevent_t{event}, nil, nil)
 	return err
 }
 
-func (ev *NetPoller) AddRead(fd int) error {
-	_, err := unix.Kevent(
-		ev.kqfd,
-		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
-		},
-		nil,
-		nil,
-	)
+func (poller *NetPoller) deleteFilter(fd int, filter int64) error {
+	err := poller.change(fd, filter, unix.EV_DELETE)
+	// A missing filter already represents the requested state.
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
+		return nil
+	}
 	return err
 }
 
-func (ev *NetPoller) ModRead(fd int) error {
-	_, err := unix.Kevent(
-		ev.kqfd,
-		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_DELETE, Filter: writeEvents},
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
-		},
-		nil,
-		nil,
-	)
+func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
+	// Register before kevent so Close cannot release descriptors still in use.
+	poller.mu.Lock()
+	if poller.closed.Load() {
+		poller.release()
+		err := poller.closeError()
+		poller.mu.Unlock()
+		return 0, err
+	}
+	poller.waiters++
+	poller.mu.Unlock()
+	defer poller.finishWait()
+	var timeoutSpec *unix.Timespec
+	if timeout >= 0 {
+		spec := unix.NsecToTimespec(int64(time.Duration(timeout) * time.Millisecond))
+		timeoutSpec = &spec
+	}
+	n, err := unix.Kevent(poller.kqfd, nil, poller.rawEvents[:], timeoutSpec)
+	if poller.closed.Load() {
+		return 0, poller.closeError()
+	}
+	if errors.Is(err, unix.EINTR) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, event := range poller.rawEvents[:n] {
+		fd := int(event.Ident)
+		if fd == poller.wakeRead {
+			poller.drainWake()
+			continue
+		}
+		if count == len(out) {
+			// Level triggering will report readiness again on the next Wait.
+			continue
+		}
+		var events Events
+		if event.Filter == readEvents || event.Flags&errorEvents != 0 {
+			events |= ReadEvents
+		}
+		if event.Filter == writeEvents {
+			events |= WriteEvents
+		}
+		out[count] = Event{FD: fd, Events: events}
+		count++
+	}
+	return count, nil
+}
+
+func (poller *NetPoller) Wake() error {
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed.Load() {
+		return nil
+	}
+	return poller.wakeLocked()
+}
+
+func (poller *NetPoller) wakeLocked() error {
+	// The pipe contains wake bytes only; tasks remain in the loop queue.
+	_, err := unix.Write(poller.wakeWrite, []byte{1})
+	if errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EWOULDBLOCK) {
+		return nil
+	}
 	return err
 }
 
-func (ev *NetPoller) ModWrite(fd int) error {
-	_, err := unix.Kevent(
-		ev.kqfd,
-		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_DELETE, Filter: readEvents},
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
-		},
-		nil,
-		nil,
-	)
-	return err
+func (poller *NetPoller) drainWake() {
+	var buffer [64]byte
+	for {
+		if _, err := unix.Read(poller.wakeRead, buffer[:]); err != nil {
+			return
+		}
+	}
 }
 
-func (ev *NetPoller) ModReadWrite(fd int) error {
-	_, err := unix.Kevent(
-		ev.kqfd,
-		[]unix.Kevent_t{
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: readEvents},
-			{Ident: uint64(fd), Flags: unix.EV_ADD, Filter: writeEvents},
-		},
-		nil,
-		nil,
-	)
-	return err
+func (poller *NetPoller) Close(err error) error {
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed.Load() {
+		return nil
+	}
+	// Publish the reason before closed, then let the final waiter release fds.
+	reason := err
+	poller.closeReason.Store(&reason)
+	poller.closed.Store(true)
+	if poller.waiters == 0 {
+		poller.release()
+		return nil
+	}
+	return poller.wakeLocked()
 }
 
-func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
+func (poller *NetPoller) Closed() bool { return poller.closed.Load() }
 
+func (poller *NetPoller) closeError() error {
+	if reason := poller.closeReason.Load(); reason != nil {
+		return *reason
+	}
+	return nil
+}
+
+func (poller *NetPoller) closedError() error {
+	if err := poller.closeError(); err != nil {
+		return err
+	}
+	return unix.EBADF
+}
+
+func (poller *NetPoller) release() {
+	poller.releaseOnce.Do(func() {
+		_ = unix.Close(poller.wakeRead)
+		_ = unix.Close(poller.wakeWrite)
+		_ = unix.Close(poller.kqfd)
+	})
+}
+
+func (poller *NetPoller) finishWait() {
+	poller.mu.Lock()
+	poller.waiters--
+	if poller.waiters == 0 && poller.closed.Load() {
+		poller.release()
+	}
+	poller.mu.Unlock()
+}
+
+func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
-
-	var timeout unix.Timespec
-	timeout.Sec = 0
-	timeout.Nsec = int64(time.Millisecond * 100)
-
-	var events = make([]unix.Kevent_t, 1024)
-
+	events := make([]Event, 1024)
 	for {
-		n, err := unix.Kevent(ev.kqfd, nil, events, &timeout)
-		switch {
-		case n == 0 || (n < 0 && errors.Is(err, unix.EINTR)):
-			continue
-		case nil != err:
-			handler.OnClose(ev, ev.err)
-			return ev.err
+		n, err := poller.Wait(events, -1)
+		if err != nil || poller.Closed() {
+			handler.OnClose(poller, err)
+			return err
 		}
-
-		for i := 0; i < n; i++ {
-			var event = &events[i]
-			var eventMask Events
-
-			if event.Filter == readEvents || 0 != event.Flags&errorEvents {
-				eventMask |= ReadEvents
-			}
-
-			if event.Filter == writeEvents {
-				eventMask |= WriteEvents
-			}
-
-			handler.OnEvent(ev, int(event.Ident), eventMask)
+		for _, event := range events[:n] {
+			handler.OnEvent(poller, event.FD, event.Events)
 		}
 	}
 }
 
-func (ev *NetPoller) Close(err error) error {
-	if atomic.CompareAndSwapInt32(&ev.closed, 0, 1) {
-		ev.err = err
-		return unix.Close(ev.kqfd)
-	}
-	return nil
-}
+func (poller *NetPoller) AddReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
+func (poller *NetPoller) AddRead(fd int) error      { return poller.Watch(fd, Readable) }
+func (poller *NetPoller) ModRead(fd int) error      { return poller.Watch(fd, Readable) }
+func (poller *NetPoller) ModWrite(fd int) error     { return poller.Watch(fd, Writable) }
+func (poller *NetPoller) ModReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }

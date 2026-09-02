@@ -12,6 +12,7 @@ require (
 
 require (
 	github.com/libp2p/go-reuseport v0.4.0 // indirect
+	github.com/petermattis/goid v0.0.0-20260820044319-269ab09b5261 // indirect
 	golang.org/x/sys v0.33.0 // indirect
 	golang.org/x/text v0.25.0 // indirect
 )

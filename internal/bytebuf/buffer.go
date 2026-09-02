@@ -61,11 +61,10 @@ func (b *Buffer) Bytes() []byte { return b.buf[b.off:] }
 func (b *Buffer) AvailableBuffer() []byte { return b.buf[len(b.buf):] }
 
 func (b *Buffer) CommitWrite(n int) {
-	if n < 0 || n > b.Cap() {
+	if n < 0 || n > cap(b.buf)-len(b.buf) {
 		panic("bytebuf.Buffer: commit-write out of range")
 	}
-	m := b.Len()
-	b.buf = b.buf[:m+n]
+	b.buf = b.buf[:len(b.buf)+n]
 }
 
 // Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.

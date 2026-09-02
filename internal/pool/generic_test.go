@@ -19,9 +19,13 @@ func TestGenericPoolGet(t *testing.T) {
 			get:     10,
 			expSize: 16,
 		},
+		{max: 65536, get: 1, expSize: 512},
+		{max: 65536, get: 512, expSize: 512},
+		{max: 65536, get: 513, expSize: 1024},
+		{max: 65536, get: 65536, expSize: 65536},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			p := New[any](test.max)
+			p := New[struct{}](test.max)
 			_, n := p.Get(test.get)
 			if n != test.expSize {
 				t.Errorf("Get(%d) = _, %d; want %d", test.get, n, test.expSize)
@@ -33,10 +37,10 @@ func TestGenericPoolGet(t *testing.T) {
 func TestGenericPoolPut(t *testing.T) {
 	p := New[*int](65536)
 	value := 42
-	p.Put(&value, 1024)
+	p.Put(&value, 512)
 	got, size := p.Get(10)
-	if size != 1024 {
-		t.Fatalf("Get size after Put = %d, want 1024", size)
+	if size != 512 {
+		t.Fatalf("Get size after Put = %d, want 512", size)
 	}
 	// sync.Pool may discard cached values at any garbage collection.
 	if got != nil && *got != value {

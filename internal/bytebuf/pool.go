@@ -18,6 +18,7 @@ package bytebuf
 
 import "github.com/urpc/uio/internal/pool"
 
+// Payloads up to 64 KiB use size-classed pools; larger buffers are not kept.
 var bufferPool = pool.New[*Buffer](65536)
 
 func getBuffer(capacity int) *Buffer {
@@ -31,4 +32,44 @@ func getBuffer(capacity int) *Buffer {
 func putBuffer(buffer *Buffer) {
 	buffer.Reset()
 	bufferPool.Put(buffer, buffer.Cap())
+}
+
+// CloneBuffer returns a pooled buffer containing one copy of p. The caller
+// owns the returned buffer until it is appended to a CompositeBuffer or
+// released with ReleaseBuffer.
+func CloneBuffer(p []byte) *Buffer {
+	buffer := getBuffer(len(p))
+	_, _ = buffer.Write(p)
+	return buffer
+}
+
+// CloneBuffers returns one owned buffer containing one copy of every segment.
+func CloneBuffers(vec [][]byte, size int) *Buffer {
+	buffer := getBuffer(size)
+	for _, segment := range vec {
+		_, _ = buffer.Write(segment)
+	}
+	return buffer
+}
+
+// CloneBuffersFrom copies size bytes from vec after skipping the first skip
+// bytes into one owned buffer.
+func CloneBuffersFrom(vec [][]byte, skip, size int) *Buffer {
+	buffer := getBuffer(size)
+	for _, segment := range vec {
+		if skip >= len(segment) {
+			skip -= len(segment)
+			continue
+		}
+		_, _ = buffer.Write(segment[skip:])
+		skip = 0
+	}
+	return buffer
+}
+
+// ReleaseBuffer returns an owned buffer to the pool.
+func ReleaseBuffer(buffer *Buffer) {
+	if buffer != nil {
+		putBuffer(buffer)
+	}
 }

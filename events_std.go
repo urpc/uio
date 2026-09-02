@@ -19,6 +19,7 @@
 package uio
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"strings"
@@ -40,7 +41,19 @@ import (
 //	Dial("udp://[fe80::1%lo0]:53")
 //	Dial("tcp://:80")
 //	Dial("unix:///path/your/unix.sock")
-func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
+func (ev *Events) Dial(addr string, userdata any) (Conn, error) {
+	return ev.DialContext(context.Background(), addr, userdata)
+}
+
+// DialContext connects from outside event callbacks and allows cancellation
+// while resolving or establishing the network connection.
+func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
+	if !ev.ready.Load() || ev.closing.Load() {
+		return nil, net.ErrClosed
+	}
+	if ev.currentLoop() != nil {
+		return nil, ErrDialOnEventLoop
+	}
 
 	if !strings.Contains(addr, "://") {
 		addr = "tcp://" + addr
@@ -56,7 +69,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 		address = u.Path
 	}
 
-	conn, err := net.Dial(u.Scheme, address)
+	conn, err := (&net.Dialer{}).DialContext(dialCtx, u.Scheme, address)
 	if nil != err {
 		return nil, err
 	}
@@ -72,7 +85,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 		fdc.conn = conn
 	}
 
-	fdc.ctx = ctx
+	fdc.userdata = userdata
 	fdc.localAddr = lAddr
 	fdc.remoteAddr = rAddr
 	fdc.events = ev
@@ -80,7 +93,7 @@ func (ev *Events) Dial(addr string, ctx interface{}) (Conn, error) {
 	fdc.writeSig = make(chan struct{}, 1)
 	fdc.closeSig = make(chan struct{})
 
-	if err = ev.addConn(fdc); nil != err {
+	if err = ev.addConnContext(dialCtx, fdc); nil != err {
 		return nil, err
 	}
 	return fdc, nil

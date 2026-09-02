@@ -6,8 +6,12 @@ func TestMapPutGetDeleteRangeAndClear(t *testing.T) {
 	mapping := NewMap[string]()
 	first := "first"
 	second := "second"
-	mapping.Put(0, &first)
-	mapping.Put(2, &second)
+	if err := mapping.Put(0, &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := mapping.Put(2, &second); err != nil {
+		t.Fatal(err)
+	}
 
 	if got := mapping.Get(0); got == nil || *got != first {
 		t.Fatalf("Get(0) = %v, want %q", got, first)

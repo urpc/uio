@@ -17,17 +17,19 @@
 package uio
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
-// Conn is an interface of underlying connection.
+// Conn is a non-blocking connection managed by an event loop. On Unix,
+// callbacks and connection state run on the owning loop. Writes from other
+// goroutines are safe and retain no caller-owned data after returning. Close
+// and CloseWith return after the close request is accepted; OnClose is final.
 type Conn interface {
 	// LocalAddr is the connection's local socket address.
 	LocalAddr() net.Addr
@@ -35,11 +37,11 @@ type Conn interface {
 	// RemoteAddr is the connection's remote address.
 	RemoteAddr() net.Addr
 
-	// Context returns a user-defined context, it's not concurrency-safe.
-	Context() interface{}
+	// Userdata returns user-defined connection data; it is not concurrency-safe.
+	Userdata() any
 
-	// SetContext sets a user-defined context, it's not concurrency-safe.
-	SetContext(ctx interface{})
+	// SetUserdata replaces user-defined connection data; it is not concurrency-safe.
+	SetUserdata(value any)
 
 	// SetLinger sets the behavior of Close on a connection which still
 	// has data waiting to be sent or to be acknowledged.
@@ -88,7 +90,7 @@ type Conn interface {
 	SetReadDeadline(t time.Time) error
 
 	// SetWriteDeadline sets the deadline for future data writing.
-	// If it is time.Zero, SetReadDeadline will clear the deadline.
+	// If it is time.Zero, SetWriteDeadline will clear the deadline.
 	SetWriteDeadline(t time.Time) error
 
 	// Peek returns the next len(b) bytes without advancing the inbound buffer.
@@ -103,7 +105,8 @@ type Conn interface {
 	// it's not concurrency-safe.
 	InboundBuffered() int
 
-	// OutboundBuffered returns a outbound buffer data length.
+	// OutboundBuffered returns accepted payload bytes not yet sent, including
+	// both queued write tasks and the loop-owned outbound buffer.
 	OutboundBuffered() int
 
 	// WriterTo
@@ -128,41 +131,58 @@ type Conn interface {
 	// Notice: non-blocking interface, should not be used as you use std.
 	Writev(vec [][]byte) (int, error)
 
-	// Flush writes any buffered data to the underlying connection.
-	// Notice: non-blocking interface, should not be used as you use std.
+	// Flush writes buffered data. On Unix, loop calls run immediately and other
+	// goroutines submit a FIFO barrier. The std path flushes synchronously.
 	Flush() error
 
-	// CloseWith close the connection with error.
+	// Wake schedules one OnData callback after previously submitted tasks.
+	Wake() error
+
+	// CloseWith asynchronously closes the connection on its owning loop.
+	// On Unix, unsent accepted payload is reported as UnflushedError.
 	CloseWith(err error) error
 }
 
 var errUnsupported = fmt.Errorf("unsupported method")
+
+var (
+	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow  = errors.New("uio: inbound buffer limit exceeded")
+	ErrTaskQueueFull    = errors.New("uio: pending write task limit exceeded")
+	ErrUnflushedData    = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop  = errors.New("uio: Dial cannot run on an event loop")
+)
+
+// UnflushedError reports payload accepted by the framework but not sent before
+// the connection was closed.
+type UnflushedError struct {
+	Remaining int64
+}
+
+func (err UnflushedError) Error() string {
+	return fmt.Sprintf("%v: %d bytes", ErrUnflushedData, err.Remaining)
+}
+
+func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 
 type commonConn struct {
 	events      *Events                 // events
 	loop        *eventLoop              // event loop
 	localAddr   net.Addr                // local address
 	remoteAddr  net.Addr                // remote address
-	closed      int32                   // closed flag
-	err         error                   // close error
-	ctx         interface{}             // user-defined data
-	mux         sync.Mutex              // outbound buffer & udpConns
-	outbound    bytebuf.CompositeBuffer // outbound buffer
+	userdata    any                     // user-defined data
 	inbound     bytebuf.CompositeBuffer // inbound buffer
 	inboundTail []byte                  // inbound tail buffer
+	internal    bool                    // framework-owned endpoint, not a user connection
 }
 
 func (fc *commonConn) LocalAddr() net.Addr                { return fc.localAddr }
 func (fc *commonConn) RemoteAddr() net.Addr               { return fc.remoteAddr }
-func (fc *commonConn) Context() interface{}               { return fc.ctx }
-func (fc *commonConn) SetContext(ctx interface{})         { fc.ctx = ctx }
+func (fc *commonConn) Userdata() any                      { return fc.userdata }
+func (fc *commonConn) SetUserdata(value any)              { fc.userdata = value }
 func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
 func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
 func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
-
-func (fc *commonConn) IsClosed() bool {
-	return 0 != atomic.LoadInt32(&fc.closed)
-}
 
 func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
 	if !fc.inbound.Empty() {
@@ -249,10 +269,4 @@ func (fc *commonConn) Discard(n int) (int, error) {
 
 func (fc *commonConn) InboundBuffered() int {
 	return fc.inbound.Len() + len(fc.inboundTail)
-}
-
-func (fc *commonConn) OutboundBuffered() int {
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
-	return fc.outbound.Len()
 }

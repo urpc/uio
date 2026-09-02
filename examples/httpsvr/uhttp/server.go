@@ -26,15 +26,14 @@ import (
 func ListenAndServe(addr string, handler http.Handler) error {
 
 	var events uio.Events
-	//events.FullDuplex = true
 
 	events.OnOpen = func(c uio.Conn) {
 		//fmt.Println("connection opened:", c.RemoteAddr())
-		c.SetContext(NewHttpConn(c, handler))
+		c.SetUserdata(NewHttpConn(c, handler))
 	}
 
 	events.OnData = func(c uio.Conn) error {
-		hConn := c.Context().(*HttpConn)
+		hConn := c.Userdata().(*HttpConn)
 		return hConn.ServeHTTP()
 	}
 

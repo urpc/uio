@@ -9,6 +9,7 @@ import (
 	"unsafe"
 )
 
+// Unix fds are small integers, so all event loops can share one direct index.
 const UseSingleInstance = true
 
 var MaxOpenFiles = 1_000_000
@@ -23,6 +24,8 @@ func init() {
 }
 
 type Map[V any] struct {
+	// Direct fd indexing avoids hashing. Entries are atomic because registration
+	// and lookup can occur on different loops.
 	store []*V
 }
 
@@ -32,11 +35,18 @@ func NewMap[V any]() *Map[V] {
 	}
 }
 
-func (m *Map[V]) Put(k int, v *V) {
+func (m *Map[V]) Put(k int, v *V) error {
+	if uint(k) >= uint(len(m.store)) {
+		return ErrOutOfRange
+	}
 	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(v))
+	return nil
 }
 
 func (m *Map[V]) Get(k int) *V {
+	if uint(k) >= uint(len(m.store)) {
+		return nil
+	}
 	if val := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k]))); nil != val {
 		return (*V)(val)
 	}
@@ -46,7 +56,7 @@ func (m *Map[V]) Get(k int) *V {
 func (m *Map[V]) Range() iter.Seq2[int, *V] {
 	return func(yield func(int, *V) bool) {
 		for i := 0; i < len(m.store); i++ {
-			if v := m.store[i]; v != nil && !yield(i, v) {
+			if pointer := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[i]))); pointer != nil && !yield(i, (*V)(pointer)) {
 				return
 			}
 		}
@@ -54,6 +64,10 @@ func (m *Map[V]) Range() iter.Seq2[int, *V] {
 }
 
 func (m *Map[V]) Delete(k int) {
+	if uint(k) >= uint(len(m.store)) {
+		return
+	}
+	// Swap publishes absence before the caller closes and potentially reuses fd.
 	atomic.SwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(nil))
 }
 

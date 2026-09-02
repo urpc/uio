@@ -1,86 +1,141 @@
 //go:build windows || stdio
 
-/*
- * Copyright 2024 the urpc project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package poller
 
 import (
 	"fmt"
 	"runtime"
+	"sync"
+	"time"
 )
 
 type NetPoller struct {
-	ev     chan int
+	waker  chan struct{} // capacity one coalesces repeated wakeups
 	closed chan struct{}
-	err    error
+
+	mu          sync.Mutex
+	interests   map[int]Interest
+	closeReason error
+	closeOnce   sync.Once
 }
 
 func NewNetPoller() (*NetPoller, error) {
 	return &NetPoller{
-		ev:     make(chan int),
-		closed: make(chan struct{}),
+		waker: make(chan struct{}, 1), closed: make(chan struct{}),
+		interests: make(map[int]Interest),
 	}, nil
 }
 
-func (ev *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
+func (poller *NetPoller) Watch(fd int, want Interest) error {
+	if want == 0 {
+		return errInvalidInterest
+	}
+	poller.mu.Lock()
+	select {
+	case <-poller.closed:
+		poller.mu.Unlock()
+		return fmt.Errorf("poller closed")
+	default:
+	}
+	poller.interests[fd] = want
+	poller.mu.Unlock()
+	return nil
+}
 
+func (poller *NetPoller) Unwatch(fd int) error {
+	poller.mu.Lock()
+	delete(poller.interests, fd)
+	poller.mu.Unlock()
+	return nil
+}
+
+func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
+	if timeout == 0 {
+		select {
+		case <-poller.closed:
+			poller.mu.Lock()
+			err := poller.closeReason
+			poller.mu.Unlock()
+			return 0, err
+		case <-poller.waker:
+			return 0, nil
+		default:
+			return 0, nil
+		}
+	}
+	if timeout > 0 {
+		timer := time.NewTimer(time.Duration(timeout) * time.Millisecond)
+		defer timer.Stop()
+		select {
+		case <-poller.closed:
+			poller.mu.Lock()
+			err := poller.closeReason
+			poller.mu.Unlock()
+			return 0, err
+		case <-poller.waker:
+			return 0, nil
+		case <-timer.C:
+			return 0, nil
+		}
+	}
+	select {
+	case <-poller.closed:
+		poller.mu.Lock()
+		err := poller.closeReason
+		poller.mu.Unlock()
+		return 0, err
+	case <-poller.waker:
+		return 0, nil
+	}
+}
+
+func (poller *NetPoller) Wake() error {
+	select {
+	case poller.waker <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (poller *NetPoller) Close(err error) error {
+	poller.closeOnce.Do(func() {
+		poller.mu.Lock()
+		poller.closeReason = err
+		poller.mu.Unlock()
+		close(poller.closed)
+	})
+	return nil
+}
+
+func (poller *NetPoller) Closed() bool {
+	select {
+	case <-poller.closed:
+		return true
+	default:
+		return false
+	}
+}
+
+func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
 	}
-
+	events := make([]Event, 1)
 	for {
-		select {
-		case <-ev.closed:
-			handler.OnClose(ev, ev.err)
-			return ev.err
-		case fd := <-ev.ev:
-			handler.OnEvent(ev, fd, ReadEvents|WriteEvents)
+		n, err := poller.Wait(events, -1)
+		if err != nil || poller.Closed() {
+			handler.OnClose(poller, err)
+			return err
+		}
+		for _, event := range events[:n] {
+			handler.OnEvent(poller, event.FD, event.Events)
 		}
 	}
 }
 
-func (ev *NetPoller) Close(err error) error {
-	select {
-	case <-ev.closed:
-	default:
-		ev.err = err
-		close(ev.closed)
-	}
-	return nil
-}
-
-func (ev *NetPoller) AddRead(fd int) error {
-	select {
-	case <-ev.closed:
-		return fmt.Errorf("poller closed")
-	case ev.ev <- fd:
-		return nil
-	}
-}
-
-func (ev *NetPoller) ModRead(fd int) error {
-	return nil
-}
-
-func (ev *NetPoller) ModWrite(fd int) error {
-	return nil
-}
-
-func (ev *NetPoller) ModReadWrite(fd int) error {
-	return nil
-}
+func (poller *NetPoller) AddReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
+func (poller *NetPoller) AddRead(fd int) error      { return poller.Watch(fd, Readable) }
+func (poller *NetPoller) ModRead(fd int) error      { return poller.Watch(fd, Readable) }
+func (poller *NetPoller) ModWrite(fd int) error     { return poller.Watch(fd, Writable) }
+func (poller *NetPoller) ModReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }

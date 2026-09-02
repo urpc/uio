@@ -16,6 +16,8 @@
 
 package poller
 
+import "errors"
+
 // Events is a bitmask for read/write/error events. Poller implementations
 // may pass these to OnEvent callback to handle multiple events
 // in a single call (avoids double Get/dispatch for read+write).
@@ -25,6 +27,23 @@ const (
 	ReadEvents Events = 1 << iota
 	WriteEvents
 )
+
+// Interest is the desired readiness state for a watched descriptor.
+type Interest uint8
+
+const (
+	Readable Interest = 1 << iota
+	Writable
+)
+
+// Event is one level-triggered readiness notification. Readiness remains
+// observable until the descriptor is no longer ready.
+type Event struct {
+	FD     int
+	Events Events
+}
+
+var errInvalidInterest = errors.New("poller: empty interest")
 
 type EventHandler interface {
 	OnEvent(ep *NetPoller, fd int, events Events)

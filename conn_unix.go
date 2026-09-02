@@ -1,633 +1,527 @@
 //go:build (linux || darwin || netbsd || freebsd || openbsd || dragonfly) && !stdio
 
-/*
- * Copyright 2024 the urpc project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *      https://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package uio
 
 import (
 	"errors"
+	"fmt"
 	"io"
+	"net"
+	"os"
+	"sync"
+	"sync/atomic"
 	"syscall"
-	"unsafe"
+	"time"
 
+	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 )
 
 type fdConn struct {
-	commonConn                    // base connection
-	fd         int                // connection fd
-	isUdp      bool               // is udp server or udp client
-	rUdpAddr   syscall.Sockaddr   // remote udp address
-	udpSvr     *fdConn            // owner udp server
-	udpConns   map[string]*fdConn // child udp connections
+	commonConn
+	fd       int
+	fdFile   *os.File // owns a duplicated UDP listener fd when non-nil
+	isUDP    bool
+	rUDPAddr syscall.Sockaddr
+	udpSvr   *fdConn
+	udpConns map[socket.UDPAddress]*fdConn
+	udpKey   socket.UDPAddress
+
+	// submitMu only orders cross-goroutine Write, Flush, and Close submissions.
+	// It never protects socket I/O or outbound buffers.
+	submitMu     sync.Mutex
+	closing      atomic.Bool
+	pending      atomic.Int64 // accepted payload in tasks plus outbound
+	queuedWrites atomic.Int64 // write tasks not yet consumed by the loop
+
+	// The remaining state is owned exclusively by conn.loop.
+	closed           bool
+	outbound         bytebuf.CompositeBuffer
+	throttled        bool
+	writeBlocked     bool
+	touched          bool
+	interest         poller.Interest
+	deferredCloseErr error
+
+	readTimer       *time.Timer
+	writeTimer      *time.Timer
+	readGeneration  uint64
+	writeGeneration uint64
+	readTimerGen    atomic.Uint64
+	writeTimerGen   atomic.Uint64
+	readDeadline    time.Time
+	writeDeadline   time.Time
 }
 
-func (fc *fdConn) Fd() int {
-	return fc.fd
-}
-
-func (fc *fdConn) SetLinger(secs int) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetLinger(fc.fd, secs)
-}
-
-func (fc *fdConn) SetNoDelay(nodelay bool) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetNoDelay(fc.fd, nodelay)
-}
-
-func (fc *fdConn) SetReadBuffer(size int) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetRecvBuffer(fc.fd, size)
-}
-
-func (fc *fdConn) SetWriteBuffer(size int) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetSendBuffer(fc.fd, size)
-}
-
-func (fc *fdConn) SetKeepAlive(keepalive bool) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetKeepAlive(fc.fd, keepalive)
-}
-
-func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-	return socket.SetKeepAlivePeriod(fc.fd, secs)
-}
-
-func (fc *fdConn) WriteByte(b byte) error {
-	var bb [1]byte
-	bb[0] = b
-	_, err := fc.Write(bb[:])
-	return err
-}
-
-func (fc *fdConn) WriteString(s string) (n int, err error) {
-	var data = unsafe.Slice(unsafe.StringData(s), len(s))
-	return fc.Write(data)
-}
-
-func (fc *fdConn) Write(b []byte) (n int, err error) {
-	if fc.IsClosed() {
-		return 0, fc.err
-	}
-
-	if fc.isUdp {
-		return fc.onSendUDP(b)
-	}
-
-	fc.mux.Lock()
-
-	bufferedThreshold := fc.events.WriteBufferedThreshold
-	writeBuffered := bufferedThreshold > 0 && len(b) < bufferedThreshold
-
-	if !fc.outbound.Empty() || writeBuffered {
-		// write to outbound buffer.
-		if n, err = fc.outbound.Write(b); nil != err {
-			fc.mux.Unlock()
-			return n, err
-		}
-
-		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
-		var socketWriteBytes int
-		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
-			// If there is an error in flush, the connection will be closed.
-			if socketWriteBytes, err = fc.flush(true); nil != err {
-				fc.mux.Unlock()
-				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-				fc.events.closeConn(fc, err)
-				return 0, err
-			}
-		}
-
-		fc.mux.Unlock()
-		fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-		return
-	}
-
-	writeSize, err := syscall.Write(fc.fd, b)
-	if err != nil {
-		if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
-			fc.mux.Unlock()
-			fc.events.closeConn(fc, err)
-			return 0, err
-		}
-		// ignore: EAGAIN
-		writeSize, err = 0, nil
-	}
-
-	socketWriteBytes := writeSize
-
-	if writeSize != len(b) {
-		n, _ := fc.outbound.Write(b[writeSize:])
-		writeSize += n
-
-		// Read events are always registered, which will improve program performance in most cases,
-		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
-		// in the absence of intervention may lead to service memory depletion.
-		// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
-		// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
-		if fc.events.FullDuplex {
-			err = fc.loop.modReadWrite(fc)
-		} else {
-			err = fc.loop.modWrite(fc)
-		}
-	}
-
-	fc.mux.Unlock()
-	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-	return writeSize, err
-}
-
-func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
-	if fc.IsClosed() {
-		return 0, fc.err
-	}
-
-	if fc.isUdp {
-		return 0, errUnsupported
-	}
-
-	fc.mux.Lock()
-
-	var totalBytes int
-	for _, b := range vec {
-		totalBytes += len(b)
-	}
-
-	bufferedThreshold := fc.events.WriteBufferedThreshold
-	writeBuffered := bufferedThreshold > 0 && totalBytes < bufferedThreshold
-
-	if !fc.outbound.Empty() || writeBuffered {
-		// write to outbound buffer.
-		if n, err = fc.outbound.Writev(vec); nil != err {
-			fc.mux.Unlock()
-			return n, err
-		}
-
-		// If the current outbound buffer exceeds the threshold, the actively flushes the data to be sent.
-		var socketWriteBytes int
-		if bufferedThreshold > 0 && fc.outbound.Len() >= bufferedThreshold {
-			// If there is an error in flush, the connection will be closed.
-			if socketWriteBytes, err = fc.flush(true); nil != err {
-				fc.mux.Unlock()
-				fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-				fc.events.closeConn(fc, err)
-				return 0, err
-			}
-		}
-
-		fc.mux.Unlock()
-		fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-		return
-	}
-
-	// invoke writev() syscall.
-	writeSize, err := socket.Writev(fc.fd, vec)
-	if err != nil {
-		if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
-			fc.mux.Unlock()
-			fc.events.closeConn(fc, err)
-			return 0, err
-		}
-		// ignore: EAGAIN
-		writeSize, err = 0, nil
-	}
-
-	socketWriteBytes := writeSize
-
-	// trim vec buffer.
-	if writeSize < totalBytes {
-		var skipBytes int
-		var skipIdx = -1
-		var skipOffset = -1
-		for i, b := range vec {
-			sz := min(len(b), writeSize-skipBytes)
-			if skipBytes += sz; skipBytes >= writeSize {
-				if sz == len(b) {
-					skipIdx = i + 1
-				} else {
-					skipIdx = i
-					skipOffset = sz
-				}
-				break
-			}
-		}
-
-		if -1 != skipIdx {
-			if vec = vec[skipIdx:]; len(vec) > 0 {
-				vec[0] = vec[0][skipOffset:]
-			}
-		}
-	} else {
-		// all vec write success.
-		vec = nil
-	}
-
-	// remain bytes write to outbound buffer.
-	if len(vec) > 0 {
-		n, _ := fc.outbound.Writev(vec)
-		writeSize += n
-
-		// Read events are always registered, which will improve program performance in most cases,
-		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
-		// in the absence of intervention may lead to service memory depletion.
-		// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
-		// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
-		if fc.events.FullDuplex {
-			err = fc.loop.modReadWrite(fc)
-		} else {
-			err = fc.loop.modWrite(fc)
-		}
-	}
-
-	fc.mux.Unlock()
-	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-	return writeSize, err
-}
-
-func (fc *fdConn) Flush() (err error) {
-	if fc.IsClosed() {
-		return fc.err
-	}
-
-	fc.mux.Lock()
-
-	// write outbound buffer.
-	var socketWriteBytes int
-	if !fc.outbound.Empty() {
-		socketWriteBytes, err = fc.flush(true)
-	}
-
-	fc.mux.Unlock()
-	fc.events.onSocketBytesWrite(fc, socketWriteBytes)
-
-	if nil != err {
-		fc.events.closeConn(fc, err)
-	}
-	return
-}
-
-func (fc *fdConn) flush(opEvent bool) (socketWriteBytes int, err error) {
-
-	// udp unsupported.
-	if fc.isUdp {
-		return 0, nil // nothing to do.
-	}
-
-	var vecBuf [16][]byte
-	for !fc.outbound.Empty() {
-		// peek writeable vec bytes.
-		vec, _ := fc.outbound.PeekVec(vecBuf[:0])
-		// invoke writev() syscall.
-		var writeSize int
-		writeSize, err = socket.Writev(fc.fd, vec)
-		if nil != err {
-			if !(errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
-				return socketWriteBytes, err
-			}
-			// ignore: EAGAIN
-			writeSize, err = 0, nil
-			break
-		}
-
-		// commit write offset.
-		fc.outbound.Discard(writeSize)
-		socketWriteBytes += writeSize
-	}
-
-	if opEvent && !fc.outbound.Empty() {
-		// Read events are always registered, which will improve program performance in most cases,
-		// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
-		// in the absence of intervention may lead to service memory depletion.
-		// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
-		// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
-		if fc.events.FullDuplex {
-			err = fc.loop.modReadWrite(fc)
-		} else {
-			err = fc.loop.modWrite(fc)
-		}
-	}
-
-	return socketWriteBytes, err
-}
-
-func (fc *fdConn) fdClose(err error) bool {
-	fc.mux.Lock()
-	defer fc.mux.Unlock()
-
-	if fc.IsClosed() {
+func (conn *fdConn) Fd() int                          { return conn.fd }
+func (conn *fdConn) initialInterest() poller.Interest { return poller.Readable }
+func (conn *fdConn) isClosing() bool                  { return conn.closing.Load() }
+func (conn *fdConn) isClosedOnLoop() bool             { return conn.closed }
+func (conn *fdConn) afterRegister()                   {}
+func (conn *fdConn) clearTouched()                    { conn.touched = false }
+func (conn *fdConn) markTouched() bool {
+	if conn.touched {
 		return false
 	}
-
-	// try flush outbound buffer.
-	_, _ = fc.flush(false)
-
-	// delete connection fd-mapping.
-	fc.loop.delConn(fc)
-
-	// close socket and release resource.
-	_ = syscall.Close(fc.fd)
-
-	fc.err = err
-	fc.closed = 1
-
-	fc.outbound.Reset()
-	// warning: data race
-	//fc.inbound.Reset()
-	//fc.inboundTail = nil
-
+	conn.touched = true
 	return true
 }
 
-func (fc *fdConn) Close() error {
-	return fc.closeWithError(io.ErrUnexpectedEOF)
-}
-
-func (fc *fdConn) CloseWith(err error) error {
-	return fc.closeWithError(err)
-}
-
-func (fc *fdConn) closeWithError(err error) error {
-	if fc.IsClosed() {
-		return fc.err
-	}
-
-	fc.mux.Lock()
-	if 0 != fc.closed {
-		fc.mux.Unlock()
-		return fc.err
-	}
-
-	if fc.isUdp {
-		// udp child connection
-		if nil != fc.udpSvr {
-			rAddr := fc.remoteAddr.String()
-
-			fc.udpSvr.mux.Lock()
-			defer fc.udpSvr.mux.Unlock()
-
-			fc.closed = 1
-			fc.err = err
-			delete(fc.udpSvr.udpConns, rAddr)
-
-			if onClose := fc.events.OnClose; nil != onClose {
-				onClose(fc, err)
-			}
-
-			fc.mux.Unlock()
-			return nil
+func (conn *fdConn) closeUnregistered() {
+	if conn.closing.CompareAndSwap(false, true) {
+		conn.closed = true
+		if conn.fdFile != nil {
+			_ = conn.fdFile.Close()
+		} else {
+			_ = syscall.Close(conn.fd)
 		}
-
-		// udp server
-		if nil != fc.udpConns {
-			for addr, fdc := range fc.udpConns {
-				delete(fc.udpConns, addr)
-				if onClose := fc.events.OnClose; nil != onClose {
-					onClose(fdc, err)
-				}
-			}
-
-			fc.closed = 1
-			fc.err = err
-			fc.mux.Unlock()
-
-			fc.fdClose(err)
-			return nil
-		}
-
-		// udp client connection.
-		//
 	}
-
-	fc.mux.Unlock()
-	fc.events.closeConn(fc, err)
-	return nil
 }
 
-func (fc *fdConn) fireReadEvent() error {
-	if fc.isUdp {
-		return fc.onRecvUDP()
-	}
-	return fc.onRead()
+func (conn *fdConn) SetLinger(seconds int) error {
+	return conn.setSocketOption(optionLinger, seconds)
+}
+func (conn *fdConn) SetNoDelay(noDelay bool) error {
+	return conn.setSocketOption(optionNoDelay, boolInt(noDelay))
+}
+func (conn *fdConn) SetReadBuffer(size int) error {
+	return conn.setSocketOption(optionReadBuffer, size)
+}
+func (conn *fdConn) SetWriteBuffer(size int) error {
+	return conn.setSocketOption(optionWriteBuffer, size)
+}
+func (conn *fdConn) SetKeepAlive(keepAlive bool) error {
+	return conn.setSocketOption(optionKeepAlive, boolInt(keepAlive))
+}
+func (conn *fdConn) SetKeepAlivePeriod(seconds int) error {
+	return conn.setSocketOption(optionKeepAlivePeriod, seconds)
 }
 
-func (fc *fdConn) fireWriteEvent() error {
-	if fc.isUdp {
-		panic("udp connection dont need fireWriteEvent")
+func boolInt(value bool) int {
+	if value {
+		return 1
 	}
-	return fc.onWrite()
+	return 0
 }
 
-func (fc *fdConn) onSendUDP(b []byte) (n int, err error) {
-
-	// dialed udp client
-	if nil == fc.rUdpAddr {
-		n, err = syscall.Write(fc.fd, b)
-		if n > 0 {
-			fc.events.onSocketBytesWrite(fc, n)
-		}
-		return
+func (conn *fdConn) setSocketOption(kind socketOptionKind, value int) error {
+	if conn.isClosing() {
+		return net.ErrClosed
 	}
-
-	// child udp connection
-	if err = syscall.Sendto(fc.fd, b, 0, fc.rUdpAddr); nil != err {
-		return 0, err
+	if conn.loop.inLoop() {
+		return conn.applySocketOption(kind, value)
 	}
-	fc.events.onSocketBytesWrite(fc, len(b))
-	return len(b), nil
+	// External callers wait for the loop result; no submission lock covers I/O.
+	t := acquireTask(optionTask, conn)
+	t.optionKind, t.optionValue = kind, value
+	t.done = make(chan error, 1)
+	done := t.done
+	if !conn.loop.submitTask(t) {
+		releaseTask(t)
+		return net.ErrClosed
+	}
+	return <-done
 }
 
-func (fc *fdConn) onRecvUDP() error {
-	buffer := fc.loop.getBuffer()
+func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
+	if conn.closed {
+		return net.ErrClosed
+	}
+	switch kind {
+	case optionLinger:
+		return socket.SetLinger(conn.fd, value)
+	case optionNoDelay:
+		return socket.SetNoDelay(conn.fd, value != 0)
+	case optionKeepAlive:
+		return socket.SetKeepAlive(conn.fd, value != 0)
+	case optionKeepAlivePeriod:
+		return socket.SetKeepAlivePeriod(conn.fd, value)
+	case optionReadBuffer:
+		return socket.SetRecvBuffer(conn.fd, value)
+	default:
+		return socket.SetSendBuffer(conn.fd, value)
+	}
+}
 
-	n, sa, err := syscall.Recvfrom(fc.fd, buffer, 0)
-	if nil != err {
-		_ = fc.closeWithError(err)
+func (conn *fdConn) fireOnOpen() {
+	if callback := conn.events.OnOpen; callback != nil {
+		callback(conn)
+	}
+	if err := conn.finishCallback(); err != nil {
+		conn.requestClose(err)
+	}
+}
+
+func (conn *fdConn) fireOnData() error {
+	var err error
+	if callback := conn.events.OnData; callback != nil {
+		err = callback(conn)
+	} else {
+		_, _ = conn.Discard(-1)
+	}
+	if err != nil {
 		return err
 	}
-
-	// udp connection
-	var udpConn = fc
-
-	// udp server
-	if nil != fc.udpConns {
-		remoteAddr := socket.SockaddrToAddr(sa, true)
-		rAddr := remoteAddr.String()
-		conn, ok := fc.udpConns[rAddr]
-		if !ok {
-			conn = &fdConn{}
-			conn.fd = fc.fd
-			conn.localAddr = fc.localAddr
-			conn.remoteAddr = remoteAddr
-			conn.loop = fc.loop
-			conn.events = fc.events
-			conn.isUdp = true
-			conn.rUdpAddr = sa
-			conn.udpSvr = fc
-			conn.udpConns = nil // udp connection always nil
-
-			// save child connection.
-			fc.mux.Lock()
-			fc.udpConns[rAddr] = conn
-			fc.mux.Unlock()
-
-			// fire udp on-open event.
-			if onOpen := fc.events.OnOpen; nil != onOpen {
-				onOpen(conn)
-			}
-		}
-
-		udpConn = conn
-	}
-
-	// fire udp on-data event.
-	udpConn.inboundTail = buffer[:n]
-
-	// trigger inbound event.
-	fc.events.onSocketBytesRead(udpConn, n)
-
-	err = fc.events.onData(udpConn)
-
-	// drop unread udp packet.
-	_, _ = udpConn.Discard(-1)
-
-	if nil != err {
-		// close udp connection
-		_ = udpConn.closeWithError(err)
-	}
-
-	return nil
+	return conn.finishCallback()
 }
 
-func (fc *fdConn) onRead() error {
-
-	buffer := fc.loop.getBuffer()
-
-	for {
-
-		fc.mux.Lock()
-		if 0 != fc.closed {
-			fc.mux.Unlock()
-			return fc.err
-		}
-
-		// read data from fd
-		n, err := syscall.Read(fc.fd, buffer)
-		fc.mux.Unlock()
-
-		if 0 == n || err != nil {
-			if nil != err && (errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK)) {
-				return nil
-			}
-			// remote closed
-			if nil == err {
-				err = io.EOF
-			}
-			fc.events.closeConn(fc, err)
-			return nil
-		}
-
-		fc.inboundTail = buffer[:n]
-
-		// trigger on any bytes received.
-		fc.events.onSocketBytesRead(fc, n)
-
-		// fire data callback.
-		if err = fc.events.onData(fc); nil != err {
-			fc.events.closeConn(fc, err)
-			return nil
-		}
-
-		// append tail bytes to inbound buffer
-		if len(fc.inboundTail) > 0 {
-			_, _ = fc.inbound.Write(fc.inboundTail)
-			fc.inboundTail = fc.inboundTail[:0]
-		}
-
-		// try flush outbound buffer.
-		if fc.events.WriteBufferedThreshold > 0 {
-			_ = fc.Flush()
-		}
-
-		// there is no more data to read.
-		if n < len(buffer) {
-			break
-		}
-	}
-
-	return nil
-}
-
-func (fc *fdConn) onWrite() error {
-	fc.mux.Lock()
-
-	var totalWriteBytes int
-	for !fc.outbound.Empty() {
-		// writeable buffer
-		data := fc.outbound.Peek(fc.loop.getBuffer())
-
-		if 0 == len(data) {
-			panic("uio: buffer is too small")
-		}
-
-		// write buffer to fd.
-		sent, err := syscall.Write(fc.fd, data)
-		if nil != err {
-			fc.mux.Unlock()
-			// trigger on any bytes write.
-			fc.events.onSocketBytesWrite(fc, totalWriteBytes)
-
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
-				return nil
-			}
-			fc.events.closeConn(fc, err)
-			return nil
-		}
-
-		// count of write bytes.
-		totalWriteBytes += sent
-
-		// commit read offset.
-		fc.outbound.Discard(sent)
-	}
-
-	fc.mux.Unlock()
-	// trigger on any bytes write.
-	fc.events.onSocketBytesWrite(fc, totalWriteBytes)
-
-	// read events are always registered in FullDuplex mode.
-	if fc.events.FullDuplex {
+func (conn *fdConn) finishCallback() error {
+	if conn.isClosing() || conn.closed {
 		return nil
 	}
+	// The threshold batches within this callback; EAGAIN tails remain poller-driven.
+	if _, err := conn.flushOnLoop(); err != nil {
+		return err
+	}
+	return conn.updateInterest()
+}
 
-	// outbound buffer is empty.
-	return fc.loop.modRead(fc)
+func (conn *fdConn) fireReadEvent() error {
+	if conn.isUDP {
+		return conn.onRecvUDP()
+	}
+	return conn.onRead()
+}
+
+func (conn *fdConn) fireWriteEvent() error {
+	if conn.isUDP {
+		return nil
+	}
+	conn.writeBlocked = false
+	if _, err := conn.flushOnLoop(); err != nil {
+		return err
+	}
+	return conn.updateInterest()
+}
+
+func (conn *fdConn) onRead() error {
+	buffer := conn.loop.getBuffer()
+	totalRead := 0
+	for calls := 0; calls < 16 && totalRead < 1<<20; calls++ {
+		n, err := syscall.Read(conn.fd, buffer)
+		if err != nil {
+			if isWouldBlock(err) {
+				return nil
+			}
+			return err
+		}
+		if n == 0 {
+			return io.EOF
+		}
+		totalRead += n
+		// inboundTail aliases the loop read buffer. Unconsumed bytes are copied
+		// into inbound before the buffer is reused by the next syscall.
+		conn.inboundTail = buffer[:n]
+		conn.events.onSocketBytesRead(conn, n)
+		if conn.isClosing() {
+			conn.inboundTail = nil
+			return nil
+		}
+		if err = conn.fireOnData(); err != nil {
+			return err
+		}
+		if conn.isClosing() {
+			conn.inboundTail = nil
+			return nil
+		}
+		if len(conn.inboundTail) > 0 {
+			if limit := conn.events.MaxInboundBuffered; limit > 0 && conn.InboundBuffered() > limit {
+				conn.inboundTail = nil
+				return ErrInboundOverflow
+			}
+			_, _ = conn.inbound.Write(conn.inboundTail)
+			conn.inboundTail = nil
+		}
+		if n < len(buffer) {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (conn *fdConn) onRecvUDP() error {
+	buffer := conn.loop.getBuffer()
+	totalRead := 0
+	var receive socket.UDPReceive
+	for packets := 0; packets < 16 && totalRead < 1<<20; packets++ {
+		n, err := socket.RecvUDP(conn.fd, buffer, &receive)
+		if err != nil {
+			if isWouldBlock(err) {
+				return nil
+			}
+			return err
+		}
+		totalRead += n
+		conn.handleUDPPacket(buffer[:n], receive.Addr)
+		if conn.isClosing() {
+			return nil
+		}
+	}
+	return nil
+}
+
+func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
+	packetConn := conn
+	if conn.udpConns != nil {
+		// UDP children are logical connections that share the server fd.
+		packetConn = conn.udpConns[source]
+		if packetConn == nil {
+			sockaddr := source.Sockaddr()
+			if sockaddr == nil {
+				return
+			}
+			packetConn = &fdConn{fd: conn.fd, isUDP: true, rUDPAddr: sockaddr, udpSvr: conn}
+			packetConn.events, packetConn.loop = conn.events, conn.loop
+			packetConn.localAddr, packetConn.remoteAddr = conn.localAddr, source.NetAddr()
+			packetConn.udpKey = source
+			conn.udpConns[source] = packetConn
+			packetConn.fireOnOpen()
+		}
+	}
+	if packetConn.isClosing() {
+		return
+	}
+	packetConn.inboundTail = packet
+	packetConn.events.onSocketBytesRead(packetConn, len(packet))
+	err := packetConn.fireOnData()
+	_, _ = packetConn.Discard(-1)
+	packetConn.inboundTail = nil
+	if err != nil {
+		packetConn.requestClose(err)
+	}
+}
+
+func isWouldBlock(err error) bool {
+	return err == syscall.EAGAIN || err == syscall.EWOULDBLOCK
+}
+
+func (conn *fdConn) runWakeTask() error {
+	if conn.closed || conn.isClosing() {
+		return net.ErrClosed
+	}
+	return conn.fireOnData()
+}
+
+func (conn *fdConn) Wake() error {
+	if conn.isClosing() {
+		return net.ErrClosed
+	}
+	t := acquireTask(wakeTask, conn)
+	if !conn.loop.submitTask(t) {
+		releaseTask(t)
+		return net.ErrClosed
+	}
+	return nil
+}
+
+func (conn *fdConn) Close() error { return conn.CloseWith(io.ErrUnexpectedEOF) }
+
+func (conn *fdConn) CloseWith(err error) error {
+	t := acquireTask(closeTask, conn)
+	t.err = err
+	// Setting closing and linking closeTask under submitMu puts Close after
+	// external writes that have already reached their submission point.
+	conn.submitMu.Lock()
+	if conn.closing.Load() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+		conn.submitMu.Unlock()
+		releaseTask(t)
+		return net.ErrClosed
+	}
+	conn.closing.Store(true)
+	if !conn.loop.pushTask(t) {
+		conn.submitMu.Unlock()
+		releaseTask(t)
+		return net.ErrClosed
+	}
+	conn.submitMu.Unlock()
+	conn.loop.notify()
+	return nil
+}
+
+func (conn *fdConn) requestClose(err error) {
+	if conn.isClosing() {
+		return
+	}
+	t := acquireTask(closeTask, conn)
+	t.err = err
+	conn.submitMu.Lock()
+	if conn.closing.Load() {
+		conn.submitMu.Unlock()
+		releaseTask(t)
+		return
+	}
+	conn.closing.Store(true)
+	if !conn.loop.pushTask(t) {
+		// The queue is already stopping; preserve the I/O cause for shutdown.
+		conn.deferredCloseErr = err
+		conn.submitMu.Unlock()
+		releaseTask(t)
+		return
+	}
+	conn.submitMu.Unlock()
+	conn.loop.notify()
+}
+
+func (conn *fdConn) closeOnLoop(cause error) {
+	if conn.closed {
+		return
+	}
+	conn.closed = true
+	conn.closing.Store(true)
+	// Close gets one bounded flush attempt; a slow peer cannot delay shutdown.
+	var flushErr error
+	if !conn.isUDP {
+		conn.writeBlocked = false
+		_, flushErr = conn.flushOnLoop()
+	}
+	remaining := conn.pending.Load()
+	finalErr := errors.Join(cause, conn.deferredCloseErr, flushErr)
+	if remaining > 0 {
+		finalErr = errors.Join(finalErr, UnflushedError{Remaining: remaining})
+	}
+	conn.stopDeadlines()
+	if conn.udpSvr != nil {
+		// A child only leaves the peer map; its server owns the shared fd.
+		delete(conn.udpSvr.udpConns, conn.udpKey)
+	} else {
+		if conn.udpConns != nil {
+			children := conn.udpConns
+			conn.udpConns = nil
+			for _, child := range children {
+				child.closeOnLoop(finalErr)
+			}
+		}
+		conn.loop.delConn(conn)
+		if conn.fdFile != nil {
+			_ = conn.fdFile.Close()
+		} else {
+			_ = syscall.Close(conn.fd)
+		}
+	}
+	conn.outbound.Reset()
+	conn.inbound.Reset()
+	conn.inboundTail = nil
+	conn.pending.Store(0)
+	if callback := conn.events.OnClose; callback != nil && !conn.internal {
+		callback(conn, finalErr)
+	}
+}
+
+func (conn *fdConn) SetDeadline(deadline time.Time) error {
+	return conn.setDeadline(deadlineBoth, deadline)
+}
+func (conn *fdConn) SetReadDeadline(deadline time.Time) error {
+	return conn.setDeadline(deadlineRead, deadline)
+}
+func (conn *fdConn) SetWriteDeadline(deadline time.Time) error {
+	return conn.setDeadline(deadlineWrite, deadline)
+}
+
+func (conn *fdConn) setDeadline(kind deadlineKind, deadline time.Time) error {
+	if conn.isClosing() {
+		return net.ErrClosed
+	}
+	if conn.loop.inLoop() {
+		return conn.applyDeadline(kind, deadline)
+	}
+	// Deadline setters are synchronous even though application happens on-loop.
+	t := acquireTask(deadlineTask, conn)
+	t.deadlineKind, t.deadline = kind, deadline
+	t.done = make(chan error, 1)
+	done := t.done
+	if !conn.loop.submitTask(t) {
+		releaseTask(t)
+		return net.ErrClosed
+	}
+	return <-done
+}
+
+func (conn *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
+	if conn.closed {
+		return net.ErrClosed
+	}
+	// Generations make callbacks from a stopped or reset timer harmless.
+	if kind == deadlineBoth || kind == deadlineRead {
+		conn.readGeneration++
+		conn.readDeadline = deadline
+		conn.readTimerGen.Store(conn.readGeneration)
+		conn.readTimer = conn.resetDeadlineTimer(conn.readTimer, deadlineRead, deadline)
+	}
+	if kind == deadlineBoth || kind == deadlineWrite {
+		conn.writeGeneration++
+		conn.writeDeadline = deadline
+		conn.writeTimerGen.Store(conn.writeGeneration)
+		conn.writeTimer = conn.resetDeadlineTimer(conn.writeTimer, deadlineWrite, deadline)
+	}
+	return nil
+}
+
+func (conn *fdConn) resetDeadlineTimer(timer *time.Timer, kind deadlineKind, deadline time.Time) *time.Timer {
+	if timer != nil {
+		timer.Stop()
+	}
+	if deadline.IsZero() {
+		return timer
+	}
+	delay := time.Until(deadline)
+	if delay < 0 {
+		delay = 0
+	}
+	if timer == nil {
+		// The callback only submits work; it never touches loop-owned state.
+		return time.AfterFunc(delay, func() { conn.submitTimeout(kind) })
+	}
+	timer.Reset(delay)
+	return timer
+}
+
+func (conn *fdConn) submitTimeout(kind deadlineKind) {
+	if conn.isClosing() {
+		return
+	}
+	t := acquireTask(timeoutTask, conn)
+	t.deadlineKind = kind
+	if kind == deadlineRead {
+		t.generation = conn.readTimerGen.Load()
+	} else {
+		t.generation = conn.writeTimerGen.Load()
+	}
+	if !conn.loop.submitTask(t) {
+		releaseTask(t)
+	}
+}
+
+func (conn *fdConn) handleTimeout(kind deadlineKind, generation uint64) {
+	if conn.closed || conn.isClosing() {
+		return
+	}
+	var current uint64
+	var deadline time.Time
+	if kind == deadlineRead {
+		current, deadline = conn.readGeneration, conn.readDeadline
+	} else {
+		current, deadline = conn.writeGeneration, conn.writeDeadline
+	}
+	// Reset races can submit the current generation early, so check time too.
+	if generation != current || deadline.IsZero() || time.Now().Before(deadline) {
+		return
+	}
+	conn.requestClose(fmt.Errorf("uio: %s deadline: %w", deadlineName(kind), os.ErrDeadlineExceeded))
+}
+
+func deadlineName(kind deadlineKind) string {
+	if kind == deadlineRead {
+		return "read"
+	}
+	return "write"
+}
+
+func (conn *fdConn) stopDeadlines() {
+	if conn.readTimer != nil {
+		conn.readTimer.Stop()
+	}
+	if conn.writeTimer != nil {
+		conn.writeTimer.Stop()
+	}
 }

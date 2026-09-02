@@ -21,13 +21,16 @@ import (
 	"time"
 )
 
-var timeValue atomic.Value
-var timeRFC1123Value atomic.Value
+type cachedTime struct {
+	value   time.Time
+	rfc1123 string
+}
+
+var timeValue atomic.Pointer[cachedTime]
 
 func init() {
-	// init time.
-	timeValue.Store(time.Now())
-	timeRFC1123Value.Store(string(appendTime(nil, time.Now())))
+	now := time.Now()
+	timeValue.Store(&cachedTime{value: now, rfc1123: string(appendTime(nil, now))})
 
 	// every second to flush the time.
 	go func() {
@@ -39,18 +42,18 @@ func init() {
 		for t := range ticker.C {
 			timeBytes := appendTime(timeBuf[:0], t)
 
-			timeValue.Store(t)
-			timeRFC1123Value.Store(string(timeBytes))
+			// Publish both forms together so they always represent the same tick.
+			timeValue.Store(&cachedTime{value: t, rfc1123: string(timeBytes)})
 		}
 	}()
 }
 
 func Now() time.Time {
-	return timeValue.Load().(time.Time)
+	return timeValue.Load().value
 }
 
 func NowRFC1123String() string {
-	return timeRFC1123Value.Load().(string)
+	return timeValue.Load().rfc1123
 }
 
 // TimeFormat is the time format to use when generating times in HTTP

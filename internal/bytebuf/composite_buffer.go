@@ -18,8 +18,11 @@ package bytebuf
 
 import "io"
 
+// CompositeBuffer keeps payload in separately pooled blocks so writev can
+// expose segments without joining or copying them.
 type CompositeBuffer struct {
 	bufList []*Buffer
+	length  int
 }
 
 func NewCompositeBuffer() *CompositeBuffer {
@@ -28,16 +31,11 @@ func NewCompositeBuffer() *CompositeBuffer {
 
 // Empty reports whether the unread portion of the buffer is empty.
 func (b *CompositeBuffer) Empty() bool {
-	return len(b.bufList) == 0
+	return b.length == 0
 }
 
 // Len returns the number of bytes of the unread portion of the buffer;
-func (b *CompositeBuffer) Len() (length int) {
-	for _, buf := range b.bufList {
-		length += buf.Len()
-	}
-	return
-}
+func (b *CompositeBuffer) Len() int { return b.length }
 
 // Cap returns the capacity of the buffer's underlying byte slice, that is, the
 // total space allocated for the buffer's data.
@@ -56,10 +54,10 @@ func (b *CompositeBuffer) Available() (bytes int) {
 	return
 }
 
-// Reset resets the buffer to be empty,
-// but it retains the underlying storage for use by future writes.
+// Reset returns payload blocks to the shared pool and retains the pointer list.
 func (b *CompositeBuffer) Reset() {
 	b.removeRange(len(b.bufList))
+	b.length = 0
 }
 
 // Close resets the buffer to be empty, Close is the same as CompositeBuffer.Reset
@@ -109,8 +107,22 @@ func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
 		n += wn
 		b.bufList = append(b.bufList, buffer)
 	}
-
+	b.length += n
 	return
+}
+
+// AppendOwned transfers ownership of buffer to the composite buffer without
+// copying its payload. An empty buffer is released immediately.
+func (b *CompositeBuffer) AppendOwned(buffer *Buffer) {
+	if buffer == nil {
+		return
+	}
+	if buffer.Len() == 0 {
+		putBuffer(buffer)
+		return
+	}
+	b.bufList = append(b.bufList, buffer)
+	b.length += buffer.Len()
 }
 
 // WriteByte appends the byte c to the buffer, growing the buffer as needed.
@@ -147,7 +159,7 @@ func (b *CompositeBuffer) WriteString(s string) (n int, err error) {
 		n += wn
 		b.bufList = append(b.bufList, buffer)
 	}
-
+	b.length += n
 	return
 }
 
@@ -163,6 +175,7 @@ func (b *CompositeBuffer) ReadFrom(r io.Reader) (n int64, err error) {
 			rn, err := r.Read(spaceBuffer[:space])
 			n += int64(rn)
 			last.CommitWrite(rn)
+			b.length += rn
 			if io.EOF == err {
 				return n, nil
 			}
@@ -178,6 +191,7 @@ func (b *CompositeBuffer) ReadFrom(r io.Reader) (n int64, err error) {
 	if rn, err = buffer.ReadFrom(r); rn > 0 {
 		b.bufList = append(b.bufList, buffer)
 		n += rn
+		b.length += int(rn)
 		return
 	}
 	putBuffer(buffer)
@@ -194,6 +208,7 @@ func (b *CompositeBuffer) WriteTo(w io.Writer) (n int64, err error) {
 		var sz int64
 		sz, err = buf.WriteTo(w)
 		n += sz
+		b.length -= int(sz)
 		if nil != err {
 			break
 		}
@@ -222,6 +237,7 @@ func (b *CompositeBuffer) Read(p []byte) (n int, err error) {
 		var sz int
 		sz, err = buf.Read(p[n:])
 		n += sz
+		b.length -= sz
 
 		if 0 != buf.Len() || (nil != err && io.EOF != err) {
 			endIdx = idx
@@ -277,6 +293,27 @@ func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
 	return dst, length
 }
 
+// PeekVecN returns at most max unread segments without advancing the buffer.
+// The limit prevents a flush from walking or allocating for the whole queue.
+func (b *CompositeBuffer) PeekVecN(dst [][]byte, max int) (vec [][]byte, length int) {
+	if len(b.bufList) == 0 || max <= 0 {
+		return dst[:0], 0
+	}
+
+	count := min(len(b.bufList), max)
+	if cap(dst) < count {
+		dst = make([][]byte, 0, count)
+	} else {
+		dst = dst[:0]
+	}
+	vec = dst
+	for _, buffer := range b.bufList[:count] {
+		vec = append(vec, buffer.Bytes())
+		length += buffer.Len()
+	}
+	return vec, length
+}
+
 // Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
 func (b *CompositeBuffer) Discard(n int) int {
 	if 0 == len(b.bufList) {
@@ -284,7 +321,7 @@ func (b *CompositeBuffer) Discard(n int) int {
 	}
 
 	// number of available bytes
-	nBytes := b.Len()
+	nBytes := b.length
 
 	// discard all unread bytes.
 	if n <= 0 {
@@ -318,7 +355,7 @@ func (b *CompositeBuffer) Discard(n int) int {
 	if endIdx > 0 {
 		b.removeRange(endIdx)
 	}
-
+	b.length -= size
 	return size
 }
 
@@ -327,6 +364,7 @@ func (b *CompositeBuffer) removeRange(endIdx int) {
 		return
 	}
 
+	// Discarded owned blocks return to the same pool used by producers.
 	for idx, buf := range b.bufList[:endIdx] {
 		putBuffer(buf)
 		b.bufList[idx] = nil // avoid memory leak

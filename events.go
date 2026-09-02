@@ -17,8 +17,11 @@
 package uio
 
 import (
+	"context"
+	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
@@ -26,11 +29,15 @@ import (
 type CompositeBuffer = bytebuf.CompositeBuffer
 
 type Events struct {
-	master    *eventLoop     // serving listener
-	workers   []*eventLoop   // serving connection
-	acceptor  *acceptor      // connection acceptor
-	waitGroup sync.WaitGroup // wait for all eventLoop exit on shutdown
-	mux       sync.Mutex
+	master        *eventLoop     // serving listener
+	workers       []*eventLoop   // serving connection
+	acceptor      *acceptor      // connection acceptor
+	waitGroup     sync.WaitGroup // wait for all eventLoop exit on shutdown
+	mux           sync.Mutex     // serializes initialization and shutdown publication
+	closing       atomic.Bool
+	ready         atomic.Bool  // Dial is allowed only after full initialization
+	startGoid     atomic.Int64 // lets Close detect the synchronous OnStart path
+	callbackGoids sync.Map     // std callback goroutines currently outside loops
 
 	// Pollers is set up to start the given number of event-loop goroutine.
 	// The default value is runtime.NumCPU().
@@ -58,13 +65,17 @@ type Events struct {
 	// The default value is 0.
 	WriteBufferedThreshold int
 
-	// FullDuplex read events are always registered, which will improve program performance in most cases,
-	// unfortunately if there are malicious clients may deliberately slow to receive data will lead to server outbound buffer accumulation,
-	// in the absence of intervention may lead to service memory depletion.
-	// Turning this option off will change the event registration policy, readable events are unregistered if there is currently data waiting to be sent in the outbound buffer.
-	// Readable events are re-registered after the send buffer has been sent. In this case, network reads and writes will degenerate into half-duplex mode, ensuring that server memory is not exhausted.
-	// The default value is false.
-	FullDuplex bool
+	// MaxOutboundBuffered limits accepted but unsent payload bytes per
+	// connection. Zero disables the byte limit.
+	MaxOutboundBuffered int
+
+	// MaxPendingWrites limits write tasks not yet consumed by a connection's
+	// event loop. Values <= 0 use a default of 1024.
+	MaxPendingWrites int
+
+	// MaxInboundBuffered limits unread payload retained per connection. Zero
+	// disables the limit.
+	MaxInboundBuffered int
 
 	// OnOpen fires when a new connection has been opened.
 	OnOpen func(c Conn)
@@ -89,6 +100,9 @@ type Events struct {
 }
 
 func (ev *Events) Serve(addrs ...string) (err error) {
+	if ev.closing.Load() {
+		return net.ErrClosed
+	}
 	// append listen address.
 	ev.Addrs = append(ev.Addrs, addrs...)
 
@@ -97,10 +111,13 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		return err
 	}
 
-	// trigger OnStart event.
+	// OnStart runs before master.Serve, but Close must still avoid waiting on
+	// the goroutine that will become the master loop.
+	ev.startGoid.Store(currentGoroutineID())
 	if ev.OnStart != nil {
 		ev.OnStart(ev)
 	}
+	ev.startGoid.Store(0)
 
 	defer func() {
 		// trigger OnStop event.
@@ -109,19 +126,20 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		}
 	}()
 
-	// serve listener
-	ev.waitGroup.Add(1)
-	defer ev.waitGroup.Done()
-	return ev.master.Serve(ev.LockOSThread, ev.acceptor)
+	// Serve the listener loop on the caller goroutine.
+	err = ev.master.Serve(ev.LockOSThread, ev.acceptor)
+	ev.waitGroup.Done()
+	ev.initiateClose(err)
+	ev.waitGroup.Wait()
+	return err
 }
 
 func (ev *Events) Close(err error) error {
-	// close events.
-	ev.closeEvents(err)
-
-	// waiting for all event-loop exited.
-	ev.waitGroup.Wait()
-
+	onLoop := ev.initiateClose(err)
+	// Waiting from a callback would make that callback wait for itself.
+	if !onLoop {
+		ev.waitGroup.Wait()
+	}
 	return nil
 }
 
@@ -129,6 +147,9 @@ func (ev *Events) initEvents() (err error) {
 
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
+	if ev.closing.Load() {
+		return net.ErrClosed
+	}
 
 	// init configs.
 	if err = ev.initConfig(); nil != err {
@@ -142,31 +163,65 @@ func (ev *Events) initEvents() (err error) {
 
 	// init listener.
 	if err = ev.initListeners(); nil != err {
+		ev.rollbackInit(err)
 		return err
 	}
+	// Publish the master loop before initEvents unlocks so Close cannot observe
+	// a successfully initialized Events with an incomplete wait group.
+	ev.waitGroup.Add(1)
+	ev.ready.Store(true)
 
 	return nil
 }
 
-func (ev *Events) closeEvents(err error) {
+func (ev *Events) initiateClose(err error) bool {
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
-
-	// close all listeners
-	ev.acceptor.close()
-
-	// stop main poller
-	if nil != ev.master {
-		_ = ev.master.Close(err)
+	callerGoid := currentGoroutineID()
+	_, inExternalCallback := ev.callbackGoids.Load(callerGoid)
+	onLoop := ev.currentLoop() != nil || ev.startGoid.Load() == callerGoid || inExternalCallback
+	// Publish closing before sealing queues so producers reject new work.
+	if !ev.closing.CompareAndSwap(false, true) {
+		return onLoop
 	}
-
-	// close all worker pollers
+	ev.ready.Store(false)
+	if ev.master != nil {
+		ev.master.beginStop(err)
+	}
 	for _, worker := range ev.workers {
-		if nil != worker {
-			_ = worker.Close(err)
-			//ev.workers[idx] = nil
+		if worker != nil {
+			worker.beginStop(err)
 		}
 	}
+	return onLoop
+}
+
+func (ev *Events) enterExternalCallback() int64 {
+	id := currentGoroutineID()
+	ev.callbackGoids.Store(id, struct{}{})
+	return id
+}
+
+func (ev *Events) leaveExternalCallback(id int64) {
+	ev.callbackGoids.Delete(id)
+}
+
+func (ev *Events) rollbackInit(err error) {
+	// Workers may already be serving even though listener setup failed.
+	ev.closing.Store(true)
+	ev.ready.Store(false)
+	if ev.acceptor != nil {
+		ev.acceptor.close()
+	}
+	for _, worker := range ev.workers {
+		if worker != nil {
+			worker.beginStop(err)
+		}
+	}
+	if ev.master != nil {
+		_ = ev.master.poller.Close(err)
+	}
+	ev.waitGroup.Wait()
 }
 
 func (ev *Events) initConfig() error {
@@ -179,8 +234,8 @@ func (ev *Events) initConfig() error {
 		ev.MaxBufferSize = 1024 * 4
 	}
 
-	if ev.WriteBufferedThreshold > 0 && ev.WriteBufferedThreshold < 1024 {
-		ev.WriteBufferedThreshold = 1024
+	if ev.MaxPendingWrites <= 0 {
+		ev.MaxPendingWrites = 1024
 	}
 
 	return nil
@@ -196,6 +251,10 @@ func (ev *Events) initLoops() (err error) {
 	ev.workers = make([]*eventLoop, ev.Pollers)
 	for idx := range ev.workers {
 		if ev.workers[idx], err = newEventLoop(ev); nil != err {
+			_ = ev.master.poller.Close(err)
+			for _, worker := range ev.workers[:idx] {
+				_ = worker.poller.Close(err)
+			}
 			return err
 		}
 	}
@@ -204,8 +263,12 @@ func (ev *Events) initLoops() (err error) {
 		ev.waitGroup.Add(1)
 
 		go func(worker *eventLoop) {
-			defer ev.waitGroup.Done()
-			worker.Serve(ev.LockOSThread, nil)
+			serveErr := worker.Serve(ev.LockOSThread, nil)
+			// rollbackInit may hold ev.mux while waiting for this worker.
+			ev.waitGroup.Done()
+			if serveErr != nil {
+				ev.initiateClose(serveErr)
+			}
 		}(worker)
 	}
 
@@ -229,34 +292,114 @@ func (ev *Events) initListeners() (err error) {
 }
 
 func (ev *Events) selectLoop(fd int) *eventLoop {
+	return ev.selectWorker(fd)
+}
+
+func (ev *Events) selectWorker(fd int) *eventLoop {
+	if len(ev.workers) == 0 {
+		return nil
+	}
 	return ev.workers[fd%len(ev.workers)]
 }
 
 func (ev *Events) addConn(fdc *fdConn) error {
+	return ev.addConnContext(nil, fdc)
+}
 
-	// fire on-open event callback
-	if nil != ev.OnOpen {
-		ev.OnOpen(fdc)
+const (
+	registerPending uint32 = iota
+	registerCanceled
+	registerCompleted
+)
+
+type registerRequest struct {
+	ctx   context.Context
+	state atomic.Uint32
+}
+
+func (request *registerRequest) cause() error {
+	if cause := context.Cause(request.ctx); cause != nil {
+		return cause
 	}
+	return context.Canceled
+}
 
-	// register to poller
-	if err := fdc.loop.addConn(fdc); err != nil {
-		ev.closeConn(fdc, err)
-		return err
+func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
+	if fdc.loop == nil || ev.closing.Load() {
+		fdc.closeUnregistered()
+		return net.ErrClosed
 	}
-
-	return nil
+	if ctx != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			fdc.closeUnregistered()
+			return cause
+		}
+	}
+	if fdc.loop.inLoop() {
+		return fdc.loop.registerConn(fdc)
+	}
+	// External Dial returns only after registration and OnOpen complete.
+	t := acquireTask(registerTask, fdc)
+	t.done = make(chan error, 1)
+	done := t.done
+	var request *registerRequest
+	if ctx != nil {
+		request = &registerRequest{ctx: ctx}
+		t.registration = request
+	}
+	if !fdc.loop.submitTask(t) {
+		releaseTask(t)
+		fdc.closeUnregistered()
+		if ctx != nil {
+			if cause := context.Cause(ctx); cause != nil {
+				return cause
+			}
+		}
+		return net.ErrClosed
+	}
+	if request == nil {
+		return <-done
+	}
+	select {
+	case result := <-done:
+		return result
+	case <-ctx.Done():
+		if request.state.CompareAndSwap(registerPending, registerCanceled) {
+			return request.cause()
+		}
+		return <-done
+	}
 }
 
 func (ev *Events) closeConn(fdc *fdConn, err error) {
+	fdc.requestClose(err)
+}
 
-	// close socket and release resource.
-	if fdc.fdClose(err) {
-		// fire on-close event.
-		if nil != ev.OnClose {
-			ev.OnClose(fdc, err)
+func (ev *Events) submitAccepted(fdc *fdConn) bool {
+	if fdc.loop == nil || ev.closing.Load() {
+		fdc.closeUnregistered()
+		return false
+	}
+	// The listener loop never waits for a worker's OnOpen callback.
+	t := acquireTask(registerTask, fdc)
+	if !fdc.loop.submitTask(t) {
+		releaseTask(t)
+		fdc.closeUnregistered()
+		return false
+	}
+	return true
+}
+
+func (ev *Events) currentLoop() *eventLoop {
+	if ev.master != nil && ev.master.inLoop() {
+		return ev.master
+	}
+	for _, worker := range ev.workers {
+		if worker != nil && worker.inLoop() {
+			return worker
 		}
 	}
+	return nil
 }
 
 func (ev *Events) onData(fdc *fdConn) error {

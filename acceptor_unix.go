@@ -21,6 +21,7 @@ package uio
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/url"
 	"os"
@@ -62,12 +63,14 @@ func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) 
 		ld.mux.Unlock()
 
 		if ok {
-			_ = ld.accept(l)
+			if err := ld.accept(l); err != nil {
+				ld.events.initiateClose(err)
+			}
 		}
 	}
 
 	if 0 != events&poller.WriteEvents {
-		panic("unreachable here")
+		return
 	}
 }
 
@@ -82,17 +85,13 @@ func (ld *acceptor) accept(l *listener) error {
 		return ld.onReadUDP(l)
 	}
 
-	for {
-		nfd, sa, err := syscall.Accept(l.fd)
+	// Bound one readiness dispatch so a busy listener cannot monopolize master.
+	for accepted := 0; accepted < 16; accepted++ {
+		nfd, sa, err := socket.Accept(l.fd)
 		if nil != err {
-			if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			if isWouldBlock(err) {
 				return nil
 			}
-			return err
-		}
-
-		if err = socket.SetNonblock(nfd, true); err != nil {
-			_ = syscall.Close(nfd)
 			return err
 		}
 
@@ -105,12 +104,13 @@ func (ld *acceptor) accept(l *listener) error {
 		fdc := &fdConn{}
 		fdc.fd = nfd
 		fdc.events = ld.events
-		fdc.loop = ld.events.selectLoop(nfd)
+		fdc.loop = ld.events.selectWorker(nfd)
 		fdc.localAddr = l.laddr
 		fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
 
-		return ld.events.addConn(fdc)
+		ld.events.submitAccepted(fdc)
 	}
+	return nil
 }
 
 func (ld *acceptor) addListen(addr string) (err error) {
@@ -133,25 +133,36 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.fd = l.fd
+		// The logical UDP server takes ownership of the duplicated poller fd.
+		l.udpSvr.fdFile = l.file
+		l.file = nil
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
-		l.udpSvr.isUdp = true
-		l.udpSvr.udpConns = make(map[string]*fdConn)
+		l.udpSvr.isUDP = true
+		l.udpSvr.internal = true
+		l.udpSvr.udpConns = make(map[socket.UDPAddress]*fdConn)
+		l.udpSvr.localAddr = l.laddr
 
-		return ld.loop.addConn(l.udpSvr)
+		if err = ld.loop.fdMap.Put(l.fd, l.udpSvr); err != nil {
+			l.udpSvr.closeUnregistered()
+			return err
+		}
+		if err = ld.loop.poller.Watch(l.fd, poller.Readable); err != nil {
+			ld.loop.fdMap.Delete(l.fd)
+			return err
+		}
+		l.udpSvr.interest = poller.Readable
+		return nil
 	}
 
 	return ld.loop.listen(l.fd)
 }
 
 func (ld *acceptor) closeListener(l *listener) {
-	if l.udpSvr != nil {
-		_ = l.udpSvr.Close()
+	if l.udpSvr != nil && !l.udpSvr.closed {
+		l.udpSvr.closeOnLoop(io.ErrUnexpectedEOF)
 	}
-	if l.fd > 0 {
-		_ = syscall.Close(l.fd)
-	}
-	if l.file != nil {
+	if l.file != nil && l.udpSvr == nil {
 		_ = l.file.Close()
 	}
 	if l.ln != nil {
@@ -169,10 +180,12 @@ func (ld *acceptor) closeListener(l *listener) {
 
 func (ld *acceptor) close() {
 	ld.mux.Lock()
-	defer ld.mux.Unlock()
-
-	for fd, l := range ld.listeners {
-		delete(ld.listeners, fd)
+	// User OnClose callbacks run while closing UDP children, so release the
+	// listener-map lock before closing resources.
+	listeners := ld.listeners
+	ld.listeners = nil
+	ld.mux.Unlock()
+	for _, l := range listeners {
 		ld.closeListener(l)
 	}
 }

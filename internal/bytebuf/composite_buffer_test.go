@@ -3,10 +3,98 @@ package bytebuf
 import (
 	"bytes"
 	"crypto/rand"
+	"errors"
+	"fmt"
 	"io"
 	"reflect"
 	"testing"
 )
+
+func newTestCompositeBuffer(buffers []*Buffer) *CompositeBuffer {
+	buffer := &CompositeBuffer{bufList: buffers}
+	for _, item := range buffers {
+		buffer.length += item.Len()
+	}
+	return buffer
+}
+
+func assertCompositeBufferLength(t *testing.T, buffer *CompositeBuffer) {
+	t.Helper()
+	actual := 0
+	for _, item := range buffer.bufList {
+		actual += item.Len()
+	}
+	if buffer.Len() != actual {
+		t.Fatalf("cached length = %d, actual = %d", buffer.Len(), actual)
+	}
+	if buffer.Empty() != (actual == 0) {
+		t.Fatalf("Empty = %t with actual length %d", buffer.Empty(), actual)
+	}
+}
+
+type partialCompositeWriter struct{ limit int }
+
+func (writer partialCompositeWriter) Write(data []byte) (int, error) {
+	return min(writer.limit, len(data)), io.ErrClosedPipe
+}
+
+func TestCompositeBufferLengthInvariant(t *testing.T) {
+	var buffer CompositeBuffer
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.Write([]byte("abc"))
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.WriteString("def")
+	assertCompositeBufferLength(t, &buffer)
+	_ = buffer.WriteByte('g')
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.Writev([][]byte{[]byte("hi"), []byte("jk")})
+	assertCompositeBufferLength(t, &buffer)
+	buffer.AppendOwned(CloneBuffer([]byte("owned")))
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.Read(make([]byte, 4))
+	assertCompositeBufferLength(t, &buffer)
+	buffer.Discard(3)
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.ReadFrom(bytes.NewBufferString("read-from"))
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.WriteTo(io.Discard)
+	assertCompositeBufferLength(t, &buffer)
+
+	_, _ = buffer.WriteString("partial")
+	written, err := buffer.WriteTo(partialCompositeWriter{limit: 3})
+	if written != 3 || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("partial WriteTo = %d, %v", written, err)
+	}
+	assertCompositeBufferLength(t, &buffer)
+	buffer.Reset()
+	assertCompositeBufferLength(t, &buffer)
+	_, _ = buffer.WriteString("close")
+	if err = buffer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	assertCompositeBufferLength(t, &buffer)
+}
+
+func BenchmarkCompositeBufferDrainSegments(b *testing.B) {
+	for _, segments := range []int{1024, 2048, 4096, 8192} {
+		b.Run(fmt.Sprintf("segments_%d", segments), func(b *testing.B) {
+			b.ReportAllocs()
+			b.ReportMetric(float64(segments), "segments/op")
+			for range b.N {
+				b.StopTimer()
+				var buffer CompositeBuffer
+				for range segments {
+					buffer.AppendOwned(NewBuffer([]byte{'x'}))
+				}
+				b.StartTimer()
+				for !buffer.Empty() {
+					buffer.Discard(8)
+				}
+				b.StopTimer()
+			}
+		})
+	}
+}
 
 func TestCompositeBuffer_Available(t *testing.T) {
 	tests := []struct {
@@ -48,9 +136,7 @@ func TestCompositeBuffer_Available(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if gotBytes := b.Available(); gotBytes != tt.wantBytes {
 				t.Errorf("Available() = %v, want %v", gotBytes, tt.wantBytes)
 			}
@@ -98,9 +184,7 @@ func TestCompositeBuffer_Cap(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if gotCapacity := b.Cap(); gotCapacity != tt.wantCapacity {
 				t.Errorf("Cap() = %v, want %v", gotCapacity, tt.wantCapacity)
 			}
@@ -148,9 +232,7 @@ func TestCompositeBuffer_Len(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if gotLength := b.Len(); gotLength != tt.wantLength {
 				t.Errorf("Len() = %v, want %v", gotLength, tt.wantLength)
 			}
@@ -200,9 +282,7 @@ func TestCompositeBuffer_Read(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotN, err := b.Read(tt.args.p)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Read() error = %v, wantErr %v", err, tt.wantErr)
@@ -257,9 +337,7 @@ func TestCompositeBuffer_ReadFrom(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotN, err := b.ReadFrom(tt.args.r)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("ReadFrom() error = %v, wantErr %v", err, tt.wantErr)
@@ -269,6 +347,28 @@ func TestCompositeBuffer_ReadFrom(t *testing.T) {
 				t.Errorf("ReadFrom() gotN = %v, want %v", gotN, tt.wantN)
 			}
 		})
+	}
+}
+
+func TestCompositeBufferReadFromAfterPartialRead(t *testing.T) {
+	var buffer CompositeBuffer
+	_, _ = buffer.WriteString("abcdef")
+	read := make([]byte, 2)
+	if n, err := buffer.Read(read); err != nil || n != len(read) {
+		t.Fatalf("Read = %d, %v", n, err)
+	}
+	if n, err := buffer.ReadFrom(bytes.NewBufferString("XYZ")); err != nil || n != 3 {
+		t.Fatalf("ReadFrom = %d, %v", n, err)
+	}
+	if buffer.Len() != len("cdefXYZ") {
+		t.Fatalf("Len = %d, want %d", buffer.Len(), len("cdefXYZ"))
+	}
+	result := make([]byte, buffer.Len())
+	if n, err := buffer.Read(result); err != nil || n != len(result) {
+		t.Fatalf("final Read = %d, %v", n, err)
+	}
+	if got := string(result); got != "cdefXYZ" {
+		t.Fatalf("final content = %q, want cdefXYZ", got)
 	}
 }
 
@@ -292,9 +392,7 @@ func TestCompositeBuffer_Reset(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			b.Reset()
 			if n := b.Cap(); n != 0 {
 				t.Errorf("Reset() gotN = %v, want %v", n, 0)
@@ -338,9 +436,7 @@ func TestCompositeBuffer_Write(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotN, err := b.Write(tt.args.p)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Write() error = %v, wantErr %v", err, tt.wantErr)
@@ -385,9 +481,7 @@ func TestCompositeBuffer_WriteTo(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			w := &Buffer{}
 			gotN, err := b.WriteTo(w)
 			if (err != nil) != tt.wantErr {
@@ -477,9 +571,7 @@ func TestCompositeBuffer_Discard(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			got := b.Discard(tt.args.n)
 
 			if got != tt.want {
@@ -526,9 +618,7 @@ func TestCompositeBuffer_Peek(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if got := b.Peek(tt.args.p); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("Peek() = %v, want %v", got, tt.want)
 			}
@@ -611,9 +701,7 @@ func TestCompositeBuffer_PeekVec(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotVec, gotLength := b.PeekVec(nil)
 			if !reflect.DeepEqual(gotVec, tt.wantVec) {
 				t.Errorf("PeekVec() gotVec = %v, want %v", gotVec, tt.wantVec)
@@ -622,6 +710,42 @@ func TestCompositeBuffer_PeekVec(t *testing.T) {
 				t.Errorf("PeekVec() gotLength = %v, want %v", gotLength, tt.wantLength)
 			}
 		})
+	}
+}
+
+func TestCompositeBufferAppendOwnedAndPeekVecN(t *testing.T) {
+	var buffer CompositeBuffer
+	first := CloneBuffer([]byte("first"))
+	second := CloneBuffer([]byte("second"))
+	buffer.AppendOwned(first)
+	buffer.AppendOwned(second)
+
+	storage := make([][]byte, 0, 1)
+	vec, length := buffer.PeekVecN(storage, 1)
+	if len(vec) != 1 || string(vec[0]) != "first" || length != len("first") {
+		t.Fatalf("PeekVecN = %q, %d", vec, length)
+	}
+	if got := buffer.Len(); got != len("firstsecond") {
+		t.Fatalf("Len = %d", got)
+	}
+	var stackStorage [2][]byte
+	allocations := testing.AllocsPerRun(1000, func() {
+		got, gotLength := buffer.PeekVecN(stackStorage[:0], len(stackStorage))
+		if len(got) != 2 || gotLength != len("firstsecond") {
+			panic("unexpected PeekVecN result")
+		}
+	})
+	if allocations != 0 {
+		t.Fatalf("PeekVecN allocations = %v", allocations)
+	}
+	buffer.Reset()
+}
+
+func TestCloneBuffersFrom(t *testing.T) {
+	buffer := CloneBuffersFrom([][]byte{[]byte("ab"), []byte("cde"), []byte("f")}, 3, 3)
+	defer ReleaseBuffer(buffer)
+	if got := string(buffer.Bytes()); got != "def" {
+		t.Fatalf("CloneBuffersFrom = %q", got)
 	}
 }
 
@@ -653,9 +777,7 @@ func TestCompositeBuffer_WriteString(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotN, err := b.WriteString(tt.args.s)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("WriteString() error = %v, wantErr %v", err, tt.wantErr)
@@ -690,9 +812,7 @@ func TestCompositeBuffer_WriteByte(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if err := b.WriteByte(tt.args.c); (err != nil) != tt.wantErr {
 				t.Errorf("WriteByte() error = %v, wantErr %v", err, tt.wantErr)
 			}
@@ -735,9 +855,7 @@ func TestCompositeBuffer_Writev(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			gotN, err := b.Writev(tt.args.vec)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Writev() error = %v, wantErr %v", err, tt.wantErr)
@@ -774,9 +892,7 @@ func TestCompositeBuffer_Close(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			b := &CompositeBuffer{
-				bufList: tt.bufList,
-			}
+			b := newTestCompositeBuffer(tt.bufList)
 			if err := b.Close(); (err != nil) != tt.wantErr {
 				t.Errorf("Close() error = %v, wantErr %v", err, tt.wantErr)
 			}
