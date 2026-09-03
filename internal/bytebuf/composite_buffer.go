@@ -275,6 +275,14 @@ func (b *CompositeBuffer) Peek(p []byte) []byte {
 	return p[:off]
 }
 
+// PeekChunk returns the first contiguous unread block without advancing it.
+func (b *CompositeBuffer) PeekChunk() []byte {
+	if len(b.bufList) == 0 {
+		return nil
+	}
+	return b.bufList[0].Bytes()
+}
+
 // PeekVec returns the [][]bytes without advancing the buffer.
 func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
 	if 0 == len(b.bufList) {
@@ -293,14 +301,14 @@ func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
 	return dst, length
 }
 
-// PeekVecN returns at most max unread segments without advancing the buffer.
+// PeekVecN returns at most limit unread segments without advancing the buffer.
 // The limit prevents a flush from walking or allocating for the whole queue.
-func (b *CompositeBuffer) PeekVecN(dst [][]byte, max int) (vec [][]byte, length int) {
-	if len(b.bufList) == 0 || max <= 0 {
+func (b *CompositeBuffer) PeekVecN(dst [][]byte, limit int) (vec [][]byte, length int) {
+	if len(b.bufList) == 0 || limit <= 0 {
 		return dst[:0], 0
 	}
 
-	count := min(len(b.bufList), max)
+	count := min(len(b.bufList), limit)
 	if cap(dst) < count {
 		dst = make([][]byte, 0, count)
 	} else {

@@ -1,0 +1,37 @@
+//go:build linux && !stdio
+
+package poller
+
+import (
+	"errors"
+	"testing"
+
+	"golang.org/x/sys/unix"
+)
+
+func TestLinuxAddAndModifyInterest(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	poller, err := NewNetPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poller.Close(nil)
+	if err = poller.Add(fds[0], Readable); err != nil {
+		t.Fatal(err)
+	}
+	if err = poller.Add(fds[0], Readable); !errors.Is(err, unix.EEXIST) {
+		t.Fatalf("duplicate Add error = %v, want EEXIST", err)
+	}
+	if err = poller.Modify(fds[0], Readable, Readable|Writable); err != nil {
+		t.Fatal(err)
+	}
+	if err = poller.Remove(fds[0], Readable|Writable); err != nil {
+		t.Fatal(err)
+	}
+}

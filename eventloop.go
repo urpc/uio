@@ -280,19 +280,30 @@ func (loop *eventLoop) OnClose(_ *poller.NetPoller, err error) { loop.shutdown(e
 
 func (loop *eventLoop) getBuffer() []byte      { return loop.buffer }
 func (loop *eventLoop) getConn(fd int) *fdConn { return loop.fdMap.Get(fd) }
-func (loop *eventLoop) listen(fd int) error    { return loop.poller.Watch(fd, poller.Readable) }
+func (loop *eventLoop) listen(fd int) error    { return loop.poller.Add(fd, poller.Readable) }
 func (loop *eventLoop) delConn(conn *fdConn) {
 	loop.fdMap.Delete(conn.Fd())
-	_ = loop.poller.Unwatch(conn.Fd())
+	_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
 }
 func (loop *eventLoop) modRead(conn *fdConn) error {
-	return loop.poller.Watch(conn.Fd(), poller.Readable)
+	return loop.modifyInterest(conn, poller.Readable)
 }
 func (loop *eventLoop) modWrite(conn *fdConn) error {
-	return loop.poller.Watch(conn.Fd(), poller.Writable)
+	return loop.modifyInterest(conn, poller.Writable)
 }
 func (loop *eventLoop) modReadWrite(conn *fdConn) error {
-	return loop.poller.Watch(conn.Fd(), poller.Readable|poller.Writable)
+	return loop.modifyInterest(conn, poller.Readable|poller.Writable)
+}
+func (loop *eventLoop) modifyInterest(conn *fdConn, want poller.Interest) error {
+	previous := conn.currentInterest()
+	if previous == want {
+		return nil
+	}
+	if err := loop.poller.Modify(conn.Fd(), previous, want); err != nil {
+		return err
+	}
+	conn.setInterest(want)
+	return nil
 }
 
 func (loop *eventLoop) registerConn(conn *fdConn) error {
@@ -302,12 +313,14 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 		conn.closeUnregistered()
 		return err
 	}
-	if err := loop.poller.Watch(fd, conn.initialInterest()); err != nil {
+	interest := conn.initialInterest()
+	if err := loop.poller.Add(fd, interest); err != nil {
 		loop.fdMap.Delete(fd)
-		_ = loop.poller.Unwatch(fd)
+		_ = loop.poller.Remove(fd, interest)
 		conn.closeUnregistered()
 		return err
 	}
+	conn.setInterest(interest)
 	conn.fireOnOpen()
 	// Blocking std backends start I/O only after OnOpen; native pollers do nothing here.
 	if !conn.isClosing() {

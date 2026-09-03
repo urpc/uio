@@ -23,9 +23,8 @@ type NetPoller struct {
 	wakeRead  int
 	wakeWrite int
 
-	mu        sync.Mutex // protects interests, waiters, and descriptor lifetime
-	interests map[int]Interest
-	waiters   int // includes readiness-event conversion after kevent
+	mu      sync.Mutex // protects waiters and descriptor lifetime
+	waiters int        // includes readiness-event conversion after kevent
 
 	closed      atomic.Bool
 	closeReason atomic.Pointer[error]
@@ -52,7 +51,7 @@ func NewNetPoller() (*NetPoller, error) {
 			return nil, err
 		}
 	}
-	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1], interests: make(map[int]Interest)}
+	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1]}
 	if err = poller.change(waker[0], readEvents, unix.EV_ADD); err != nil {
 		poller.release()
 		return nil, err
@@ -60,7 +59,17 @@ func NewNetPoller() (*NetPoller, error) {
 	return poller, nil
 }
 
-func (poller *NetPoller) Watch(fd int, want Interest) error {
+// Add registers a descriptor.
+func (poller *NetPoller) Add(fd int, want Interest) error {
+	return poller.modify(fd, 0, want)
+}
+
+// Modify changes filters using the caller-owned previous interest.
+func (poller *NetPoller) Modify(fd int, previous, want Interest) error {
+	return poller.modify(fd, previous, want)
+}
+
+func (poller *NetPoller) modify(fd int, previous, want Interest) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
@@ -72,10 +81,10 @@ func (poller *NetPoller) Watch(fd int, want Interest) error {
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
-	previous := poller.interests[fd]
-	if previous == want {
-		return nil
-	}
+	return poller.modifyLocked(fd, previous, want)
+}
+
+func (poller *NetPoller) modifyLocked(fd int, previous, want Interest) error {
 	if previous&Readable != 0 && want&Readable == 0 {
 		if err := poller.deleteFilter(fd, readEvents); err != nil {
 			return err
@@ -96,19 +105,20 @@ func (poller *NetPoller) Watch(fd int, want Interest) error {
 			return err
 		}
 	}
-	poller.interests[fd] = want
 	return nil
 }
 
-func (poller *NetPoller) Unwatch(fd int) error {
+// Remove deletes filters using the caller-owned previous interest.
+func (poller *NetPoller) Remove(fd int, previous Interest) error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
-	previous := poller.interests[fd]
-	// Clear the shadow even when DELETE reports that the filter is already gone.
-	delete(poller.interests, fd)
 	if poller.closed.Load() {
 		return nil
 	}
+	return poller.removeLocked(fd, previous)
+}
+
+func (poller *NetPoller) removeLocked(fd int, previous Interest) error {
 	var errs []error
 	if previous&Readable != 0 {
 		errs = append(errs, poller.deleteFilter(fd, readEvents))
@@ -279,9 +289,3 @@ func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 		}
 	}
 }
-
-func (poller *NetPoller) AddReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
-func (poller *NetPoller) AddRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModWrite(fd int) error     { return poller.Watch(fd, Writable) }
-func (poller *NetPoller) ModReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }

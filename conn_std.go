@@ -31,6 +31,9 @@ import (
 	"github.com/urpc/uio/internal/poller"
 )
 
+// Keep tiny writes coalesced while bounding payload work done under mux.
+const stdOwnedWriteThreshold = 4 << 10
+
 type fdConn struct {
 	commonConn
 	conn       net.Conn
@@ -43,7 +46,7 @@ type fdConn struct {
 	err        error
 	mux        sync.Mutex
 	outbound   bytebuf.CompositeBuffer
-	writeMu    sync.Mutex // serializes socket writers without blocking producers
+	writeMu    sync.Mutex // keeps close cleanup from racing the detached write batch
 	writeBatch bytebuf.CompositeBuffer
 	writeBytes int
 	closing    atomic.Bool
@@ -60,6 +63,8 @@ func (fc *fdConn) OutboundBuffered() int {
 }
 
 func (fc *fdConn) initialInterest() poller.Interest { return poller.Readable }
+func (fc *fdConn) setInterest(poller.Interest)      {}
+func (fc *fdConn) currentInterest() poller.Interest { return poller.Readable }
 func (fc *fdConn) isClosing() bool                  { return fc.closing.Load() || fc.IsClosed() }
 func (fc *fdConn) isClosedOnLoop() bool             { return fc.IsClosed() }
 func (fc *fdConn) afterRegister() {
@@ -251,6 +256,15 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		}
 		return
 	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(p) >= stdOwnedWriteThreshold {
+		if limit := fc.events.MaxOutboundBuffered; limit > 0 && len(p) > limit {
+			return 0, ErrOutboundOverflow
+		}
+		return fc.WriteOwned(bytebuf.CloneBuffer(p))
+	}
 
 	fc.mux.Lock()
 	if fc.isClosing() {
@@ -289,8 +303,54 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	total := 0
+	segments := 0
 	for _, segment := range vec {
+		if len(segment) > int(^uint(0)>>1)-total {
+			return 0, ErrOutboundOverflow
+		}
 		total += len(segment)
+		if len(segment) > 0 {
+			segments++
+		}
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	if total >= stdOwnedWriteThreshold {
+		if limit := fc.events.MaxOutboundBuffered; limit > 0 && total > limit {
+			return 0, ErrOutboundOverflow
+		}
+		var inline [8]*bytebuf.Buffer
+		owned := inline[:0]
+		if segments > len(inline) {
+			owned = append(owned, bytebuf.CloneBuffers(vec, total))
+		} else {
+			for _, segment := range vec {
+				if len(segment) > 0 {
+					owned = append(owned, bytebuf.CloneBuffer(segment))
+				}
+			}
+		}
+		fc.mux.Lock()
+		if fc.isClosing() {
+			fc.mux.Unlock()
+			releaseStdBuffers(owned)
+			return 0, net.ErrClosed
+		}
+		if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
+			fc.mux.Unlock()
+			releaseStdBuffers(owned)
+			return 0, ErrOutboundOverflow
+		}
+		for _, buffer := range owned {
+			fc.outbound.AppendOwned(buffer)
+		}
+		fc.mux.Unlock()
+		select {
+		case fc.writeSig <- struct{}{}:
+		default:
+		}
+		return total, nil
 	}
 	fc.mux.Lock()
 	if fc.isClosing() {
@@ -318,24 +378,68 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	return
 }
 
+func releaseStdBuffers(buffers []*bytebuf.Buffer) {
+	for _, buffer := range buffers {
+		bytebuf.ReleaseBuffer(buffer)
+	}
+}
+
+func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
+	if owned == nil {
+		return 0, nil
+	}
+	size := owned.Len()
+	if size == 0 {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, nil
+	}
+	if fc.isClosing() {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, net.ErrClosed
+	}
+	if fc.udp != nil {
+		defer bytebuf.ReleaseBuffer(owned)
+		return fc.Write(owned.Bytes())
+	}
+
+	fc.mux.Lock()
+	if fc.isClosing() {
+		fc.mux.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		return 0, net.ErrClosed
+	}
+	if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
+		fc.mux.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		return 0, ErrOutboundOverflow
+	}
+	fc.outbound.AppendOwned(owned)
+	fc.mux.Unlock()
+
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
+	}
+	return size, nil
+}
+
 func (fc *fdConn) Flush() error {
 	if fc.isClosing() {
 		return net.ErrClosed
 	}
-	var storage [8][]byte
-	_, written, err := fc.drainOutbound(storage[:0])
-	if written > 0 {
-		fc.events.onSocketBytesWrite(fc, written)
+	// Writes are FIFO in outbound. A coalesced wake is enough to make the
+	// dedicated writer drain everything accepted before this call.
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
 	}
-	if err != nil {
-		fc.events.closeConn(fc, err)
-	}
-	return err
+	return nil
 }
 
 func (fc *fdConn) drainOutbound(vec [][]byte) ([][]byte, int, error) {
 	fc.writeMu.Lock()
 	defer fc.writeMu.Unlock()
+	vec = vec[:0]
 
 	fc.mux.Lock()
 	if fc.isClosing() {
@@ -545,6 +649,11 @@ func (fc *fdConn) writeLoop() {
 }
 
 func (fc *fdConn) readUDPLoop() {
+	// This goroutine only enters user code through callbacks. Register it once
+	// so callback-initiated Events.Close does not wait for its own return.
+	callbackID := fc.events.enterExternalCallback()
+	defer fc.events.leaveExternalCallback(callbackID)
+
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
 		n, _, err := fc.udp.ReadFrom(buffer)
@@ -555,7 +664,6 @@ func (fc *fdConn) readUDPLoop() {
 		}
 
 		fc.callbackMu.Lock()
-		callbackID := fc.events.enterExternalCallback()
 		fc.inboundTail = buffer[:n]
 
 		// trigger inbound event.
@@ -563,7 +671,6 @@ func (fc *fdConn) readUDPLoop() {
 
 		// fire data callback.
 		if err = fc.events.onData(fc); nil != err {
-			fc.events.leaveExternalCallback(callbackID)
 			fc.callbackMu.Unlock()
 			// close on error.
 			fc.events.closeConn(fc, err)
@@ -572,12 +679,15 @@ func (fc *fdConn) readUDPLoop() {
 
 		// drop unread udp packet.
 		_, _ = fc.Discard(-1)
-		fc.events.leaveExternalCallback(callbackID)
 		fc.callbackMu.Unlock()
 	}
 }
 
 func (fc *fdConn) readLoop() {
+	// Keep one callback marker for the lifetime of this dedicated read goroutine.
+	callbackID := fc.events.enterExternalCallback()
+	defer fc.events.leaveExternalCallback(callbackID)
+
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
 		n, err := fc.conn.Read(buffer)
@@ -589,14 +699,12 @@ func (fc *fdConn) readLoop() {
 
 		// fire data callback.
 		fc.callbackMu.Lock()
-		callbackID := fc.events.enterExternalCallback()
 		fc.inboundTail = buffer[:n]
 
 		// trigger inbound event.
 		fc.events.onSocketBytesRead(fc, n)
 
 		if err = fc.events.onData(fc); nil != err {
-			fc.events.leaveExternalCallback(callbackID)
 			fc.callbackMu.Unlock()
 			// close on error.
 			fc.events.closeConn(fc, err)
@@ -606,7 +714,6 @@ func (fc *fdConn) readLoop() {
 		if len(fc.inboundTail) > 0 {
 			if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.InboundBuffered() > limit {
 				fc.inboundTail = nil
-				fc.events.leaveExternalCallback(callbackID)
 				fc.callbackMu.Unlock()
 				fc.events.closeConn(fc, ErrInboundOverflow)
 				return
@@ -619,7 +726,6 @@ func (fc *fdConn) readLoop() {
 		if fc.events.WriteBufferedThreshold > 0 {
 			_ = fc.Flush()
 		}
-		fc.events.leaveExternalCallback(callbackID)
 		fc.callbackMu.Unlock()
 	}
 }
@@ -645,6 +751,9 @@ func (fc *fdConn) fireReadEvent() error {
 }
 
 func (fc *fdConn) listenUDP() error {
+	// UDP peer callbacks all run on this listener goroutine.
+	callbackID := fc.events.enterExternalCallback()
+	defer fc.events.leaveExternalCallback(callbackID)
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 
@@ -677,11 +786,9 @@ func (fc *fdConn) listenUDP() error {
 		if !ok {
 			// fire udp on-open event.
 			udpConn.callbackMu.Lock()
-			callbackID := fc.events.enterExternalCallback()
 			if onOpen := fc.events.OnOpen; nil != onOpen {
 				onOpen(udpConn)
 			}
-			fc.events.leaveExternalCallback(callbackID)
 			udpConn.callbackMu.Unlock()
 		}
 		if udpConn.isClosing() {
@@ -689,7 +796,6 @@ func (fc *fdConn) listenUDP() error {
 		}
 
 		udpConn.callbackMu.Lock()
-		callbackID := fc.events.enterExternalCallback()
 		udpConn.inboundTail = buffer[:n]
 
 		// trigger inbound event
@@ -700,7 +806,6 @@ func (fc *fdConn) listenUDP() error {
 
 		// drop unread udp packet.
 		_, _ = udpConn.Discard(-1)
-		fc.events.leaveExternalCallback(callbackID)
 		udpConn.callbackMu.Unlock()
 
 		if nil != err {

@@ -14,6 +14,7 @@ func TestBufferPoolSizeClasses(t *testing.T) {
 		{65, 512},
 		{1024, 1024},
 		{65536, 65536},
+		{65537, 65537},
 	} {
 		buffer := getBuffer(test.requested)
 		if got := buffer.Cap(); got != test.capacity {

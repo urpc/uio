@@ -25,7 +25,7 @@ func (handler *stdTestHandler) OnEvent(_ *NetPoller, fd int, events Events) {
 
 func (handler *stdTestHandler) OnClose(_ *NetPoller, err error) { handler.closeCh <- err }
 
-func TestStdPollerWatchAndClose(t *testing.T) {
+func TestStdPollerInterestAndClose(t *testing.T) {
 	poller, err := NewNetPoller()
 	if err != nil {
 		t.Fatal(err)
@@ -35,22 +35,22 @@ func TestStdPollerWatchAndClose(t *testing.T) {
 	go func() { serveDone <- poller.Serve(true, handler) }()
 
 	addDone := make(chan error, 1)
-	go func() { addDone <- poller.AddRead(42) }()
+	go func() { addDone <- poller.Add(42, Readable) }()
 	select {
 	case err = <-addDone:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("AddRead did not complete")
+		t.Fatal("Add did not complete")
 	}
-	if err = poller.ModRead(42); err != nil {
+	if err = poller.Modify(42, Readable, Readable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.ModWrite(42); err != nil {
+	if err = poller.Modify(42, Readable, Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.ModReadWrite(42); err != nil {
+	if err = poller.Modify(42, Writable, Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
 
@@ -77,8 +77,8 @@ func TestStdPollerWatchAndClose(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not stop")
 	}
-	if err = poller.AddRead(99); err == nil {
-		t.Fatal("AddRead succeeded after Close")
+	if err = poller.Add(99, Readable); err == nil {
+		t.Fatal("Add succeeded after Close")
 	}
 }
 
@@ -125,8 +125,8 @@ func TestStdPollerWaitModesAndValidation(t *testing.T) {
 	if poller.Closed() {
 		t.Fatal("new poller is closed")
 	}
-	if err = poller.Watch(1, 0); !errors.Is(err, errInvalidInterest) {
-		t.Fatalf("Watch empty interest error = %v", err)
+	if err = poller.Add(1, 0); !errors.Is(err, errInvalidInterest) {
+		t.Fatalf("Add empty interest error = %v", err)
 	}
 	var events [1]Event
 	if n, waitErr := poller.Wait(events[:], 0); n != 0 || waitErr != nil {
@@ -141,19 +141,19 @@ func TestStdPollerWaitModesAndValidation(t *testing.T) {
 	if n, waitErr := poller.Wait(events[:], 0); n != 0 || waitErr != nil {
 		t.Fatalf("wake zero-timeout Wait = %d, %v", n, waitErr)
 	}
-	if err = poller.AddReadWrite(1); err != nil {
+	if err = poller.Add(1, Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.Watch(1, Writable); err != nil {
+	if err = poller.Modify(1, Readable|Writable, Writable); err != nil {
 		t.Fatal(err)
 	}
 	if n, waitErr := poller.Wait(nil, 0); n != 0 || waitErr != nil {
 		t.Fatalf("watch generated an event: %d, %v", n, waitErr)
 	}
-	if err = poller.Unwatch(1); err != nil {
+	if err = poller.Remove(1, Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.Watch(2, Readable); err != nil {
+	if err = poller.Add(2, Readable); err != nil {
 		t.Fatal(err)
 	}
 	if n, waitErr := poller.Wait(events[:], 10); n != 0 || waitErr != nil {
@@ -186,7 +186,7 @@ func TestStdPollerClosedWaitModes(t *testing.T) {
 	}
 }
 
-func TestStdPollerBurstWatchDoesNotBlock(t *testing.T) {
+func TestStdPollerBurstAddDoesNotBlock(t *testing.T) {
 	poller, err := NewNetPoller()
 	if err != nil {
 		t.Fatal(err)
@@ -196,7 +196,7 @@ func TestStdPollerBurstWatchDoesNotBlock(t *testing.T) {
 	result := make(chan error, 1)
 	go func() {
 		for fd := 0; fd < total; fd++ {
-			if watchErr := poller.Watch(fd, Readable); watchErr != nil {
+			if watchErr := poller.Add(fd, Readable); watchErr != nil {
 				result <- watchErr
 				return
 			}
@@ -209,12 +209,23 @@ func TestStdPollerBurstWatchDoesNotBlock(t *testing.T) {
 			t.Fatal(watchErr)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("burst Watch blocked without a waiter")
+		t.Fatal("burst Add blocked without a waiter")
 	}
-	poller.mu.Lock()
-	registered := len(poller.interests)
-	poller.mu.Unlock()
-	if registered != total {
-		t.Fatalf("registered %d descriptors, want %d", registered, total)
+}
+
+func TestStdCallerOwnedInterestTransitions(t *testing.T) {
+	poller, err := NewNetPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poller.Close(nil)
+	if err = poller.Add(1, Readable); err != nil {
+		t.Fatal(err)
+	}
+	if err = poller.Modify(1, Readable, Readable|Writable); err != nil {
+		t.Fatal(err)
+	}
+	if err = poller.Remove(1, Readable|Writable); err != nil {
+		t.Fatal(err)
 	}
 }

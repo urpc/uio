@@ -76,6 +76,29 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 	return conn.queueOwnedWrite(owned, total)
 }
 
+func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
+	if owned == nil {
+		return 0, nil
+	}
+	size := owned.Len()
+	if size == 0 {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, nil
+	}
+	if conn.isClosing() {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, net.ErrClosed
+	}
+	if conn.loop.inLoop() && conn.queuedWrites.Load() == 0 {
+		if conn.isDatagram() {
+			defer bytebuf.ReleaseBuffer(owned)
+			return conn.sendUDPOnLoop(owned.Bytes())
+		}
+		return conn.writeOwnedOnLoop(owned, size)
+	}
+	return conn.queueOwnedWrite(owned, size)
+}
+
 func (conn *fdConn) precheckQueuedWrite(size int) error {
 	// queueOwnedWrite repeats these checks after cloning to close races.
 	if limit := conn.events.MaxPendingWrites; limit > 0 && conn.queuedWrites.Load() >= int64(limit) {
@@ -142,7 +165,7 @@ func (conn *fdConn) reservePending(size int64) bool {
 }
 
 func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
-	if conn.isUDP {
+	if conn.isDatagram() {
 		return conn.sendUDPOnLoop(data)
 	}
 	threshold := conn.events.WriteBufferedThreshold
@@ -164,7 +187,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		if isWouldBlock(err) {
 			written, err = 0, nil
 		} else {
-			conn.requestClose(err)
+			conn.failDirectWrite(err)
 			return written, err
 		}
 	}
@@ -174,6 +197,9 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	}
 	remaining := data[written:]
 	if !conn.reservePending(int64(len(remaining))) {
+		if written > 0 {
+			conn.failDirectWrite(ErrOutboundOverflow)
+		}
 		return written, ErrOutboundOverflow
 	}
 	// Only the unsent suffix must survive after Write returns.
@@ -183,7 +209,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 }
 
 func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
-	if conn.isUDP {
+	if conn.isDatagram() {
 		return 0, errUnsupported
 	}
 	threshold := conn.events.WriteBufferedThreshold
@@ -202,7 +228,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		if isWouldBlock(err) {
 			written, err = 0, nil
 		} else {
-			conn.requestClose(err)
+			conn.failDirectWrite(err)
 			return written, err
 		}
 	}
@@ -212,6 +238,9 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	}
 	remaining := total - written
 	if !conn.reservePending(int64(remaining)) {
+		if written > 0 {
+			conn.failDirectWrite(ErrOutboundOverflow)
+		}
 		return written, ErrOutboundOverflow
 	}
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
@@ -220,11 +249,56 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	return total, nil
 }
 
+func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
+	threshold := conn.events.WriteBufferedThreshold
+	if !conn.outbound.Empty() || (threshold > 0 && size < threshold) {
+		if !conn.reservePending(int64(size)) {
+			bytebuf.ReleaseBuffer(owned)
+			return 0, ErrOutboundOverflow
+		}
+		conn.outbound.AppendOwned(owned)
+		return size, nil
+	}
+
+	written, err := syscall.Write(conn.fd, owned.Bytes())
+	if written < 0 {
+		written = 0
+	}
+	if err != nil {
+		if isWouldBlock(err) {
+			written, err = 0, nil
+		} else {
+			bytebuf.ReleaseBuffer(owned)
+			conn.failDirectWrite(err)
+			return written, err
+		}
+	}
+	conn.events.onSocketBytesWrite(conn, written)
+	if written == size {
+		bytebuf.ReleaseBuffer(owned)
+		return written, nil
+	}
+	remaining := size - written
+	if !conn.reservePending(int64(remaining)) {
+		bytebuf.ReleaseBuffer(owned)
+		if written > 0 {
+			conn.failDirectWrite(ErrOutboundOverflow)
+		}
+		return written, ErrOutboundOverflow
+	}
+	if written > 0 {
+		owned.Discard(written)
+	}
+	conn.outbound.AppendOwned(owned)
+	conn.writeBlocked = written == 0
+	return size, nil
+}
+
 func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
-	if conn.rUDPAddr == nil {
+	if conn.udp.remote == nil {
 		written, err = syscall.Write(conn.fd, data)
 	} else {
-		err = syscall.Sendto(conn.fd, data, 0, conn.rUDPAddr)
+		err = syscall.Sendto(conn.fd, data, 0, conn.udp.remote)
 		if err == nil {
 			written = len(data)
 		}
@@ -253,6 +327,13 @@ func isUDPSendBlocked(err error) bool {
 	return isWouldBlock(err) || err == syscall.ENOBUFS
 }
 
+func (conn *fdConn) failDirectWrite(err error) {
+	// Once a syscall has made the byte stream unusable, queued writes must not
+	// be appended ahead of the close task or flushed during close.
+	conn.writeFailed = true
+	conn.requestClose(err)
+}
+
 func (conn *fdConn) runWriteTask(t *task) {
 	conn.queuedWrites.Add(-1)
 	size := t.buf.Len()
@@ -260,7 +341,12 @@ func (conn *fdConn) runWriteTask(t *task) {
 		conn.pending.Add(-int64(size))
 		return
 	}
-	if conn.isUDP {
+	if conn.writeFailed {
+		// Keep accepted bytes pending until close reports them as unflushed;
+		// releaseTask still releases the task's owned buffer immediately.
+		return
+	}
+	if conn.isDatagram() {
 		data := t.buf.Bytes()
 		written, err := conn.sendUDPOnLoop(data)
 		conn.pending.Add(-int64(written))
@@ -311,7 +397,7 @@ func (conn *fdConn) runFlushTask() error {
 }
 
 func (conn *fdConn) flushOnLoop() (int, error) {
-	if conn.isUDP || conn.outbound.Empty() {
+	if conn.isDatagram() || conn.outbound.Empty() {
 		return 0, nil
 	}
 	if conn.writeBlocked {
@@ -346,14 +432,14 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 }
 
 func (conn *fdConn) updateInterest() error {
-	if conn.closed || conn.udpSvr != nil {
+	if conn.closed || (conn.udp != nil && conn.udp.server != nil) {
 		return nil
 	}
 	want := conn.desiredInterest()
 	if want == conn.interest {
 		return nil
 	}
-	if err := conn.loop.poller.Watch(conn.fd, want); err != nil {
+	if err := conn.loop.poller.Modify(conn.fd, conn.interest, want); err != nil {
 		return err
 	}
 	conn.interest = want
@@ -361,7 +447,7 @@ func (conn *fdConn) updateInterest() error {
 }
 
 func (conn *fdConn) desiredInterest() poller.Interest {
-	if conn.isUDP {
+	if conn.isDatagram() {
 		return poller.Readable
 	}
 	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {

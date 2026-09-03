@@ -49,20 +49,20 @@ func TestNetPollerRegistrationAndDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.AddReadWrite(fds[0]); err != nil {
+	if err = poller.Add(fds[0], Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.ModReadWrite(fds[0]); err != nil {
+	if err = poller.Modify(fds[0], Readable|Writable, Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.ModWrite(fds[0]); err != nil {
+	if err = poller.Modify(fds[0], Readable|Writable, Writable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.ModRead(fds[0]); err != nil {
+	if err = poller.Modify(fds[0], Writable, Readable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.AddRead(-1); err == nil {
-		t.Fatal("AddRead(-1) succeeded")
+	if err = poller.Add(-1, Readable); err == nil {
+		t.Fatal("Add(-1) succeeded")
 	}
 
 	handler := newUnixTestHandler()
@@ -132,7 +132,7 @@ func TestNetPollerCloseBeforeServe(t *testing.T) {
 	}
 }
 
-func TestNetPollerDeclarativeInterestAndWake(t *testing.T) {
+func TestNetPollerInterestLifecycleAndWake(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -145,19 +145,16 @@ func TestNetPollerDeclarativeInterestAndWake(t *testing.T) {
 	}
 	defer poller.Close(nil)
 
-	if err = poller.Watch(fds[0], Readable); err != nil {
+	if err = poller.Add(fds[0], Readable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.Watch(fds[0], Readable); err != nil {
-		t.Fatalf("idempotent Watch failed: %v", err)
-	}
-	if err = poller.Unwatch(fds[0]); err != nil {
+	if err = poller.Remove(fds[0], Readable); err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.Unwatch(fds[0]); err != nil {
-		t.Fatalf("idempotent Unwatch failed: %v", err)
+	if err = poller.Remove(fds[0], Readable); err != nil {
+		t.Fatalf("idempotent Remove failed: %v", err)
 	}
-	if err = poller.Watch(fds[0], Readable); err != nil {
+	if err = poller.Add(fds[0], Readable); err != nil {
 		t.Fatal(err)
 	}
 
@@ -197,8 +194,8 @@ func TestNetPollerValidationAndClosedOperations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = poller.Watch(fds[0], 0); !errors.Is(err, errInvalidInterest) {
-		t.Fatalf("Watch empty interest error = %v", err)
+	if err = poller.Add(fds[0], 0); !errors.Is(err, errInvalidInterest) {
+		t.Fatalf("Add empty interest error = %v", err)
 	}
 	if err = poller.closeError(); err != nil {
 		t.Fatalf("closeError before Close = %v", err)
@@ -213,11 +210,11 @@ func TestNetPollerValidationAndClosedOperations(t *testing.T) {
 	if !poller.Closed() {
 		t.Fatal("Closed returned false")
 	}
-	if err = poller.Watch(fds[0], Readable); !errors.Is(err, closeErr) {
-		t.Fatalf("Watch after Close error = %v", err)
+	if err = poller.Add(fds[0], Readable); !errors.Is(err, closeErr) {
+		t.Fatalf("Add after Close error = %v", err)
 	}
-	if err = poller.Unwatch(fds[0]); err != nil {
-		t.Fatalf("Unwatch after Close error = %v", err)
+	if err = poller.Remove(fds[0], Readable); err != nil {
+		t.Fatalf("Remove after Close error = %v", err)
 	}
 	if err = poller.Wake(); err != nil {
 		t.Fatalf("Wake after Close error = %v", err)
@@ -240,7 +237,7 @@ func TestNetPollerWaitModesAndEventMasks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer poller.Close(nil)
-	if err = poller.Watch(fds[0], Readable); err != nil {
+	if err = poller.Add(fds[0], Readable); err != nil {
 		t.Fatal(err)
 	}
 	var events [1]Event
@@ -258,13 +255,13 @@ func TestNetPollerWaitModesAndEventMasks(t *testing.T) {
 	}
 	var buffer [1]byte
 	_, _ = unix.Read(fds[0], buffer[:])
-	if err = poller.Watch(fds[0], Readable|Writable); err != nil {
+	if err = poller.Modify(fds[0], Readable, Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
 	if n, waitErr := poller.Wait(events[:], 100); n != 1 || waitErr != nil || events[0].Events&WriteEvents == 0 {
 		t.Fatalf("writable Wait = %#v, %v", events[:n], waitErr)
 	}
-	if err = poller.Unwatch(fds[0]); err != nil {
+	if err = poller.Remove(fds[0], Readable|Writable); err != nil {
 		t.Fatal(err)
 	}
 }

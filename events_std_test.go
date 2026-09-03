@@ -3,6 +3,7 @@
 package uio
 
 import (
+	"bytes"
 	"errors"
 	"io"
 	"net"
@@ -22,6 +23,9 @@ type stdRegistrationConn struct {
 	orderViolation atomic.Bool
 	readActive     atomic.Int32
 	maxReadActive  atomic.Int32
+	readCalls      atomic.Int32
+	secondRead     chan struct{}
+	secondReadOnce sync.Once
 	writeCalls     atomic.Int32
 	writeStarted   chan struct{}
 	writeRelease   chan struct{}
@@ -36,6 +40,9 @@ func newStdRegistrationConn(fd uintptr) *stdRegistrationConn {
 }
 
 func (conn *stdRegistrationConn) Read(buffer []byte) (int, error) {
+	if conn.readCalls.Add(1) == 2 && conn.secondRead != nil {
+		conn.secondReadOnce.Do(func() { close(conn.secondRead) })
+	}
 	active := conn.readActive.Add(1)
 	defer conn.readActive.Add(-1)
 	for maximum := conn.maxReadActive.Load(); active > maximum; maximum = conn.maxReadActive.Load() {
@@ -282,7 +289,7 @@ func TestStdRegisterBurstAndClose(t *testing.T) {
 	}
 }
 
-func TestStdCloseInterruptsBlockedFlush(t *testing.T) {
+func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
 	events.OnOpen = func(conn Conn) {
 		conn.(*fdConn).conn.(*stdRegistrationConn).openReturned.Store(true)
@@ -309,15 +316,23 @@ func TestStdCloseInterruptsBlockedFlush(t *testing.T) {
 		t.Fatal("register task did not return")
 	}
 
-	conn.mux.Lock()
-	_, _ = conn.outbound.Write([]byte("blocked"))
-	conn.mux.Unlock()
-	flushDone := make(chan error, 1)
-	go func() { flushDone <- conn.Flush() }()
+	if n, err := conn.Write([]byte("blocked")); err != nil || n != len("blocked") {
+		t.Fatalf("Write = %d, %v", n, err)
+	}
 	select {
 	case <-raw.writeStarted:
 	case <-time.After(time.Second):
-		t.Fatal("Flush did not enter the blocking write")
+		t.Fatal("write loop did not enter the blocking write")
+	}
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- conn.Flush() }()
+	select {
+	case err := <-flushDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Flush waited for blocking socket I/O")
 	}
 
 	type writeResult struct {
@@ -381,14 +396,6 @@ func TestStdCloseInterruptsBlockedFlush(t *testing.T) {
 			t.Fatal("Close or Serve did not return within one second")
 		}
 	}
-	select {
-	case err := <-flushDone:
-		if !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("Flush error = %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Flush did not return after socket close")
-	}
 	if buffered := conn.OutboundBuffered(); buffered != 0 {
 		t.Fatalf("outbound bytes after Close = %d", buffered)
 	}
@@ -418,6 +425,87 @@ func TestStdWritevCopiesBeforeReturnAndDoesNotRetainVector(t *testing.T) {
 	}
 }
 
+func TestStdLargeWritevUsesOwnedBuffersAndSmallWritesCoalesce(t *testing.T) {
+	t.Run("large Writev", func(t *testing.T) {
+		conn := &fdConn{
+			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			writeSig:   make(chan struct{}, 1),
+		}
+		header := []byte("header")
+		payload := bytes.Repeat([]byte{'p'}, stdOwnedWriteThreshold)
+		want := append(append([]byte(nil), header...), payload...)
+		if n, err := conn.Writev([][]byte{header, payload}); err != nil || n != len(want) {
+			t.Fatalf("Writev = %d, %v", n, err)
+		}
+		clear(header)
+		clear(payload)
+
+		conn.mux.Lock()
+		var storage [8][]byte
+		buffers, size := conn.outbound.PeekVecN(storage[:0], len(storage))
+		var got []byte
+		for _, buffer := range buffers {
+			got = append(got, buffer...)
+		}
+		conn.outbound.Reset()
+		conn.mux.Unlock()
+		if len(buffers) != 2 || size != len(want) {
+			t.Fatalf("outbound vectors/bytes = %d/%d, want 2/%d", len(buffers), size, len(want))
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatal("owned Writev did not retain its payload copy")
+		}
+	})
+
+	t.Run("small writes", func(t *testing.T) {
+		conn := &fdConn{
+			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			writeSig:   make(chan struct{}, 1),
+		}
+		if _, err := conn.Write([]byte{'a'}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte{'b'}); err != nil {
+			t.Fatal(err)
+		}
+		conn.mux.Lock()
+		var storage [8][]byte
+		buffers, size := conn.outbound.PeekVecN(storage[:0], len(storage))
+		var got []byte
+		if len(buffers) > 0 {
+			got = append(got, buffers[0]...)
+		}
+		conn.outbound.Reset()
+		conn.mux.Unlock()
+		if len(buffers) != 1 || size != 2 || string(got) != "ab" {
+			t.Fatalf("small-write vectors/bytes/payload = %d/%d/%q", len(buffers), size, got)
+		}
+	})
+
+	t.Run("many tiny vectors", func(t *testing.T) {
+		conn := &fdConn{
+			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			writeSig:   make(chan struct{}, 1),
+		}
+		vec := make([][]byte, stdOwnedWriteThreshold)
+		for index := range vec {
+			vec[index] = []byte{'x'}
+		}
+		if n, err := conn.Writev(vec); err != nil || n != len(vec) {
+			t.Fatalf("Writev = %d, %v", n, err)
+		}
+		conn.mux.Lock()
+		var storage [8][]byte
+		buffers, size := conn.outbound.PeekVecN(storage[:0], len(storage))
+		capacity := conn.outbound.Cap()
+		conn.outbound.Reset()
+		conn.mux.Unlock()
+		if len(buffers) != 1 || size != len(vec) || capacity > 2*len(vec) {
+			t.Fatalf("tiny-vector buffers/bytes/capacity = %d/%d/%d", len(buffers), size, capacity)
+		}
+	})
+}
+
 func BenchmarkStdWritev1MiB(b *testing.B) {
 	conn := &fdConn{
 		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
@@ -437,6 +525,130 @@ func BenchmarkStdWritev1MiB(b *testing.B) {
 		conn.mux.Lock()
 		conn.outbound.Reset()
 		conn.mux.Unlock()
+	}
+}
+
+func BenchmarkStdConcurrentWritev64KiB(b *testing.B) {
+	header := make([]byte, 10)
+	payload := make([]byte, 64<<10)
+	vec := [][]byte{header, payload}
+	wireSize := len(header) + len(payload)
+
+	for _, benchmark := range []struct {
+		name  string
+		write func(*fdConn)
+	}{
+		{
+			name: "owned-outside-lock",
+			write: func(conn *fdConn) {
+				if n, err := conn.Writev(vec); err != nil || n != wireSize {
+					panic("Writev failed")
+				}
+				conn.mux.Lock()
+				conn.outbound.Reset()
+				conn.mux.Unlock()
+			},
+		},
+		{
+			name: "copy-under-lock",
+			write: func(conn *fdConn) {
+				conn.mux.Lock()
+				_, _ = conn.outbound.Writev(vec)
+				conn.outbound.Reset()
+				conn.mux.Unlock()
+			},
+		},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			conn := &fdConn{
+				commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+				writeSig:   make(chan struct{}, 1),
+			}
+			b.ReportAllocs()
+			b.SetBytes(int64(wireSize))
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					benchmark.write(conn)
+				}
+			})
+		})
+	}
+}
+
+func BenchmarkStdWriteOwned1MiB(b *testing.B) {
+	conn := &fdConn{
+		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		writeSig:   make(chan struct{}, 1),
+	}
+	payload := make([]byte, 1<<20)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for range b.N {
+		buffer := AcquireBuffer(len(payload))
+		_, _ = buffer.Write(payload)
+		if n, err := conn.WriteOwned(buffer); err != nil || n != len(payload) {
+			b.Fatalf("WriteOwned() = %d, %v", n, err)
+		}
+		conn.mux.Lock()
+		conn.outbound.Reset()
+		conn.mux.Unlock()
+		select {
+		case <-conn.writeSig:
+		default:
+		}
+	}
+}
+
+func TestStdWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
+	conn := &fdConn{
+		commonConn: commonConn{events: &Events{MaxOutboundBuffered: 16}},
+		writeSig:   make(chan struct{}, 1),
+	}
+	buffer := AcquireBuffer(8)
+	dst := buffer.AvailableBuffer()[:8]
+	encoded := &dst[0]
+	buffer.CommitWrite(copy(dst, "payload"))
+	n, err := conn.WriteOwned(buffer)
+	if err != nil || n != 7 {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	peeked := conn.outbound.Peek(make([]byte, 7))
+	if string(peeked) != "payload" || &peeked[0] != encoded {
+		t.Fatal("owned write was copied before entering outbound")
+	}
+	conn.outbound.Reset()
+}
+
+func TestStdUDPWriteOwnedSendsOneDatagram(t *testing.T) {
+	receiver, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := net.DialUDP("udp", nil, receiver.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sender.Close()
+	conn := &fdConn{udp: sender}
+	conn.events = &Events{}
+
+	buffer := AcquireBuffer(8)
+	_, _ = buffer.WriteString("datagram")
+	if n, err := conn.WriteOwned(buffer); err != nil || n != 8 {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	if err = receiver.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	received := make([]byte, 16)
+	n, _, err := receiver.ReadFromUDP(received)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(received[:n]); got != "datagram" {
+		t.Fatalf("datagram = %q, want datagram", got)
 	}
 }
 
@@ -461,13 +673,24 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 	conn := &fdConn{
 		conn: raw, writeSig: make(chan struct{}, 1), closeSig: make(chan struct{}),
 	}
-	conn.events = &Events{MaxOutboundBuffered: 2}
+	conn.events = &Events{MaxOutboundBuffered: 3}
+	writeLoopDone := make(chan struct{})
+	go func() {
+		conn.writeLoop()
+		close(writeLoopDone)
+	}()
+	defer func() {
+		close(conn.closeSig)
+		select {
+		case <-writeLoopDone:
+		case <-time.After(time.Second):
+			t.Error("write loop did not stop")
+		}
+	}()
 
 	if n, err := conn.Write([]byte("A")); err != nil || n != 1 {
 		t.Fatalf("first Write = %d, %v", n, err)
 	}
-	flushDone := make(chan error, 1)
-	go func() { flushDone <- conn.Flush() }()
 	select {
 	case <-writeStarted:
 	case <-time.After(time.Second):
@@ -492,32 +715,62 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 	if buffered := conn.OutboundBuffered(); buffered != 2 {
 		t.Fatalf("OutboundBuffered during write = %d, want 2", buffered)
 	}
-	if n, err := conn.Write([]byte("C")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
-		t.Fatalf("overflow Write = %d, %v", n, err)
-	}
-	close(writeRelease)
+	flushDone := make(chan error, 1)
+	go func() { flushDone <- conn.Flush() }()
 	select {
 	case err := <-flushDone:
 		if err != nil {
 			t.Fatal(err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("first Flush did not return")
+		t.Fatal("Flush waited for the blocked writer")
 	}
-	if buffered := conn.OutboundBuffered(); buffered != 1 {
-		t.Fatalf("OutboundBuffered after first Flush = %d, want 1", buffered)
+	if n, err := conn.Write([]byte("C")); err != nil || n != 1 {
+		t.Fatalf("post-Flush Write = %d, %v", n, err)
 	}
+	if n, err := conn.Write([]byte("D")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("overflow Write = %d, %v", n, err)
+	}
+	close(writeRelease)
+	deadline := time.Now().Add(time.Second)
+	for {
+		receivedMu.Lock()
+		got := string(received)
+		receivedMu.Unlock()
+		buffered := conn.OutboundBuffered()
+		if got == "ABC" && buffered == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("socket received %q with %d buffered bytes, want ABC/0", got, buffered)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestStdFlushCoalescesWakeWithoutAllocating(t *testing.T) {
+	conn := &fdConn{writeSig: make(chan struct{}, 1)}
+	conn.events = &Events{}
+
 	if err := conn.Flush(); err != nil {
 		t.Fatal(err)
 	}
-	receivedMu.Lock()
-	got := string(received)
-	receivedMu.Unlock()
-	if got != "AB" {
-		t.Fatalf("socket received %q, want AB", got)
+	if len(conn.writeSig) != 1 {
+		t.Fatal("Flush did not signal the write loop")
 	}
-	if buffered := conn.OutboundBuffered(); buffered != 0 {
-		t.Fatalf("OutboundBuffered after second Flush = %d", buffered)
+
+	var flushErr error
+	allocations := testing.AllocsPerRun(1000, func() {
+		flushErr = conn.Flush()
+	})
+	if flushErr != nil {
+		t.Fatal(flushErr)
+	}
+	if allocations != 0 {
+		t.Fatalf("Flush allocations = %.2f, want 0", allocations)
+	}
+	if len(conn.writeSig) != 1 {
+		t.Fatal("Flush did not coalesce write-loop wakeups")
 	}
 }
 
@@ -635,5 +888,124 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("stdio Serve did not stop")
+	}
+}
+
+func TestStdExternalCloseWaitsForLifetimeCallback(t *testing.T) {
+	started := make(chan string, 1)
+	callbackEntered := make(chan bool, 1)
+	releaseCallback := make(chan struct{})
+	shutdownErr := errors.New("external close during std callback")
+	var callbackOnce sync.Once
+
+	events := &Events{Pollers: 1}
+	events.OnStart = func(events *Events) {
+		events.acceptor.mux.Lock()
+		defer events.acceptor.mux.Unlock()
+		for _, listener := range events.acceptor.listeners {
+			started <- listener.ln.Addr().String()
+			return
+		}
+	}
+	events.OnData = func(conn Conn) error {
+		callbackOnce.Do(func() {
+			_, registered := events.callbackGoids.Load(currentGoroutineID())
+			callbackEntered <- registered
+			<-releaseCallback
+		})
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+	client, err := net.Dial("tcp", <-started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err = client.Write([]byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	if registered := <-callbackEntered; !registered {
+		t.Fatal("read goroutine was not registered for callback-safe Close")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- events.Close(shutdownErr) }()
+	select {
+	case <-closeDone:
+		t.Fatal("external Events.Close returned while OnData was blocked")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(releaseCallback)
+
+	select {
+	case err = <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("external Events.Close did not finish after OnData returned")
+	}
+	select {
+	case err = <-serveDone:
+		if !errors.Is(err, shutdownErr) {
+			t.Fatalf("Serve error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Serve did not stop")
+	}
+
+	entries := 0
+	events.callbackGoids.Range(func(_, _ any) bool {
+		entries++
+		return true
+	})
+	if entries != 0 {
+		t.Fatalf("callback goroutine entries after shutdown = %d", entries)
+	}
+}
+
+func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
+	raw := newStdRegistrationConn(30004)
+	raw.openReturned.Store(true)
+	raw.secondRead = make(chan struct{})
+	events := &Events{MaxBufferSize: 64}
+	callbackID := make(chan int64, 1)
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(-1)
+		callbackID <- currentGoroutineID()
+		return nil
+	}
+	conn := &fdConn{conn: raw}
+	conn.events = events
+	readDone := make(chan struct{})
+	go func() {
+		conn.readLoop()
+		close(readDone)
+	}()
+
+	raw.readData <- []byte("first")
+	id := <-callbackID
+	select {
+	case <-raw.secondRead:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not start its second read")
+	}
+	if _, registered := events.callbackGoids.Load(id); !registered {
+		t.Fatal("callback goroutine was unregistered between reads")
+	}
+
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-readDone:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not exit")
+	}
+	if _, registered := events.callbackGoids.Load(id); registered {
+		t.Fatal("callback goroutine remained registered after read loop exit")
 	}
 }

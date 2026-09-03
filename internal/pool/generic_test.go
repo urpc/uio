@@ -5,27 +5,28 @@ import "testing"
 func TestGenericPoolGet(t *testing.T) {
 	for _, test := range []struct {
 		name     string
-		min, max int
+		capacity int
 		get      int
 		expSize  int
 	}{
 		{
-			max:     32,
-			get:     10,
-			expSize: 16,
+			capacity: 32,
+			get:      10,
+			expSize:  16,
 		},
 		{
-			max:     16,
-			get:     10,
-			expSize: 16,
+			capacity: 16,
+			get:      10,
+			expSize:  16,
 		},
-		{max: 65536, get: 1, expSize: 512},
-		{max: 65536, get: 512, expSize: 512},
-		{max: 65536, get: 513, expSize: 1024},
-		{max: 65536, get: 65536, expSize: 65536},
+		{capacity: 65536, get: 1, expSize: 512},
+		{capacity: 65536, get: 512, expSize: 512},
+		{capacity: 65536, get: 513, expSize: 1024},
+		{capacity: 65536, get: 65536, expSize: 65536},
+		{capacity: 65536, get: 65537, expSize: 65537},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			p := New[struct{}](test.max)
+			p := New[struct{}](test.capacity)
 			_, n := p.Get(test.get)
 			if n != test.expSize {
 				t.Errorf("Get(%d) = _, %d; want %d", test.get, n, test.expSize)

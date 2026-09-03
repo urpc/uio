@@ -12,15 +12,24 @@ import (
 // Unix fds are small integers, so all event loops can share one direct index.
 const UseSingleInstance = true
 
-var MaxOpenFiles = 1_000_000
+const maxOpenFilesCeiling = 1 << 20
+
+// MaxOpenFiles covers the conventional Unix per-process fd ceiling. It is
+// reduced to the process soft limit during initialization when necessary.
+var MaxOpenFiles = maxOpenFilesCeiling
 
 func init() {
 	var limit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &limit); err == nil {
-		if n := int(limit.Max); n > 0 && n < MaxOpenFiles {
-			MaxOpenFiles = n
-		}
+		MaxOpenFiles = openFileCapacity(uint64(limit.Cur))
 	}
+}
+
+func openFileCapacity(limit uint64) int {
+	if limit > 0 && limit < maxOpenFilesCeiling {
+		return int(limit)
+	}
+	return maxOpenFilesCeiling
 }
 
 type Map[V any] struct {

@@ -7,6 +7,22 @@ import (
 	"testing"
 )
 
+func TestOpenFileCapacity(t *testing.T) {
+	for _, test := range []struct {
+		limit uint64
+		want  int
+	}{
+		{limit: 0, want: maxOpenFilesCeiling},
+		{limit: 1024, want: 1024},
+		{limit: maxOpenFilesCeiling, want: maxOpenFilesCeiling},
+		{limit: maxOpenFilesCeiling * 2, want: maxOpenFilesCeiling},
+	} {
+		if got := openFileCapacity(test.limit); got != test.want {
+			t.Fatalf("openFileCapacity(%d) = %d, want %d", test.limit, got, test.want)
+		}
+	}
+}
+
 func TestMapClear(t *testing.T) {
 	mapping := NewMap[int]()
 	first, second := 1, 2

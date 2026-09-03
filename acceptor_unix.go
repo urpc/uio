@@ -134,20 +134,21 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.fd = l.fd
 		// The logical UDP server takes ownership of the duplicated poller fd.
-		l.udpSvr.fdFile = l.file
+		l.udpSvr.udp = &unixUDPState{
+			file:  l.file,
+			peers: make(map[socket.UDPAddress]*fdConn),
+		}
 		l.file = nil
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
-		l.udpSvr.isUDP = true
 		l.udpSvr.internal = true
-		l.udpSvr.udpConns = make(map[socket.UDPAddress]*fdConn)
 		l.udpSvr.localAddr = l.laddr
 
 		if err = ld.loop.fdMap.Put(l.fd, l.udpSvr); err != nil {
 			l.udpSvr.closeUnregistered()
 			return err
 		}
-		if err = ld.loop.poller.Watch(l.fd, poller.Readable); err != nil {
+		if err = ld.loop.poller.Add(l.fd, poller.Readable); err != nil {
 			ld.loop.fdMap.Delete(l.fd)
 			return err
 		}

@@ -93,6 +93,9 @@ func TestCommonConnPeekVariants(t *testing.T) {
 	if got := string(conn.Peek(make([]byte, 2))); got != "ta" {
 		t.Fatalf("tail Peek = %q", got)
 	}
+	if got := string(conn.PeekChunk()); got != "tail" {
+		t.Fatalf("tail PeekChunk = %q", got)
+	}
 
 	conn = &commonConn{inboundTail: []byte("cd")}
 	_, _ = conn.inbound.WriteString("ab")
@@ -102,6 +105,12 @@ func TestCommonConnPeekVariants(t *testing.T) {
 	}
 	if got := string(conn.Peek(buffer[:1])); got != "a" {
 		t.Fatalf("buffer-only Peek = %q", got)
+	}
+	if got := string(conn.PeekChunk()); got != "ab" {
+		t.Fatalf("buffer-first PeekChunk = %q", got)
+	}
+	if got := (&commonConn{}).PeekChunk(); got != nil {
+		t.Fatalf("empty PeekChunk = %q", got)
 	}
 }
 

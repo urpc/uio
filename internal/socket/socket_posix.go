@@ -105,7 +105,7 @@ func DupNetConn(conn net.Conn) (int, error) {
 
 	var newFd int
 	errCtrl := rc.Control(func(fd uintptr) {
-		newFd, err = syscall.Dup(int(fd))
+		newFd, err = Dup(int(fd))
 	})
 
 	if errCtrl != nil {

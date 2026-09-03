@@ -8,8 +8,8 @@ import (
 
 func TestLogarithmicRange(t *testing.T) {
 	for _, test := range []struct {
-		min, max int
-		exp      []int
+		start, end int
+		exp        []int
 	}{
 		{0, 8, []int{1, 2, 4, 8}},
 		{0, 7, []int{1, 2, 4}},
@@ -20,11 +20,11 @@ func TestLogarithmicRange(t *testing.T) {
 	} {
 		t.Run("", func(t *testing.T) {
 			var act []int
-			LogarithmicRange(test.min, test.max, func(n int) {
+			LogarithmicRange(test.start, test.end, func(n int) {
 				act = append(act, n)
 			})
 			if !reflect.DeepEqual(act, test.exp) {
-				t.Errorf("unexpected range from %d to %d: %v; want %v", test.min, test.max, act, test.exp)
+				t.Errorf("unexpected range from %d to %d: %v; want %v", test.start, test.end, act, test.exp)
 			}
 		})
 	}

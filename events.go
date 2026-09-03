@@ -38,13 +38,11 @@ type Events struct {
 	ready         atomic.Bool  // Dial is allowed only after full initialization
 	startGoid     atomic.Int64 // lets Close detect the synchronous OnStart path
 	callbackGoids sync.Map     // std callback goroutines currently outside loops
+	listenAddr    string
 
 	// Pollers is set up to start the given number of event-loop goroutine.
 	// The default value is runtime.NumCPU().
 	Pollers int
-
-	// Addrs is the listening addr list for a server.
-	Addrs []string
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
 	// The default value is false.
@@ -99,12 +97,20 @@ type Events struct {
 	OnStop func(ev *Events)
 }
 
+// Serve starts the event loops and optionally listens on one address. Calling
+// Serve without an address starts a dial-only Events. More than one address is
+// rejected.
 func (ev *Events) Serve(addrs ...string) (err error) {
+	if len(addrs) > 1 {
+		return ErrTooManyListenAddresses
+	}
 	if ev.closing.Load() {
 		return net.ErrClosed
 	}
-	// append listen address.
-	ev.Addrs = append(ev.Addrs, addrs...)
+	ev.listenAddr = ""
+	if len(addrs) == 1 {
+		ev.listenAddr = addrs[0]
+	}
 
 	// initialize events
 	if err = ev.initEvents(); nil != err {
@@ -282,8 +288,8 @@ func (ev *Events) initListeners() (err error) {
 		events: ev,
 	}
 
-	for _, addr := range ev.Addrs {
-		if err = ev.acceptor.addListen(addr); nil != err {
+	if ev.listenAddr != "" {
+		if err = ev.acceptor.addListen(ev.listenAddr); nil != err {
 			return err
 		}
 	}

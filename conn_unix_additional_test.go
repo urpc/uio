@@ -3,6 +3,7 @@
 package uio
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -19,6 +20,56 @@ import (
 	"github.com/urpc/uio/internal/taskqueue"
 	"golang.org/x/sys/unix"
 )
+
+func newPartialStreamWriter(t *testing.T) (writer, reader int) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.SetNonblock(fds[0], true); err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		t.Fatal(err)
+	}
+	if err = unix.SetNonblock(fds[1], true); err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		t.Fatal(err)
+	}
+	if err = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+		t.Fatal(err)
+	}
+	return fds[0], fds[1]
+}
+
+func readStreamToEOF(t *testing.T, fd int) []byte {
+	t.Helper()
+	var result []byte
+	buffer := make([]byte, 64*1024)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		n, err := unix.Read(fd, buffer)
+		if n > 0 {
+			result = append(result, buffer[:n]...)
+		}
+		if n == 0 && err == nil {
+			return result
+		}
+		if err == nil {
+			continue
+		}
+		if isWouldBlock(err) {
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		t.Fatal(err)
+	}
+	t.Fatal("stream did not reach EOF")
+	return nil
+}
 
 func TestUDPPeerKey(t *testing.T) {
 	key4 := socket.UDPAddress{Family: 4, Port: 1234}
@@ -48,12 +99,13 @@ func TestExistingUDPPeerPacketDoesNotAllocate(t *testing.T) {
 		},
 	}
 	loop := &eventLoop{}
-	server := &fdConn{fd: -1, isUDP: true, udpConns: make(map[socket.UDPAddress]*fdConn)}
+	loop.loopGoid.Store(currentGoroutineID())
+	server := &fdConn{fd: -1, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
 	server.events, server.loop = events, loop
 	source := socket.UDPAddress{Family: 4, Port: 1234}
 	copy(source.Addr[:4], []byte{127, 0, 0, 1})
 	server.handleUDPPacket([]byte("first"), source)
-	if opened != 1 || packets != 1 || len(server.udpConns) != 1 {
+	if opened != 1 || packets != 1 || len(server.udp.peers) != 1 {
 		t.Fatalf("first packet created %d peers and delivered %d packets", opened, packets)
 	}
 	next := []byte("next")
@@ -63,7 +115,7 @@ func TestExistingUDPPeerPacketDoesNotAllocate(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("existing UDP peer packet allocated %.2f objects/op", allocs)
 	}
-	if opened != 1 || packets != 1002 || len(server.udpConns) != 1 {
+	if opened != 1 || packets != 1002 || len(server.udp.peers) != 1 {
 		t.Fatalf("steady packets created %d peers and delivered %d packets", opened, packets)
 	}
 }
@@ -107,9 +159,9 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 		return nil
 	}}
 	loop := &eventLoop{buffer: make([]byte, 64)}
+	loop.loopGoid.Store(currentGoroutineID())
 	server := &fdConn{
-		fd: receiver, isUDP: true, interest: poller.Readable,
-		udpConns: make(map[socket.UDPAddress]*fdConn),
+		fd: receiver, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}, interest: poller.Readable,
 	}
 	server.events, server.loop = events, loop
 	payload := []byte{'x'}
@@ -139,8 +191,8 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 	if allocs != 0 {
 		t.Fatalf("full existing-peer receive path allocated %.2f objects/packet", allocs)
 	}
-	if packets != measuredPackets+2 || len(server.udpConns) != 1 {
-		t.Fatalf("received %d packets across %d peers", packets, len(server.udpConns))
+	if packets != measuredPackets+2 || len(server.udp.peers) != 1 {
+		t.Fatalf("received %d packets across %d peers", packets, len(server.udp.peers))
 	}
 }
 
@@ -154,7 +206,8 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 		return nil
 	}}
 	loop := &eventLoop{buffer: make([]byte, 64)}
-	conn := &fdConn{fd: receiver, isUDP: true, interest: poller.Readable}
+	loop.loopGoid.Store(currentGoroutineID())
+	conn := &fdConn{fd: receiver, udp: &unixUDPState{}, interest: poller.Readable}
 	conn.events, conn.loop = events, loop
 	for range 32 {
 		if err := unix.Sendto(sender, []byte{'x'}, 0, target); err != nil {
@@ -208,32 +261,40 @@ func TestUDPWouldBlockReportsUnflushedDatagram(t *testing.T) {
 	defer unix.Close(fds[1])
 	payload := fillDatagramSendBuffer(t, fds[0])
 
-	direct := &fdConn{fd: fds[0], isUDP: true}
+	direct := &fdConn{fd: fds[0], udp: &unixUDPState{}}
 	direct.events = &Events{}
-	if n, writeErr := direct.sendUDPOnLoop(payload); n != 0 || !isUDPSendBlocked(writeErr) {
-		t.Fatalf("direct UDP write = %d, %v", n, writeErr)
+	direct.loop = &eventLoop{}
+	direct.loop.loopGoid.Store(currentGoroutineID())
+	directBuffer := AcquireBuffer(len(payload))
+	_, _ = directBuffer.Write(payload)
+	if n, writeErr := direct.WriteOwned(directBuffer); n != 0 || !isUDPSendBlocked(writeErr) {
+		t.Fatalf("direct UDP WriteOwned = %d, %v", n, writeErr)
 	}
 	if direct.isClosing() {
 		t.Fatal("direct EAGAIN closed a datagram that was never accepted")
 	}
 
 	closed := make(chan error, 1)
-	events := &Events{OnClose: func(_ Conn, errorValue error) { closed <- errorValue }}
+	events := &Events{MaxPendingWrites: 1, OnClose: func(_ Conn, errorValue error) { closed <- errorValue }}
 	loop := &eventLoop{tasks: taskqueue.New[*task]()}
 	loop.wakePending.Store(true)
-	server := &fdConn{udpConns: make(map[socket.UDPAddress]*fdConn)}
-	conn := &fdConn{fd: fds[0], isUDP: true, udpSvr: server}
+	server := &fdConn{udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
+	conn := &fdConn{fd: fds[0], udp: &unixUDPState{server: server}}
 	conn.events, conn.loop = events, loop
-	server.udpConns[conn.udpKey] = conn
+	server.udp.peers[conn.udp.key] = conn
 	otherKey := socket.UDPAddress{Family: 4, Port: 1}
-	other := &fdConn{fd: fds[0], isUDP: true, udpSvr: server, udpKey: otherKey}
-	server.udpConns[otherKey] = other
-	conn.pending.Store(int64(len(payload)))
-	conn.queuedWrites.Store(1)
-	task := acquireTask(writeTask, conn)
-	task.buf = bytebuf.CloneBuffer(payload)
-	conn.runWriteTask(task)
-	releaseTask(task)
+	other := &fdConn{fd: fds[0], udp: &unixUDPState{server: server, key: otherKey}}
+	server.udp.peers[otherKey] = other
+	queuedBuffer := AcquireBuffer(len(payload))
+	_, _ = queuedBuffer.Write(payload)
+	if n, writeErr := conn.WriteOwned(queuedBuffer); n != len(payload) || writeErr != nil {
+		t.Fatalf("queued UDP WriteOwned = %d, %v", n, writeErr)
+	}
+	writeNode := loop.tasks.Drain()
+	if writeNode == nil || writeNode.TakeNext() != nil {
+		t.Fatal("UDP WriteOwned did not enqueue exactly one write task")
+	}
+	loop.runTask(writeNode.Value)
 	if conn.pending.Load() != int64(len(payload)) || conn.queuedWrites.Load() != 0 {
 		t.Fatalf("EAGAIN counters = pending %d, queued %d", conn.pending.Load(), conn.queuedWrites.Load())
 	}
@@ -250,8 +311,8 @@ func TestUDPWouldBlockReportsUnflushedDatagram(t *testing.T) {
 	if !errors.As(closeErr, &unflushed) || unflushed.Remaining != int64(len(payload)) {
 		t.Fatalf("UDP unflushed error = %#v", unflushed)
 	}
-	if conn.pending.Load() != 0 || len(server.udpConns) != 1 || server.udpConns[otherKey] != other {
-		t.Fatalf("closed UDP state = pending %d, peers %d", conn.pending.Load(), len(server.udpConns))
+	if conn.pending.Load() != 0 || len(server.udp.peers) != 1 || server.udp.peers[otherKey] != other {
+		t.Fatalf("closed UDP state = pending %d, peers %d", conn.pending.Load(), len(server.udp.peers))
 	}
 }
 
@@ -321,7 +382,7 @@ func TestCloseUnregisteredDescriptorOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer writeFile.Close()
-	conn = &fdConn{fdFile: readFile}
+	conn = &fdConn{udp: &unixUDPState{file: readFile}}
 	conn.closeUnregistered()
 	if _, err := readFile.Stat(); err == nil {
 		t.Fatal("owned file remained open")
@@ -355,6 +416,120 @@ func TestLoopDirectWritevAndFlush(t *testing.T) {
 	}
 	if got := string(readPeer(t, testConn.peer, 4)); got != "abcd" {
 		t.Fatalf("peer received %q", got)
+	}
+}
+
+func TestDirectPartialWriteOverflowAbortsStream(t *testing.T) {
+	payload := bytes.Repeat([]byte{'P'}, 8<<20)
+	tests := []struct {
+		name  string
+		write func(*fdConn, []byte) (int, error)
+	}{
+		{
+			name: "Write",
+			write: func(conn *fdConn, data []byte) (int, error) {
+				return conn.writeOnLoop(data)
+			},
+		},
+		{
+			name: "Writev",
+			write: func(conn *fdConn, data []byte) (int, error) {
+				middle := len(data) / 2
+				return conn.writevOnLoop([][]byte{data[:middle], data[middle:]}, len(data))
+			},
+		},
+		{
+			name: "WriteOwned",
+			write: func(conn *fdConn, data []byte) (int, error) {
+				owned := bytebuf.CloneBuffer(data)
+				return conn.writeOwnedOnLoop(owned, len(data))
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			writer, reader := newPartialStreamWriter(t)
+			defer unix.Close(reader)
+			writerOpen := true
+			defer func() {
+				if writerOpen {
+					_ = unix.Close(writer)
+				}
+			}()
+
+			closed := make(chan error, 1)
+			events := &Events{
+				MaxOutboundBuffered: 1,
+				MaxPendingWrites:    2,
+				OnClose: func(_ Conn, err error) {
+					closed <- err
+				},
+			}
+			if err := events.initConfig(); err != nil {
+				t.Fatal(err)
+			}
+			loop, err := newEventLoop(events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer loop.poller.Close(nil)
+			conn := &fdConn{fd: writer}
+			conn.events, conn.loop = events, loop
+
+			// Model an external producer winning submitMu after the callback chose
+			// the direct path but before its syscall returned.
+			marker := bytebuf.CloneBuffer([]byte{'M'})
+			if n, queueErr := conn.queueOwnedWrite(marker, 1); n != 1 || queueErr != nil {
+				t.Fatalf("queue marker = %d, %v", n, queueErr)
+			}
+
+			written, writeErr := test.write(conn, payload)
+			if !errors.Is(writeErr, ErrOutboundOverflow) {
+				t.Fatalf("partial write error = %v", writeErr)
+			}
+			if written <= 0 || written >= len(payload) {
+				t.Fatalf("write result = %d, want a partial write of %d bytes", written, len(payload))
+			}
+			if !conn.writeFailed || !conn.isClosing() {
+				t.Fatalf("failed stream state = writeFailed %v, closing %v", conn.writeFailed, conn.isClosing())
+			}
+
+			writeNode := loop.tasks.Drain()
+			if writeNode == nil || writeNode.Value.kind != writeTask {
+				t.Fatal("queued write task is missing")
+			}
+			closeNode := writeNode.TakeNext()
+			if closeNode == nil || closeNode.Value.kind != closeTask || closeNode.TakeNext() != nil {
+				t.Fatal("close task did not follow the queued write")
+			}
+			loop.runTask(writeNode.Value)
+			if conn.pending.Load() != 1 || !conn.outbound.Empty() {
+				t.Fatalf("discarded task left pending %d, outbound %d", conn.pending.Load(), conn.outbound.Len())
+			}
+			// A failed stream must not flush even if an earlier bug or callback
+			// leaves bytes in outbound before the close task runs.
+			_, _ = conn.outbound.Write([]byte{'N'})
+			conn.pending.Add(1)
+			loop.runTask(closeNode.Value)
+			writerOpen = false
+			closeErr := <-closed
+			var unflushed UnflushedError
+			if !errors.Is(closeErr, ErrOutboundOverflow) || !errors.As(closeErr, &unflushed) || unflushed.Remaining != 2 {
+				t.Fatalf("close error = %v", closeErr)
+			}
+
+			received := readStreamToEOF(t, reader)
+			if bytes.Contains(received, []byte{'M'}) || bytes.Contains(received, []byte{'N'}) {
+				t.Fatal("bytes queued after the partial frame reached the peer")
+			}
+			if len(received) != written || !bytes.Equal(received, payload[:written]) {
+				t.Fatalf("peer received %d bytes, want only the %d-byte direct prefix", len(received), written)
+			}
+			if conn.pending.Load() != 0 {
+				t.Fatalf("close left %d pending bytes", conn.pending.Load())
+			}
+		})
 	}
 }
 
@@ -400,13 +575,69 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	if err := conn.fireWriteEvent(); err != nil || conn.writeBlocked {
 		t.Fatalf("fireWriteEvent = %v, blocked %v", err, conn.writeBlocked)
 	}
-	conn.isUDP = true
+	conn.udp = &unixUDPState{}
 	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, errUnsupported) {
 		t.Fatalf("UDP Writev = %d, %v", n, err)
 	}
 	if err := conn.fireWriteEvent(); err != nil {
 		t.Fatalf("UDP fireWriteEvent = %v", err)
 	}
+}
+
+func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
+	loop := &eventLoop{}
+	loop.loopGoid.Store(currentGoroutineID())
+	conn := &fdConn{fd: -1}
+	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 16}
+	conn.loop = loop
+
+	buffer := AcquireBuffer(8)
+	dst := buffer.AvailableBuffer()[:8]
+	encoded := &dst[0]
+	buffer.CommitWrite(copy(dst, "payload"))
+	n, err := conn.WriteOwned(buffer)
+	if err != nil || n != 7 {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	peeked := conn.outbound.Peek(make([]byte, 7))
+	if string(peeked) != "payload" || &peeked[0] != encoded {
+		t.Fatal("owned write was copied before entering outbound")
+	}
+	if conn.OutboundBuffered() != 7 {
+		t.Fatalf("buffered bytes = %d, want 7", conn.OutboundBuffered())
+	}
+	conn.outbound.Reset()
+	conn.pending.Store(0)
+}
+
+func TestExternalWriteOwnedTransfersBufferThroughTask(t *testing.T) {
+	loop := &eventLoop{tasks: taskqueue.New[*task]()}
+	loop.wakePending.Store(true)
+	conn := &fdConn{fd: -1}
+	conn.events = &Events{MaxPendingWrites: 1, MaxOutboundBuffered: 16}
+	conn.loop = loop
+
+	buffer := AcquireBuffer(8)
+	dst := buffer.AvailableBuffer()[:8]
+	encoded := &dst[0]
+	buffer.CommitWrite(copy(dst, "payload"))
+	n, err := conn.WriteOwned(buffer)
+	if err != nil || n != 7 {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	batch := loop.tasks.Drain()
+	if batch == nil || batch.Value.buf == nil {
+		t.Fatal("owned write did not enqueue its buffer")
+	}
+	writeTask := batch.Value
+	conn.runWriteTask(writeTask)
+	releaseTask(writeTask)
+	peeked := conn.outbound.Peek(make([]byte, 7))
+	if string(peeked) != "payload" || &peeked[0] != encoded {
+		t.Fatal("write task copied its owned buffer")
+	}
+	conn.outbound.Reset()
+	conn.pending.Store(0)
 }
 
 func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
@@ -440,7 +671,7 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 
 	loop = &eventLoop{tasks: taskqueue.New[*task]()}
 	loop.wakePending.Store(true)
-	conn = &fdConn{fd: -1, isUDP: true}
+	conn = &fdConn{fd: -1, udp: &unixUDPState{}}
 	conn.events = &Events{MaxPendingWrites: 1}
 	conn.loop = loop
 	conn.queuedWrites.Store(1)
@@ -722,6 +953,10 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 	conn := &fdConn{fd: fds[0]}
 	conn.events = events
 	conn.loop = loop
+	if err := loop.poller.Add(conn.fd, poller.Readable); err != nil {
+		t.Fatal(err)
+	}
+	conn.setInterest(poller.Readable)
 	if err := loop.modRead(conn); err != nil {
 		t.Fatal(err)
 	}
@@ -945,17 +1180,18 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	rejectedClose.events = events
 	rejectedClose.loop = stopped
 	rejectedClose.requestClose(wantErr)
-	if !errors.Is(rejectedClose.deferredCloseErr, wantErr) {
+	if rejectedClose.deferredCloseErr == nil || !errors.Is(*rejectedClose.deferredCloseErr, wantErr) {
 		t.Fatalf("deferred close error = %v", rejectedClose.deferredCloseErr)
 	}
 
 	rejectedTimeout := &fdConn{fd: -1}
 	rejectedTimeout.events = events
 	rejectedTimeout.loop = stopped
-	rejectedTimeout.readTimerGen.Store(3)
+	rejectedTimeout.deadlines = &deadlineState{}
+	rejectedTimeout.deadlines.readTimerGen.Store(3)
 	rejectedTimeout.submitTimeout(deadlineRead)
-	rejectedTimeout.readGeneration = 3
-	rejectedTimeout.readDeadline = time.Now().Add(time.Hour)
+	rejectedTimeout.deadlines.readGeneration = 3
+	rejectedTimeout.deadlines.readDeadline = time.Now().Add(time.Hour)
 	rejectedTimeout.handleTimeout(deadlineRead, 2)
 	if rejectedTimeout.isClosing() {
 		t.Fatal("stale timeout closed the connection")

@@ -23,6 +23,7 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"syscall"
 )
 
 // Dial connects to the address on the named network.
@@ -43,6 +44,45 @@ import (
 //	Dial("unix:///path/your/unix.sock")
 func (ev *Events) Dial(addr string, userdata any) (Conn, error) {
 	return ev.DialContext(context.Background(), addr, userdata)
+}
+
+// Adopt transfers ownership of an established stream connection to ev. The
+// caller must not use conn after calling Adopt, including when Adopt returns an
+// error. ev must already be serving.
+func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
+	if conn == nil {
+		return nil, errUnsupported
+	}
+	if !ev.ready.Load() || ev.closing.Load() {
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
+	if _, ok := conn.(syscall.Conn); !ok {
+		_ = conn.Close()
+		return nil, errUnsupported
+	}
+
+	fdc := &fdConn{
+		commonConn: commonConn{
+			events:     ev,
+			localAddr:  conn.LocalAddr(),
+			remoteAddr: conn.RemoteAddr(),
+			userdata:   userdata,
+		},
+		conn:     conn,
+		writeSig: make(chan struct{}, 1),
+		closeSig: make(chan struct{}),
+	}
+	fd := fdc.Fd()
+	if fd < 0 {
+		fdc.closeUnregistered()
+		return nil, errUnsupported
+	}
+	fdc.loop = ev.selectLoop(fd)
+	if err := ev.addConn(fdc); err != nil {
+		return nil, err
+	}
+	return fdc, nil
 }
 
 // DialContext connects from outside event callbacks and allows cancellation

@@ -18,19 +18,47 @@ package bytebuf
 
 import "github.com/urpc/uio/internal/pool"
 
-// Payloads up to 64 KiB use size-classed pools; larger buffers are not kept.
-var bufferPool = pool.New[*Buffer](65536)
+type bufferPoolKind uint8
+
+const (
+	defaultBufferPool bufferPoolKind = iota
+	ownedBufferPool
+)
+
+// Ordinary copied payloads stay bounded at 64 KiB. Explicit owned buffers may
+// retain a frame up to 16 MiB without expanding retention for every Write.
+var bufferPool = pool.New[*Buffer](64 << 10)
+var largeOwnedBufferPool = pool.New[*Buffer](16 << 20)
 
 func getBuffer(capacity int) *Buffer {
-	buffer, n := bufferPool.Get(capacity)
+	return getBufferFrom(bufferPool, defaultBufferPool, capacity)
+}
+
+func getBufferFrom(owner *pool.Pool[*Buffer], kind bufferPoolKind, capacity int) *Buffer {
+	buffer, n := owner.Get(capacity)
 	if nil != buffer {
+		buffer.poolKind = kind
 		return buffer
 	}
-	return NewBuffer(make([]byte, 0, n))
+	buffer = NewBuffer(make([]byte, 0, n))
+	buffer.poolKind = kind
+	return buffer
+}
+
+// AcquireBuffer returns an empty pooled buffer with at least capacity bytes of
+// writable space. Release it with ReleaseBuffer when ownership is not
+// transferred to a CompositeBuffer.
+func AcquireBuffer(capacity int) *Buffer {
+	return getBufferFrom(largeOwnedBufferPool, ownedBufferPool, capacity)
 }
 
 func putBuffer(buffer *Buffer) {
+	kind := buffer.poolKind
 	buffer.Reset()
+	if kind == ownedBufferPool {
+		largeOwnedBufferPool.Put(buffer, buffer.Cap())
+		return
+	}
 	bufferPool.Put(buffer, buffer.Cap())
 }
 

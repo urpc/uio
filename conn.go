@@ -37,10 +37,12 @@ type Conn interface {
 	// RemoteAddr is the connection's remote address.
 	RemoteAddr() net.Addr
 
-	// Userdata returns user-defined connection data; it is not concurrency-safe.
+	// Userdata returns user-defined connection data. It may be called outside a
+	// callback, but callers must serialize it with SetUserdata.
 	Userdata() any
 
-	// SetUserdata replaces user-defined connection data; it is not concurrency-safe.
+	// SetUserdata replaces user-defined connection data. It may be called outside
+	// a callback, but callers must serialize it with Userdata.
 	SetUserdata(value any)
 
 	// SetLinger sets the behavior of Close on a connection which still
@@ -94,15 +96,20 @@ type Conn interface {
 	SetWriteDeadline(t time.Time) error
 
 	// Peek returns the next len(b) bytes without advancing the inbound buffer.
-	// it's not concurrency-safe.
+	// It may only be called from a connection callback.
 	Peek(b []byte) []byte
 
+	// PeekChunk returns the first contiguous inbound chunk without advancing it.
+	// The returned slice is valid only until Discard or the callback returns.
+	// It may only be called from a connection callback.
+	PeekChunk() []byte
+
 	// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
-	// it's not concurrency-safe.
+	// It may only be called from a connection callback.
 	Discard(n int) (int, error)
 
 	// InboundBuffered returns a inbound buffer data length.
-	// it's not concurrency-safe.
+	// It may only be called from a connection callback.
 	InboundBuffered() int
 
 	// OutboundBuffered returns accepted payload bytes not yet sent, including
@@ -110,12 +117,13 @@ type Conn interface {
 	OutboundBuffered() int
 
 	// WriterTo
-	// it's not concurrency-safe.
+	// It may only be called from a connection callback.
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.WriterTo
 
 	// ReadWriteCloser
-	// Read() it's not concurrency-safe.
+	// Read may only be called from a connection callback. Write and Close are
+	// safe from other goroutines.
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.ReadWriteCloser
 
@@ -131,8 +139,13 @@ type Conn interface {
 	// Notice: non-blocking interface, should not be used as you use std.
 	Writev(vec [][]byte) (int, error)
 
-	// Flush writes buffered data. On Unix, loop calls run immediately and other
-	// goroutines submit a FIFO barrier. The std path flushes synchronously.
+	// WriteOwned submits buffer without copying and always consumes its
+	// ownership, including when it returns an error. For UDP, one buffer is sent
+	// as one datagram.
+	WriteOwned(buffer *Buffer) (int, error)
+
+	// Flush schedules buffered data for writing without waiting for socket I/O.
+	// Writes accepted before Flush remain ordered before later writes.
 	Flush() error
 
 	// Wake schedules one OnData callback after previously submitted tasks.
@@ -146,11 +159,12 @@ type Conn interface {
 var errUnsupported = fmt.Errorf("unsupported method")
 
 var (
-	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
-	ErrInboundOverflow  = errors.New("uio: inbound buffer limit exceeded")
-	ErrTaskQueueFull    = errors.New("uio: pending write task limit exceeded")
-	ErrUnflushedData    = errors.New("uio: connection closed with unflushed data")
-	ErrDialOnEventLoop  = errors.New("uio: Dial cannot run on an event loop")
+	ErrOutboundOverflow       = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow        = errors.New("uio: inbound buffer limit exceeded")
+	ErrTaskQueueFull          = errors.New("uio: pending write task limit exceeded")
+	ErrUnflushedData          = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop        = errors.New("uio: Dial cannot run on an event loop")
+	ErrTooManyListenAddresses = errors.New("uio: Serve accepts at most one listen address")
 )
 
 // UnflushedError reports payload accepted by the framework but not sent before
@@ -185,6 +199,7 @@ func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupporte
 func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
 
 func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
+	fc.assertInboundAccess()
 	if !fc.inbound.Empty() {
 		n, err = fc.inbound.WriteTo(w)
 	}
@@ -200,6 +215,7 @@ func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (fc *commonConn) Read(b []byte) (n int, err error) {
+	fc.assertInboundAccess()
 	if !fc.inbound.Empty() {
 		if n, _ = fc.inbound.Read(b); n == len(b) {
 			return
@@ -215,6 +231,7 @@ func (fc *commonConn) Read(b []byte) (n int, err error) {
 }
 
 func (fc *commonConn) Peek(b []byte) []byte {
+	fc.assertInboundAccess()
 	// inbound buffer size
 	inboundLen := fc.inbound.Len()
 	inboundTailLen := len(fc.inboundTail)
@@ -237,7 +254,16 @@ func (fc *commonConn) Peek(b []byte) []byte {
 	return data
 }
 
+func (fc *commonConn) PeekChunk() []byte {
+	fc.assertInboundAccess()
+	if !fc.inbound.Empty() {
+		return fc.inbound.PeekChunk()
+	}
+	return fc.inboundTail
+}
+
 func (fc *commonConn) Discard(n int) (int, error) {
+	fc.assertInboundAccess()
 
 	// inbound buffer size
 	inboundLen := fc.inbound.Len()
@@ -268,5 +294,22 @@ func (fc *commonConn) Discard(n int) (int, error) {
 }
 
 func (fc *commonConn) InboundBuffered() int {
+	fc.assertInboundAccess()
 	return fc.inbound.Len() + len(fc.inboundTail)
+}
+
+func (fc *commonConn) assertInboundAccess() {
+	// Unregistered connections are used by low-level helpers and tests before an
+	// owner exists. Registered connections always have both fields.
+	if fc.loop == nil || fc.events == nil {
+		return
+	}
+	id := currentGoroutineID()
+	if owner := fc.loop.loopGoid.Load(); owner != 0 && owner == id {
+		return
+	}
+	if _, ok := fc.events.callbackGoids.Load(id); ok {
+		return
+	}
+	panic("uio: inbound access outside a connection callback")
 }

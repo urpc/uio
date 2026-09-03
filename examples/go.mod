@@ -1,6 +1,6 @@
 module github.com/urpc/uio/examples
 
-go 1.23.0
+go 1.25
 
 replace github.com/urpc/uio => ../
 

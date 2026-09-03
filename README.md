@@ -37,9 +37,6 @@ type Events struct {
 	// The default value is runtime.NumCPU().
 	Pollers int
 
-	// Addrs is the listening addr list for a server.
-	Addrs []string
-
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
 	// The default value is false.
 	ReusePort bool
@@ -102,6 +99,33 @@ Basic Echo Server
 connection setup. Calls from callbacks currently running on an event loop
 return `ErrDialOnEventLoop`; start the call from an external goroutine instead.
 Use `DialContext` when the operation needs cancellation or a deadline.
+`Events.Serve` accepts zero or one listening address. Call `Serve()` without an
+address when using an Events instance only for outbound dialing.
+
+`Events.Adopt` transfers an already-established stream connection into the
+event loops. The `Events` instance must already be serving, and ownership is
+consumed on both success and failure; the caller must never use the original
+`net.Conn` again after calling it.
+
+Inside a connection callback, `Conn.PeekChunk` exposes the first contiguous
+inbound chunk without copying it. Process the returned slice before calling
+`Discard`; the slice is invalid after `Discard` or after the callback returns.
+
+For encoders that can write into caller-provided storage, `AcquireBuffer` and
+`Conn.WriteOwned` avoid copying the encoded result into asynchronous outbound
+storage. `WriteOwned` consumes the buffer on both success and failure:
+
+```go
+buffer := uio.AcquireBuffer(size)
+dst := buffer.AvailableBuffer()[:size]
+n, err := encode(dst)
+if err != nil {
+	uio.ReleaseBuffer(buffer)
+	return err
+}
+buffer.CommitWrite(n)
+_, err = conn.WriteOwned(buffer)
+```
 
 ```go
 package main

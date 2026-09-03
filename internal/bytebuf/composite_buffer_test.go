@@ -626,6 +626,22 @@ func TestCompositeBuffer_Peek(t *testing.T) {
 	}
 }
 
+func TestCompositeBufferPeekChunk(t *testing.T) {
+	var buffer CompositeBuffer
+	if got := buffer.PeekChunk(); got != nil {
+		t.Fatalf("empty PeekChunk = %q", got)
+	}
+	buffer.AppendOwned(NewBufferString("first"))
+	buffer.AppendOwned(NewBufferString("second"))
+	if got := string(buffer.PeekChunk()); got != "first" {
+		t.Fatalf("PeekChunk = %q, want first", got)
+	}
+	buffer.Discard(len("first"))
+	if got := string(buffer.PeekChunk()); got != "second" {
+		t.Fatalf("PeekChunk after Discard = %q, want second", got)
+	}
+}
+
 func BenchmarkBuffer(b *testing.B) {
 
 	var data [256]byte

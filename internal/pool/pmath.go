@@ -6,13 +6,13 @@ const (
 	maxintHeadBit = 1 << (bitsize - 2)
 )
 
-// LogarithmicRange iterates from ceiled to power of two min to max,
+// LogarithmicRange iterates from the ceiled power-of-two start to end,
 // calling cb on each iteration.
-func LogarithmicRange(min, max int, cb func(int)) {
-	if min == 0 {
-		min = 1
+func LogarithmicRange(start, end int, cb func(int)) {
+	if start == 0 {
+		start = 1
 	}
-	for n := CeilToPowerOfTwo(min); n <= max; n <<= 1 {
+	for n := CeilToPowerOfTwo(start); n <= end; n <<= 1 {
 		cb(n)
 	}
 }

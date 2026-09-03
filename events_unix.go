@@ -48,6 +48,48 @@ func (ev *Events) Dial(addr string, userdata any) (Conn, error) {
 	return ev.DialContext(context.Background(), addr, userdata)
 }
 
+// Adopt transfers ownership of an established stream connection to ev. The
+// caller must not use conn after calling Adopt, including when Adopt returns an
+// error. ev must already be serving.
+func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
+	if conn == nil {
+		return nil, errUnsupported
+	}
+	if !ev.ready.Load() || ev.closing.Load() {
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
+	localAddr := conn.LocalAddr()
+	remoteAddr := conn.RemoteAddr()
+
+	// Detach the socket from net.Conn before giving its duplicate to the native
+	// poller. DupNetConn marks the new descriptor close-on-exec.
+	fd, err := socket.DupNetConn(conn)
+	_ = conn.Close()
+	if err != nil {
+		return nil, err
+	}
+	if err = socket.SetNonblock(fd, true); err != nil {
+		_ = syscall.Close(fd)
+		return nil, err
+	}
+
+	fdc := &fdConn{
+		commonConn: commonConn{
+			events:     ev,
+			localAddr:  localAddr,
+			remoteAddr: remoteAddr,
+			userdata:   userdata,
+		},
+		fd: fd,
+	}
+	fdc.loop = ev.selectLoop(fd)
+	if err = ev.addConn(fdc); err != nil {
+		return nil, err
+	}
+	return fdc, nil
+}
+
 // DialContext connects from outside event callbacks and allows cancellation
 // while resolving or establishing the network connection.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
@@ -102,7 +144,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	fdc.remoteAddr = rAddr
 	fdc.events = ev
 	fdc.loop = ev.selectLoop(nfd)
-	fdc.isUDP = strings.HasPrefix(u.Scheme, "udp")
+	if strings.HasPrefix(u.Scheme, "udp") {
+		fdc.udp = &unixUDPState{}
+	}
 
 	if err = ev.addConnContext(dialCtx, fdc); nil != err {
 		return nil, err

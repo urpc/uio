@@ -159,7 +159,14 @@ func TestDupNetConn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = unix.Close(duplicate)
+	defer unix.Close(duplicate)
+	flags, err := unix.FcntlInt(uintptr(duplicate), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatal("duplicated connection fd is not close-on-exec")
+	}
 }
 
 type rawConnStub struct {

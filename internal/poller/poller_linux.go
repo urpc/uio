@@ -22,9 +22,8 @@ type NetPoller struct {
 	epfd   int
 	wakefd int
 
-	mu        sync.Mutex // protects interests, waiters, and descriptor lifetime
-	interests map[int]Interest
-	waiters   int // includes readiness-event conversion after epoll_wait
+	mu      sync.Mutex // protects waiters and descriptor lifetime
+	waiters int        // includes readiness-event conversion after epoll_wait
 
 	closed      atomic.Bool
 	closeReason atomic.Pointer[error]
@@ -42,7 +41,7 @@ func NewNetPoller() (*NetPoller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &NetPoller{epfd: epfd, wakefd: wakefd, interests: make(map[int]Interest)}
+	poller := &NetPoller{epfd: epfd, wakefd: wakefd}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
@@ -53,7 +52,31 @@ func NewNetPoller() (*NetPoller, error) {
 	return poller, nil
 }
 
-func (poller *NetPoller) Watch(fd int, want Interest) error {
+// Add registers a descriptor that is not already watched.
+func (poller *NetPoller) Add(fd int, want Interest) error {
+	return poller.control(fd, want, unix.EPOLL_CTL_ADD)
+}
+
+// Modify changes the interest of an already watched descriptor.
+func (poller *NetPoller) Modify(fd int, _ Interest, want Interest) error {
+	return poller.control(fd, want, unix.EPOLL_CTL_MOD)
+}
+
+// Remove unregisters a descriptor. previous is used by kqueue backends.
+func (poller *NetPoller) Remove(fd int, _ Interest) error {
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed.Load() {
+		return nil
+	}
+	err := unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_DEL, fd, nil)
+	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
+		return nil
+	}
+	return err
+}
+
+func (poller *NetPoller) control(fd int, want Interest, operation int) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
@@ -65,20 +88,11 @@ func (poller *NetPoller) Watch(fd int, want Interest) error {
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
-	previous, exists := poller.interests[fd]
-	if exists && previous == want {
-		return nil
-	}
-	operation := unix.EPOLL_CTL_ADD
-	if exists {
-		operation = unix.EPOLL_CTL_MOD
-	}
 	if err := unix.EpollCtl(poller.epfd, operation, fd, &unix.EpollEvent{
 		Fd: int32(fd), Events: epollEvents(want),
 	}); err != nil {
 		return err
 	}
-	poller.interests[fd] = want
 	return nil
 }
 
@@ -91,21 +105,6 @@ func epollEvents(want Interest) uint32 {
 		events |= writeEvents
 	}
 	return events
-}
-
-func (poller *NetPoller) Unwatch(fd int) error {
-	poller.mu.Lock()
-	defer poller.mu.Unlock()
-	// Forget the fd even if the kernel already removed it after close.
-	delete(poller.interests, fd)
-	if poller.closed.Load() {
-		return nil
-	}
-	err := unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_DEL, fd, nil)
-	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
-		return nil
-	}
-	return err
 }
 
 func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
@@ -248,9 +247,3 @@ func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 		}
 	}
 }
-
-func (poller *NetPoller) AddReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
-func (poller *NetPoller) AddRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModWrite(fd int) error     { return poller.Watch(fd, Writable) }
-func (poller *NetPoller) ModReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }

@@ -518,12 +518,12 @@ func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	cause := errors.New("closed")
 	closed := make(chan error, 1)
 	events := &Events{OnClose: func(_ Conn, err error) { closed <- err }}
-	server := &fdConn{udpConns: make(map[socket.UDPAddress]*fdConn)}
-	child := &fdConn{isUDP: true, udpSvr: server}
+	server := &fdConn{udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
+	child := &fdConn{udp: &unixUDPState{server: server}}
 	child.events = events
 	child.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
-	child.udpKey = socket.UDPAddress{Port: 1}
-	server.udpConns[child.udpKey] = child
+	child.udp.key = socket.UDPAddress{Port: 1}
+	server.udp.peers[child.udp.key] = child
 	child.pending.Store(7)
 	child.closeOnLoop(cause)
 	err := <-closed
@@ -534,8 +534,8 @@ func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	if !errors.As(err, &unflushed) || unflushed.Remaining != 7 {
 		t.Fatalf("unflushed error = %#v", unflushed)
 	}
-	if len(server.udpConns) != 0 {
-		t.Fatalf("closed UDP child left %d peer entries", len(server.udpConns))
+	if len(server.udp.peers) != 0 {
+		t.Fatalf("closed UDP child left %d peer entries", len(server.udp.peers))
 	}
 }
 

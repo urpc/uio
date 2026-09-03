@@ -20,13 +20,8 @@ import (
 
 type fdConn struct {
 	commonConn
-	fd       int
-	fdFile   *os.File // owns a duplicated UDP listener fd when non-nil
-	isUDP    bool
-	rUDPAddr syscall.Sockaddr
-	udpSvr   *fdConn
-	udpConns map[socket.UDPAddress]*fdConn
-	udpKey   socket.UDPAddress
+	fd  int
+	udp *unixUDPState // nil for stream connections
 
 	// submitMu only orders cross-goroutine Write, Flush, and Close submissions.
 	// It never protects socket I/O or outbound buffers.
@@ -40,10 +35,25 @@ type fdConn struct {
 	outbound         bytebuf.CompositeBuffer
 	throttled        bool
 	writeBlocked     bool
+	writeFailed      bool
 	touched          bool
 	interest         poller.Interest
-	deferredCloseErr error
+	deferredCloseErr *error
 
+	deadlines *deadlineState // allocated by the first nonzero deadline
+}
+
+// unixUDPState contains fields that TCP connections never use.
+type unixUDPState struct {
+	file   *os.File // owns a duplicated UDP listener fd when non-nil
+	remote syscall.Sockaddr
+	server *fdConn
+	peers  map[socket.UDPAddress]*fdConn
+	key    socket.UDPAddress
+}
+
+// deadlineState remains loop-owned except for its atomic timer generations.
+type deadlineState struct {
 	readTimer       *time.Timer
 	writeTimer      *time.Timer
 	readGeneration  uint64
@@ -54,12 +64,15 @@ type fdConn struct {
 	writeDeadline   time.Time
 }
 
-func (conn *fdConn) Fd() int                          { return conn.fd }
-func (conn *fdConn) initialInterest() poller.Interest { return poller.Readable }
-func (conn *fdConn) isClosing() bool                  { return conn.closing.Load() }
-func (conn *fdConn) isClosedOnLoop() bool             { return conn.closed }
-func (conn *fdConn) afterRegister()                   {}
-func (conn *fdConn) clearTouched()                    { conn.touched = false }
+func (conn *fdConn) Fd() int                              { return conn.fd }
+func (conn *fdConn) initialInterest() poller.Interest     { return poller.Readable }
+func (conn *fdConn) setInterest(interest poller.Interest) { conn.interest = interest }
+func (conn *fdConn) currentInterest() poller.Interest     { return conn.interest }
+func (conn *fdConn) isClosing() bool                      { return conn.closing.Load() }
+func (conn *fdConn) isClosedOnLoop() bool                 { return conn.closed }
+func (conn *fdConn) isDatagram() bool                     { return conn.udp != nil }
+func (conn *fdConn) afterRegister()                       {}
+func (conn *fdConn) clearTouched()                        { conn.touched = false }
 func (conn *fdConn) markTouched() bool {
 	if conn.touched {
 		return false
@@ -71,8 +84,8 @@ func (conn *fdConn) markTouched() bool {
 func (conn *fdConn) closeUnregistered() {
 	if conn.closing.CompareAndSwap(false, true) {
 		conn.closed = true
-		if conn.fdFile != nil {
-			_ = conn.fdFile.Close()
+		if conn.udp != nil && conn.udp.file != nil {
+			_ = conn.udp.file.Close()
 		} else {
 			_ = syscall.Close(conn.fd)
 		}
@@ -178,14 +191,14 @@ func (conn *fdConn) finishCallback() error {
 }
 
 func (conn *fdConn) fireReadEvent() error {
-	if conn.isUDP {
+	if conn.isDatagram() {
 		return conn.onRecvUDP()
 	}
 	return conn.onRead()
 }
 
 func (conn *fdConn) fireWriteEvent() error {
-	if conn.isUDP {
+	if conn.isDatagram() {
 		return nil
 	}
 	conn.writeBlocked = false
@@ -263,19 +276,18 @@ func (conn *fdConn) onRecvUDP() error {
 
 func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 	packetConn := conn
-	if conn.udpConns != nil {
+	if conn.udp.peers != nil {
 		// UDP children are logical connections that share the server fd.
-		packetConn = conn.udpConns[source]
+		packetConn = conn.udp.peers[source]
 		if packetConn == nil {
 			sockaddr := source.Sockaddr()
 			if sockaddr == nil {
 				return
 			}
-			packetConn = &fdConn{fd: conn.fd, isUDP: true, rUDPAddr: sockaddr, udpSvr: conn}
+			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
 			packetConn.events, packetConn.loop = conn.events, conn.loop
 			packetConn.localAddr, packetConn.remoteAddr = conn.localAddr, source.NetAddr()
-			packetConn.udpKey = source
-			conn.udpConns[source] = packetConn
+			conn.udp.peers[source] = packetConn
 			packetConn.fireOnOpen()
 		}
 	}
@@ -354,7 +366,7 @@ func (conn *fdConn) requestClose(err error) {
 	conn.closing.Store(true)
 	if !conn.loop.pushTask(t) {
 		// The queue is already stopping; preserve the I/O cause for shutdown.
-		conn.deferredCloseErr = err
+		conn.deferredCloseErr = &err
 		conn.submitMu.Unlock()
 		releaseTask(t)
 		return
@@ -371,30 +383,35 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	conn.closing.Store(true)
 	// Close gets one bounded flush attempt; a slow peer cannot delay shutdown.
 	var flushErr error
-	if !conn.isUDP {
+	if !conn.isDatagram() && !conn.writeFailed {
 		conn.writeBlocked = false
 		_, flushErr = conn.flushOnLoop()
 	}
 	remaining := conn.pending.Load()
-	finalErr := errors.Join(cause, conn.deferredCloseErr, flushErr)
+	var deferredCloseErr error
+	if conn.deferredCloseErr != nil {
+		deferredCloseErr = *conn.deferredCloseErr
+		conn.deferredCloseErr = nil
+	}
+	finalErr := errors.Join(cause, deferredCloseErr, flushErr)
 	if remaining > 0 {
 		finalErr = errors.Join(finalErr, UnflushedError{Remaining: remaining})
 	}
 	conn.stopDeadlines()
-	if conn.udpSvr != nil {
+	if conn.udp != nil && conn.udp.server != nil {
 		// A child only leaves the peer map; its server owns the shared fd.
-		delete(conn.udpSvr.udpConns, conn.udpKey)
+		delete(conn.udp.server.udp.peers, conn.udp.key)
 	} else {
-		if conn.udpConns != nil {
-			children := conn.udpConns
-			conn.udpConns = nil
+		if conn.udp != nil && conn.udp.peers != nil {
+			children := conn.udp.peers
+			conn.udp.peers = nil
 			for _, child := range children {
 				child.closeOnLoop(finalErr)
 			}
 		}
 		conn.loop.delConn(conn)
-		if conn.fdFile != nil {
-			_ = conn.fdFile.Close()
+		if conn.udp != nil && conn.udp.file != nil {
+			_ = conn.udp.file.Close()
 		} else {
 			_ = syscall.Close(conn.fd)
 		}
@@ -441,18 +458,26 @@ func (conn *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if conn.closed {
 		return net.ErrClosed
 	}
+	state := conn.deadlines
+	if state == nil {
+		if deadline.IsZero() {
+			return nil
+		}
+		state = &deadlineState{}
+		conn.deadlines = state
+	}
 	// Generations make callbacks from a stopped or reset timer harmless.
 	if kind == deadlineBoth || kind == deadlineRead {
-		conn.readGeneration++
-		conn.readDeadline = deadline
-		conn.readTimerGen.Store(conn.readGeneration)
-		conn.readTimer = conn.resetDeadlineTimer(conn.readTimer, deadlineRead, deadline)
+		state.readGeneration++
+		state.readDeadline = deadline
+		state.readTimerGen.Store(state.readGeneration)
+		state.readTimer = conn.resetDeadlineTimer(state.readTimer, deadlineRead, deadline)
 	}
 	if kind == deadlineBoth || kind == deadlineWrite {
-		conn.writeGeneration++
-		conn.writeDeadline = deadline
-		conn.writeTimerGen.Store(conn.writeGeneration)
-		conn.writeTimer = conn.resetDeadlineTimer(conn.writeTimer, deadlineWrite, deadline)
+		state.writeGeneration++
+		state.writeDeadline = deadline
+		state.writeTimerGen.Store(state.writeGeneration)
+		state.writeTimer = conn.resetDeadlineTimer(state.writeTimer, deadlineWrite, deadline)
 	}
 	return nil
 }
@@ -477,15 +502,16 @@ func (conn *fdConn) resetDeadlineTimer(timer *time.Timer, kind deadlineKind, dea
 }
 
 func (conn *fdConn) submitTimeout(kind deadlineKind) {
-	if conn.isClosing() {
+	state := conn.deadlines
+	if conn.isClosing() || state == nil {
 		return
 	}
 	t := acquireTask(timeoutTask, conn)
 	t.deadlineKind = kind
 	if kind == deadlineRead {
-		t.generation = conn.readTimerGen.Load()
+		t.generation = state.readTimerGen.Load()
 	} else {
-		t.generation = conn.writeTimerGen.Load()
+		t.generation = state.writeTimerGen.Load()
 	}
 	if !conn.loop.submitTask(t) {
 		releaseTask(t)
@@ -493,15 +519,16 @@ func (conn *fdConn) submitTimeout(kind deadlineKind) {
 }
 
 func (conn *fdConn) handleTimeout(kind deadlineKind, generation uint64) {
-	if conn.closed || conn.isClosing() {
+	state := conn.deadlines
+	if conn.closed || conn.isClosing() || state == nil {
 		return
 	}
 	var current uint64
 	var deadline time.Time
 	if kind == deadlineRead {
-		current, deadline = conn.readGeneration, conn.readDeadline
+		current, deadline = state.readGeneration, state.readDeadline
 	} else {
-		current, deadline = conn.writeGeneration, conn.writeDeadline
+		current, deadline = state.writeGeneration, state.writeDeadline
 	}
 	// Reset races can submit the current generation early, so check time too.
 	if generation != current || deadline.IsZero() || time.Now().Before(deadline) {
@@ -518,10 +545,14 @@ func deadlineName(kind deadlineKind) string {
 }
 
 func (conn *fdConn) stopDeadlines() {
-	if conn.readTimer != nil {
-		conn.readTimer.Stop()
+	state := conn.deadlines
+	if state == nil {
+		return
 	}
-	if conn.writeTimer != nil {
-		conn.writeTimer.Stop()
+	if state.readTimer != nil {
+		state.readTimer.Stop()
+	}
+	if state.writeTimer != nil {
+		state.writeTimer.Stop()
 	}
 }

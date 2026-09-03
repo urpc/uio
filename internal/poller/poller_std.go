@@ -14,7 +14,6 @@ type NetPoller struct {
 	closed chan struct{}
 
 	mu          sync.Mutex
-	interests   map[int]Interest
 	closeReason error
 	closeOnce   sync.Once
 }
@@ -22,32 +21,32 @@ type NetPoller struct {
 func NewNetPoller() (*NetPoller, error) {
 	return &NetPoller{
 		waker: make(chan struct{}, 1), closed: make(chan struct{}),
-		interests: make(map[int]Interest),
 	}, nil
 }
 
-func (poller *NetPoller) Watch(fd int, want Interest) error {
+func (poller *NetPoller) Add(_ int, want Interest) error {
+	return poller.validateInterest(want)
+}
+
+func (poller *NetPoller) Modify(_ int, _ Interest, want Interest) error {
+	return poller.validateInterest(want)
+}
+
+func (poller *NetPoller) validateInterest(want Interest) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
 	poller.mu.Lock()
+	defer poller.mu.Unlock()
 	select {
 	case <-poller.closed:
-		poller.mu.Unlock()
 		return fmt.Errorf("poller closed")
 	default:
+		return nil
 	}
-	poller.interests[fd] = want
-	poller.mu.Unlock()
-	return nil
 }
 
-func (poller *NetPoller) Unwatch(fd int) error {
-	poller.mu.Lock()
-	delete(poller.interests, fd)
-	poller.mu.Unlock()
-	return nil
-}
+func (poller *NetPoller) Remove(int, Interest) error { return nil }
 
 func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
 	if timeout == 0 {
@@ -133,9 +132,3 @@ func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 		}
 	}
 }
-
-func (poller *NetPoller) AddReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
-func (poller *NetPoller) AddRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModRead(fd int) error      { return poller.Watch(fd, Readable) }
-func (poller *NetPoller) ModWrite(fd int) error     { return poller.Watch(fd, Writable) }
-func (poller *NetPoller) ModReadWrite(fd int) error { return poller.Watch(fd, Readable|Writable) }
