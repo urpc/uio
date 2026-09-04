@@ -627,6 +627,8 @@ func (fc *fdConn) updateInterest() error              { return nil }
 func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 
 func (fc *fdConn) writeLoop() {
+	callbackID := fc.events.enterExternalCallback()
+	defer fc.events.finishExternalCallback(callbackID)
 	var storage [8][]byte
 	writeBuffers := storage[:0]
 	for {
@@ -652,7 +654,7 @@ func (fc *fdConn) readUDPLoop() {
 	// This goroutine only enters user code through callbacks. Register it once
 	// so callback-initiated Events.Close does not wait for its own return.
 	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.leaveExternalCallback(callbackID)
+	defer fc.events.finishExternalCallback(callbackID)
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
@@ -686,7 +688,7 @@ func (fc *fdConn) readUDPLoop() {
 func (fc *fdConn) readLoop() {
 	// Keep one callback marker for the lifetime of this dedicated read goroutine.
 	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.leaveExternalCallback(callbackID)
+	defer fc.events.finishExternalCallback(callbackID)
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
@@ -735,12 +737,14 @@ func (fc *fdConn) fireWriteEvent() error {
 		return nil // udp client nothing to do.
 	}
 
+	fc.events.callbackWG.Add(1)
 	go fc.writeLoop()
 
 	return nil
 }
 
 func (fc *fdConn) fireReadEvent() error {
+	fc.events.callbackWG.Add(1)
 	// udp client
 	if nil != fc.udp {
 		go fc.readUDPLoop()
@@ -753,7 +757,7 @@ func (fc *fdConn) fireReadEvent() error {
 func (fc *fdConn) listenUDP() error {
 	// UDP peer callbacks all run on this listener goroutine.
 	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.leaveExternalCallback(callbackID)
+	defer fc.events.finishExternalCallback(callbackID)
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 

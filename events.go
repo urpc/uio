@@ -35,9 +35,10 @@ type Events struct {
 	waitGroup     sync.WaitGroup // wait for all eventLoop exit on shutdown
 	mux           sync.Mutex     // serializes initialization and shutdown publication
 	closing       atomic.Bool
-	ready         atomic.Bool  // Dial is allowed only after full initialization
-	startGoid     atomic.Int64 // lets Close detect the synchronous OnStart path
-	callbackGoids sync.Map     // std callback goroutines currently outside loops
+	ready         atomic.Bool    // Dial is allowed only after full initialization
+	startGoid     atomic.Int64   // lets Close detect the synchronous OnStart path
+	callbackGoids sync.Map       // std callback goroutines currently outside loops
+	callbackWG    sync.WaitGroup // std I/O goroutines still able to enter callbacks
 	listenAddr    string
 
 	// Pollers is set up to start the given number of event-loop goroutine.
@@ -137,6 +138,7 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 	ev.waitGroup.Done()
 	ev.initiateClose(err)
 	ev.waitGroup.Wait()
+	ev.callbackWG.Wait()
 	return err
 }
 
@@ -145,6 +147,7 @@ func (ev *Events) Close(err error) error {
 	// Waiting from a callback would make that callback wait for itself.
 	if !onLoop {
 		ev.waitGroup.Wait()
+		ev.callbackWG.Wait()
 	}
 	return nil
 }
@@ -212,6 +215,11 @@ func (ev *Events) leaveExternalCallback(id int64) {
 	ev.callbackGoids.Delete(id)
 }
 
+func (ev *Events) finishExternalCallback(id int64) {
+	ev.callbackGoids.Delete(id)
+	ev.callbackWG.Done()
+}
+
 func (ev *Events) rollbackInit(err error) {
 	// Workers may already be serving even though listener setup failed.
 	ev.closing.Store(true)
@@ -228,6 +236,7 @@ func (ev *Events) rollbackInit(err error) {
 		_ = ev.master.poller.Close(err)
 	}
 	ev.waitGroup.Wait()
+	ev.callbackWG.Wait()
 }
 
 func (ev *Events) initConfig() error {

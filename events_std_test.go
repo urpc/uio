@@ -675,6 +675,7 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 		conn: raw, writeSig: make(chan struct{}, 1), closeSig: make(chan struct{}),
 	}
 	conn.events = &Events{MaxOutboundBuffered: 3}
+	conn.events.callbackWG.Add(1)
 	writeLoopDone := make(chan struct{})
 	go func() {
 		conn.writeLoop()
@@ -981,6 +982,7 @@ func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
 	}
 	conn := &fdConn{conn: raw}
 	conn.events = events
+	events.callbackWG.Add(1)
 	readDone := make(chan struct{})
 	go func() {
 		conn.readLoop()

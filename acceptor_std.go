@@ -79,6 +79,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr.udp = l.udp.(*net.UDPConn)
 		l.udpSvr.udpConns = make(map[string]*fdConn)
 
+		ld.events.callbackWG.Add(1)
 		go l.udpSvr.listenUDP()
 		return nil
 	}
