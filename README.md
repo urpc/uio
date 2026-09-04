@@ -160,5 +160,55 @@ func main() {
 
 ```
 
+## tcpkali2 Benchmark (2026-09-05)
+
+The following results use [tcpkali2 0.3.0](https://github.com/limpo1989/tcpkali2)
+with 1,000 connections, a 3-second
+warmup, a 10-second measurement window, 1 KiB random messages, `--pipeline`,
+and the default TCP_NODELAY setting. Every run completed with a 100% success
+rate and zero connection errors. The UWS server used here has compression
+disabled. P99 is saturated pipeline latency, not idle single-request latency.
+
+Plain TCP was run with:
+
+```bash
+tcpkali2 -c 1000 --connect-rate 2000 -T 10s --warmup 3s \
+  -s 1024 --pipeline 127.0.0.1:9527
+```
+
+The UWS run adds `--websocket` and targets port `19701`.
+
+| OS | Service | Backend | Requests/s | Avg latency | P99 latency | Bandwidth |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| macOS M4 Pro | UIO TCP echo | events | 1,060,782 | 30.22 ms | 106.05 ms | 2,172 MB/s |
+| macOS M4 Pro | UIO TCP echo | stdio | 2,279,489 | 13.07 ms | 22.69 ms | 4,668 MB/s |
+| macOS M4 Pro | UWS echo | events | 651,341 | 48.61 ms | 479.49 ms | 1,334 MB/s |
+| macOS M4 Pro | UWS echo | stdio | 2,020,297 | 14.09 ms | 27.57 ms | 4,138 MB/s |
+| Linux Xeon, 48 logical CPUs | UIO TCP echo | events | 3,726,609 | 5.77 ms | 12.19 ms | 7,632 MB/s |
+| Linux Xeon, 48 logical CPUs | UIO TCP echo | stdio | 3,370,873 | 6.37 ms | 13.62 ms | 6,904 MB/s |
+| Linux Xeon, 48 logical CPUs | UWS echo | events | 946,234 | 32.60 ms | 81.66 ms | 1,938 MB/s |
+| Linux Xeon, 48 logical CPUs | UWS echo | stdio | 2,004,953 | 10.69 ms | 22.32 ms | 4,106 MB/s |
+
+Linux peak RSS sampled during the same runs was approximately 10 MiB for UIO
+events, 62 MiB for UIO stdio, 13 MiB for UWS events, and 66 MiB for UWS stdio.
+The difference comes from stdio's per-connection read/write goroutines and
+buffers; it is expected to grow with the number of live connections.
+
+### Selection guidance
+
+- For UWS or high-throughput RPC with a moderate number of active connections,
+  stdio is currently the faster path and has substantially lower saturated P99.
+- For plain UIO TCP echo on the tested Linux host, events is about 11% faster
+  and uses much less memory. It is the better choice when connection count is
+  the primary constraint.
+- For large numbers of long-lived connections, prefer events even when stdio
+  wins throughput: its memory footprint is shared by event loops instead of
+  being proportional to two goroutines and a read buffer per connection.
+- Results are platform and workload dependent. Linux and macOS use different
+  pollers and CPU/NUMA topologies, and pipeline saturation amplifies queueing
+  latency. Use the same connection count, payload, Go version, CPU placement,
+  and warmup when comparing a deployment.
+
 ## License
+
 The repository released under version 2.0 of the Apache License.

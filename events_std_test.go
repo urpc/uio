@@ -750,6 +750,35 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 	}
 }
 
+func TestStdDrainOutboundClearsVectorStorage(t *testing.T) {
+	raw := newStdRegistrationConn(30003)
+	raw.openReturned.Store(true)
+	conn := &fdConn{commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}}, conn: raw}
+	if _, err := conn.outbound.Write([]byte("payload")); err != nil {
+		t.Fatal(err)
+	}
+	storage := make([][]byte, stdWriteVecLimit)
+	if written, err := conn.drainOutbound(storage); err != nil || written != len("payload") {
+		t.Fatalf("drainOutbound = %d, %v", written, err)
+	}
+	for index, buffer := range storage {
+		if buffer != nil {
+			t.Fatalf("vector storage slot %d retained %d bytes", index, len(buffer))
+		}
+	}
+	for index := range storage {
+		storage[index] = []byte("stale")
+	}
+	if written, err := conn.drainOutbound(storage[:0]); err != nil || written != 0 {
+		t.Fatalf("empty drainOutbound = %d, %v", written, err)
+	}
+	for index, buffer := range storage {
+		if buffer != nil {
+			t.Fatalf("empty drain retained vector storage slot %d", index)
+		}
+	}
+}
+
 func TestStdFlushCoalescesWakeWithoutAllocating(t *testing.T) {
 	conn := &fdConn{writeSig: make(chan struct{}, 1)}
 	conn.events = &Events{}
@@ -780,7 +809,7 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 	started := make(chan string, 1)
 	opened := make(chan Conn, 1)
 	dataCalls := make(chan struct{}, 2)
-	events := &Events{Pollers: 1}
+	events := &Events{Pollers: 1, WriteBufferedThreshold: 1}
 	events.OnStart = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {

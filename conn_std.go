@@ -33,6 +33,7 @@ import (
 
 // Keep tiny writes coalesced while bounding payload work done under mux.
 const stdOwnedWriteThreshold = 4 << 10
+const stdWriteVecLimit = 16
 
 type fdConn struct {
 	commonConn
@@ -436,20 +437,20 @@ func (fc *fdConn) Flush() error {
 	return nil
 }
 
-func (fc *fdConn) drainOutbound(vec [][]byte) ([][]byte, int, error) {
+func (fc *fdConn) drainOutbound(vec [][]byte) (int, error) {
 	fc.writeMu.Lock()
 	defer fc.writeMu.Unlock()
-	vec = vec[:0]
+	defer clear(vec[:cap(vec)])
 
 	fc.mux.Lock()
 	if fc.isClosing() {
 		fc.mux.Unlock()
-		return vec[:0], 0, net.ErrClosed
+		return 0, net.ErrClosed
 	}
 	fc.writeBytes = fc.outbound.Len()
 	if fc.writeBytes == 0 {
 		fc.mux.Unlock()
-		return vec[:0], 0, nil
+		return 0, nil
 	}
 	// The detached batch is immutable while producers append to a fresh buffer.
 	fc.outbound, fc.writeBatch = fc.writeBatch, fc.outbound
@@ -458,11 +459,10 @@ func (fc *fdConn) drainOutbound(vec [][]byte) ([][]byte, int, error) {
 	totalWritten := 0
 	var writeErr error
 	for !fc.writeBatch.Empty() {
-		buffers, size := fc.writeBatch.PeekVecN(vec[:0], 8)
+		buffers, size := fc.writeBatch.PeekVecN(vec, cap(vec))
 		netBuffers := net.Buffers(buffers)
 		written, err := netBuffers.WriteTo(fc.conn)
 		clear(buffers)
-		vec = buffers[:0]
 		if written > 0 {
 			n := int(written)
 			fc.writeBatch.Discard(n)
@@ -484,7 +484,7 @@ func (fc *fdConn) drainOutbound(vec [][]byte) ([][]byte, int, error) {
 	fc.mux.Lock()
 	fc.writeBytes = 0
 	fc.mux.Unlock()
-	return vec, totalWritten, writeErr
+	return totalWritten, writeErr
 }
 
 func (fc *fdConn) Close() error {
@@ -629,8 +629,7 @@ func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 func (fc *fdConn) writeLoop() {
 	callbackID := fc.events.enterExternalCallback()
 	defer fc.events.finishExternalCallback(callbackID)
-	var storage [8][]byte
-	writeBuffers := storage[:0]
+	var storage [stdWriteVecLimit][]byte
 	for {
 		select {
 		case <-fc.closeSig:
@@ -638,7 +637,7 @@ func (fc *fdConn) writeLoop() {
 		case <-fc.writeSig:
 			var written int
 			var err error
-			writeBuffers, written, err = fc.drainOutbound(writeBuffers)
+			written, err = fc.drainOutbound(storage[:])
 			if written > 0 {
 				fc.events.onSocketBytesWrite(fc, written)
 			}
@@ -724,10 +723,6 @@ func (fc *fdConn) readLoop() {
 			fc.inboundTail = fc.inboundTail[:0]
 		}
 
-		// try flush outbound buffer.
-		if fc.events.WriteBufferedThreshold > 0 {
-			_ = fc.Flush()
-		}
 		fc.callbackMu.Unlock()
 	}
 }
