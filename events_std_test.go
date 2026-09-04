@@ -184,7 +184,7 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 	}
 	serveDone := startStdTestEvents(t, events)
 
-	raw := newStdRegistrationConn(10001)
+	raw := newStdRegistrationConn(0)
 	conn := newStdFDConn(events, raw)
 	registerDone := make(chan error, 1)
 	task := acquireTask(registerTask, conn)
@@ -246,7 +246,8 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 }
 
 func TestStdRegisterBurstAndClose(t *testing.T) {
-	const total = 2048
+	const desiredTotal = 2048
+	total := min(desiredTotal, stdTestFDLimit())
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
 	var opened atomic.Int32
 	events.OnOpen = func(conn Conn) {
@@ -258,7 +259,7 @@ func TestStdRegisterBurstAndClose(t *testing.T) {
 	results := make([]chan error, total)
 	rawConns := make([]*stdRegistrationConn, total)
 	for i := 0; i < total; i++ {
-		raw := newStdRegistrationConn(uintptr(20000 + i))
+		raw := newStdRegistrationConn(uintptr(i))
 		rawConns[i] = raw
 		conn := newStdFDConn(events, raw)
 		task := acquireTask(registerTask, conn)
@@ -296,7 +297,7 @@ func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 	}
 	serveDone := startStdTestEvents(t, events)
 
-	raw := newStdRegistrationConn(30001)
+	raw := newStdRegistrationConn(0)
 	raw.writeStarted = make(chan struct{})
 	raw.writeRelease = make(chan struct{})
 	conn := newStdFDConn(events, raw)
