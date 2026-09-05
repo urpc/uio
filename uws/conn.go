@@ -2,6 +2,7 @@ package uws
 
 import (
 	"net"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -104,6 +105,38 @@ func (c *Conn) SetWriteDeadline(deadline time.Time) error {
 		return ErrNotReady
 	}
 	return c.raw.SetWriteDeadline(deadline)
+}
+
+// SetNoDelay controls whether the underlying TCP connection uses Nagle's
+// algorithm.
+func (c *Conn) SetNoDelay(noDelay bool) error {
+	if c == nil || c.raw == nil {
+		return ErrNotReady
+	}
+	return c.raw.SetNoDelay(noDelay)
+}
+
+// Request returns the HTTP upgrade request until OnOpen returns for a
+// connection adopted through Server.ServeHTTP. It returns nil afterward and
+// for connections accepted by Server.Serve. The request is read-only.
+func (c *Conn) Request() *http.Request {
+	if c == nil {
+		return nil
+	}
+	return handshakeHTTPRequest(c.handshake.Load())
+}
+
+func handshakeHTTPRequest(state *handshakeState) *http.Request {
+	if state == nil {
+		return nil
+	}
+	state.mu.Lock()
+	var request *http.Request
+	if state.upgrade != nil {
+		request = state.upgrade.request.HTTP
+	}
+	state.mu.Unlock()
+	return request
 }
 
 func (c *Conn) isClient() bool { return c.config != nil && c.config.client }

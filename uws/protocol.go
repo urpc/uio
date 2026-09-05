@@ -176,10 +176,9 @@ func (c *Conn) ensureHandshakeState() *handshakeState {
 }
 
 func (c *Conn) releaseHandshakeState(state *handshakeState) {
-	state.data = nil
-	state.upgrade = nil
-	state.clientKey = ""
-	c.handshake.CompareAndSwap(state, nil)
+	if state != nil {
+		c.handshake.CompareAndSwap(state, nil)
+	}
 }
 
 func (c *Conn) readAvailable() error {
@@ -377,7 +376,6 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		c.config.heartbeatConnections.Store(c, c)
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
-	c.releaseHandshakeState(state)
 	if err := c.dispatchOpen(); err != nil {
 		return err
 	}
@@ -417,7 +415,6 @@ func (c *Conn) consumeClientHandshake() error {
 		return context.DeadlineExceeded
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
-	c.releaseHandshakeState(state)
 	if err := c.dispatchOpen(); err != nil {
 		return err
 	}

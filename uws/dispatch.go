@@ -4,6 +4,8 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+
+	"github.com/urpc/uio"
 )
 
 type dispatchEventKind uint8
@@ -15,10 +17,12 @@ const (
 )
 
 type dispatchEvent struct {
-	kind    dispatchEventKind
-	message Message
-	close   CloseEvent
-	bytes   int
+	kind      dispatchEventKind
+	message   Message
+	close     CloseEvent
+	handshake *handshakeState
+	buffer    *uio.Buffer
+	bytes     int
 }
 
 type dispatchState struct {
@@ -28,6 +32,8 @@ type dispatchState struct {
 	budget             *pendingBudget
 	mu                 sync.Mutex
 	queue              []dispatchEvent
+	head               int
+	runner             func()
 	running            bool
 	closed             bool
 	failed             bool
@@ -53,6 +59,15 @@ type pendingBudget struct {
 	maxBytes    int64
 	messages    atomic.Int64
 	bytes       atomic.Int64
+}
+
+func (s *dispatchState) appendEvent(event dispatchEvent) {
+	if s.head >= 64 && s.head*2 >= len(s.queue) {
+		copy(s.queue, s.queue[s.head:])
+		s.queue = s.queue[:len(s.queue)-s.head]
+		s.head = 0
+	}
+	s.queue = append(s.queue, event)
 }
 
 func (b *pendingBudget) configure(maxMessages, maxBytes int64) {
@@ -108,25 +123,33 @@ func (b *pendingBudget) release(size int) {
 }
 
 func (c *Conn) dispatchOpen() error {
+	handshake := c.handshake.Load()
 	handler := c.callbackHandler()
 	if handler == nil {
+		c.releaseHandshakeState(handshake)
 		return nil
 	}
 	state := c.dispatch
 	if state == nil {
+		defer c.releaseHandshakeState(handshake)
 		handler.OnOpen(c)
 		return nil
 	}
 	state.mu.Lock()
 	if state.closed || state.failed {
 		state.mu.Unlock()
+		c.releaseHandshakeState(handshake)
 		return ErrClosed
+	}
+	if state.runner == nil {
+		state.runner = c.runDispatch
 	}
 	start := !state.running
 	state.running = true
-	state.queue = append(state.queue, dispatchEvent{kind: dispatchOpen})
+	state.appendEvent(dispatchEvent{kind: dispatchOpen, handshake: handshake})
+	runner := state.runner
 	state.mu.Unlock()
-	if start && !state.executor.Submit(c.runDispatch) {
+	if start && !state.executor.Submit(runner) {
 		c.failDispatch()
 		return ErrExecutorRejected
 	}
@@ -166,32 +189,42 @@ func (c *Conn) enqueueMessage(message Message) error {
 		return ErrApplicationBackpressure
 	}
 
-	// The parser owns message.Payload until this callback returns. Copy it
-	// before handing the event to an executor that may run later.
-	payload := append([]byte(nil), message.Payload...)
+	// The parser owns message.Payload until this callback returns. Transfer a
+	// pooled copy to the queued event so an executor may run later without a
+	// per-message heap allocation after the pool is warm.
+	owned := uio.AcquireBuffer(len(message.Payload))
+	_, _ = owned.Write(message.Payload)
+	payload := owned.Bytes()
 	queued := Message{Type: message.Type, Payload: payload}
 	state.mu.Lock()
 	if state.closed || state.failed || c.closed.Load() {
 		state.mu.Unlock()
 		state.budget.release(len(payload))
+		uio.ReleaseBuffer(owned)
 		return ErrClosed
 	}
 	if state.messages >= maxMessages || len(payload) > maxBytes-state.bytes {
 		state.mu.Unlock()
 		state.budget.release(len(payload))
+		uio.ReleaseBuffer(owned)
 		return ErrApplicationBackpressure
+	}
+	if state.runner == nil {
+		state.runner = c.runDispatch
 	}
 	start := !state.running
 	state.running = true
-	state.queue = append(state.queue, dispatchEvent{
+	state.appendEvent(dispatchEvent{
 		kind:    dispatchMessage,
 		message: queued,
+		buffer:  owned,
 		bytes:   len(payload),
 	})
 	state.messages++
 	state.bytes += len(payload)
+	runner := state.runner
 	state.mu.Unlock()
-	if start && !state.executor.Submit(c.runDispatch) {
+	if start && !state.executor.Submit(runner) {
 		c.failDispatch()
 		return ErrExecutorRejected
 	}
@@ -219,23 +252,30 @@ func (c *Conn) dispatchClose(info CloseEvent) {
 		return
 	}
 	state.closed = true
-	oldQueue := state.queue
+	oldQueue := state.queue[state.head:]
 	kept := make([]dispatchEvent, 0, len(oldQueue))
 	for index, event := range oldQueue {
 		if event.kind == dispatchOpen {
 			kept = append(kept, event)
 		} else if event.kind == dispatchMessage {
 			state.budget.release(event.bytes)
+			uio.ReleaseBuffer(event.buffer)
 		}
 		oldQueue[index] = dispatchEvent{}
 	}
-	state.queue = append(kept, dispatchEvent{kind: dispatchClose, close: info})
+	state.queue = kept
+	state.head = 0
+	state.appendEvent(dispatchEvent{kind: dispatchClose, close: info})
 	state.messages = 0
 	state.bytes = 0
+	if state.runner == nil {
+		state.runner = c.runDispatch
+	}
 	start := !state.running
 	state.running = true
+	runner := state.runner
 	state.mu.Unlock()
-	if start && !state.executor.Submit(c.runDispatch) {
+	if start && !state.executor.Submit(runner) {
 		c.failDispatch()
 	}
 }
@@ -252,16 +292,20 @@ func (c *Conn) failDispatch() {
 	}
 	state.failed = true
 	state.running = false
-	for index := range state.queue {
+	for index := state.head; index < len(state.queue); index++ {
 		switch state.queue[index].kind {
+		case dispatchOpen:
+			c.releaseHandshakeState(state.queue[index].handshake)
 		case dispatchMessage:
 			state.budget.release(state.queue[index].bytes)
+			uio.ReleaseBuffer(state.queue[index].buffer)
 		case dispatchClose:
 			state.closeSent = true
 		}
 		state.queue[index] = dispatchEvent{}
 	}
 	state.queue = nil
+	state.head = 0
 	state.messages = 0
 	state.bytes = 0
 	state.mu.Unlock()
@@ -281,14 +325,16 @@ func (c *Conn) runDispatch() {
 		return
 	}
 	state.mu.Lock()
-	if len(state.queue) == 0 {
+	if state.head >= len(state.queue) {
+		state.queue = nil
+		state.head = 0
 		state.running = false
 		state.mu.Unlock()
 		return
 	}
-	event := state.queue[0]
-	state.queue[0] = dispatchEvent{}
-	state.queue = state.queue[1:]
+	event := state.queue[state.head]
+	state.queue[state.head] = dispatchEvent{}
+	state.head++
 	if event.kind == dispatchMessage {
 		state.messages--
 		state.bytes -= event.bytes
@@ -300,21 +346,30 @@ func (c *Conn) runDispatch() {
 
 	switch event.kind {
 	case dispatchOpen:
-		c.callbackHandler().OnOpen(c)
+		func() {
+			defer c.releaseHandshakeState(event.handshake)
+			c.callbackHandler().OnOpen(c)
+		}()
 	case dispatchMessage:
-		c.callbackHandler().OnMessage(c, event.message)
+		func() {
+			defer uio.ReleaseBuffer(event.buffer)
+			c.callbackHandler().OnMessage(c, event.message)
+		}()
 	case dispatchClose:
 		c.callbackHandler().OnClose(c, event.close)
 	}
 
 	state.mu.Lock()
-	if len(state.queue) == 0 {
+	if state.head >= len(state.queue) {
+		state.queue = nil
+		state.head = 0
 		state.running = false
 		state.mu.Unlock()
 		return
 	}
+	runner := state.runner
 	state.mu.Unlock()
-	if !state.executor.Submit(c.runDispatch) {
+	if !state.executor.Submit(runner) {
 		c.failDispatch()
 	}
 }

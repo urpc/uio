@@ -281,10 +281,10 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 	if !ok || conn == nil {
 		return
 	}
-	conn.stopHandshakeTimer()
 	conn.releaseParser()
 	conn.releaseAssembler()
 	if !conn.opened.Load() {
+		conn.stopHandshakeTimer()
 		if !conn.closed.CompareAndSwap(false, true) {
 			return
 		}

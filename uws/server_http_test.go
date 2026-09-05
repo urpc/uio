@@ -18,11 +18,15 @@ import (
 )
 
 func TestServerHTTPHandlerEcho(t *testing.T) {
-	serverHandler := &echoHandler{
+	baseHandler := &echoHandler{
 		open:    make(chan struct{}),
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 		conn:    make(chan *Conn, 1),
+	}
+	serverHandler := &httpEchoHandler{
+		echoHandler: baseHandler,
+		request:     make(chan *http.Request, 1),
 	}
 	server := NewServer(serverHandler)
 	server.Events = &uio.Events{Pollers: 1}
@@ -56,6 +60,12 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 	if serverConn.raw.Userdata() != serverConn {
 		t.Fatal("transport userdata changed meaning during HTTP adoption")
 	}
+	if request := <-serverHandler.request; request == nil || request.RequestURI != "/" {
+		t.Fatalf("HTTP upgrade request = %#v, want request URI /", request)
+	}
+	if request := serverConn.Request(); request != nil {
+		t.Fatalf("HTTP upgrade request retained after OnOpen: %#v", request)
+	}
 	if serverConn.handshake.Load() != nil {
 		t.Fatal("HTTP adoption retained handshake state after OnOpen")
 	}
@@ -86,6 +96,16 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("client did not receive echo")
 	}
+}
+
+type httpEchoHandler struct {
+	*echoHandler
+	request chan *http.Request
+}
+
+func (h *httpEchoHandler) OnOpen(conn *Conn) {
+	h.request <- conn.Request()
+	h.echoHandler.OnOpen(conn)
 }
 
 func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {

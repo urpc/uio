@@ -5,13 +5,46 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/uws/internal/handshake"
 )
+
+func TestExecutorOpenRequestIsReleasedAfterCallback(t *testing.T) {
+	executor := &queuedExecutor{}
+	request := &http.Request{RequestURI: "/rpc"}
+	seen := make(chan *http.Request, 1)
+	conn := &Conn{
+		handler: handlerFuncs{onOpen: func(conn *Conn) { seen <- conn.Request() }},
+	}
+	conn.dispatch = newDispatchState(executor, 1, 1, nil)
+	state := &handshakeState{upgrade: &httpUpgrade{request: handshake.Request{HTTP: request}}}
+	conn.handshake.Store(state)
+
+	if err := conn.dispatchOpen(); err != nil {
+		t.Fatal(err)
+	}
+	if got := conn.handshake.Load(); got != state {
+		t.Fatalf("executor queue handshake state = %p, want %p", got, state)
+	}
+	if !executor.runNext() {
+		t.Fatal("executor did not run OnOpen")
+	}
+	if got := <-seen; got != request {
+		t.Fatalf("OnOpen request = %p, want %p", got, request)
+	}
+	if got := conn.Request(); got != nil {
+		t.Fatalf("request retained after OnOpen: %#v", got)
+	}
+	if got := conn.handshake.Load(); got != nil {
+		t.Fatalf("handshake state retained after OnOpen: %#v", got)
+	}
+}
 
 type blockingCloseHandler struct {
 	called  chan struct{}
@@ -455,13 +488,18 @@ func TestRunDispatchEmptyPath(t *testing.T) {
 
 func TestDispatchExecutorRejectsOpenAndClose(t *testing.T) {
 	openRaw := newScriptedConn()
+	handshake := &handshakeState{}
 	openConn := &Conn{
 		raw:      openRaw,
 		handler:  &recordingHandler{},
 		dispatch: newDispatchState(rejectingExecutor{}, 0, 0, nil),
 	}
+	openConn.handshake.Store(handshake)
 	if err := openConn.dispatchOpen(); !errors.Is(err, ErrExecutorRejected) {
 		t.Fatalf("rejected open error = %v", err)
+	}
+	if got := openConn.handshake.Load(); got != nil {
+		t.Fatalf("rejected open retained handshake state: %#v", got)
 	}
 	if openRaw.closes != 1 {
 		t.Fatalf("rejected open closes = %d, want 1", openRaw.closes)

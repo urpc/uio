@@ -362,10 +362,10 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		}
 		raw.SetUserdata(conn)
 	}
-	conn.stopHandshakeTimer()
 	conn.releaseParser()
 	conn.releaseAssembler()
 	if !conn.opened.Load() {
+		conn.stopHandshakeTimer()
 		if !conn.closed.CompareAndSwap(false, true) {
 			return
 		}

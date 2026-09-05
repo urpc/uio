@@ -134,7 +134,6 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 		_ = raw.CloseWith(ErrClosed)
 		return
 	}
-	conn.releaseHandshakeState(state)
 	if conn.heartbeat != nil {
 		conn.heartbeat.lastPong.Store(time.Now().UnixNano())
 		conn.config.heartbeatConnections.Store(conn, conn)
