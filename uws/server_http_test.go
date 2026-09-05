@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,10 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 	}
 	if request := <-serverHandler.request; request == nil || request.RequestURI != "/" {
 		t.Fatalf("HTTP upgrade request = %#v, want request URI /", request)
+	}
+	deadline := time.Now().Add(testIOTimeout())
+	for serverConn.Request() != nil && time.Now().Before(deadline) {
+		runtime.Gosched()
 	}
 	if request := serverConn.Request(); request != nil {
 		t.Fatalf("HTTP upgrade request retained after OnOpen: %#v", request)

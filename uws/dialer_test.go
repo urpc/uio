@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -229,6 +230,10 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	case <-clientHandler.open:
 	case <-time.After(testIOTimeout()):
 		t.Fatal("client OnOpen was not called")
+	}
+	deadline := time.Now().Add(testIOTimeout())
+	for client.handshake.Load() != nil && time.Now().Before(deadline) {
+		runtime.Gosched()
 	}
 	if client.handshake.Load() != nil {
 		t.Fatal("completed client handshake retained handshake state")
@@ -609,6 +614,9 @@ func TestDialerHandshakeFailureCallsOnClose(t *testing.T) {
 		}
 		_, writeErr := io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
 		serverErr <- writeErr
+		if writeErr == nil {
+			_, _ = io.Copy(io.Discard, conn)
+		}
 	}()
 
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
