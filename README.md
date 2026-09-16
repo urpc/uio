@@ -34,7 +34,7 @@ go get github.com/urpc/uio
 
 type Events struct {
 	// Pollers is set up to start the given number of event-loop goroutine.
-	// The default value is runtime.NumCPU().
+	// The default value is 4, capped by runtime.NumCPU().
 	Pollers int
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
@@ -99,7 +99,7 @@ Basic Echo Server
 connection setup. Calls from callbacks currently running on an event loop
 return `ErrDialOnEventLoop`; start the call from an external goroutine instead.
 Use `DialContext` when the operation needs cancellation or a deadline.
-`Events.Serve` accepts zero or one listening address. Call `Serve()` without an
+`Events.Serve` listens on every supplied address. Call `Serve()` without an
 address when using an Events instance only for outbound dialing.
 
 `Events.Adopt` transfers an already-established stream connection into the

@@ -36,14 +36,15 @@ func TestConfigureWriteBuffer(t *testing.T) {
 	}
 }
 
-func TestServerServeRejectsMultipleAddressesBeforeStart(t *testing.T) {
+func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
 	server := NewServer(nil)
-	err := server.Serve("127.0.0.1:0", "127.0.0.1:0")
-	if !errors.Is(err, uio.ErrTooManyListenAddresses) {
-		t.Fatalf("Serve error = %v, want %v", err, uio.ErrTooManyListenAddresses)
+	server.Events = &uio.Events{Pollers: 1}
+	server.Events.OnStart = func(*uio.Events) { _ = server.Close(nil) }
+	if err := server.Serve("127.0.0.1:0", "127.0.0.1:0"); err != nil {
+		t.Fatalf("Serve with multiple addresses: %v", err)
 	}
-	if server.started.Load() || server.ready.Load() || server.config != nil {
-		t.Fatal("rejected Serve initialized the Server")
+	if !server.started.Load() || server.ready.Load() {
+		t.Fatal("Serve did not start and stop the Server")
 	}
 }
 

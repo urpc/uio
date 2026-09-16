@@ -39,10 +39,9 @@ type Events struct {
 	startGoid     atomic.Int64   // lets Close detect the synchronous OnStart path
 	callbackGoids sync.Map       // std callback goroutines currently outside loops
 	callbackWG    sync.WaitGroup // std I/O goroutines still able to enter callbacks
-	listenAddr    string
 
 	// Pollers is set up to start the given number of event-loop goroutine.
-	// The default value is runtime.NumCPU().
+	// The default value is 4, capped by runtime.NumCPU().
 	Pollers int
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
@@ -98,23 +97,15 @@ type Events struct {
 	OnStop func(ev *Events)
 }
 
-// Serve starts the event loops and optionally listens on one address. Calling
-// Serve without an address starts a dial-only Events. More than one address is
-// rejected.
+// Serve starts the event loops and listens on each supplied address. Calling
+// Serve without an address starts a dial-only Events.
 func (ev *Events) Serve(addrs ...string) (err error) {
-	if len(addrs) > 1 {
-		return ErrTooManyListenAddresses
-	}
 	if ev.closing.Load() {
 		return net.ErrClosed
 	}
-	ev.listenAddr = ""
-	if len(addrs) == 1 {
-		ev.listenAddr = addrs[0]
-	}
 
 	// initialize events
-	if err = ev.initEvents(); nil != err {
+	if err = ev.initEvents(addrs); nil != err {
 		return err
 	}
 
@@ -152,7 +143,7 @@ func (ev *Events) Close(err error) error {
 	return nil
 }
 
-func (ev *Events) initEvents() (err error) {
+func (ev *Events) initEvents(addrs []string) (err error) {
 
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
@@ -171,7 +162,7 @@ func (ev *Events) initEvents() (err error) {
 	}
 
 	// init listener.
-	if err = ev.initListeners(); nil != err {
+	if err = ev.initListeners(addrs); nil != err {
 		ev.rollbackInit(err)
 		return err
 	}
@@ -241,9 +232,10 @@ func (ev *Events) rollbackInit(err error) {
 
 func (ev *Events) initConfig() error {
 
-	if ev.Pollers <= 0 || ev.Pollers > runtime.NumCPU() {
-		ev.Pollers = runtime.NumCPU()
+	if ev.Pollers <= 0 {
+		ev.Pollers = 4
 	}
+	ev.Pollers = min(ev.Pollers, runtime.NumCPU())
 
 	if ev.MaxBufferSize <= 0 {
 		ev.MaxBufferSize = 1024 * 4
@@ -290,15 +282,18 @@ func (ev *Events) initLoops() (err error) {
 	return nil
 }
 
-func (ev *Events) initListeners() (err error) {
+func (ev *Events) initListeners(addrs []string) (err error) {
 
 	ev.acceptor = &acceptor{
 		loop:   ev.master,
 		events: ev,
 	}
 
-	if ev.listenAddr != "" {
-		if err = ev.acceptor.addListen(ev.listenAddr); nil != err {
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		if err = ev.acceptor.addListen(addr); nil != err {
 			return err
 		}
 	}

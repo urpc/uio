@@ -80,12 +80,9 @@ func NewServer(handler Handler) *Server {
 	}
 }
 
-// Serve starts the event loops and optionally listens on one address. Calling
+// Serve starts the event loops and listens on each supplied address. Calling
 // Serve without an address prepares the Server for use as an http.Handler.
 func (s *Server) Serve(addrs ...string) error {
-	if len(addrs) > 1 {
-		return uio.ErrTooManyListenAddresses
-	}
 	s.closeMu.Lock()
 	if s.closed {
 		s.closeMu.Unlock()

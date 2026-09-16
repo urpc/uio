@@ -159,12 +159,11 @@ type Conn interface {
 var errUnsupported = fmt.Errorf("unsupported method")
 
 var (
-	ErrOutboundOverflow       = errors.New("uio: outbound buffer limit exceeded")
-	ErrInboundOverflow        = errors.New("uio: inbound buffer limit exceeded")
-	ErrTaskQueueFull          = errors.New("uio: pending write task limit exceeded")
-	ErrUnflushedData          = errors.New("uio: connection closed with unflushed data")
-	ErrDialOnEventLoop        = errors.New("uio: Dial cannot run on an event loop")
-	ErrTooManyListenAddresses = errors.New("uio: Serve accepts at most one listen address")
+	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow  = errors.New("uio: inbound buffer limit exceeded")
+	ErrTaskQueueFull    = errors.New("uio: pending write task limit exceeded")
+	ErrUnflushedData    = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop  = errors.New("uio: Dial cannot run on an event loop")
 )
 
 // UnflushedError reports payload accepted by the framework but not sent before

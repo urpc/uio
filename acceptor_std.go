@@ -41,7 +41,7 @@ type listener struct {
 
 type acceptor struct {
 	mux       sync.Mutex
-	listeners map[string]*listener
+	listeners map[int]*listener
 	loop      *eventLoop
 	events    *Events
 }
@@ -58,7 +58,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	defer ld.mux.Unlock()
 
 	if nil == ld.listeners {
-		ld.listeners = make(map[string]*listener)
+		ld.listeners = make(map[int]*listener)
 	}
 
 	var l *listener
@@ -69,7 +69,8 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		return err
 	}
 
-	ld.listeners[addr] = l
+	// The requested address may be repeated with port 0; each bind is distinct.
+	ld.listeners[len(ld.listeners)] = l
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}

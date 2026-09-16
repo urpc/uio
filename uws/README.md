@@ -49,6 +49,9 @@ defer server.Close(nil)
 log.Fatal(httpServer.ListenAndServe())
 ```
 
+`Server.Serve` accepts multiple listening addresses, or no address for use as
+an `http.Handler`.
+
 Calling `ServeHTTP` before `Serve` is ready returns HTTP 500 and does not start
 UIO implicitly. The Handler adapter supports plain HTTP/1.1 TCP connections. It
 validates the request, hijacks it, rejects any client bytes already buffered
