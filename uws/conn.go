@@ -28,8 +28,7 @@ type Conn struct {
 	userData any
 	metadata atomic.Pointer[connMetadata]
 
-	writeMu               sync.Mutex
-	closeSent             bool
+	writes                connWriteState
 	handshake             atomic.Pointer[handshakeState]
 	heartbeat             *heartbeatState
 	transportClosePending atomic.Bool
@@ -38,14 +37,43 @@ type Conn struct {
 	closeTimer            atomic.Pointer[closeTimerState]
 }
 
+type connWriteState struct {
+	mu sync.Mutex
+	// A close request raises drainRequested before it becomes eligible to
+	// close the transport. Only a holder of mu may clear it after draining any
+	// executor batch that could still accept an in-flight frame.
+	drainRequested atomic.Bool
+	closeFrameSent bool
+}
+
+type dispatchWriteBatch struct {
+	// owner is installed under connWriteState.mu and is cleared only after
+	// buffer has been flushed or detached under that same lock.
+	owner atomic.Int64
+	// A runner or closer can request completion without waiting for the write
+	// lock; the current or next lock holder assumes the flush responsibility.
+	finishRequested atomic.Bool
+	// buffer is protected by connWriteState.mu.
+	buffer *uio.Buffer
+}
+
 type compressionState struct {
 	encoder *compress.Encoder
 	decoder *compress.Decoder
 }
 
 type heartbeatState struct {
-	lastPong        atomic.Int64
-	pingOutstanding atomic.Bool
+	mu           sync.Mutex
+	pingQueuedAt int64
+	pingSentAt   int64
+	pingNonce    uint64
+	pingTarget   uint64
+	// Accepted and retired are monotonic FIFO byte positions. The ping target
+	// marks when its complete frame has left the transport queue without
+	// requiring the connection's later writes to drain first.
+	outboundAccepted atomic.Uint64
+	outboundRetired  atomic.Uint64
+	pingOutstanding  atomic.Bool
 }
 
 type closeTimerState struct {
@@ -203,6 +231,13 @@ func (c *Conn) maxOutboundBytes() int {
 		return DefaultMaxOutboundBytes
 	}
 	return c.config.maxOutboundBytes
+}
+
+func (c *Conn) writeBufferedThreshold() int {
+	if c.config == nil || c.config.writeBufferedThreshold == 0 {
+		return defaultWriteBufferedThreshold
+	}
+	return c.config.writeBufferedThreshold
 }
 
 func (c *Conn) closeInfo() CloseEvent {

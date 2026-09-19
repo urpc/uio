@@ -354,19 +354,32 @@ func TestControlAndMessageValidationErrors(t *testing.T) {
 	raw := newScriptedConn()
 	conn := testServerConn(raw)
 	conn.heartbeat = &heartbeatState{}
-	conn.heartbeat.pingOutstanding.Store(true)
-	beforePong := time.Now().Add(-time.Second).UnixNano()
-	conn.heartbeat.lastPong.Store(beforePong)
+	const heartbeatNonce = uint64(0x0102030405060708)
+	conn.heartbeat.beginPing(time.Now().Add(-time.Second), heartbeatNonce)
 	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte("ping")}); err != nil {
 		t.Fatal(err)
 	}
 	if len(raw.written) != 1 || raw.written[0][0]&0x0f != byte(frame.Pong) {
 		t.Fatalf("pong frame = %x", raw.written)
 	}
-	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Pong}); err != nil {
+	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: []byte("mismatch")}); err != nil {
 		t.Fatal(err)
 	}
-	if conn.heartbeat.pingOutstanding.Load() || conn.heartbeat.lastPong.Load() <= beforePong {
+	if !conn.heartbeat.pingOutstanding.Load() {
+		t.Fatal("unrelated pong acknowledged the heartbeat")
+	}
+	var pongPayload [8]byte
+	binary.BigEndian.PutUint64(pongPayload[:], heartbeatNonce)
+	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: pongPayload[:]}); err != nil {
+		t.Fatal(err)
+	}
+	conn.heartbeat.mu.Lock()
+	queuedAt := conn.heartbeat.pingQueuedAt
+	sentAt := conn.heartbeat.pingSentAt
+	nonce := conn.heartbeat.pingNonce
+	target := conn.heartbeat.pingTarget
+	conn.heartbeat.mu.Unlock()
+	if conn.heartbeat.pingOutstanding.Load() || queuedAt != 0 || sentAt != 0 || nonce != 0 || target != 0 {
 		t.Fatal("pong did not acknowledge the heartbeat")
 	}
 	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Text}); !errors.Is(err, frame.ErrProtocol) {
@@ -513,6 +526,14 @@ func TestCloseAndWriterStateErrors(t *testing.T) {
 	if _, err := writer.Write(nil); !errors.Is(err, ErrWriterClosed) {
 		t.Fatalf("closed Writer.Write error = %v", err)
 	}
+	firstFailure := errors.New("first writer failure")
+	failedWriter := &Writer{conn: limitedConn, closed: true, failure: firstFailure}
+	if err := failedWriter.fail(errors.New("later writer failure")); !errors.Is(err, firstFailure) {
+		t.Fatalf("repeated Writer failure = %v, want %v", err, firstFailure)
+	}
+	if err := (&Writer{conn: limitedConn}).emitCompressed(nil); err != nil {
+		t.Fatalf("empty compressed emission = %v", err)
+	}
 }
 
 func TestReadAvailableHandshakeAndParserErrors(t *testing.T) {
@@ -580,6 +601,26 @@ func TestHandshakeAndCloseLifecycleErrors(t *testing.T) {
 	if err := testServerConn(failedRaw).closeTransport(); !errors.Is(err, flushErr) {
 		t.Fatalf("closeTransport flush error = %v", err)
 	}
+}
+
+func TestCloseTransportDoesNotWaitForWriter(t *testing.T) {
+	raw := newScriptedConn()
+	conn := testServerConn(raw)
+	writer, err := conn.BeginMessage(BinaryMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- conn.closeTransport() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(testIOTimeout()):
+		t.Fatal("closeTransport waited for Writer.Close")
+	}
+	_ = writer.fail(ErrClosed)
 }
 
 func TestSendCloseAndLimitStateBranches(t *testing.T) {
@@ -650,6 +691,33 @@ func TestSendQueuesMessagesWithoutFlushBarrier(t *testing.T) {
 	}
 }
 
+func TestTransportOwnedWriteErrors(t *testing.T) {
+	writeErr := errors.New("owned write failed")
+	failedRaw := newScriptedConn()
+	failedRaw.writeErr = writeErr
+	failed := testServerConn(failedRaw)
+	failedBuffer := uio.AcquireBuffer(4)
+	_, _ = failedBuffer.WriteString("data")
+	if err := failed.writeTransportOwned(failedBuffer); !errors.Is(err, writeErr) {
+		t.Fatalf("owned write error = %v, want %v", err, writeErr)
+	}
+	if pending := failed.pendingBytes.Load(); pending != 0 {
+		t.Fatalf("pending bytes after failed owned write = %d, want 0", pending)
+	}
+
+	shortRaw := newScriptedConn()
+	shortRaw.short = true
+	short := testServerConn(shortRaw)
+	shortBuffer := uio.AcquireBuffer(4)
+	_, _ = shortBuffer.WriteString("data")
+	if err := short.writeTransportOwned(shortBuffer); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("short owned write error = %v, want io.ErrShortWrite", err)
+	}
+	if pending := short.pendingBytes.Load(); pending != 3 {
+		t.Fatalf("pending bytes after short owned write = %d, want 3", pending)
+	}
+}
+
 func TestCloseRetriesAfterBackpressure(t *testing.T) {
 	raw := newScriptedConn()
 	conn := testServerConn(raw)
@@ -658,15 +726,15 @@ func TestCloseRetriesAfterBackpressure(t *testing.T) {
 	if err := conn.Close(1000, ""); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("backpressured Close() = %v", err)
 	}
-	if conn.closeSent || conn.closing.Load() {
+	if conn.writes.closeFrameWasSent() || conn.closing.Load() {
 		t.Fatal("failed close poisoned connection state")
 	}
 	conn.releaseOutbound(4)
 	if err := conn.Close(1000, ""); err != nil {
 		t.Fatalf("retried Close() = %v", err)
 	}
-	if !conn.closeSent || !conn.closing.Load() || raw.writes != 1 {
-		t.Fatalf("retried close state: sent=%v closing=%v writes=%d", conn.closeSent, conn.closing.Load(), raw.writes)
+	if !conn.writes.closeFrameWasSent() || !conn.closing.Load() || raw.writes != 1 {
+		t.Fatalf("retried close state: sent=%v closing=%v writes=%d", conn.writes.closeFrameWasSent(), conn.closing.Load(), raw.writes)
 	}
 }
 

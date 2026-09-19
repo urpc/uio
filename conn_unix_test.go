@@ -3,6 +3,7 @@
 package uio
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -381,6 +382,262 @@ func TestCallbackThresholdBatchesWithoutTasks(t *testing.T) {
 	}
 	if testConn.conn.queuedWrites.Load() != 0 || testConn.conn.loop.tasks.HasPending() {
 		t.Fatal("callback threshold write created a queued task")
+	}
+}
+
+func TestReadEventFlushesCallbacksAsOneBatch(t *testing.T) {
+	for _, test := range []struct {
+		name                string
+		explicitFlush       bool
+		maxOutboundBuffered int
+		wantWrites          []int
+	}{
+		{name: "implicit", wantWrites: []int{2}},
+		{name: "implicit constrained", maxOutboundBuffered: 1, wantWrites: []int{1, 1}},
+		{name: "explicit", explicitFlush: true, wantWrites: []int{1, 1}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			outbound := make(chan int, 3)
+			events := &Events{
+				Pollers:                1,
+				MaxBufferSize:          4,
+				MaxOutboundBuffered:    test.maxOutboundBuffered,
+				WriteBufferedThreshold: 16,
+			}
+			events.OnData = func(conn Conn) error {
+				if _, err := conn.Discard(-1); err != nil {
+					return err
+				}
+				if err := conn.WriteByte('x'); err != nil {
+					return err
+				}
+				if test.explicitFlush {
+					return conn.Flush()
+				}
+				return nil
+			}
+			events.OnOutbound = func(_ Conn, written int) { outbound <- written }
+			testConn := newTestConnection(t, events)
+			if _, err := unix.Write(testConn.peer, []byte("12345678")); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(readPeer(t, testConn.peer, 2)); got != "xx" {
+				t.Fatalf("peer received %q", got)
+			}
+			for _, want := range test.wantWrites {
+				select {
+				case got := <-outbound:
+					if got != want {
+						t.Fatalf("OnOutbound bytes = %d, want %d", got, want)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("timed out waiting for OnOutbound")
+				}
+			}
+			select {
+			case extra := <-outbound:
+				t.Fatalf("unexpected extra OnOutbound call for %d bytes", extra)
+			default:
+			}
+		})
+	}
+}
+
+func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		write func(*fdConn) error
+	}{
+		{name: "write", write: func(conn *fdConn) error {
+			_, err := conn.Write([]byte{'x'})
+			return err
+		}},
+		{name: "writev", write: func(conn *fdConn) error {
+			_, err := conn.Writev([][]byte{{'x'}})
+			return err
+		}},
+		{name: "write-owned", write: func(conn *fdConn) error {
+			buffer := AcquireBuffer(1)
+			_, _ = buffer.Write([]byte{'x'})
+			_, err := conn.WriteOwned(buffer)
+			return err
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			events := &Events{Pollers: 1, WriteBufferedThreshold: 16}
+			if err := events.initConfig(); err != nil {
+				t.Fatal(err)
+			}
+			loop, err := newEventLoop(events)
+			if err != nil {
+				t.Fatal(err)
+			}
+			events.workers = []*eventLoop{loop}
+			sourceFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			targetFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+			if err != nil {
+				_ = unix.Close(sourceFDs[0])
+				_ = unix.Close(sourceFDs[1])
+				t.Fatal(err)
+			}
+			for _, fd := range []int{sourceFDs[0], sourceFDs[1], targetFDs[0], targetFDs[1]} {
+				if err := unix.SetNonblock(fd, true); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := &fdConn{fd: sourceFDs[0]}
+			target := &fdConn{fd: targetFDs[0]}
+			for _, conn := range []*fdConn{source, target} {
+				conn.events = events
+				conn.loop = loop
+			}
+			callbackErr := make(chan error, 1)
+			events.OnData = func(conn Conn) error {
+				if conn != source {
+					_, _ = conn.Discard(-1)
+					return nil
+				}
+				_, _ = conn.Discard(-1)
+				err := test.write(target)
+				callbackErr <- err
+				return err
+			}
+			done := make(chan error, 1)
+			go func() { done <- loop.Serve(false, nil) }()
+			for _, conn := range []*fdConn{source, target} {
+				registered := make(chan error, 1)
+				go func(conn *fdConn) { registered <- events.addConn(conn) }(conn)
+				if err := <-registered; err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Cleanup(func() {
+				for _, conn := range []*fdConn{source, target} {
+					if !conn.isClosing() {
+						_ = conn.CloseWith(io.EOF)
+					}
+				}
+				loop.beginStop(nil)
+				select {
+				case <-done:
+				case <-time.After(2 * time.Second):
+					t.Error("event loop did not stop")
+				}
+				_ = unix.Close(sourceFDs[1])
+				_ = unix.Close(targetFDs[1])
+			})
+			if _, err := unix.Write(sourceFDs[1], []byte{'a'}); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(readPeer(t, targetFDs[1], 1)); got != "x" {
+				t.Fatalf("target received %q, want x", got)
+			}
+			if err := <-callbackErr; err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
+	events := &Events{Pollers: 1, MaxOutboundBuffered: 2 << 20, WriteBufferedThreshold: -1}
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events.workers = []*eventLoop{loop}
+	sourceFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targetFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range []int{sourceFDs[0], sourceFDs[1], targetFDs[0], targetFDs[1]} {
+		if err := unix.SetNonblock(fd, true); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := unix.SetsockoptInt(targetFDs[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	source := &fdConn{fd: sourceFDs[0], commonConn: commonConn{events: events, loop: loop}}
+	target := &fdConn{fd: targetFDs[0], commonConn: commonConn{events: events, loop: loop}}
+	payload := make([]byte, 1<<20)
+	for index := range payload {
+		payload[index] = byte(index)
+	}
+	callbackErr := make(chan error, 1)
+	events.OnData = func(conn Conn) error {
+		if conn != source {
+			_, _ = conn.Discard(-1)
+			return nil
+		}
+		_, _ = conn.Discard(-1)
+		_, err := target.Write(payload)
+		callbackErr <- err
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- loop.Serve(false, nil) }()
+	for _, conn := range []*fdConn{source, target} {
+		registered := make(chan error, 1)
+		go func(conn *fdConn) { registered <- events.addConn(conn) }(conn)
+		if err := <-registered; err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, conn := range []*fdConn{source, target} {
+			if !conn.isClosing() {
+				_ = conn.CloseWith(io.EOF)
+			}
+		}
+		loop.beginStop(nil)
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Error("event loop did not stop")
+		}
+		_ = unix.Close(sourceFDs[1])
+		_ = unix.Close(targetFDs[1])
+	})
+	if _, err := unix.Write(sourceFDs[1], []byte{'a'}); err != nil {
+		t.Fatal(err)
+	}
+	got := readPeer(t, targetFDs[1], len(payload))
+	if !bytes.Equal(got, payload) {
+		t.Fatal("target did not receive the complete partial-write suffix")
+	}
+	if err := <-callbackErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFlushTouchedUsesBudgetAndReleasesLargeStorage(t *testing.T) {
+	loop := &eventLoop{events: &Events{}}
+	connections := make([]fdConn, touchedBudget+1)
+	for index := range connections {
+		connections[index].closed = true
+		loop.touch(&connections[index])
+	}
+	loop.flushTouched()
+	if loop.touchedHead != touchedBudget || !loop.hasTouched() {
+		t.Fatalf("touched progress = %d/%d", loop.touchedHead, len(loop.touched))
+	}
+	if connections[touchedBudget].touched != true {
+		t.Fatal("unprocessed connection lost its touched marker")
+	}
+	loop.flushTouched()
+	if loop.hasTouched() || len(loop.touched) != 0 || cap(loop.touched) != 0 {
+		t.Fatalf("drained touched storage len/cap = %d/%d", len(loop.touched), cap(loop.touched))
 	}
 }
 

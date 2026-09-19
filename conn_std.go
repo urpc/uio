@@ -691,39 +691,34 @@ func (fc *fdConn) readLoop() {
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
-		n, err := fc.conn.Read(buffer)
-		if nil != err {
-			// close on error.
-			fc.events.closeConn(fc, err)
-			return
-		}
-
-		// fire data callback.
-		fc.callbackMu.Lock()
-		fc.inboundTail = buffer[:n]
-
-		// trigger inbound event.
-		fc.events.onSocketBytesRead(fc, n)
-
-		if err = fc.events.onData(fc); nil != err {
-			fc.callbackMu.Unlock()
-			// close on error.
-			fc.events.closeConn(fc, err)
-			break
-		}
-
-		if len(fc.inboundTail) > 0 {
-			if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.InboundBuffered() > limit {
-				fc.inboundTail = nil
+		n, readErr := fc.conn.Read(buffer)
+		if n > 0 {
+			// A Reader may return payload and a terminal error together. Deliver the
+			// payload before closing so the final stream segment is not lost.
+			fc.callbackMu.Lock()
+			fc.inboundTail = buffer[:n]
+			fc.events.onSocketBytesRead(fc, n)
+			if callbackErr := fc.events.onData(fc); callbackErr != nil {
 				fc.callbackMu.Unlock()
-				fc.events.closeConn(fc, ErrInboundOverflow)
+				fc.events.closeConn(fc, callbackErr)
 				return
 			}
-			_, _ = fc.inbound.Write(fc.inboundTail)
-			fc.inboundTail = fc.inboundTail[:0]
+			if len(fc.inboundTail) > 0 {
+				if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.InboundBuffered() > limit {
+					fc.inboundTail = nil
+					fc.callbackMu.Unlock()
+					fc.events.closeConn(fc, ErrInboundOverflow)
+					return
+				}
+				_, _ = fc.inbound.Write(fc.inboundTail)
+				fc.inboundTail = fc.inboundTail[:0]
+			}
+			fc.callbackMu.Unlock()
 		}
-
-		fc.callbackMu.Unlock()
+		if readErr != nil {
+			fc.events.closeConn(fc, readErr)
+			return
+		}
 	}
 }
 

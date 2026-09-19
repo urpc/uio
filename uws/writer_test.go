@@ -35,9 +35,52 @@ func TestConnectionOutboundBudgetRecoversAfterRelease(t *testing.T) {
 	if raw.writes != 2 {
 		t.Fatalf("writes = %d, want 2", raw.writes)
 	}
-	wantWritevs := 2
+	wantWritevs := 0
 	if raw.writevs != wantWritevs {
 		t.Fatalf("vectored writes = %d, want %d", raw.writevs, wantWritevs)
+	}
+}
+
+func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
+	raw := &writeProbeConn{}
+	server := &Server{
+		Events:           &uio.Events{WriteBufferedThreshold: 64},
+		MaxFramePayload:  1024,
+		MaxMessageSize:   1024,
+		MaxOutboundBytes: 1 << 20,
+	}
+	conn := &Conn{raw: raw, config: testServerConfig(server)}
+	conn.opened.Store(true)
+
+	if err := conn.SendBinary(make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if raw.writes != 1 || raw.writevs != 0 {
+		t.Fatalf("small frame transport calls = Write:%d Writev:%d, want 1/0", raw.writes, raw.writevs)
+	}
+	if err := conn.SendBinary(make([]byte, 64)); err != nil {
+		t.Fatal(err)
+	}
+	if raw.writes != 2 || raw.writevs != 1 {
+		t.Fatalf("large frame transport calls = Write:%d Writev:%d, want 2/1", raw.writes, raw.writevs)
+	}
+
+	disabledRaw := &writeProbeConn{}
+	disabled := &Conn{
+		raw: disabledRaw,
+		config: testServerConfig(&Server{
+			Events:           &uio.Events{WriteBufferedThreshold: -1},
+			MaxFramePayload:  1024,
+			MaxMessageSize:   1024,
+			MaxOutboundBytes: 1 << 20,
+		}),
+	}
+	disabled.opened.Store(true)
+	if err := disabled.SendBinary(make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if disabledRaw.writes != 1 || disabledRaw.writevs != 1 {
+		t.Fatalf("disabled coalescing transport calls = Write:%d Writev:%d, want 1/1", disabledRaw.writes, disabledRaw.writevs)
 	}
 }
 
@@ -183,8 +226,8 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 	}
 	lockAvailable := make(chan struct{})
 	go func() {
-		conn.writeMu.Lock()
-		conn.writeMu.Unlock()
+		conn.lockWrite()
+		conn.unlockWrite()
 		close(lockAvailable)
 	}()
 	select {
@@ -244,6 +287,17 @@ func (conn *failNthWriteConn) Writev(buffers [][]byte) (int, error) {
 	previous := conn.writeErr
 	conn.writeErr = conn.err
 	n, err := conn.scriptedConn.Writev(buffers)
+	conn.writeErr = previous
+	return n, err
+}
+
+func (conn *failNthWriteConn) WriteOwned(buffer *uio.Buffer) (int, error) {
+	if conn.writes+1 != conn.failAt {
+		return conn.scriptedConn.WriteOwned(buffer)
+	}
+	previous := conn.writeErr
+	conn.writeErr = conn.err
+	n, err := conn.scriptedConn.WriteOwned(buffer)
 	conn.writeErr = previous
 	return n, err
 }

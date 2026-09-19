@@ -82,6 +82,8 @@ type writeProbeConn struct {
 	readDeadline  time.Time
 	writeDeadline time.Time
 	deadlineErr   error
+	noDelay       bool
+	noDelayErr    error
 }
 
 type bufferedProbeConn struct {
@@ -296,6 +298,11 @@ func (c *writeProbeConn) SetReadDeadline(deadline time.Time) error {
 func (c *writeProbeConn) SetWriteDeadline(deadline time.Time) error {
 	c.writeDeadline = deadline
 	return c.deadlineErr
+}
+
+func (c *writeProbeConn) SetNoDelay(noDelay bool) error {
+	c.noDelay = noDelay
+	return c.noDelayErr
 }
 
 func (c *writeProbeConn) CloseWith(err error) error {

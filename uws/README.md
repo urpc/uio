@@ -98,7 +98,7 @@ Handlers normally run on the I/O event loop and should return promptly. Set
 `Server.Executor` or `Dialer.Executor` to move `OnOpen`, `OnMessage`, and
 `OnClose` to an application executor. Callbacks for one connection remain
 serialized. The executor's `Submit` method must return promptly and return
-`false` when its bounded queue is full; use a fixed worker pool for the
+`false` when its bounded queue is full; use a bounded worker pool for the
 application work. UWS keeps generous internal mailbox limits as a final guard
 against an executor that stops making progress. An overloaded connection is
 closed with code 1013 and `ErrApplicationBackpressure`; other connections
@@ -109,12 +109,13 @@ the I/O loop, so remaining callbacks, including `OnClose`, are dropped. Size
 the executor for the expected concurrent connections, or provide a fair
 scheduler in front of a bounded worker pool.
 
-`*taskgo.Queue` implements this executor interface directly (taskgo's
+[`*taskgo.Queue`](https://github.com/limpo1989/taskgo) implements this executor interface directly (taskgo's
 `Submit` API). A typical setup for deep, bursty business calls is:
 
 ```go
+workers := runtime.GOMAXPROCS(0) * 8
 executor := taskgo.New(
-	taskgo.WithConcurrency(8),
+	taskgo.WithConcurrency(workers),
 	taskgo.WithMaxIdle(time.Second),
 	taskgo.WithMaxPending(10128), // connection runners plus scheduling headroom
 )
@@ -126,6 +127,15 @@ Keep the taskgo pending limit larger than the expected number of simultaneously
 scheduled connection runners (leave headroom for runner replacement while a
 worker callback is still returning). UWS independently bounds queued messages
 with its per-connection and server-wide mailbox limits.
+
+An executor runner handles at most 64 callbacks or one millisecond before it
+resubmits the connection. This preserves connection order while preventing a
+busy connection from monopolizing one worker; a callback that itself blocks
+still occupies only that worker. Ordinary server data frames produced during
+one runner turn are submitted to the transport in batches of at most 64 KiB.
+Control frames and explicit flushes remain barriers. Worker needs depend on the
+ratio and duration of blocking callbacks; `4-10 * GOMAXPROCS` is a practical
+starting range, not a universal default.
 
 `Close` sends a close frame and waits for the peer response, bounded by
 `CloseTimeout`. Protocol errors are reported as close code 1002; invalid UTF-8

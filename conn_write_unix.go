@@ -13,6 +13,10 @@ import (
 	"github.com/urpc/uio/internal/socket"
 )
 
+// nativeWriteVecLimit bounds stack use while allowing a read event's small
+// owned writes to drain in one syscall.
+const nativeWriteVecLimit = 64
+
 func (conn *fdConn) WriteByte(value byte) error {
 	var data [1]byte
 	data[0] = value
@@ -164,6 +168,19 @@ func (conn *fdConn) reservePending(size int64) bool {
 	}
 }
 
+func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
+	if conn.reservePending(size) {
+		return true, nil
+	}
+	if conn.outbound.Empty() || conn.writeBlocked {
+		return false, nil
+	}
+	if _, err := conn.flushOnLoop(); err != nil {
+		return false, err
+	}
+	return conn.reservePending(size), nil
+}
+
 func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	if conn.isDatagram() {
 		return conn.sendUDPOnLoop(data)
@@ -171,10 +188,15 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
 	if !conn.outbound.Empty() || (threshold > 0 && len(data) < threshold) {
 		// Batching or an existing tail requires one copy into loop-owned storage.
-		if !conn.reservePending(int64(len(data))) {
+		reserved, err := conn.reservePendingAfterFlush(int64(len(data)))
+		if err != nil {
+			return 0, err
+		}
+		if !reserved {
 			return 0, ErrOutboundOverflow
 		}
 		_, _ = conn.outbound.Write(data)
+		conn.loop.touch(conn)
 		return len(data), nil
 	}
 
@@ -205,6 +227,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	// Only the unsent suffix must survive after Write returns.
 	_, _ = conn.outbound.Write(remaining)
 	conn.writeBlocked = written == 0
+	conn.loop.touch(conn)
 	return len(data), nil
 }
 
@@ -214,10 +237,15 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	}
 	threshold := conn.events.WriteBufferedThreshold
 	if !conn.outbound.Empty() || (threshold > 0 && total < threshold) {
-		if !conn.reservePending(int64(total)) {
+		reserved, err := conn.reservePendingAfterFlush(int64(total))
+		if err != nil {
+			return 0, err
+		}
+		if !reserved {
 			return 0, ErrOutboundOverflow
 		}
 		_, _ = conn.outbound.Writev(vec)
+		conn.loop.touch(conn)
 		return total, nil
 	}
 	written, err := socket.Writev(conn.fd, vec)
@@ -246,17 +274,24 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
 	conn.outbound.AppendOwned(owned)
 	conn.writeBlocked = written == 0
+	conn.loop.touch(conn)
 	return total, nil
 }
 
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
 	if !conn.outbound.Empty() || (threshold > 0 && size < threshold) {
-		if !conn.reservePending(int64(size)) {
+		reserved, err := conn.reservePendingAfterFlush(int64(size))
+		if err != nil {
+			bytebuf.ReleaseBuffer(owned)
+			return 0, err
+		}
+		if !reserved {
 			bytebuf.ReleaseBuffer(owned)
 			return 0, ErrOutboundOverflow
 		}
 		conn.outbound.AppendOwned(owned)
+		conn.loop.touch(conn)
 		return size, nil
 	}
 
@@ -291,6 +326,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	}
 	conn.outbound.AppendOwned(owned)
 	conn.writeBlocked = written == 0
+	conn.loop.touch(conn)
 	return size, nil
 }
 
@@ -404,7 +440,7 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 		// Once EAGAIN is observed, only a Writable event should retry the fd.
 		return 0, nil
 	}
-	var vecStorage [8][]byte
+	var vecStorage [nativeWriteVecLimit][]byte
 	totalWritten := 0
 	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.outbound.Empty(); calls++ {
 		vec, _ := conn.outbound.PeekVecN(vecStorage[:0], len(vecStorage))

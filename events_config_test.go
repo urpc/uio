@@ -1,6 +1,9 @@
 package uio
 
 import (
+	"context"
+	"errors"
+	"net"
 	"runtime"
 	"testing"
 )
@@ -25,5 +28,29 @@ func TestPollerCountDefaultsAndLimits(t *testing.T) {
 				t.Fatalf("Pollers = %d, want %d", events.Pollers, test.want)
 			}
 		})
+	}
+}
+
+func TestEventLifecycleHelpers(t *testing.T) {
+	events := &Events{}
+	events.callbackWG.Add(1)
+	callbackID := events.enterExternalCallback()
+	if _, exists := events.callbackGoids.Load(callbackID); !exists {
+		t.Fatal("external callback was not registered")
+	}
+	events.finishExternalCallback(callbackID)
+	events.callbackWG.Wait()
+	if _, exists := events.callbackGoids.Load(callbackID); exists {
+		t.Fatal("finished external callback remained registered")
+	}
+
+	request := &registerRequest{ctx: context.Background()}
+	if err := request.cause(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("uncanceled request cause = %v, want context.Canceled", err)
+	}
+
+	events.closing.Store(true)
+	if err := events.Serve(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Serve after close = %v, want net.ErrClosed", err)
 	}
 }

@@ -511,6 +511,57 @@ func TestParserAndAssemblerRejectNilCallbacks(t *testing.T) {
 	}
 }
 
+func TestAcceptSingleValidatesCompleteFrames(t *testing.T) {
+	cfg := &AssemblerConfig{MaxMessage: 4, MaxCompressedPayload: 3, ValidateUTF8: true}
+	sentinel := errors.New("callback failed")
+
+	if err := AcceptSingle(Frame{Fin: true, RSV1: true, Opcode: Ping}, cfg,
+		func(Frame) error { return nil }, func(Message) error { return nil }); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("compressed control error = %v, want ErrProtocol", err)
+	}
+	if err := AcceptSingle(Frame{Fin: true, Opcode: Ping}, cfg, nil,
+		func(Message) error { return nil }); err == nil {
+		t.Fatal("nil control callback was accepted")
+	}
+	if err := AcceptSingle(Frame{Fin: true, Opcode: Pong}, cfg,
+		func(frame Frame) error {
+			if frame.Opcode != Pong {
+				t.Fatalf("control opcode = %v, want Pong", frame.Opcode)
+			}
+			return sentinel
+		}, func(Message) error { return nil }); !errors.Is(err, sentinel) {
+		t.Fatalf("control callback error = %v, want %v", err, sentinel)
+	}
+
+	if err := AcceptSingle(Frame{Fin: true, Opcode: Binary}, cfg,
+		func(Frame) error { return nil }, nil); err == nil {
+		t.Fatal("nil message callback was accepted")
+	}
+	if err := AcceptSingle(Frame{Fin: true, Opcode: Continuation}, cfg,
+		func(Frame) error { return nil }, func(Message) error { return nil }); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("continuation error = %v, want ErrProtocol", err)
+	}
+	if err := AcceptSingle(Frame{Opcode: Text}, cfg,
+		func(Frame) error { return nil }, func(Message) error { return nil }); !errors.Is(err, ErrProtocol) {
+		t.Fatalf("fragmented frame error = %v, want ErrProtocol", err)
+	}
+	if err := AcceptSingle(Frame{Fin: true, Opcode: Binary, Payload: []byte("12345")}, cfg,
+		func(Frame) error { return nil }, func(Message) error { return nil }); !errors.Is(err, ErrMessageTooBig) {
+		t.Fatalf("oversized frame error = %v, want ErrMessageTooBig", err)
+	}
+
+	payload := []byte("abc")
+	if err := AcceptSingle(Frame{Fin: true, RSV1: true, Opcode: Binary, Payload: payload, Borrowed: true}, cfg,
+		func(Frame) error { return nil }, func(message Message) error {
+			if message.Opcode != Binary || !message.Compressed || !message.Borrowed || !bytes.Equal(message.Payload, payload) {
+				t.Fatalf("message metadata = %+v", message)
+			}
+			return sentinel
+		}); !errors.Is(err, sentinel) {
+		t.Fatalf("message callback error = %v, want %v", err, sentinel)
+	}
+}
+
 func TestIncrementalParserResetsBeforeCallbackError(t *testing.T) {
 	first := Append(nil, Frame{Fin: true, Opcode: Binary, Payload: []byte("first")}, [4]byte{})
 	second := Append(nil, Frame{Fin: true, Opcode: Binary, Payload: []byte("second")}, [4]byte{})

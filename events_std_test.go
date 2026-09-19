@@ -31,6 +31,7 @@ type stdRegistrationConn struct {
 	writeRelease   chan struct{}
 	writeOnce      sync.Once
 	writeFunc      func([]byte) (int, error)
+	readFunc       func([]byte) (int, error)
 }
 
 func newStdRegistrationConn(fd uintptr) *stdRegistrationConn {
@@ -52,6 +53,9 @@ func (conn *stdRegistrationConn) Read(buffer []byte) (int, error) {
 	}
 	if !conn.openReturned.Load() {
 		conn.orderViolation.Store(true)
+	}
+	if conn.readFunc != nil {
+		return conn.readFunc(buffer)
 	}
 	select {
 	case data := <-conn.readData:
@@ -1039,5 +1043,45 @@ func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
 	}
 	if _, registered := events.callbackGoids.Load(id); registered {
 		t.Fatal("callback goroutine remained registered after read loop exit")
+	}
+}
+
+func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
+	raw := newStdRegistrationConn(30005)
+	raw.openReturned.Store(true)
+	var once sync.Once
+	raw.readFunc = func(buffer []byte) (int, error) {
+		n := 0
+		once.Do(func() { n = copy(buffer, "tail") })
+		return n, io.EOF
+	}
+	events := &Events{MaxBufferSize: 64}
+	received := make(chan string, 1)
+	events.OnData = func(conn Conn) error {
+		chunk := append([]byte(nil), conn.PeekChunk()...)
+		_, _ = conn.Discard(-1)
+		received <- string(chunk)
+		return nil
+	}
+	conn := &fdConn{conn: raw}
+	conn.events = events
+	events.callbackWG.Add(1)
+	done := make(chan struct{})
+	go func() {
+		conn.readLoop()
+		close(done)
+	}()
+	select {
+	case got := <-received:
+		if got != "tail" {
+			t.Fatalf("final payload = %q, want tail", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("final payload was not delivered")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("read loop did not exit after terminal error")
 	}
 }

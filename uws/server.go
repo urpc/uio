@@ -54,11 +54,14 @@ type Server struct {
 	AllowCompressionContextTakeover bool
 	// HeartbeatInterval enables server pings when positive.
 	HeartbeatInterval time.Duration
-	// HeartbeatTimeout closes a connection without a pong. Zero uses twice the interval.
+	// HeartbeatTimeout bounds both the time a ping may remain queued and the
+	// time to receive its matching pong after it is written. Zero uses twice
+	// the interval.
 	HeartbeatTimeout time.Duration
 
 	connections    sync.Map
 	heartbeatStop  chan struct{}
+	heartbeatDone  chan struct{}
 	heartbeatMu    sync.Mutex
 	dispatchBudget pendingBudget
 	config         *connConfig
@@ -112,8 +115,8 @@ func (s *Server) Serve(addrs ...string) error {
 		s.CompressionLevel = -1
 	}
 	s.dispatchBudget.configure(defaultMaxPendingTotalMessages, defaultMaxPendingTotalBytes)
-	s.config = newServerConnConfig(s)
 	configureWriteBuffer(events)
+	s.config = newServerConnConfig(s)
 	oldOnStart := events.OnStart
 	events.OnStart = func(events *uio.Events) {
 		s.closeMu.Lock()
@@ -166,56 +169,89 @@ func (s *Server) startHeartbeat(config *connConfig) {
 	timeout := config.heartbeatTimeout
 	connections := config.heartbeatConnections
 	stop := make(chan struct{})
+	done := make(chan struct{})
 	s.heartbeatMu.Lock()
-	previous := s.heartbeatStop
-	s.heartbeatStop = stop
-	s.heartbeatMu.Unlock()
-	if previous != nil {
-		close(previous)
+	previousStop := s.heartbeatStop
+	previousDone := s.heartbeatDone
+	if previousStop != nil {
+		close(previousStop)
 	}
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case now := <-ticker.C:
-				connections.Range(func(_, value any) bool {
-					conn := value.(*Conn)
-					if conn.closed.Load() {
-						return true
-					}
-					heartbeat := conn.heartbeat
-					if heartbeat == nil {
-						return true
-					}
-					last := time.Unix(0, heartbeat.lastPong.Load())
-					if heartbeat.pingOutstanding.Load() && now.Sub(last) >= timeout {
-						_ = conn.Close(1001, "heartbeat timeout")
-						_ = conn.closeTransport()
-						return true
-					}
-					if heartbeat.pingOutstanding.CompareAndSwap(false, true) {
-						if err := conn.Ping(nil); err != nil {
-							heartbeat.pingOutstanding.Store(false)
-						}
-					}
-					return true
-				})
-			case <-stop:
-				return
-			}
-		}
-	}()
+	if previousDone != nil {
+		<-previousDone
+	}
+	s.heartbeatStop = stop
+	s.heartbeatDone = done
+	go s.runHeartbeat(connections, interval, timeout, stop, done)
+	s.heartbeatMu.Unlock()
 }
 
 func (s *Server) stopHeartbeat() {
 	s.heartbeatMu.Lock()
 	stop := s.heartbeatStop
+	done := s.heartbeatDone
 	s.heartbeatStop = nil
-	s.heartbeatMu.Unlock()
+	s.heartbeatDone = nil
 	if stop != nil {
 		close(stop)
 	}
+	if done != nil {
+		<-done
+	}
+	s.heartbeatMu.Unlock()
+}
+
+func (s *Server) runHeartbeat(connections *sync.Map, interval, timeout time.Duration, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			if !scanHeartbeat(connections, now, timeout, stop) {
+				return
+			}
+		case <-stop:
+			return
+		}
+	}
+}
+
+func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, stop <-chan struct{}) bool {
+	completed := true
+	connections.Range(func(_, value any) bool {
+		select {
+		case <-stop:
+			completed = false
+			return false
+		default:
+		}
+		conn := value.(*Conn)
+		if conn.closed.Load() || conn.closing.Load() || conn.heartbeat == nil {
+			return true
+		}
+		heartbeat := conn.heartbeat
+		if heartbeat.pingOutstanding.Load() {
+			if heartbeat.expirePing(now, timeout) {
+				conn.expireHeartbeat()
+			}
+			return true
+		}
+		_, _ = conn.tryHeartbeatPing(now)
+		return true
+	})
+	return completed
+}
+
+func (c *Conn) expireHeartbeat() {
+	const (
+		code   = uint16(1001)
+		reason = "heartbeat timeout"
+	)
+	if c.closed.Load() || c.closing.Load() || c.tryHeartbeatClose(code, reason) {
+		return
+	}
+	c.setCloseReason(code, reason)
+	_ = c.closeTransport()
 }
 
 func (s *Server) onOpen(raw uio.Conn) {

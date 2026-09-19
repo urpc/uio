@@ -176,7 +176,16 @@ func (conn *fdConn) fireOnData() error {
 	if err != nil {
 		return err
 	}
-	return conn.finishCallback()
+	if conn.isClosing() || conn.closed {
+		return nil
+	}
+	if conn.isDatagram() {
+		return conn.finishCallback()
+	}
+	// One readable event may invoke OnData for several socket reads. Flush the
+	// complete read round once, while explicit Flush calls remain immediate.
+	conn.loop.touch(conn)
+	return nil
 }
 
 func (conn *fdConn) finishCallback() error {

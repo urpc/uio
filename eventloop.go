@@ -11,8 +11,10 @@ import (
 )
 
 const (
-	taskBudget = 256
-	eventBatch = 1024
+	taskBudget         = 256
+	touchedBudget      = 256
+	maxRetainedTouched = 256
+	eventBatch         = 1024
 )
 
 var unixFdMap *fdmap.Map[fdConn]
@@ -42,6 +44,7 @@ type eventLoop struct {
 	loopGoid    atomic.Int64
 	stopErr     error
 	touched     []*fdConn
+	touchedHead int
 }
 
 func newEventLoop(events *Events) (*eventLoop, error) {
@@ -181,7 +184,10 @@ func (loop *eventLoop) touch(conn *fdConn) {
 }
 
 func (loop *eventLoop) flushTouched() {
-	for _, conn := range loop.touched {
+	end := min(loop.touchedHead+touchedBudget, len(loop.touched))
+	for index := loop.touchedHead; index < end; index++ {
+		conn := loop.touched[index]
+		loop.touched[index] = nil
 		conn.clearTouched()
 		if conn.isClosedOnLoop() {
 			continue
@@ -194,8 +200,19 @@ func (loop *eventLoop) flushTouched() {
 			conn.requestClose(err)
 		}
 	}
-	loop.touched = loop.touched[:0]
+	loop.touchedHead = end
+	if loop.touchedHead != len(loop.touched) {
+		return
+	}
+	loop.touchedHead = 0
+	if cap(loop.touched) > maxRetainedTouched {
+		loop.touched = nil
+	} else {
+		loop.touched = loop.touched[:0]
+	}
 }
+
+func (loop *eventLoop) hasTouched() bool { return loop.touchedHead < len(loop.touched) }
 
 func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (result error) {
 	if lockOSThread {
@@ -215,7 +232,7 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 		}
 
 		timeout := -1
-		if loop.hasPendingTasks() {
+		if loop.hasPendingTasks() || loop.hasTouched() {
 			timeout = 0
 		} else {
 			// Clear before the second queue check to close the lost-wakeup race.
@@ -249,6 +266,9 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 }
 
 func (loop *eventLoop) shutdown(err error) {
+	clear(loop.touched)
+	loop.touched = nil
+	loop.touchedHead = 0
 	// fdMap is shared on Unix, so only close entries owned by this loop.
 	for fd, conn := range loop.fdMap.Range() {
 		if conn.loop == loop {
@@ -273,6 +293,7 @@ func (loop *eventLoop) OnEvent(_ *poller.NetPoller, fd int, events poller.Events
 		if err := conn.fireReadEvent(); err != nil {
 			conn.requestClose(err)
 		}
+		loop.flushTouched()
 	}
 }
 

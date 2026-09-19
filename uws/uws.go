@@ -136,3 +136,10 @@ func configureWriteBuffer(events *uio.Events) {
 		events.WriteBufferedThreshold = defaultWriteBufferedThreshold
 	}
 }
+
+func effectiveWriteBufferedThreshold(events *uio.Events) int {
+	if events == nil || events.WriteBufferedThreshold == 0 {
+		return defaultWriteBufferedThreshold
+	}
+	return events.WriteBufferedThreshold
+}

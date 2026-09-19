@@ -16,10 +16,11 @@ type connConfig struct {
 	parser    frame.ParserConfig
 	assembler frame.AssemblerConfig
 
-	maxHeaderBytes   int
-	maxOutboundBytes int
-	closeTimeout     time.Duration
-	handshakeTimeout time.Duration
+	maxHeaderBytes         int
+	maxOutboundBytes       int
+	writeBufferedThreshold int
+	closeTimeout           time.Duration
+	handshakeTimeout       time.Duration
 
 	compressionEnabled         bool
 	compressionLevel           int
@@ -79,6 +80,7 @@ func newServerConnConfig(server *Server) *connConfig {
 		},
 		maxHeaderBytes:             maxHeader,
 		maxOutboundBytes:           maxOutbound,
+		writeBufferedThreshold:     effectiveWriteBufferedThreshold(server.Events),
 		closeTimeout:               closeTimeout,
 		handshakeTimeout:           handshakeTimeout,
 		compressionEnabled:         server.EnableCompression,
@@ -124,15 +126,16 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 		assembler: frame.AssemblerConfig{
 			MaxMessage: maxMessage, MaxCompressedPayload: maxFrame, ValidateUTF8: !dialer.DisableUTF8Check,
 		},
-		maxHeaderBytes:     maxHeader,
-		maxOutboundBytes:   maxOutbound,
-		closeTimeout:       closeTimeout,
-		handshakeTimeout:   handshakeTimeout,
-		compressionEnabled: dialer.EnableCompression,
-		compressionLevel:   compressionLevel,
-		subprotocols:       append([]string(nil), dialer.Subprotocols...),
-		executor:           dialer.Executor,
-		dispatchBudget:     &dialer.dispatchBudget,
+		maxHeaderBytes:         maxHeader,
+		maxOutboundBytes:       maxOutbound,
+		writeBufferedThreshold: effectiveWriteBufferedThreshold(dialer.Events),
+		closeTimeout:           closeTimeout,
+		handshakeTimeout:       handshakeTimeout,
+		compressionEnabled:     dialer.EnableCompression,
+		compressionLevel:       compressionLevel,
+		subprotocols:           append([]string(nil), dialer.Subprotocols...),
+		executor:               dialer.Executor,
+		dispatchBudget:         &dialer.dispatchBudget,
 	}
 }
 

@@ -3,6 +3,7 @@ package uws
 import (
 	"unicode/utf8"
 
+	"github.com/petermattis/goid"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 )
@@ -23,9 +24,23 @@ func (c *Conn) BeginMessage(typ MessageType) (*Writer, error) {
 	if c.closed.Load() || c.closing.Load() {
 		return nil, ErrClosed
 	}
-	c.writeMu.Lock()
+	c.lockWrite()
+	if c.dispatch != nil {
+		owner := c.dispatch.writeBatch.ownerID()
+		if owner != 0 && owner == goid.Get() {
+			c.dispatch.writeBatch.requestFinish()
+		}
+	}
+	if err := c.finishWriteResponsibilitiesLocked(); err != nil {
+		c.unlockWrite()
+		return nil, err
+	}
+	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+		c.unlockWrite()
+		return nil, err
+	}
 	if c.closed.Load() || c.closing.Load() {
-		c.writeMu.Unlock()
+		c.unlockWrite()
 		return nil, ErrClosed
 	}
 	opcode := frame.Text
@@ -36,7 +51,7 @@ func (c *Conn) BeginMessage(typ MessageType) (*Writer, error) {
 	if c.compression != nil && c.compression.encoder != nil {
 		stream, err := c.compression.encoder.NewStream(writer.emitCompressed)
 		if err != nil {
-			c.writeMu.Unlock()
+			c.unlockWrite()
 			return nil, err
 		}
 		writer.stream = stream
@@ -149,13 +164,16 @@ func (w *Writer) Close() error {
 		err = w.conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: opcode})
 	}
 	if err == nil {
+		err = w.conn.flushDispatchWritesLocked()
+	}
+	if err == nil {
 		err = w.conn.flush()
 	}
 	if err != nil {
 		return w.fail(err)
 	}
 	w.closed = true
-	w.conn.writeMu.Unlock()
+	w.conn.unlockWrite()
 	return nil
 }
 
@@ -171,7 +189,7 @@ func (w *Writer) fail(err error) error {
 	if w.stream != nil {
 		w.stream.Abort()
 	}
-	w.conn.writeMu.Unlock()
+	w.conn.unlockWrite()
 	if w.conn.raw != nil {
 		_ = w.conn.raw.CloseWith(w.failure)
 	}

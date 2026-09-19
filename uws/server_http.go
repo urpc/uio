@@ -5,7 +5,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
@@ -135,7 +134,6 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 		return
 	}
 	if conn.heartbeat != nil {
-		conn.heartbeat.lastPong.Store(time.Now().UnixNano())
 		conn.config.heartbeatConnections.Store(conn, conn)
 	}
 	if err := conn.dispatchOpen(); err != nil {

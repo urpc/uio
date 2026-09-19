@@ -2,6 +2,7 @@ package uws
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -372,7 +373,6 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		return context.DeadlineExceeded
 	}
 	if c.heartbeat != nil {
-		c.heartbeat.lastPong.Store(time.Now().UnixNano())
 		c.config.heartbeatConnections.Store(c, c)
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
@@ -439,10 +439,19 @@ func (c *Conn) rejectHandshake() {
 }
 
 func (c *Conn) closeTransport() error {
+	c.closing.Store(true)
+	c.writes.requestDrain()
+	if c.dispatch != nil {
+		c.dispatch.writeBatch.requestFinish()
+	}
+	c.transportClosePending.Store(true)
+	dispatchErr := c.tryFinishWriteResponsibilities()
+	if dispatchErr != nil && !errors.Is(dispatchErr, net.ErrClosed) {
+		return dispatchErr
+	}
 	if err := c.flush(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return err
 	}
-	c.transportClosePending.Store(true)
 	if closed, err := c.tryCloseTransport(); closed {
 		return err
 	}
@@ -496,7 +505,10 @@ func (c *Conn) ensureCloseTimer() {
 }
 
 func (c *Conn) tryCloseTransport() (bool, error) {
-	if !c.transportClosePending.Load() || c.pendingBytes.Load() != 0 {
+	if !c.transportClosePending.Load() || c.writes.drainIsRequested() || c.pendingBytes.Load() != 0 {
+		return false, nil
+	}
+	if c.dispatch != nil && c.dispatch.writeBatch.finishIsRequested() {
 		return false, nil
 	}
 	if !c.transportClosePending.CompareAndSwap(true, false) {
@@ -578,9 +590,8 @@ func (c *Conn) acceptControl(f frame.Frame) error {
 	case frame.Ping:
 		return c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
 	case frame.Pong:
-		if c.heartbeat != nil {
-			c.heartbeat.lastPong.Store(time.Now().UnixNano())
-			c.heartbeat.pingOutstanding.Store(false)
+		if c.heartbeat != nil && len(f.Payload) == 8 {
+			c.heartbeat.acknowledgePing(binary.BigEndian.Uint64(f.Payload))
 		}
 		return nil
 	case frame.Close:
