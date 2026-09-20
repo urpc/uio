@@ -932,7 +932,7 @@ func TestExecutorBatchDoesNotCaptureExternalSend(t *testing.T) {
 	}
 }
 
-func TestExecutorFlushesMessageWritesBeforeCloseCallback(t *testing.T) {
+func TestExecutorFlushesMessageWritesBeforeResubmittedCloseCallback(t *testing.T) {
 	raw := newScriptedConn()
 	executor := &queuedExecutor{}
 	messageStarted := make(chan struct{})
@@ -965,15 +965,24 @@ func TestExecutorFlushesMessageWritesBeforeCloseCallback(t *testing.T) {
 	}()
 	<-messageStarted
 	conn.dispatchClose(CloseEvent{Code: 1000})
+	// Force the callback past the runner's time budget so Close must run in a
+	// resubmitted task after the message batch has been flushed.
+	time.Sleep(2 * maxDispatchRunDuration)
 	close(resume)
 	<-runnerDone
+	if pending := executor.pending(); pending != 1 {
+		t.Fatalf("executor tasks after time-slice yield = %d, want 1", pending)
+	}
+	if !executor.runNext() {
+		t.Fatal("executor did not run the resubmitted Close callback")
+	}
 	select {
 	case writes := <-closeWrites:
 		if writes != 1 {
 			t.Fatalf("writes visible to OnClose = %d, want 1", writes)
 		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("OnClose was not called")
+	default:
+		t.Fatal("resubmitted OnClose was not called")
 	}
 }
 
