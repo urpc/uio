@@ -203,8 +203,14 @@ through `CloseEvent.Err`.
 
 ## Linux benchmark
 
-Compare UWS, stdio, and Gorilla with the same client, payload, connection
-count, CPU affinity, and warmup. Do not use a single run as a performance
-claim; report multiple runs and include P99 latency. The UIO Unix path is
-intended for bounded coroutine counts, while `stdio` is a portability and
-baseline implementation.
+Compare UWS backends and other libraries with the same client version, worker
+count, payload, connection count, CPU affinity, and warmup. Do not use a
+single run as a performance claim; report multiple runs and include P99
+latency. For a like-for-like comparison, assign disjoint CPU sets to the
+server and load generator, then give events the same poller count as the
+stdio server's `GOMAXPROCS`. In the current 24-CPU Linux test, events slightly
+outperforms stdio while using substantially less memory. Increasing events
+or stdio `MaxBufferSize` from 4 KiB to 16 KiB did not materially improve the
+tested 1 KiB WebSocket pipeline workload; stdio also retained more memory at
+16 KiB. Buffer sizing should follow the actual payload and protocol. Measure
+both on the deployment platform.
