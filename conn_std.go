@@ -35,6 +35,10 @@ import (
 const stdOwnedWriteThreshold = 4 << 10
 const stdWriteVecLimit = 16
 
+// fdConn uses one blocking reader and one blocking writer per stream. mux
+// protects producer admission and counters; writeMu protects the detached
+// batch while the writer performs blocking net.Conn writes; callbackMu keeps
+// OnData, Wake, and OnClose serialized for the connection.
 type fdConn struct {
 	commonConn
 	conn       net.Conn
@@ -52,7 +56,6 @@ type fdConn struct {
 	writeBytes int
 	closing    atomic.Bool
 	callbackMu sync.Mutex // serializes OnData, Wake, and OnClose
-	touched    bool
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -67,23 +70,19 @@ func (fc *fdConn) initialInterest() poller.Interest { return poller.Readable }
 func (fc *fdConn) setInterest(poller.Interest)      {}
 func (fc *fdConn) currentInterest() poller.Interest { return poller.Readable }
 func (fc *fdConn) isClosing() bool                  { return fc.closing.Load() || fc.IsClosed() }
+func (fc *fdConn) beginShutdown()                   {}
+func (fc *fdConn) isDatagram() bool                 { return fc.udp != nil }
 func (fc *fdConn) isClosedOnLoop() bool             { return fc.IsClosed() }
 func (fc *fdConn) afterRegister() {
 	_ = fc.fireWriteEvent()
 	_ = fc.fireReadEvent()
 }
-func (fc *fdConn) markTouched() bool {
-	if fc.touched {
-		return false
-	}
-	fc.touched = true
-	return true
-}
-func (fc *fdConn) clearTouched() { fc.touched = false }
 
 func (fc *fdConn) fireOnOpen() {
 	if callback := fc.events.OnOpen; callback != nil {
+		started := fc.beginInboundCallback()
 		callback(fc)
+		fc.endInboundCallback(started)
 	}
 }
 
@@ -200,6 +199,8 @@ func (fc *fdConn) SetWriteDeadline(deadline time.Time) error {
 	return fc.applyDeadline(deadlineWrite, deadline)
 }
 
+// applyDeadline delegates directly to the blocking net.Conn; unlike native
+// timers, the Go network poller owns interruption and reset semantics.
 func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if fc.isClosing() {
 		return net.ErrClosed
@@ -237,6 +238,8 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 	return fc.Write(data)
 }
 
+// Write copies tiny payloads into the shared outbound tail and transfers larger
+// payloads as owned blocks, keeping allocation and copying outside mux.
 func (fc *fdConn) Write(p []byte) (n int, err error) {
 	if fc.isClosing() {
 		return 0, net.ErrClosed
@@ -293,6 +296,9 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	return
 }
 
+// Writev preserves large source segments as separate owned blocks when the
+// fixed writer vector can carry them; larger segment counts collapse into one
+// block to avoid retaining an unbounded pointer list.
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 
 	if fc.isClosing() {
@@ -437,6 +443,9 @@ func (fc *fdConn) Flush() error {
 	return nil
 }
 
+// drainOutbound swaps the producer buffer into writeBatch before blocking on
+// the network. Producers immediately continue on a fresh CompositeBuffer;
+// writeMu prevents close cleanup from returning in-flight blocks to the pool.
 func (fc *fdConn) drainOutbound(vec [][]byte) (int, error) {
 	fc.writeMu.Lock()
 	defer fc.writeMu.Unlock()
@@ -511,6 +520,9 @@ func (fc *fdConn) enqueueClose(err error) error {
 
 func (fc *fdConn) requestClose(err error) { _ = fc.enqueueClose(err) }
 
+// closeOnLoop owns resource teardown and detaches UDP children. The user
+// callback is scheduled separately so a slow OnClose cannot block the logical
+// event loop or race an active OnData callback.
 func (fc *fdConn) closeOnLoop(err error) {
 	if fc.IsClosed() {
 		return
@@ -541,15 +553,28 @@ func (fc *fdConn) closeOnLoop(err error) {
 			return
 		}
 	}
-	fc.callbackMu.Lock()
-	defer fc.callbackMu.Unlock()
-	fc.inbound.Reset()
-	fc.inboundTail = nil
-	if callback := fc.events.OnClose; callback != nil && !fc.internal {
-		callback(fc, err)
-	}
+	fc.scheduleCloseCallback(err)
 }
 
+func (fc *fdConn) scheduleCloseCallback(err error) {
+	fc.events.callbackWG.Add(1)
+	go func() {
+		defer fc.events.callbackWG.Done()
+		fc.callbackMu.Lock()
+		defer fc.callbackMu.Unlock()
+		fc.inbound.Reset()
+		fc.inboundTail = nil
+		if callback := fc.events.OnClose; callback != nil && !fc.internal {
+			started := fc.beginInboundCallback()
+			callback(fc, err)
+			fc.endInboundCallback(started)
+		}
+	}()
+}
+
+// fdClose wins physical teardown once, interrupts blocking I/O by closing the
+// socket first, then waits for the detached writer batch before recycling any
+// pooled blocks.
 func (fc *fdConn) fdClose(err error) bool {
 	if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
 		return false
@@ -598,6 +623,8 @@ func (fc *fdConn) Wake() error {
 	return nil
 }
 
+func (fc *fdConn) YieldRead() error { return fc.Wake() }
+
 func (fc *fdConn) runWakeTask() error {
 	if fc.isClosing() {
 		return net.ErrClosed
@@ -605,30 +632,19 @@ func (fc *fdConn) runWakeTask() error {
 	// A Wake callback must not race the blocking read goroutine's inbound view.
 	fc.callbackMu.Lock()
 	defer fc.callbackMu.Unlock()
+	started := fc.beginInboundCallback()
+	defer fc.endInboundCallback(started)
 	return fc.events.onData(fc)
 }
 
-func (fc *fdConn) runWriteTask(t *task) {
-	if fc.isClosing() {
-		return
-	}
-	fc.mux.Lock()
-	_, _ = fc.outbound.Write(t.buf.Bytes())
-	fc.mux.Unlock()
-	select {
-	case fc.writeSig <- struct{}{}:
-	default:
-	}
-}
-
-func (fc *fdConn) runFlushTask() error                { return fc.Flush() }
 func (fc *fdConn) flushOnLoop() (int, error)          { return 0, nil }
 func (fc *fdConn) updateInterest() error              { return nil }
 func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 
+// writeLoop drains every coalesced notification to completion. writeSig is a
+// level signal for "output exists", not one acknowledgement per Write.
 func (fc *fdConn) writeLoop() {
-	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.finishExternalCallback(callbackID)
+	defer fc.events.callbackWG.Done()
 	var storage [stdWriteVecLimit][]byte
 	for {
 		select {
@@ -649,11 +665,10 @@ func (fc *fdConn) writeLoop() {
 	}
 }
 
+// readUDPLoop owns a connected UDP socket. A datagram is borrowed for one
+// callback and always discarded before the next blocking read.
 func (fc *fdConn) readUDPLoop() {
-	// This goroutine only enters user code through callbacks. Register it once
-	// so callback-initiated Events.Close does not wait for its own return.
-	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.finishExternalCallback(callbackID)
+	defer fc.events.callbackWG.Done()
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
@@ -671,7 +686,9 @@ func (fc *fdConn) readUDPLoop() {
 		fc.events.onSocketBytesRead(fc, n)
 
 		// fire data callback.
+		started := fc.beginInboundCallback()
 		if err = fc.events.onData(fc); nil != err {
+			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
 			// close on error.
 			fc.events.closeConn(fc, err)
@@ -680,14 +697,16 @@ func (fc *fdConn) readUDPLoop() {
 
 		// drop unread udp packet.
 		_, _ = fc.Discard(-1)
+		fc.endInboundCallback(started)
 		fc.callbackMu.Unlock()
 	}
 }
 
+// readLoop delivers n > 0 before a simultaneous terminal error, as required by
+// io.Reader. callbackMu protects both the borrowed slice and retained inbound
+// storage for the full callback lifetime.
 func (fc *fdConn) readLoop() {
-	// Keep one callback marker for the lifetime of this dedicated read goroutine.
-	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.finishExternalCallback(callbackID)
+	defer fc.events.callbackWG.Done()
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 	for {
@@ -698,7 +717,9 @@ func (fc *fdConn) readLoop() {
 			fc.callbackMu.Lock()
 			fc.inboundTail = buffer[:n]
 			fc.events.onSocketBytesRead(fc, n)
+			started := fc.beginInboundCallback()
 			if callbackErr := fc.events.onData(fc); callbackErr != nil {
+				fc.endInboundCallback(started)
 				fc.callbackMu.Unlock()
 				fc.events.closeConn(fc, callbackErr)
 				return
@@ -706,6 +727,7 @@ func (fc *fdConn) readLoop() {
 			if len(fc.inboundTail) > 0 {
 				if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.InboundBuffered() > limit {
 					fc.inboundTail = nil
+					fc.endInboundCallback(started)
 					fc.callbackMu.Unlock()
 					fc.events.closeConn(fc, ErrInboundOverflow)
 					return
@@ -713,6 +735,7 @@ func (fc *fdConn) readLoop() {
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
 			}
+			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
 		}
 		if readErr != nil {
@@ -744,10 +767,11 @@ func (fc *fdConn) fireReadEvent() error {
 	return nil
 }
 
+// listenUDP owns the shared packet socket and logical peer map. Each packet is
+// borrowed for one callback and discarded before the receive buffer is reused.
 func (fc *fdConn) listenUDP() error {
 	// UDP peer callbacks all run on this listener goroutine.
-	callbackID := fc.events.enterExternalCallback()
-	defer fc.events.finishExternalCallback(callbackID)
+	defer fc.events.callbackWG.Done()
 
 	var buffer = make([]byte, fc.events.MaxBufferSize)
 
@@ -781,7 +805,9 @@ func (fc *fdConn) listenUDP() error {
 			// fire udp on-open event.
 			udpConn.callbackMu.Lock()
 			if onOpen := fc.events.OnOpen; nil != onOpen {
+				started := udpConn.beginInboundCallback()
 				onOpen(udpConn)
+				udpConn.endInboundCallback(started)
 			}
 			udpConn.callbackMu.Unlock()
 		}

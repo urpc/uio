@@ -12,7 +12,9 @@ import (
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
-// Conn is an established or handshaking WebSocket connection.
+// Conn is an established or handshaking WebSocket connection. UIO serializes
+// protocol and handler callbacks per connection; atomics here coordinate
+// external writers, timers, heartbeat scanning, and transport callbacks.
 type Conn struct {
 	raw         uio.Conn
 	config      *connConfig
@@ -28,46 +30,69 @@ type Conn struct {
 	userData any
 	metadata atomic.Pointer[connMetadata]
 
-	writes                connWriteState
-	handshake             atomic.Pointer[handshakeState]
-	heartbeat             *heartbeatState
-	transportClosePending atomic.Bool
-	pendingBytes          atomic.Int64
-	dispatch              *dispatchState
-	closeTimer            atomic.Pointer[closeTimerState]
+	writes     connWriteState
+	handshake  atomic.Pointer[handshakeState]
+	heartbeat  *heartbeatState
+	closeTimer atomic.Pointer[closeTimerState]
 }
 
+// connWriteState serializes frame construction and streaming Writer ownership.
+// close tracks progress that may be updated by a Writer, a protocol callback,
+// or UIO's outbound callback without making any of them wait for mu.
 type connWriteState struct {
-	mu sync.Mutex
-	// A close request raises drainRequested before it becomes eligible to
-	// close the transport. Only a holder of mu may clear it after draining any
-	// executor batch that could still accept an in-flight frame.
-	drainRequested atomic.Bool
-	closeFrameSent bool
+	mu    sync.Mutex
+	close connCloseProgress
 }
 
-type dispatchWriteBatch struct {
-	// owner is installed under connWriteState.mu and is cleared only after
-	// buffer has been flushed or detached under that same lock.
-	owner atomic.Int64
-	// A runner or closer can request completion without waiting for the write
-	// lock; the current or next lock holder assumes the flush responsibility.
-	finishRequested atomic.Bool
-	// buffer is protected by connWriteState.mu.
-	buffer *uio.Buffer
+// These fields represent independent obligations rather than one phase: a
+// queued Close frame can be in flight while bytes are still retiring, and a
+// streaming Writer may own mu throughout both. transitionMu only protects
+// short state transitions; it never covers socket I/O or application work.
+type connCloseProgress struct {
+	transitionMu sync.Mutex
+	pendingClose *pendingCloseFrame
+	pendingBytes atomic.Int64
+	flags        atomic.Uint32
 }
 
+const (
+	transportCloseIdle uint32 = iota
+	transportClosePending
+	transportCloseClaimed
+)
+
+const (
+	closeDrainRequested uint32 = 1 << iota
+	closeFrameSent
+	closeWriterAborted
+)
+
+const (
+	transportPhaseShift = 3
+	transportPhaseMask  = uint32(3 << transportPhaseShift)
+)
+
+// pendingCloseFrame owns a copied close payload until the current Writer exits.
+type pendingCloseFrame struct{ payload []byte }
+
+// compressionState holds negotiated direction-specific RFC 7692 contexts.
 type compressionState struct {
 	encoder *compress.Encoder
 	decoder *compress.Decoder
 }
 
+// heartbeatState distinguishes a Ping waiting to be accepted, queued for
+// transport, and actually sent. The first failed enqueue keeps its deadline
+// across retries; byte positions mark when the Ping leaves the transport queue.
 type heartbeatState struct {
-	mu           sync.Mutex
-	pingQueuedAt int64
-	pingSentAt   int64
-	pingNonce    uint64
-	pingTarget   uint64
+	submitMu sync.Mutex
+	mu       sync.Mutex
+	// sendStalledAt remains set across busy Writer and backpressure retries.
+	sendStalledAt int64
+	pingQueuedAt  int64
+	pingSentAt    int64
+	pingNonce     uint64
+	pingTarget    uint64
 	// Accepted and retired are monotonic FIFO byte positions. The ping target
 	// marks when its complete frame has left the transport queue without
 	// requiring the connection's later writes to drain first.
@@ -76,11 +101,15 @@ type heartbeatState struct {
 	pingOutstanding  atomic.Bool
 }
 
+// closeTimerState protects lazy creation, replacement, and cancellation of the
+// graceful-close deadline from callback and timer goroutines.
 type closeTimerState struct {
 	mu    sync.Mutex
 	timer *time.Timer
 }
 
+// connMetadata groups infrequently used negotiated and close information so a
+// normal connection does not pay for separate synchronization fields.
 type connMetadata struct {
 	mu          sync.Mutex
 	protocol    string
@@ -89,6 +118,9 @@ type connMetadata struct {
 	closeReason string
 }
 
+// handshakeState contains every resource whose lifetime ends at handshake
+// completion. notifyOpen releases the entire object after OnOpen returns, which
+// also bounds the lifetime of an adopted net/http request.
 type handshakeState struct {
 	mu          sync.Mutex
 	data        []byte
@@ -224,13 +256,6 @@ func (c *Conn) maxMessageSize() uint64 {
 		return DefaultMaxMessageSize
 	}
 	return c.config.assembler.MaxMessage
-}
-
-func (c *Conn) maxOutboundBytes() int {
-	if c.config == nil || c.config.maxOutboundBytes == 0 {
-		return DefaultMaxOutboundBytes
-	}
-	return c.config.maxOutboundBytes
 }
 
 func (c *Conn) writeBufferedThreshold() int {

@@ -1,3 +1,5 @@
+// Package uio provides event-driven connections whose native Unix data path
+// runs in serialized connection tasks outside epoll/kqueue loops.
 package uio
 
 import "github.com/urpc/uio/internal/bytebuf"

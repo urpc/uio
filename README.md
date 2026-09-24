@@ -33,9 +33,13 @@ go get github.com/urpc/uio
 ```go
 
 type Events struct {
-	// Pollers is set up to start the given number of event-loop goroutine.
+	// Pollers is the number of event-loop goroutines.
 	// The default value is 4, capped by runtime.NumCPU().
 	Pollers int
+
+	// Executor optionally supplies an asynchronous native connection-task
+	// scheduler with typed single and batch submission.
+	Executor Executor
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
 	// The default value is false.
@@ -45,42 +49,37 @@ type Events struct {
 	// The default value is false.
 	LockOSThread bool
 
-	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
-	// The default value is 4KB.
+	// MaxBufferSize is the buffer size of each socket read. The default is 4 KiB.
 	MaxBufferSize int
 
-	// WriteBufferedThreshold enabled when value is greater than 0, writes will go into the outbound buffer instead of attempting to send them out immediately,
-	// unless the outbound buffer reaches the threshold or the flush function is manually called.
-	//
-	// If you have multiple Write call requirements, opening it will improve write performance because it reduces the number of system calls by merging multiple write operations to improve performance.
-	// The default value is 0.
+	// WriteBufferedThreshold batches smaller native callback writes until the
+	// connection task flushes. Zero disables size-based buffering.
 	WriteBufferedThreshold int
 
 	// MaxOutboundBuffered limits accepted but unsent payload bytes per
-	// connection. Zero disables the limit.
+	// connection. Native transports pause that connection's reads while its
+	// backlog is high. Zero disables the limit.
 	MaxOutboundBuffered int
 
-	// MaxPendingWrites limits write tasks that have not yet been consumed by
-	// the connection's event loop. Values <= 0 use the default of 1024.
-	MaxPendingWrites int
-
-	// MaxInboundBuffered limits unread payload retained per connection. Zero
-	// disables the limit.
+	// MaxInboundBuffered limits payload left unread after a callback returns.
+	// Zero disables the limit.
 	MaxInboundBuffered int
 
-	// OnOpen fires when a new connection has been opened.
+	// Lifecycle and data callbacks are serialized per connection; different
+	// connections may execute concurrently.
 	OnOpen func(c Conn)
 
-	// OnData fires when a socket receives data from the remote.
+	// OnData runs while inbound access methods are valid.
 	OnData func(c Conn) error
 
-	// OnClose fires when a connection has been closed.
+	// OnClose is final and never overlaps OnOpen or OnData for its connection.
 	OnClose func(c Conn, err error)
 
-	// OnInbound when any bytes read by a socket, it triggers the inbound event.
+	// OnInbound runs before OnData and shares its inbound-access scope.
 	OnInbound func(c Conn, readBytes int)
 
-	// OnOutbound when any bytes write to a socket, it triggers the outbound event.
+	// OnOutbound may run on a backend writer goroutine and does not grant
+	// inbound-buffer access.
 	OnOutbound func(c Conn, writeBytes int)
 
 	// OnStart it triggers on the server initialized.
@@ -95,17 +94,48 @@ type Events struct {
 
 Basic Echo Server
 
+On native Unix, stream event loops collect readiness, manage descriptors, and
+apply interest changes. Stream socket I/O and callbacks run in serialized
+connection tasks on the configured `Executor` or UIO's typed taskgo queue. One
+blocked stream connection therefore does not block its poller or another
+connection. Native UDP callbacks and datagram sends remain on their owning
+event loop because peers share the socket. An external UDP `Write` or
+`WriteOwned` waits for that loop's nonblocking send result; a call from another
+event loop returns `ErrUDPWriteOnEventLoop` to avoid a wait cycle. The
+`stdio`/Windows backend instead uses dedicated blocking read/write goroutines
+per connection; `Executor` does not apply there. Without an external executor,
+native UIO uses a taskgo queue with `512 * runtime.NumCPU()` workers and a
+30-second idle retirement window.
+
 `Events.Dial` and `Events.DialContext` perform synchronous resolution and
-connection setup. Calls from callbacks currently running on an event loop
-return `ErrDialOnEventLoop`; start the call from an external goroutine instead.
-Use `DialContext` when the operation needs cancellation or a deadline.
+connection setup. Calls from an event-loop goroutine return
+`ErrDialOnEventLoop`. Native stream callbacks run on task workers and may dial,
+but the synchronous operation occupies that worker; move long dials to an
+application goroutine when appropriate. Native UDP callbacks run on their event
+loop and cannot dial synchronously. A synchronous dial similarly blocks a stdio
+connection's callback path. Use `DialContext` when the operation needs
+cancellation or a deadline.
 `Events.Serve` listens on every supplied address. Call `Serve()` without an
 address when using an Events instance only for outbound dialing.
+
+`Events.Close` only publishes shutdown and always returns without waiting. The
+return of `Serve` is the usual lifecycle join point; `Events.Wait` is available
+when shutdown is initiated from another goroutine. `Wait` includes event loops,
+connection tasks, stdio I/O goroutines, and `OnStop`, and must not be called
+from one of those callbacks.
 
 `Events.Adopt` transfers an already-established stream connection into the
 event loops. The `Events` instance must already be serving, and ownership is
 consumed on both success and failure; the caller must never use the original
 `net.Conn` again after calling it.
+
+`MaxOutboundBuffered` is the only outbound backpressure budget. It is applied
+per connection: a write that would push buffered unsent data beyond it returns
+`ErrOutboundOverflow`. Native transports also pause reads for that connection
+at 75% of the limit and resume them after the backlog falls to 50%.
+`MaxInboundBuffered` closes a connection with `ErrInboundOverflow` when a
+callback leaves too much input unconsumed. Both limits default to zero, which
+disables them.
 
 Inside a connection callback, `Conn.PeekChunk` exposes the first contiguous
 inbound chunk without copying it. Process the returned slice before calling

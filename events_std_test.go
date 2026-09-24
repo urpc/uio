@@ -369,8 +369,11 @@ func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 	}
 
 	shutdownErr := errors.New("blocked flush shutdown")
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- events.Close(shutdownErr) }()
+	if err := events.Close(shutdownErr); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- events.Wait() }()
 	timer := time.NewTimer(time.Second)
 	defer timer.Stop()
 	select {
@@ -379,19 +382,19 @@ func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 		t.Fatal("Close did not interrupt the blocking socket write")
 	}
 	select {
-	case <-closeDone:
-		t.Fatal("Close returned before the blocked writer released its payload")
+	case <-waitDone:
+		t.Fatal("Wait returned before the blocked writer released its payload")
 	default:
 	}
 	close(raw.writeRelease)
 
-	for closeDone != nil || serveDone != nil {
+	for waitDone != nil || serveDone != nil {
 		select {
-		case err := <-closeDone:
-			if err != nil {
-				t.Fatalf("Events.Close error = %v", err)
+		case err := <-waitDone:
+			if !errors.Is(err, shutdownErr) {
+				t.Fatalf("Events.Wait error = %v", err)
 			}
-			closeDone = nil
+			waitDone = nil
 		case err := <-serveDone:
 			if !errors.Is(err, shutdownErr) {
 				t.Fatalf("Events.Serve error = %v", err)
@@ -926,9 +929,9 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 	}
 }
 
-func TestStdExternalCloseWaitsForLifetimeCallback(t *testing.T) {
+func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 	started := make(chan string, 1)
-	callbackEntered := make(chan bool, 1)
+	callbackEntered := make(chan struct{}, 1)
 	releaseCallback := make(chan struct{})
 	shutdownErr := errors.New("external close during std callback")
 	var callbackOnce sync.Once
@@ -944,8 +947,7 @@ func TestStdExternalCloseWaitsForLifetimeCallback(t *testing.T) {
 	}
 	events.OnData = func(conn Conn) error {
 		callbackOnce.Do(func() {
-			_, registered := events.callbackGoids.Load(currentGoroutineID())
-			callbackEntered <- registered
+			callbackEntered <- struct{}{}
 			<-releaseCallback
 		})
 		_, _ = conn.Discard(-1)
@@ -962,26 +964,27 @@ func TestStdExternalCloseWaitsForLifetimeCallback(t *testing.T) {
 	if _, err = client.Write([]byte("block")); err != nil {
 		t.Fatal(err)
 	}
-	if registered := <-callbackEntered; !registered {
-		t.Fatal("read goroutine was not registered for callback-safe Close")
-	}
+	<-callbackEntered
 
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- events.Close(shutdownErr) }()
+	if err = events.Close(shutdownErr); err != nil {
+		t.Fatal(err)
+	}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- events.Wait() }()
 	select {
-	case <-closeDone:
-		t.Fatal("external Events.Close returned while OnData was blocked")
+	case <-waitDone:
+		t.Fatal("Wait returned while OnData was blocked")
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(releaseCallback)
 
 	select {
-	case err = <-closeDone:
-		if err != nil {
-			t.Fatal(err)
+	case err = <-waitDone:
+		if !errors.Is(err, shutdownErr) {
+			t.Fatalf("Wait error = %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("external Events.Close did not finish after OnData returned")
+		t.Fatal("Wait did not finish after OnData returned")
 	}
 	select {
 	case err = <-serveDone:
@@ -991,26 +994,17 @@ func TestStdExternalCloseWaitsForLifetimeCallback(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Serve did not stop")
 	}
-
-	entries := 0
-	events.callbackGoids.Range(func(_, _ any) bool {
-		entries++
-		return true
-	})
-	if entries != 0 {
-		t.Fatalf("callback goroutine entries after shutdown = %d", entries)
-	}
 }
 
-func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
+func TestStdReadLoopKeepsLifetimeUntilExit(t *testing.T) {
 	raw := newStdRegistrationConn(30004)
 	raw.openReturned.Store(true)
 	raw.secondRead = make(chan struct{})
 	events := &Events{MaxBufferSize: 64}
-	callbackID := make(chan int64, 1)
+	callbackDone := make(chan struct{}, 1)
 	events.OnData = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
-		callbackID <- currentGoroutineID()
+		callbackDone <- struct{}{}
 		return nil
 	}
 	conn := &fdConn{conn: raw}
@@ -1023,14 +1017,21 @@ func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
 	}()
 
 	raw.readData <- []byte("first")
-	id := <-callbackID
+	<-callbackDone
 	select {
 	case <-raw.secondRead:
 	case <-time.After(time.Second):
 		t.Fatal("read loop did not start its second read")
 	}
-	if _, registered := events.callbackGoids.Load(id); !registered {
-		t.Fatal("callback goroutine was unregistered between reads")
+	waitDone := make(chan struct{})
+	go func() {
+		events.callbackWG.Wait()
+		close(waitDone)
+	}()
+	select {
+	case <-waitDone:
+		t.Fatal("callback lifetime ended between reads")
+	case <-time.After(50 * time.Millisecond):
 	}
 
 	if err := raw.Close(); err != nil {
@@ -1041,8 +1042,10 @@ func TestStdReadLoopKeepsCallbackRegistrationBetweenReads(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("read loop did not exit")
 	}
-	if _, registered := events.callbackGoids.Load(id); registered {
-		t.Fatal("callback goroutine remained registered after read loop exit")
+	select {
+	case <-waitDone:
+	case <-time.After(time.Second):
+		t.Fatal("callback lifetime remained after read loop exit")
 	}
 }
 

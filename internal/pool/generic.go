@@ -1,3 +1,4 @@
+// Package pool implements bounded power-of-two object size classes.
 package pool
 
 import (
@@ -7,15 +8,15 @@ import (
 
 const minimumPooledSize = 512
 
-// Pool contains logic of reusing objects distinguishable by size in generic
-// way.
+// Pool reuses objects in power-of-two size classes up to a configured maximum.
+// It does not retain oversized objects.
 type Pool[T any] struct {
 	pool    []sync.Pool
 	minSize int
 	maxSize int
 }
 
-// New creates new Pool that reuses objects which size
+// New creates a size-classed pool whose largest retained object is capacity.
 func New[T any](capacity int) *Pool[T] {
 	maxSize := CeilToPowerOfTwo(Max(capacity, 1))
 	minSize := 1
@@ -57,7 +58,7 @@ func (p *Pool[T]) Get(size int) (T, int) {
 	return zero, n
 }
 
-// Put takes x and its size for future reuse.
+// Put retains x only when size names one of this pool's exact size classes.
 func (p *Pool[T]) Put(x T, size int) {
 	if size < p.minSize || size > p.maxSize || !IsPowerOfTwo(size) {
 		return

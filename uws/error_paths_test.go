@@ -123,9 +123,8 @@ func testServerConn(raw *scriptedConn) *Conn {
 	conn := &Conn{
 		raw: raw,
 		config: testServerConfig(&Server{
-			MaxFramePayload:  1024,
-			MaxMessageSize:   1024,
-			MaxOutboundBytes: 1 << 20,
+			MaxFramePayload: 1024,
+			MaxMessageSize:  1024,
 		}),
 	}
 	conn.opened.Store(true)
@@ -142,7 +141,6 @@ func TestProtocolCloseMapsErrorsToCloseCodes(t *testing.T) {
 		{name: "invalid UTF-8", err: frame.ErrInvalidUTF8, code: 1007},
 		{name: "frame too large", err: frame.ErrMessageTooBig, code: 1009},
 		{name: "inflate too large", err: compress.ErrTooLarge, code: 1009},
-		{name: "application backpressure", err: ErrApplicationBackpressure, code: 1013},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -243,7 +241,7 @@ func TestOversizedIncomingMessagesCloseWith1009BeforeCallback(t *testing.T) {
 			handler := &recordingHandler{}
 			conn := &Conn{
 				raw:     raw,
-				config:  testServerConfig(&Server{MaxFramePayload: 16 << 10, MaxMessageSize: maxMessage, MaxOutboundBytes: 1 << 20}),
+				config:  testServerConfig(&Server{MaxFramePayload: 16 << 10, MaxMessageSize: maxMessage}),
 				handler: handler,
 			}
 			conn.opened.Store(true)
@@ -281,7 +279,7 @@ func TestOversizedCompressedFragmentsCloseWith1009BeforeFIN(t *testing.T) {
 	handler := &recordingHandler{}
 	conn := &Conn{
 		raw:     raw,
-		config:  testServerConfig(&Server{MaxFramePayload: maxCompressed, MaxMessageSize: 64, MaxOutboundBytes: 1 << 20, EnableCompression: true}),
+		config:  testServerConfig(&Server{MaxFramePayload: maxCompressed, MaxMessageSize: 64, EnableCompression: true}),
 		handler: handler,
 	}
 	conn.opened.Store(true)
@@ -660,22 +658,11 @@ func TestSendCloseAndLimitStateBranches(t *testing.T) {
 		t.Fatalf("duplicate close writes = %d, want 1", duplicateRaw.writes)
 	}
 
-	unbounded := &Conn{config: testServerConfig(&Server{MaxOutboundBytes: -1})}
-	if !unbounded.reserveOutbound(math.MaxInt) {
-		t.Fatal("unbounded outbound reservation failed")
-	}
-	unbounded.releaseOutbound(0)
-	unbounded.releaseOutbound(1)
-
 	large := &Conn{config: testServerConfig(&Server{MaxMessageSize: math.MaxUint64})}
 	if large.maxMessageSizeInt() != math.MaxInt {
 		t.Fatalf("max message int = %d, want %d", large.maxMessageSizeInt(), math.MaxInt)
 	}
 
-	dialerLimits := &Conn{config: testDialerConfig(&Dialer{MaxOutboundBytes: 123})}
-	if dialerLimits.maxOutboundBytes() != 123 {
-		t.Fatalf("dialer outbound limit = %d", dialerLimits.maxOutboundBytes())
-	}
 }
 
 func TestSendQueuesMessagesWithoutFlushBarrier(t *testing.T) {
@@ -701,7 +688,7 @@ func TestTransportOwnedWriteErrors(t *testing.T) {
 	if err := failed.writeTransportOwned(failedBuffer); !errors.Is(err, writeErr) {
 		t.Fatalf("owned write error = %v, want %v", err, writeErr)
 	}
-	if pending := failed.pendingBytes.Load(); pending != 0 {
+	if pending := failed.writes.close.pendingBytes.Load(); pending != 0 {
 		t.Fatalf("pending bytes after failed owned write = %d, want 0", pending)
 	}
 
@@ -713,28 +700,27 @@ func TestTransportOwnedWriteErrors(t *testing.T) {
 	if err := short.writeTransportOwned(shortBuffer); !errors.Is(err, io.ErrShortWrite) {
 		t.Fatalf("short owned write error = %v, want io.ErrShortWrite", err)
 	}
-	if pending := short.pendingBytes.Load(); pending != 3 {
+	if pending := short.writes.close.pendingBytes.Load(); pending != 3 {
 		t.Fatalf("pending bytes after short owned write = %d, want 3", pending)
 	}
 }
 
 func TestCloseRetriesAfterBackpressure(t *testing.T) {
 	raw := newScriptedConn()
+	raw.writeErr = uio.ErrOutboundOverflow
 	conn := testServerConn(raw)
-	conn.config = testServerConfig(&Server{MaxOutboundBytes: 4})
-	conn.pendingBytes.Store(4)
 	if err := conn.Close(1000, ""); !errors.Is(err, ErrBackpressure) {
 		t.Fatalf("backpressured Close() = %v", err)
 	}
-	if conn.writes.closeFrameWasSent() || conn.closing.Load() {
+	if conn.writes.close.closeFrameWasSent() || conn.closing.Load() {
 		t.Fatal("failed close poisoned connection state")
 	}
-	conn.releaseOutbound(4)
+	raw.writeErr = nil
 	if err := conn.Close(1000, ""); err != nil {
 		t.Fatalf("retried Close() = %v", err)
 	}
-	if !conn.writes.closeFrameWasSent() || !conn.closing.Load() || raw.writes != 1 {
-		t.Fatalf("retried close state: sent=%v closing=%v writes=%d", conn.writes.closeFrameWasSent(), conn.closing.Load(), raw.writes)
+	if !conn.writes.close.closeFrameWasSent() || !conn.closing.Load() || raw.writes != 2 {
+		t.Fatalf("retried close state: sent=%v closing=%v writes=%d", conn.writes.close.closeFrameWasSent(), conn.closing.Load(), raw.writes)
 	}
 }
 

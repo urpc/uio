@@ -1,3 +1,5 @@
+// Package compress implements RFC 7692 message and streaming DEFLATE with
+// bounded output and negotiated context takeover.
 package compress
 
 import (
@@ -21,6 +23,7 @@ const (
 	decodeTail         = syncFlushTail + "\x01\x00\x00\xff\xff"
 )
 
+// Params is the normalized RFC 7692 negotiation result for both directions.
 type Params struct {
 	Enabled                 bool
 	ServerNoContextTakeover bool
@@ -32,6 +35,7 @@ type Params struct {
 	Level                   int
 }
 
+// Compress encodes one no-context-takeover message.
 func Compress(payload []byte, level int) ([]byte, error) {
 	encoder := NewEncoder(level, true)
 	data, err := encoder.Encode(payload)
@@ -42,10 +46,13 @@ func Compress(payload []byte, level int) ([]byte, error) {
 	return data, nil
 }
 
+// Decompress decodes one no-context-takeover message with an output bound.
 func Decompress(payload []byte, maxSize int) ([]byte, error) {
 	return NewDecoder(true).Decode(payload, maxSize)
 }
 
+// Encoder applies message-scoped DEFLATE and optionally retains the negotiated
+// sliding-window dictionary across committed messages.
 type Encoder struct {
 	level       int
 	noContext   bool
@@ -56,6 +63,8 @@ type Encoder struct {
 
 const maxPooledCompressionOutput = 256 << 10
 
+// flateWriterJob keeps a resettable stdlib writer and its bounded output buffer
+// together so pool reuse cannot mismatch compression level and storage.
 type flateWriterJob struct {
 	writer    *stdflate.Writer
 	output    bytes.Buffer
@@ -104,10 +113,12 @@ func releaseFlateWriter(job *flateWriterJob) {
 	}
 }
 
+// NewEncoder creates an encoder with the RFC default 32 KiB window.
 func NewEncoder(level int, noContext bool) *Encoder {
 	return NewEncoderWithWindow(level, noContext, DefaultWindowBits)
 }
 
+// NewEncoderWithWindow creates an encoder for a negotiated window size.
 func NewEncoderWithWindow(level int, noContext bool, windowBits int) *Encoder {
 	windowBits = normalizeWindowBits(windowBits)
 	return &Encoder{
@@ -118,6 +129,8 @@ func NewEncoderWithWindow(level int, noContext bool, windowBits int) *Encoder {
 	}
 }
 
+// Encode returns an owned compressed message. Use EncodeBorrowed on hot paths
+// that can consume output synchronously.
 func (e *Encoder) Encode(payload []byte) ([]byte, error) {
 	var result []byte
 	err := e.EncodeBorrowed(payload, func(encoded []byte) error {
@@ -192,6 +205,8 @@ func (e *Encoder) CommitStream(stream *StreamEncoder) {
 	e.dictionary = stream.takeDictionary()
 }
 
+// encodeWindowedBorrowed uses klauspost's explicit-window encoder when RFC
+// negotiation selects less than the stdlib's fixed 32 KiB window.
 func (e *Encoder) encodeWindowedBorrowed(payload []byte, use func([]byte) error) error {
 	var output bytes.Buffer
 	// The custom-window API intentionally uses its fast windowed encoder. The
@@ -234,6 +249,9 @@ func (e *Encoder) Commit(payload []byte) {
 	e.dictionary = appendDictionary(e.dictionary, payload, e.windowBytes)
 }
 
+// StreamEncoder compresses one fragmented message incrementally. It owns its
+// writer until Close or Abort and can transfer its rolling dictionary back to
+// the parent Encoder after successful completion.
 type StreamEncoder struct {
 	writer          streamWriter
 	writerJob       *flateWriterJob
@@ -244,12 +262,15 @@ type StreamEncoder struct {
 	closed          bool
 }
 
+// streamWriter is the common subset implemented by stdlib and klauspost flate.
 type streamWriter interface {
 	io.Writer
 	io.Closer
 	Flush() error
 }
 
+// newStreamEncoder selects the implementation that satisfies negotiated window
+// and context-takeover policy while reusing stdlib writers when possible.
 func newStreamEncoder(level int, dictionary []byte, windowBits int, trackDictionary bool, emit func([]byte) error) (*StreamEncoder, error) {
 	if emit == nil {
 		return nil, errors.New("websocket: nil deflate stream callback")
@@ -284,6 +305,7 @@ func newStreamEncoder(level int, dictionary []byte, windowBits int, trackDiction
 	return stream, nil
 }
 
+// Write compresses payload and sync-flushes bytes to the stream callback.
 func (s *StreamEncoder) Write(payload []byte) (int, error) {
 	if s == nil || s.closed {
 		return 0, io.ErrClosedPipe
@@ -302,6 +324,7 @@ func (s *StreamEncoder) Write(payload []byte) (int, error) {
 	return n, err
 }
 
+// Dictionary returns an owned copy of the current rolling history.
 func (s *StreamEncoder) Dictionary() []byte {
 	if s == nil || !s.trackDictionary {
 		return nil
@@ -317,6 +340,8 @@ func (s *StreamEncoder) takeDictionary() []byte {
 	return s.dictionary.Take()
 }
 
+// Close verifies and strips the RFC sync-flush tail, then releases compressor
+// resources. It does not commit dictionary state to the parent automatically.
 func (s *StreamEncoder) Close() error {
 	if s == nil || s.closed {
 		return io.ErrClosedPipe
@@ -363,12 +388,16 @@ func (s *StreamEncoder) Abort() {
 	}
 }
 
+// streamTruncWriter withholds the final four bytes so the permessage-deflate
+// sync-flush marker never reaches a WebSocket frame.
 type streamTruncWriter struct {
 	emit     func([]byte) error
 	pending  []byte
 	finished bool
 }
 
+// Write emits everything except the trailing sync-flush marker, retaining at
+// most its four bytes between compressor writes.
 func (w *streamTruncWriter) Write(payload []byte) (int, error) {
 	if w.finished {
 		return len(payload), nil
@@ -395,6 +424,8 @@ func (w *streamTruncWriter) finish() error {
 	return nil
 }
 
+// rollingDictionary is a fixed-capacity ring containing the newest DEFLATE
+// history bytes.
 type rollingDictionary struct {
 	data  []byte
 	limit int
@@ -411,6 +442,7 @@ func newRollingDictionary(limit int, initial []byte) rollingDictionary {
 	return dictionary
 }
 
+// Append retains only the newest limit bytes without shifting existing history.
 func (d *rollingDictionary) Append(payload []byte) {
 	if d == nil || d.limit == 0 || len(payload) == 0 {
 		return
@@ -442,6 +474,7 @@ func (d *rollingDictionary) writeAt(offset int, payload []byte) {
 	copy(d.data, payload[n:])
 }
 
+// Clone returns the ring in chronological dictionary order.
 func (d *rollingDictionary) Clone() []byte {
 	if d == nil || d.size == 0 {
 		return nil
@@ -452,6 +485,7 @@ func (d *rollingDictionary) Clone() []byte {
 	return result
 }
 
+// Take rotates the ring in place, transfers its backing array, and empties d.
 func (d *rollingDictionary) Take() []byte {
 	if d == nil || d.size == 0 {
 		return nil
@@ -476,24 +510,30 @@ func (e *Encoder) Close() error {
 	return nil
 }
 
+// Decoder expands one message at a time and optionally retains the negotiated
+// sliding-window dictionary.
 type Decoder struct {
 	noContext   bool
 	windowBytes int
 	dictionary  []byte
 }
 
+// decodeSource presents compressed payload followed by the synthetic DEFLATE
+// tail required to terminate one permessage-deflate message.
 type decodeSource struct {
 	payload       []byte
 	payloadOffset int
 	tailOffset    int
 }
 
+// Reset starts a new logical compressed message.
 func (source *decodeSource) Reset(payload []byte) {
 	source.payload = payload
 	source.payloadOffset = 0
 	source.tailOffset = 0
 }
 
+// Read streams payload first and the synthetic termination tail second.
 func (source *decodeSource) Read(dst []byte) (int, error) {
 	written := 0
 	if source.payloadOffset < len(source.payload) {
@@ -512,6 +552,7 @@ func (source *decodeSource) Read(dst []byte) (int, error) {
 	return written, nil
 }
 
+// flateReaderJob groups resettable decoder state and bounded reusable output.
 type flateReaderJob struct {
 	source decodeSource
 	reader io.ReadCloser
@@ -521,6 +562,8 @@ type flateReaderJob struct {
 
 var flateReaderPool sync.Pool
 
+// acquireFlateReader resets a pooled decoder with the current message and
+// negotiated context dictionary.
 func acquireFlateReader(payload, dictionary []byte) (*flateReaderJob, error) {
 	job, _ := flateReaderPool.Get().(*flateReaderJob)
 	if job == nil {
@@ -557,15 +600,18 @@ func releaseFlateReader(job *flateReaderJob) {
 	flateReaderPool.Put(job)
 }
 
+// NewDecoder creates a decoder with the RFC default 32 KiB window.
 func NewDecoder(noContext bool) *Decoder {
 	return NewDecoderWithWindow(noContext, DefaultWindowBits)
 }
 
+// NewDecoderWithWindow creates a decoder for a negotiated window size.
 func NewDecoderWithWindow(noContext bool, windowBits int) *Decoder {
 	windowBits = normalizeWindowBits(windowBits)
 	return &Decoder{noContext: noContext, windowBytes: 1 << windowBits}
 }
 
+// Decode returns an owned decompressed message bounded by maxSize.
 func (d *Decoder) Decode(payload []byte, maxSize int) ([]byte, error) {
 	var result []byte
 	err := d.DecodeBorrowed(payload, maxSize, func(decoded []byte) error {

@@ -32,6 +32,7 @@ import (
 	"github.com/urpc/uio/internal/poller"
 )
 
+// listener holds the blocking Go listener used by stdio and Windows builds.
 type listener struct {
 	addr   string
 	ln     net.Listener
@@ -39,6 +40,8 @@ type listener struct {
 	udpSvr *fdConn
 }
 
+// acceptor owns blocking listener goroutines. The logical event loop is used
+// only for registration and lifecycle serialization on this backend.
 type acceptor struct {
 	mux       sync.Mutex
 	listeners map[int]*listener
@@ -46,13 +49,16 @@ type acceptor struct {
 	events    *Events
 }
 
-func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
-}
+// OnEvent is unused because listener goroutines perform blocking accepts.
+func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {}
 
+// OnClose releases every blocking listener and stops its accept goroutine.
 func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
 	ld.close()
 }
 
+// addListen starts one blocking accept or UDP receive goroutine for addr.
+// Accepted streams are registered before their dedicated read/write loops run.
 func (ld *acceptor) addListen(addr string) (err error) {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
@@ -121,6 +127,8 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	return nil
 }
 
+// listen parses UIO's address syntax and creates the corresponding blocking Go
+// listener. Unlike the native backend, no descriptor is duplicated.
 func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 
 	// default scheme is tcp protocol.

@@ -25,6 +25,7 @@ type CompositeBuffer struct {
 	length  int
 }
 
+// NewCompositeBuffer returns an empty segmented buffer.
 func NewCompositeBuffer() *CompositeBuffer {
 	return &CompositeBuffer{}
 }
@@ -123,6 +124,38 @@ func (b *CompositeBuffer) AppendOwned(buffer *Buffer) {
 	}
 	b.bufList = append(b.bufList, buffer)
 	b.length += buffer.Len()
+}
+
+// AppendOwnedCoalesced consumes buffer and packs small adjacent payloads into
+// pooled blocks with at least targetCapacity. It is intended for a corked I/O
+// round where reducing writev segments is worth one payload copy.
+func (b *CompositeBuffer) AppendOwnedCoalesced(buffer *Buffer, targetCapacity int) {
+	if buffer == nil {
+		return
+	}
+	size := buffer.Len()
+	if size == 0 {
+		putBuffer(buffer)
+		return
+	}
+	if count := len(b.bufList); count > 0 {
+		last := b.bufList[count-1]
+		if last.Available() >= size {
+			_, _ = last.Write(buffer.Bytes())
+			b.length += size
+			putBuffer(buffer)
+			return
+		}
+	}
+	if targetCapacity <= size {
+		b.AppendOwned(buffer)
+		return
+	}
+	coalesced := getBuffer(targetCapacity)
+	_, _ = coalesced.Write(buffer.Bytes())
+	putBuffer(buffer)
+	b.bufList = append(b.bufList, coalesced)
+	b.length += size
 }
 
 // WriteByte appends the byte c to the buffer, growing the buffer as needed.
@@ -283,7 +316,8 @@ func (b *CompositeBuffer) PeekChunk() []byte {
 	return b.bufList[0].Bytes()
 }
 
-// PeekVec returns the [][]bytes without advancing the buffer.
+// PeekVec appends all unread segments to dst without advancing the buffer.
+// Returned slices remain valid until the corresponding blocks are discarded.
 func (b *CompositeBuffer) PeekVec(dst [][]byte) (vec [][]byte, length int) {
 	if 0 == len(b.bufList) {
 		return
@@ -322,7 +356,9 @@ func (b *CompositeBuffer) PeekVecN(dst [][]byte, limit int) (vec [][]byte, lengt
 	return vec, length
 }
 
-// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
+// Discard advances by at most n bytes and returns the number discarded. A
+// non-positive n discards everything. Fully consumed blocks return to their
+// originating pool.
 func (b *CompositeBuffer) Discard(n int) int {
 	if 0 == len(b.bufList) {
 		return 0

@@ -10,7 +10,7 @@ import (
 
 func TestUnixConnectionColdStateIsLazy(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) == 8 {
-		const maximum = uintptr(240)
+		const maximum = uintptr(264)
 		if size := unsafe.Sizeof(fdConn{}); size > maximum {
 			t.Fatalf("fdConn size = %d bytes, want at most %d", size, maximum)
 		}

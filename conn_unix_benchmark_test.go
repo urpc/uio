@@ -21,11 +21,11 @@ func BenchmarkCallbackWrite(b *testing.B) {
 			if err = unix.SetNonblock(fds[0], true); err != nil {
 				b.Fatal(err)
 			}
-			events := &Events{MaxPendingWrites: 1024}
+			events := &Events{}
 			loop := &eventLoop{}
-			loop.loopGoid.Store(currentGoroutineID())
 			conn := &fdConn{fd: fds[0]}
 			conn.events, conn.loop = events, loop
+			conn.ioOwner.Store(currentGoroutineID())
 			payload := make([]byte, size)
 			drainDone := make(chan struct{})
 			drained := make(chan struct{})
@@ -54,7 +54,7 @@ func BenchmarkCallbackWrite(b *testing.B) {
 					b.Fatal(err)
 				}
 				for !conn.outbound.Empty() {
-					conn.writeBlocked = false
+					conn.setWriteBlocked(false)
 					if _, err = conn.flushOnLoop(); err != nil {
 						b.Fatal(err)
 					}

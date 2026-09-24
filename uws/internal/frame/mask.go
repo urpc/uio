@@ -4,6 +4,9 @@ import "encoding/binary"
 
 const wordUnmaskThreshold = 16
 
+// unmask applies the repeating four-byte mask starting at the frame-relative
+// offset. The word-at-a-time body handles native endian order explicitly while
+// prefix and suffix loops cover unaligned bytes.
 func unmask(payload []byte, key [4]byte, offset int) {
 	offset &= 3
 	if len(payload) < wordUnmaskThreshold {

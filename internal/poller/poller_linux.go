@@ -18,6 +18,9 @@ const (
 	errorEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP | unix.EPOLLPRI
 )
 
+// NetPoller wraps epoll plus an eventfd used to wake the owner for queued
+// control work. mu coordinates Close with an active Wait through waiters;
+// descriptors are released only after the final waiter finishes conversion.
 type NetPoller struct {
 	epfd   int
 	wakefd int
@@ -26,11 +29,13 @@ type NetPoller struct {
 	waiters int        // includes readiness-event conversion after epoll_wait
 
 	closed      atomic.Bool
+	edgeFD      map[int]bool
 	closeReason atomic.Pointer[error]
 	releaseOnce sync.Once
 	rawEvents   [1024]unix.EpollEvent
 }
 
+// NewNetPoller creates epoll and registers its internal level-triggered waker.
 func NewNetPoller() (*NetPoller, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
@@ -41,7 +46,7 @@ func NewNetPoller() (*NetPoller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &NetPoller{epfd: epfd, wakefd: wakefd}
+	poller := &NetPoller{epfd: epfd, wakefd: wakefd, edgeFD: make(map[int]bool)}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
@@ -50,6 +55,18 @@ func NewNetPoller() (*NetPoller, error) {
 		return nil, err
 	}
 	return poller, nil
+}
+
+// SetEdgeTriggered selects edge-triggered readiness for future registrations.
+// It must be called before adding application descriptors.
+func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
+	poller.mu.Lock()
+	if enabled {
+		poller.edgeFD[fd] = true
+	} else {
+		delete(poller.edgeFD, fd)
+	}
+	poller.mu.Unlock()
 }
 
 // Add registers a descriptor that is not already watched.
@@ -70,6 +87,7 @@ func (poller *NetPoller) Remove(fd int, _ Interest) error {
 		return nil
 	}
 	err := unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_DEL, fd, nil)
+	delete(poller.edgeFD, fd)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
 		return nil
 	}
@@ -89,24 +107,32 @@ func (poller *NetPoller) control(fd int, want Interest, operation int) error {
 		return poller.closedError()
 	}
 	if err := unix.EpollCtl(poller.epfd, operation, fd, &unix.EpollEvent{
-		Fd: int32(fd), Events: epollEvents(want),
+		Fd: int32(fd), Events: poller.epollEvents(fd, want),
 	}); err != nil {
 		return err
 	}
 	return nil
 }
 
-func epollEvents(want Interest) uint32 {
+func (poller *NetPoller) epollEvents(fd int, want Interest) uint32 {
 	events := uint32(errorEvents)
+	// Stream descriptors use edge-triggered readiness because connection tasks
+	// drain each round until EAGAIN; the wake descriptor remains level-triggered.
+	// The wake descriptor is intentionally registered without this bit.
 	if want&Readable != 0 {
 		events |= readEvents
 	}
 	if want&Writable != 0 {
 		events |= writeEvents
 	}
+	if poller.edgeFD[fd] {
+		events |= unix.EPOLLET
+	}
 	return events
 }
 
+// Wait converts one epoll batch into normalized events. timeout is in
+// milliseconds; a negative value blocks indefinitely and zero polls.
 func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	// Register before entering epoll_wait so Close wakes instead of releasing
 	// descriptors that this call can still access.
@@ -138,7 +164,8 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 			continue
 		}
 		if count == len(out) {
-			// Level triggering will report readiness again on the next Wait.
+			// Event loops provide an output batch as large as rawEvents. Smaller
+			// callers intentionally discard the excess notification.
 			continue
 		}
 		var events Events
@@ -154,6 +181,8 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	return count, nil
 }
 
+// Wake interrupts Wait. The eventfd counter is coalesced by the event loop, so
+// its numeric value never represents a task count.
 func (poller *NetPoller) Wake() error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
@@ -179,6 +208,8 @@ func (poller *NetPoller) drainWake() {
 	_, _ = unix.Read(poller.wakefd, value[:])
 }
 
+// Close publishes the terminal reason and interrupts Wait. Descriptor release
+// is deferred until no goroutine can still read or convert epoll events.
 func (poller *NetPoller) Close(err error) error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
@@ -197,6 +228,7 @@ func (poller *NetPoller) Close(err error) error {
 	return poller.wakeLocked()
 }
 
+// Closed reports whether Close has published the terminal state.
 func (poller *NetPoller) Closed() bool { return poller.closed.Load() }
 
 func (poller *NetPoller) closeError() error {

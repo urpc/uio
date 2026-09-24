@@ -28,15 +28,16 @@ import (
 	"strings"
 	"sync"
 	"syscall"
-	"time"
 
 	"github.com/libp2p/go-reuseport"
 	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 )
 
-const defaultTCPKeepAlive = 15 * time.Second
+const acceptBatchSize = 64
 
+// listener keeps both the Go listener and the duplicated non-blocking fd used
+// by the native poller. Closing it must account for which object owns that fd.
 type listener struct {
 	network string         // network protocol
 	fd      int            // fd
@@ -48,6 +49,8 @@ type listener struct {
 	udpSvr  *fdConn        // udp server
 }
 
+// acceptor runs on the master event loop. It accepts stream sockets and owns
+// shared UDP listener state, then assigns stream connections to worker loops.
 type acceptor struct {
 	mux       sync.Mutex
 	listeners map[int]*listener
@@ -55,6 +58,8 @@ type acceptor struct {
 	events    *Events
 }
 
+// OnEvent drains listener readiness and escalates a non-retryable accept error
+// to server shutdown.
 func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
 
 	if 0 != events&poller.ReadEvents {
@@ -74,10 +79,14 @@ func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) 
 	}
 }
 
+// OnClose releases every listener owned by the master loop.
 func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
 	ld.close()
 }
 
+// accept handles a bounded portion of one listener readiness notification.
+// The bound preserves fairness between listeners; level-triggered readiness
+// is delivered again while the accept queue remains non-empty.
 func (ld *acceptor) accept(l *listener) error {
 
 	// udp server incoming
@@ -85,20 +94,15 @@ func (ld *acceptor) accept(l *listener) error {
 		return ld.onReadUDP(l)
 	}
 
+	tcp := strings.HasPrefix(l.network, "tcp")
 	// Bound one readiness dispatch so a busy listener cannot monopolize master.
-	for accepted := 0; accepted < 16; accepted++ {
+	for accepted := 0; accepted < acceptBatchSize; accepted++ {
 		nfd, sa, err := socket.Accept(l.fd)
 		if nil != err {
 			if isWouldBlock(err) {
 				return nil
 			}
 			return err
-		}
-
-		if strings.HasPrefix(l.network, "tcp") {
-			_ = socket.SetNoDelay(nfd, true)
-			_ = socket.SetKeepAlive(nfd, true)
-			_ = socket.SetKeepAlivePeriod(nfd, int(defaultTCPKeepAlive/time.Second))
 		}
 
 		fdc := &fdConn{}
@@ -108,11 +112,14 @@ func (ld *acceptor) accept(l *listener) error {
 		fdc.localAddr = l.laddr
 		fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
 
-		ld.events.submitAccepted(fdc)
+		ld.events.submitAccepted(fdc, tcp)
 	}
 	return nil
 }
 
+// addListen creates a listener and publishes its poller-visible endpoint while
+// holding the listener registry lock. UDP registers a logical internal
+// connection because all peers share the same socket.
 func (ld *acceptor) addListen(addr string) (err error) {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
@@ -160,7 +167,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 }
 
 func (ld *acceptor) closeListener(l *listener) {
-	if l.udpSvr != nil && !l.udpSvr.closed {
+	if l.udpSvr != nil && !l.udpSvr.isClosedOnLoop() {
 		l.udpSvr.closeOnLoop(io.ErrUnexpectedEOF)
 	}
 	if l.file != nil && l.udpSvr == nil {
@@ -191,6 +198,9 @@ func (ld *acceptor) close() {
 	}
 }
 
+// listen parses UIO's scheme-prefixed address and duplicates the resulting Go
+// listener descriptor. The duplicate is switched to non-blocking mode and is
+// thereafter owned by the poller-facing listener record.
 func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 
 	// default scheme is tcp protocol.

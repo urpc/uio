@@ -30,7 +30,7 @@ func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 
 func TestUnixRejectedWriteOwnedReleasesBuffer(t *testing.T) {
 	conn := &fdConn{}
-	conn.closing.Store(true)
+	conn.close.phase.Store(closeRequested)
 	payload := make([]byte, 1024)
 	write := func() {
 		buffer := AcquireBuffer(len(payload))

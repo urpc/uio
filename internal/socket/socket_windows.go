@@ -24,6 +24,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// DupNetConn duplicates conn's OS handle for independent ownership by UIO.
 func DupNetConn(conn net.Conn) (int, error) {
 	sc, ok := conn.(interface {
 		SyscallConn() (syscall.RawConn, error)

@@ -3,7 +3,6 @@ package uws
 import (
 	"unicode/utf8"
 
-	"github.com/petermattis/goid"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 )
@@ -24,18 +23,10 @@ func (c *Conn) BeginMessage(typ MessageType) (*Writer, error) {
 	if c.closed.Load() || c.closing.Load() {
 		return nil, ErrClosed
 	}
-	c.lockWrite()
-	if c.dispatch != nil {
-		owner := c.dispatch.writeBatch.ownerID()
-		if owner != 0 && owner == goid.Get() {
-			c.dispatch.writeBatch.requestFinish()
-		}
+	if !c.tryLockWrite() {
+		return nil, ErrWriteBusy
 	}
-	if err := c.finishWriteResponsibilitiesLocked(); err != nil {
-		c.unlockWrite()
-		return nil, err
-	}
-	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+	if err := c.completeWriteDrainLocked(); err != nil {
 		c.unlockWrite()
 		return nil, err
 	}
@@ -164,9 +155,6 @@ func (w *Writer) Close() error {
 		err = w.conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: opcode})
 	}
 	if err == nil {
-		err = w.conn.flushDispatchWritesLocked()
-	}
-	if err == nil {
 		err = w.conn.flush()
 	}
 	if err != nil {
@@ -177,6 +165,9 @@ func (w *Writer) Close() error {
 	return nil
 }
 
+// fail records the first error, releases write ownership exactly once, and
+// aborts the transport unless a protocol Close is already waiting for this
+// Writer to relinquish the lock.
 func (w *Writer) fail(err error) error {
 	if w.failure == nil {
 		w.failure = err
@@ -186,16 +177,19 @@ func (w *Writer) fail(err error) error {
 	}
 	w.closed = true
 	w.conn.closing.Store(true)
+	protocolClosePending := w.conn.writes.close.writerFailed()
 	if w.stream != nil {
 		w.stream.Abort()
 	}
 	w.conn.unlockWrite()
-	if w.conn.raw != nil {
-		_ = w.conn.raw.CloseWith(w.failure)
+	if w.conn.raw != nil && !protocolClosePending {
+		w.conn.abortTransport(w.failure)
 	}
 	return w.failure
 }
 
+// emitCompressed converts streaming compressor output into non-final fragments;
+// Close emits the final empty continuation required to terminate the message.
 func (w *Writer) emitCompressed(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
@@ -226,6 +220,9 @@ func (w *Writer) emitCompressed(payload []byte) error {
 	return nil
 }
 
+// validateText carries at most UTFMax-1 trailing bytes between Write calls so
+// a rune split across application chunks is validated without buffering the
+// complete message.
 func (w *Writer) validateText(payload []byte) bool {
 	if w.textTailLen > 0 {
 		var runeBytes [utf8.UTFMax]byte

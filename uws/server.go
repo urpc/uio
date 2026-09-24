@@ -1,6 +1,7 @@
 package uws
 
 import (
+	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -28,9 +29,6 @@ type Server struct {
 	MaxFramePayload uint64
 	// MaxMessageSize bounds a complete message after decompression.
 	MaxMessageSize uint64
-	// MaxOutboundBytes bounds accepted but unsent wire bytes per connection.
-	// Zero uses DefaultMaxOutboundBytes; a negative value disables this limit.
-	MaxOutboundBytes int
 	// EnableCompression enables RFC 7692 permessage-deflate negotiation.
 	EnableCompression bool
 	// CompressionLevel selects the flate level. Zero uses default compression.
@@ -44,10 +42,6 @@ type Server struct {
 	// HandshakeTimeout bounds the HTTP upgrade handshake. A zero value uses
 	// DefaultHandshakeTimeout.
 	HandshakeTimeout time.Duration
-	// Executor dispatches OnOpen, OnMessage, and OnClose callbacks away from
-	// the I/O event loop. A nil executor preserves synchronous callbacks. If
-	// Submit rejects, remaining callbacks are dropped rather than run on the loop.
-	Executor Executor
 	// AllowCompressionContextTakeover enables RFC 7692 context takeover for
 	// peers that do not request a no-context-takeover parameter. It is disabled
 	// by default to bound per-connection compression state.
@@ -59,27 +53,25 @@ type Server struct {
 	// the interval.
 	HeartbeatTimeout time.Duration
 
-	connections    sync.Map
-	heartbeatStop  chan struct{}
-	heartbeatDone  chan struct{}
-	heartbeatMu    sync.Mutex
-	dispatchBudget pendingBudget
-	config         *connConfig
-	started        atomic.Bool
-	ready          atomic.Bool
-	closeMu        sync.Mutex
-	closed         bool
+	connections   sync.Map
+	heartbeatStop chan struct{}
+	heartbeatDone chan struct{}
+	heartbeatMu   sync.Mutex
+	config        *connConfig
+	started       atomic.Bool
+	ready         atomic.Bool
+	closeMu       sync.Mutex
+	closed        bool
 }
 
 // NewServer returns a Server configured with the default limits.
 func NewServer(handler Handler) *Server {
 	return &Server{
-		Events:           &uio.Events{},
-		Handler:          handler,
-		MaxHeaderBytes:   DefaultMaxHeaderBytes,
-		MaxFramePayload:  DefaultMaxFramePayload,
-		MaxMessageSize:   DefaultMaxMessageSize,
-		MaxOutboundBytes: DefaultMaxOutboundBytes,
+		Events:          &uio.Events{},
+		Handler:         handler,
+		MaxHeaderBytes:  DefaultMaxHeaderBytes,
+		MaxFramePayload: DefaultMaxFramePayload,
+		MaxMessageSize:  DefaultMaxMessageSize,
 	}
 }
 
@@ -108,13 +100,9 @@ func (s *Server) Serve(addrs ...string) error {
 	if s.MaxMessageSize == 0 {
 		s.MaxMessageSize = DefaultMaxMessageSize
 	}
-	if s.MaxOutboundBytes == 0 {
-		s.MaxOutboundBytes = DefaultMaxOutboundBytes
-	}
 	if s.EnableCompression && s.CompressionLevel == 0 {
 		s.CompressionLevel = -1
 	}
-	s.dispatchBudget.configure(defaultMaxPendingTotalMessages, defaultMaxPendingTotalBytes)
 	configureWriteBuffer(events)
 	s.config = newServerConnConfig(s)
 	oldOnStart := events.OnStart
@@ -142,7 +130,7 @@ func (s *Server) Serve(addrs ...string) error {
 }
 
 // Close permanently stops the server and requests transport shutdown. Serve
-// returns after all event loops and callbacks have exited.
+// returns after all event loops and connection tasks have exited.
 func (s *Server) Close(err error) error {
 	s.closeMu.Lock()
 	if s.closed {
@@ -161,6 +149,9 @@ func (s *Server) Close(err error) error {
 	return events.Close(err)
 }
 
+// startHeartbeat replaces any prior scanner and waits for it to exit before
+// publishing the new lifecycle channels. A Server normally calls it once, but
+// the replacement discipline keeps tests and partial startup deterministic.
 func (s *Server) startHeartbeat(config *connConfig) {
 	if config == nil || config.heartbeatConnections == nil {
 		return
@@ -216,6 +207,8 @@ func (s *Server) runHeartbeat(connections *sync.Map, interval, timeout time.Dura
 	}
 }
 
+// scanHeartbeat performs only non-blocking per-connection operations. A busy
+// streaming Writer starts a send-stall deadline without delaying other peers.
 func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, stop <-chan struct{}) bool {
 	completed := true
 	connections.Range(func(_, value any) bool {
@@ -230,13 +223,26 @@ func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, 
 			return true
 		}
 		heartbeat := conn.heartbeat
-		if heartbeat.pingOutstanding.Load() {
-			if heartbeat.expirePing(now, timeout) {
-				conn.expireHeartbeat()
-			}
+		if heartbeat.expirePing(now, timeout) {
+			conn.expireHeartbeat()
 			return true
 		}
-		_, _ = conn.tryHeartbeatPing(now)
+		if heartbeat.pingOutstanding.Load() {
+			return true
+		}
+		attempted, err := conn.tryHeartbeatPing(now)
+		switch {
+		case err == nil && !attempted:
+			heartbeat.noteSendStall(now)
+		case errors.Is(err, ErrBackpressure):
+			heartbeat.noteSendStall(now)
+		case err != nil:
+			if !conn.closed.Load() && !conn.closing.Load() {
+				conn.setCloseError(err)
+				conn.closing.Store(true)
+				conn.abortTransport(err)
+			}
+		}
 		return true
 	})
 	return completed
@@ -254,6 +260,8 @@ func (c *Conn) expireHeartbeat() {
 	_ = c.closeTransport()
 }
 
+// onOpen distinguishes an adopted, pre-validated net/http upgrade from a native
+// socket that still needs incremental HTTP parsing.
 func (s *Server) onOpen(raw uio.Conn) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		if state := conn.handshake.Load(); state != nil && state.upgrade != nil {
@@ -278,9 +286,6 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 		config:  config,
 		handler: config.handler,
 	}
-	if config.handler != nil {
-		conn.dispatch = newDispatchState(config.executor, defaultMaxPendingMessages, defaultMaxPendingBytes, config.dispatchBudget)
-	}
 	if config.heartbeatConnections != nil {
 		conn.heartbeat = &heartbeatState{}
 	}
@@ -293,7 +298,7 @@ func (s *Server) onData(raw uio.Conn) error {
 		return ErrClosed
 	}
 	err := conn.readAvailable()
-	if err != nil && conn.closing.Load() {
+	if protocolCloseOwnsTransport(err) {
 		// protocolClose owns the graceful transport shutdown after its Close
 		// frame drains; returning the protocol error would close std transports
 		// before their asynchronous writer sends it.
@@ -309,6 +314,8 @@ func (s *Server) onOutbound(raw uio.Conn, n int) {
 	}
 }
 
+// onClose releases incremental protocol state before publishing the terminal
+// callback. closed makes duplicate transport notifications harmless.
 func (s *Server) onClose(raw uio.Conn, err error) {
 	conn, ok := raw.Userdata().(*Conn)
 	if !ok || conn == nil {
@@ -333,5 +340,5 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 	if info.Err == nil {
 		info.Err = err
 	}
-	conn.dispatchClose(info)
+	conn.notifyClose(info)
 }

@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+// Package poller normalizes epoll, kqueue, and blocking-backend wake semantics.
 package poller
 
 import "errors"
@@ -36,8 +37,8 @@ const (
 	Writable
 )
 
-// Event is one level-triggered readiness notification. Readiness remains
-// observable until the descriptor is no longer ready.
+// Event is one normalized readiness notification. A backend may use level or
+// edge triggering; users must follow the registration contract of that fd.
 type Event struct {
 	FD     int
 	Events Events
@@ -45,6 +46,7 @@ type Event struct {
 
 var errInvalidInterest = errors.New("poller: empty interest")
 
+// EventHandler consumes normalized readiness and terminal poller closure.
 type EventHandler interface {
 	OnEvent(ep *NetPoller, fd int, events Events)
 	OnClose(ep *NetPoller, err error)

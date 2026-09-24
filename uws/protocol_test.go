@@ -189,33 +189,6 @@ func TestIncrementalParserReturnsToPoolAfterProtocolError(t *testing.T) {
 	}
 }
 
-func TestReadAvailableStopsWhenTransportPausesRead(t *testing.T) {
-	first := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte("a")}, [4]byte{1, 2, 3, 4})
-	second := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte("b")}, [4]byte{5, 6, 7, 8})
-	raw := &bufferedProbeConn{}
-	raw.inbound = append(first, second...)
-	handler := &pauseAfterMessageHandler{}
-	conn := &Conn{
-		raw:     raw,
-		handler: handler,
-		config:  testServerConfig(NewServer(nil)),
-	}
-	conn.opened.Store(true)
-
-	if err := conn.readAvailable(); err != nil {
-		t.Fatal(err)
-	}
-	if handler.messages != 1 {
-		t.Fatalf("messages delivered = %d, want 1", handler.messages)
-	}
-	if got, want := raw.InboundBuffered(), len(second); got != want {
-		t.Fatalf("inbound bytes = %d, want %d", got, want)
-	}
-	if raw.wakes != 0 {
-		t.Fatalf("wake calls = %d, want 0 while reads are paused", raw.wakes)
-	}
-}
-
 func TestReadAvailableParsesFrameAcrossInboundSegments(t *testing.T) {
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte("payload")}, [4]byte{1, 2, 3, 4})
 	raw := newSegmentedProbeConn(wire[:1], wire[1:4], wire[4:])
@@ -272,7 +245,7 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 	if conn.handshake.Load() != nil {
 		t.Fatal("completed handshake retained handshake state")
 	}
-	if conn.dispatch != nil || conn.compression != nil || conn.metadata.Load() != nil {
+	if conn.compression != nil || conn.metadata.Load() != nil {
 		t.Fatal("unconfigured connection allocated optional steady-state data")
 	}
 	tracked := 0
@@ -633,7 +606,7 @@ func TestServerHandshakeAndMaskedMessage(t *testing.T) {
 
 func TestCloseWaitsForPeerClose(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20, CloseTimeout: time.Second}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -653,7 +626,7 @@ func TestCloseWaitsForPeerClose(t *testing.T) {
 
 func TestCloseTimeoutTerminatesUnresponsivePeer(t *testing.T) {
 	raw := &writeProbeConn{closed: make(chan struct{})}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20, CloseTimeout: 5 * time.Millisecond}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: 5 * time.Millisecond}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -704,7 +677,7 @@ func TestClosedConnectionDoesNotCreateCloseTimer(t *testing.T) {
 
 func TestPingRejectedAfterCloseStarts(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20, CloseTimeout: time.Second}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -718,7 +691,7 @@ func TestPingRejectedAfterCloseStarts(t *testing.T) {
 
 func TestSendFrameLockedRejectsDataAfterClosing(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	conn.closing.Store(true)

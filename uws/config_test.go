@@ -15,7 +15,6 @@ func TestServerConnectionsShareFrozenConfig(t *testing.T) {
 		MaxHeaderBytes:                  101,
 		MaxFramePayload:                 102,
 		MaxMessageSize:                  103,
-		MaxOutboundBytes:                104,
 		CloseTimeout:                    105 * time.Millisecond,
 		HandshakeTimeout:                106 * time.Millisecond,
 		EnableCompression:               true,
@@ -47,7 +46,7 @@ func TestServerConnectionsShareFrozenConfig(t *testing.T) {
 	if first.handler != handler || first.config.subprotocols[0] != "v1" {
 		t.Fatal("server connection observed configuration mutated after startup")
 	}
-	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 || first.maxOutboundBytes() != 104 {
+	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 {
 		t.Fatal("server connection limits changed after startup")
 	}
 }
@@ -58,7 +57,6 @@ func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
 		MaxHeaderBytes:    101,
 		MaxFramePayload:   102,
 		MaxMessageSize:    103,
-		MaxOutboundBytes:  104,
 		CloseTimeout:      105 * time.Millisecond,
 		HandshakeTimeout:  106 * time.Millisecond,
 		EnableCompression: true,
@@ -78,7 +76,7 @@ func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
 	if first.config.subprotocols[0] != "v1" || !first.isClient() {
 		t.Fatal("dialer connection observed configuration mutated after startup")
 	}
-	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 || first.maxOutboundBytes() != 104 {
+	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 {
 		t.Fatal("dialer connection limits changed after startup")
 	}
 }

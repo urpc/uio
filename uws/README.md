@@ -31,6 +31,7 @@ func (handler) OnClose(*uws.Conn, uws.CloseEvent) {}
 server := uws.NewServer(handler{})
 server.CheckOrigin = func(*http.Request) bool { return true }
 server.EnableCompression = true
+server.Events.MaxOutboundBuffered = int(uws.DefaultMaxFramePayload) + 14
 log.Fatal(server.Serve(":8080"))
 ```
 
@@ -67,83 +68,79 @@ Set `CheckOrigin` to an application-specific policy for browser-facing
 servers; a nil policy accepts all origins.
 
 Servers and dialers are single-lifecycle objects and cannot be restarted after
-`Close`. Their `Close` methods request transport shutdown without waiting on the
-calling event loop, so they are safe inside a synchronous callback.
+`Close`. Their `Close` methods request transport shutdown without waiting for
+the calling connection task, so they are safe inside a callback.
 `Server.Serve` is the server join point and returns only after all event loops
-have exited. Connection completion and its cause are reported by `OnClose` and
-`CloseEvent`. Use `Userdata` and `SetUserdata` for connection-specific state
-from ordered connection callbacks; synchronize access when using other
-goroutines.
+and connection tasks have exited. Connection completion and its cause are
+reported by `OnClose` and `CloseEvent`. Use `Userdata` and `SetUserdata` for
+connection-specific state from ordered connection callbacks; synchronize
+access when using other goroutines.
 
-Callbacks run in the owning UIO event loop and messages are ordered per
+Callbacks run in the owning UIO connection task and messages are ordered per
 connection. `Message.Payload` is borrowed until `OnMessage` returns; call
 `Message.Clone` before retaining it or passing it to another goroutine.
 
 `SendText`, `SendBinary`, and `Ping` are non-blocking. They return
-`uws.ErrBackpressure` when the configured outbound budget is full. Ordinary
-message sends are accepted into the transport and flushed automatically at its
-callback or task boundary. Use `BeginMessage` for large or fragmented messages
-and call `Writer.Close` after successful writes. A `Writer.Write` error aborts
-the connection and releases write ownership immediately; a later `Close` only
-returns the first error. Set `MaxOutboundBytes` to a negative value to disable
-the UWS outbound byte limit; zero uses the safe default.
+`uws.ErrBackpressure` when `Events.MaxOutboundBuffered` is full and
+`uws.ErrWriteBusy` while a streaming Writer owns the connection. Ordinary
+message sends are accepted into the transport and flushed automatically at the
+current or next connection-task boundary. Use `BeginMessage` for large or
+fragmented messages and call `Writer.Close` after successful writes. A
+`Writer.Write` error aborts the connection and releases write ownership
+immediately; a later `Close` only returns the first error. Configure
+connection-level outbound backpressure with `Events.MaxOutboundBuffered`; zero
+disables the transport limit. Size it to hold the largest frame that a callback
+may need to buffer.
 
-UWS defaults a zero `Events.WriteBufferedThreshold` to 4 KiB on every
-transport so consecutive small writes can share a transport flush. Ping, Close,
-and `Writer.Close` still establish explicit flush boundaries. An explicit
-nonzero threshold is preserved; use a negative value to keep immediate-write
-mode.
+UWS defaults a zero `Events.WriteBufferedThreshold` to 4 KiB so consecutive
+small frames can share transport storage and a flush. Ping, Close, and
+`Writer.Close` still establish explicit flush boundaries. An explicit nonzero
+threshold is preserved; use a negative value to disable this small-frame
+coalescing policy.
 
-Handlers normally run on the I/O event loop and should return promptly. Set
-`Server.Executor` or `Dialer.Executor` to move `OnOpen`, `OnMessage`, and
-`OnClose` to an application executor. Callbacks for one connection remain
-serialized. The executor's `Submit` method must return promptly and return
-`false` when its bounded queue is full; use a bounded worker pool for the
-application work. UWS keeps generous internal mailbox limits as a final guard
-against an executor that stops making progress. An overloaded connection is
-closed with code 1013 and `ErrApplicationBackpressure`; other connections
-continue to run.
-If `Submit` rejects a callback, that connection is closed with
-`ErrExecutorRejected`. UWS never falls back to running a rejected callback on
-the I/O loop, so remaining callbacks, including `OnClose`, are dropped. Size
-the executor for the expected concurrent connections, or provide a fair
-scheduler in front of a bounded worker pool.
+On native Unix transports, UIO runs the complete per-connection path as one
+serialized connection task: socket I/O, WebSocket parsing and decompression,
+then `OnOpen`, `OnMessage`, or `OnClose`. A slow connection therefore does not
+block the event loop or callbacks for other connections. UWS does not add a
+second executor mailbox or copy message payloads between schedulers.
 
-[`*taskgo.Queue`](https://github.com/limpo1989/taskgo) implements this executor interface directly (taskgo's
-`Submit` API). A typical setup for deep, bursty business calls is:
+Set `server.Events.Executor` or `dialer.Events.Executor` to provide the UIO
+connection-task scheduler. Without one, UIO creates a typed taskgo queue with
+maximum concurrency `512 * runtime.NumCPU()` and a 30-second idle retirement
+window.
+The executor's typed `Submit` and `SubmitBatch` methods must return promptly and
+must not execute tasks inline; rejection closes the affected connection. UIO
+uses a taskgo typed queue by default. A custom taskgo scheduler can be installed
+directly:
 
 ```go
-workers := runtime.GOMAXPROCS(0) * 8
-executor := taskgo.New(
+workers := runtime.NumCPU() * 512
+executor := taskgo.NewTask[uio.IOTask](
+	func(task uio.IOTask) { task.RunTask() },
 	taskgo.WithConcurrency(workers),
-	taskgo.WithMaxIdle(time.Second),
+	taskgo.WithMaxIdle(30*time.Second),
 	taskgo.WithMaxPending(10128), // connection runners plus scheduling headroom
 )
-server.Executor = executor
+server.Events.Executor = executor
 defer executor.Stop(context.Background())
 ```
 
-Keep the taskgo pending limit larger than the expected number of simultaneously
-scheduled connection runners (leave headroom for runner replacement while a
-worker callback is still returning). UWS independently bounds queued messages
-with its per-connection and server-wide mailbox limits.
+Keep the pending limit larger than the expected number of simultaneously ready
+connections. UIO applies a per-connection transport outbound budget and pauses
+reads when that connection exhausts its budget. Worker needs
+depend on the ratio and duration of blocking callbacks; size the pool from a
+production profile rather than connection count alone. The stdio/Windows
+backend keeps its dedicated per-connection blocking read/write goroutines and
+delivers callbacks synchronously from the read path.
 
-An executor runner handles at most 64 callbacks or one millisecond before it
-resubmits the connection. This preserves connection order while preventing a
-busy connection from monopolizing one worker; a callback that itself blocks
-still occupies only that worker. Ordinary server data frames produced during
-one runner turn are submitted to the transport in batches of at most 64 KiB.
-Control frames and explicit flushes remain barriers. Worker needs depend on the
-ratio and duration of blocking callbacks; `4-10 * GOMAXPROCS` is a practical
-starting range, not a universal default.
-
-`Close` sends a close frame and waits for the peer response, bounded by
-`CloseTimeout`. Protocol errors are reported as close code 1002; invalid UTF-8
-uses 1007; oversized messages use 1009.
+`Close` starts a graceful close handshake and returns after queueing its frame.
+The transport then waits for the peer response, bounded by `CloseTimeout`.
+Protocol errors are reported as close code 1002; invalid UTF-8 uses 1007;
+oversized messages use 1009.
 
 `HandshakeTimeout` closes connections that do not complete the HTTP upgrade in
-time. This protects the event loop and file-descriptor budget from slow or
-deliberately incomplete handshakes.
+time. This bounds per-connection handshake state and protects the descriptor
+budget from slow or deliberately incomplete handshakes.
 
 `Conn.SetDeadline`, `SetReadDeadline`, and `SetWriteDeadline` forward directly
 to the UIO transport. Applications own deadline policy; pass a zero time to

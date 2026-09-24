@@ -21,15 +21,21 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
-// Conn is a non-blocking connection managed by an event loop. On Unix,
-// callbacks and connection state run on the owning loop. Writes from other
-// goroutines are safe and retain no caller-owned data after returning. Close
-// and CloseWith return after the close request is accepted; OnClose is final.
+// Conn is a connection managed by Events. On native Unix, socket
+// I/O and callbacks run in one serialized connection task outside the event
+// loop. The stdio/Windows backend uses dedicated blocking I/O goroutines and
+// serializes lifecycle callbacks per connection. Writes from other goroutines
+// are safe and retain no caller-owned data after returning. Close and
+// CloseWith return after the close request is accepted; OnClose is final.
+// Native UDP writes from outside the owning event loop wait for the datagram's
+// send result. Any other event-loop callback gets ErrUDPWriteOnEventLoop
+// instead of risking a cross-loop wait cycle.
 type Conn interface {
 	// LocalAddr is the connection's local socket address.
 	LocalAddr() net.Addr
@@ -112,8 +118,8 @@ type Conn interface {
 	// It may only be called from a connection callback.
 	InboundBuffered() int
 
-	// OutboundBuffered returns accepted payload bytes not yet sent, including
-	// both queued write tasks and the loop-owned outbound buffer.
+	// OutboundBuffered returns payload bytes accepted by this connection but not
+	// yet written to the socket.
 	OutboundBuffered() int
 
 	// WriterTo
@@ -124,7 +130,8 @@ type Conn interface {
 	// ReadWriteCloser
 	// Read may only be called from a connection callback. Write and Close are
 	// safe from other goroutines.
-	// Notice: non-blocking interface, should not be used as you use std.
+	// Stream writes are non-blocking; native UDP writes from outside the owning
+	// loop wait for that loop's non-blocking datagram send result.
 	io.ReadWriteCloser
 
 	// ByteWriter
@@ -141,7 +148,8 @@ type Conn interface {
 
 	// WriteOwned submits buffer without copying and always consumes its
 	// ownership, including when it returns an error. For UDP, one buffer is sent
-	// as one datagram.
+	// as one datagram. Native UDP writes from another event loop return
+	// ErrUDPWriteOnEventLoop.
 	WriteOwned(buffer *Buffer) (int, error)
 
 	// Flush schedules buffered data for writing without waiting for socket I/O.
@@ -151,7 +159,12 @@ type Conn interface {
 	// Wake schedules one OnData callback after previously submitted tasks.
 	Wake() error
 
-	// CloseWith asynchronously closes the connection on its owning loop.
+	// YieldRead ends the current read round and schedules remaining buffered or
+	// socket data for a later OnData callback. It may only be called from a
+	// connection callback.
+	YieldRead() error
+
+	// CloseWith asynchronously releases the connection on its owning event loop.
 	// On Unix, unsent accepted payload is reported as UnflushedError.
 	CloseWith(err error) error
 }
@@ -159,11 +172,11 @@ type Conn interface {
 var errUnsupported = fmt.Errorf("unsupported method")
 
 var (
-	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
-	ErrInboundOverflow  = errors.New("uio: inbound buffer limit exceeded")
-	ErrTaskQueueFull    = errors.New("uio: pending write task limit exceeded")
-	ErrUnflushedData    = errors.New("uio: connection closed with unflushed data")
-	ErrDialOnEventLoop  = errors.New("uio: Dial cannot run on an event loop")
+	ErrOutboundOverflow    = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow     = errors.New("uio: inbound buffer limit exceeded")
+	ErrUnflushedData       = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop     = errors.New("uio: Dial cannot run on an event loop")
+	ErrUDPWriteOnEventLoop = errors.New("uio: UDP write cannot wait on another event loop")
 )
 
 // UnflushedError reports payload accepted by the framework but not sent before
@@ -178,21 +191,52 @@ func (err UnflushedError) Error() string {
 
 func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 
+// commonConn contains transport-independent identity and inbound storage.
+// inboundTail is a borrowed current-read slice; inbound owns only bytes that a
+// callback left unread before that slice had to be reused.
 type commonConn struct {
-	events      *Events                 // events
-	loop        *eventLoop              // event loop
-	localAddr   net.Addr                // local address
-	remoteAddr  net.Addr                // remote address
-	userdata    any                     // user-defined data
-	inbound     bytebuf.CompositeBuffer // inbound buffer
-	inboundTail []byte                  // inbound tail buffer
-	internal    bool                    // framework-owned endpoint, not a user connection
+	events      *Events                     // events
+	loop        *eventLoop                  // event loop
+	localAddr   net.Addr                    // local address
+	remoteAddr  net.Addr                    // remote address
+	userdata    atomic.Pointer[userdataBox] // user-defined data
+	inboundGoid atomic.Int64                // current inbound callback owner
+	inbound     bytebuf.CompositeBuffer     // inbound buffer
+	inboundTail []byte                      // inbound tail buffer
+	internal    bool                        // framework-owned endpoint, not a user connection
 }
 
-func (fc *commonConn) LocalAddr() net.Addr                { return fc.localAddr }
-func (fc *commonConn) RemoteAddr() net.Addr               { return fc.remoteAddr }
-func (fc *commonConn) Userdata() any                      { return fc.userdata }
-func (fc *commonConn) SetUserdata(value any)              { fc.userdata = value }
+// userdataBox lets atomic.Pointer publish an arbitrary interface value.
+type userdataBox struct{ value any }
+
+func (fc *commonConn) LocalAddr() net.Addr  { return fc.localAddr }
+func (fc *commonConn) RemoteAddr() net.Addr { return fc.remoteAddr }
+func (fc *commonConn) Userdata() any {
+	value := fc.userdata.Load()
+	if value == nil {
+		return nil
+	}
+	return value.value
+}
+func (fc *commonConn) SetUserdata(value any) { fc.userdata.Store(&userdataBox{value: value}) }
+
+// Callback ownership is a contract check for borrowed inbound slices, not a
+// lock. Native tasks and std callbackMu serialize access before entering here.
+// Nested internal callback helpers leave the outer owner's scope intact.
+func (fc *commonConn) beginInboundCallback() bool {
+	id := currentGoroutineID()
+	if fc.inboundGoid.Load() == id {
+		return false
+	}
+	fc.inboundGoid.Store(id)
+	return true
+}
+
+func (fc *commonConn) endInboundCallback(started bool) {
+	if started && fc.inboundGoid.Load() == currentGoroutineID() {
+		fc.inboundGoid.Store(0)
+	}
+}
 func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
 func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
 func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
@@ -229,6 +273,9 @@ func (fc *commonConn) Read(b []byte) (n int, err error) {
 	return
 }
 
+// Peek reads across persistent inbound blocks and the borrowed current-read
+// tail without advancing either. It returns a direct slice when the first
+// source is already contiguous, otherwise it fills b.
 func (fc *commonConn) Peek(b []byte) []byte {
 	fc.assertInboundAccess()
 	// inbound buffer size
@@ -261,6 +308,8 @@ func (fc *commonConn) PeekChunk() []byte {
 	return fc.inboundTail
 }
 
+// Discard advances persistent blocks before the borrowed tail so stream order
+// remains intact. A negative n consumes both sources completely.
 func (fc *commonConn) Discard(n int) (int, error) {
 	fc.assertInboundAccess()
 
@@ -303,11 +352,7 @@ func (fc *commonConn) assertInboundAccess() {
 	if fc.loop == nil || fc.events == nil {
 		return
 	}
-	id := currentGoroutineID()
-	if owner := fc.loop.loopGoid.Load(); owner != 0 && owner == id {
-		return
-	}
-	if _, ok := fc.events.callbackGoids.Load(id); ok {
+	if fc.inboundGoid.Load() == currentGoroutineID() {
 		return
 	}
 	panic("uio: inbound access outside a connection callback")

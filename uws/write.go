@@ -10,20 +10,16 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/petermattis/goid"
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
+// serverFrameScratch keeps the maximum server header and its two writev slices
+// off the heap. Client frames cannot use it because masking mutates payload.
 type serverFrameScratch struct {
 	header [14]byte
 	vec    [2][]byte
 }
-
-const (
-	dispatchWriteBatchSmallBytes = 8 << 10
-	dispatchWriteBatchMaxBytes   = 64 << 10
-)
 
 var serverFrameScratchPool sync.Pool
 
@@ -40,43 +36,156 @@ func releaseServerFrameScratch(scratch *serverFrameScratch) {
 	serverFrameScratchPool.Put(scratch)
 }
 
-func (state *connWriteState) requestDrain() { state.drainRequested.Store(true) }
-
-func (state *connWriteState) drainIsRequested() bool { return state.drainRequested.Load() }
-
-func (state *connWriteState) completeDrain() { state.drainRequested.Store(false) }
-
-func (state *connWriteState) closeFrameWasSent() bool { return state.closeFrameSent }
-
-func (state *connWriteState) markCloseFrameSent() { state.closeFrameSent = true }
-
-func (batch *dispatchWriteBatch) ownerID() int64 { return batch.owner.Load() }
-
-func (batch *dispatchWriteBatch) begin(owner int64) { batch.owner.Store(owner) }
-
-func (batch *dispatchWriteBatch) requestFinish() { batch.finishRequested.Store(true) }
-
-func (batch *dispatchWriteBatch) finishIsRequested() bool { return batch.finishRequested.Load() }
-
-func (batch *dispatchWriteBatch) complete() {
-	batch.owner.Store(0)
-	batch.finishRequested.Store(false)
+func (state *connCloseProgress) drainIsRequested() bool {
+	return state.flags.Load()&closeDrainRequested != 0
 }
 
-func (batch *dispatchWriteBatch) takeBuffer() *uio.Buffer {
-	buffer := batch.buffer
-	batch.buffer = nil
-	return buffer
+func (state *connCloseProgress) phase() uint32 {
+	return (state.flags.Load() & transportPhaseMask) >> transportPhaseShift
+}
+
+// setPhaseLocked changes only the transport claim bits. All flag writes hold
+// transitionMu; reads on the normal send path need just one atomic load.
+func (state *connCloseProgress) setPhaseLocked(phase uint32) {
+	flags := state.flags.Load()
+	state.flags.Store((flags &^ transportPhaseMask) | phase<<transportPhaseShift)
+}
+
+// completeDrain preserves a Close frame queued while the previous frame was
+// being written. The caller must keep draining while it returns false.
+func (state *connCloseProgress) completeDrain() bool {
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	if state.pendingClose != nil {
+		return false
+	}
+	state.flags.Store(state.flags.Load() &^ closeDrainRequested)
+	return true
+}
+
+func (state *connCloseProgress) closeFrameWasSent() bool {
+	return state.flags.Load()&closeFrameSent != 0
+}
+
+func (state *connCloseProgress) markCloseFrameSent() {
+	state.transitionMu.Lock()
+	state.flags.Store(state.flags.Load() | closeFrameSent)
+	state.transitionMu.Unlock()
+}
+
+// queueClose copies a protocol Close frame when a streaming Writer owns mu.
+// A second request can briefly queue while the first is being written, but
+// sendFrameLocked emits only the first successful Close frame.
+func (state *connCloseProgress) queueClose(payload []byte) bool {
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	flags := state.flags.Load()
+	if flags&closeWriterAborted != 0 || state.phase() == transportCloseClaimed {
+		return false
+	}
+	if flags&closeFrameSent != 0 || state.pendingClose != nil {
+		return true
+	}
+	pending := &pendingCloseFrame{payload: make([]byte, len(payload))}
+	copy(pending.payload, payload)
+	state.pendingClose = pending
+	state.flags.Store(flags | closeDrainRequested)
+	return true
+}
+
+func (state *connCloseProgress) takeClose() []byte {
+	state.transitionMu.Lock()
+	pending := state.pendingClose
+	state.pendingClose = nil
+	state.transitionMu.Unlock()
+	if pending == nil {
+		return nil
+	}
+	return pending.payload
+}
+
+func (state *connCloseProgress) hasPendingClose() bool {
+	state.transitionMu.Lock()
+	pending := state.pendingClose != nil
+	state.transitionMu.Unlock()
+	return pending
+}
+
+func (state *connCloseProgress) abortDrain() {
+	state.transitionMu.Lock()
+	state.pendingClose = nil
+	state.flags.Store(state.flags.Load() &^ closeDrainRequested)
+	state.transitionMu.Unlock()
+}
+
+// writerFailed decides the handoff before releasing the long-lived write lock.
+// A Close request that wins first is drained by unlockWrite; otherwise later
+// protocol Close requests cannot overtake the failed partial message.
+func (state *connCloseProgress) writerFailed() bool {
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	if state.pendingClose != nil {
+		return true
+	}
+	state.flags.Store((state.flags.Load() | closeWriterAborted) &^ closeDrainRequested)
+	return false
+}
+
+func (state *connCloseProgress) writerIsAborted() bool {
+	return state.flags.Load()&closeWriterAborted != 0
+}
+
+func (state *connCloseProgress) claimAbort() bool {
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	if state.phase() == transportCloseClaimed {
+		return false
+	}
+	state.pendingClose = nil
+	state.flags.Store((state.flags.Load() | closeWriterAborted) &^ closeDrainRequested)
+	state.setPhaseLocked(transportCloseClaimed)
+	return true
+}
+
+func (state *connCloseProgress) requestTransportClose() bool {
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	if state.writerIsAborted() {
+		return false
+	}
+	switch state.phase() {
+	case transportCloseIdle:
+		state.flags.Store(state.flags.Load() | closeDrainRequested)
+		state.setPhaseLocked(transportClosePending)
+		return true
+	case transportClosePending:
+		return true
+	default:
+		return false
+	}
+}
+
+func (state *connCloseProgress) claimTransportClose() bool {
+	if state.phase() != transportClosePending || state.pendingBytes.Load() != 0 {
+		return false
+	}
+	state.transitionMu.Lock()
+	defer state.transitionMu.Unlock()
+	if state.phase() != transportClosePending || state.writerIsAborted() || state.drainIsRequested() || state.pendingBytes.Load() != 0 {
+		return false
+	}
+	state.setPhaseLocked(transportCloseClaimed)
+	return true
 }
 
 // SendText queues payload as one text message. The transport flushes accepted
-// data at its callback or task boundary.
+// data in the connection's current or next I/O task.
 func (c *Conn) SendText(payload []byte) error {
 	return c.send(MessageType(TextMessage), payload)
 }
 
 // SendBinary queues payload as one binary message. The transport flushes
-// accepted data at its callback or task boundary.
+// accepted data in the connection's current or next I/O task.
 func (c *Conn) SendBinary(payload []byte) error {
 	return c.send(BinaryMessage, payload)
 }
@@ -89,6 +198,9 @@ func (c *Conn) Ping(payload []byte) error {
 	return c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: payload})
 }
 
+// tryHeartbeatPing never waits for a streaming Writer. It records queue time
+// now, while markPingSent starts the Pong timeout only after OnOutbound proves
+// that the complete Ping frame left UIO's queue.
 func (c *Conn) tryHeartbeatPing(now time.Time) (bool, error) {
 	if c.heartbeat == nil || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
 		return false, ErrClosed
@@ -96,7 +208,7 @@ func (c *Conn) tryHeartbeatPing(now time.Time) (bool, error) {
 	if !c.writes.mu.TryLock() {
 		return false, nil
 	}
-	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+	if err := c.completeWriteDrainLocked(); err != nil {
 		c.unlockWrite()
 		return true, err
 	}
@@ -123,7 +235,13 @@ func (c *Conn) tryHeartbeatPing(now time.Time) (bool, error) {
 		c.unlockWrite()
 		return false, nil
 	}
-	err := c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: payload[:]})
+	if !heartbeat.submitMu.TryLock() {
+		heartbeat.cancelPing(nonce)
+		c.unlockWrite()
+		return false, nil
+	}
+	err := c.sendFrameSubmitted(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: payload[:]})
+	heartbeat.submitMu.Unlock()
 	if err == nil {
 		err = c.flush()
 	}
@@ -134,6 +252,8 @@ func (c *Conn) tryHeartbeatPing(now time.Time) (bool, error) {
 	return true, err
 }
 
+// tryHeartbeatClose is the non-blocking timeout close path. false means a
+// streaming Writer still owns the connection and a later scan must retry.
 func (c *Conn) tryHeartbeatClose(code uint16, reason string) bool {
 	if c.closed.Load() || c.closing.Load() {
 		return true
@@ -146,8 +266,12 @@ func (c *Conn) tryHeartbeatClose(code uint16, reason string) bool {
 	payload[1] = byte(code)
 	copy(payload[2:], reason)
 	startedClose := false
-	err := c.flushForeignDispatchWritesLocked()
-	if err == nil && !c.closed.Load() && !c.closing.Load() {
+	if err := c.completeWriteDrainLocked(); err != nil {
+		c.unlockWrite()
+		return true
+	}
+	var err error
+	if !c.closed.Load() && !c.closing.Load() {
 		c.setCloseReason(code, reason)
 		err = c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 		if err == nil {
@@ -162,7 +286,7 @@ func (c *Conn) tryHeartbeatClose(code uint16, reason string) bool {
 	if err != nil {
 		c.setCloseError(err)
 		c.closing.Store(true)
-		_ = c.raw.CloseWith(err)
+		c.abortTransport(err)
 		return true
 	}
 	if startedClose {
@@ -189,8 +313,10 @@ func (c *Conn) Close(code uint16, reason string) error {
 	if c.closing.Load() {
 		return nil
 	}
-	c.lockWrite()
-	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+	if !c.tryLockWrite() {
+		return ErrWriteBusy
+	}
+	if err := c.completeWriteDrainLocked(); err != nil {
 		c.unlockWrite()
 		return err
 	}
@@ -209,7 +335,7 @@ func (c *Conn) Close(code uint16, reason string) error {
 	}
 	if err := c.flush(); err != nil {
 		c.unlockWrite()
-		_ = c.raw.CloseWith(err)
+		c.abortTransport(err)
 		return err
 	}
 	c.closing.Store(true)
@@ -218,6 +344,8 @@ func (c *Conn) Close(code uint16, reason string) error {
 	return nil
 }
 
+// send validates one complete application message while holding write
+// ownership, optionally compresses it, and queues exactly one logical message.
 func (c *Conn) send(typ MessageType, payload []byte) error {
 	opcode := frame.Text
 	if typ == BinaryMessage {
@@ -225,9 +353,11 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 	} else if typ != TextMessage {
 		return frame.ErrProtocol
 	}
-	c.lockWrite()
+	if !c.tryLockWrite() {
+		return ErrWriteBusy
+	}
 	defer c.unlockWrite()
-	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+	if err := c.completeWriteDrainLocked(); err != nil {
 		return err
 	}
 	if !c.opened.Load() {
@@ -269,9 +399,11 @@ func (c *Conn) sendFrame(f frame.Frame) error {
 	if c.closed.Load() || c.closing.Load() {
 		return ErrClosed
 	}
-	c.lockWrite()
+	if !c.tryLockWrite() {
+		return ErrWriteBusy
+	}
 	defer c.unlockWrite()
-	if err := c.flushForeignDispatchWritesLocked(); err != nil {
+	if err := c.completeWriteDrainLocked(); err != nil {
 		return err
 	}
 	if err := c.sendFrameLocked(f); err != nil {
@@ -280,7 +412,87 @@ func (c *Conn) sendFrame(f frame.Frame) error {
 	return c.flush()
 }
 
+// sendProtocolControlFrame preserves protocol progress when a Writer owns the
+// normal write lock: Close is handed off, while Ping/Pong use an owned frame
+// that can be safely queued concurrently by UIO.
+func (c *Conn) sendProtocolControlFrame(f frame.Frame) error {
+	if !c.opened.Load() {
+		return ErrNotReady
+	}
+	if c.closed.Load() || c.writes.close.writerIsAborted() || (c.closing.Load() && f.Opcode != frame.Close) {
+		return ErrClosed
+	}
+	if c.tryLockWrite() {
+		defer c.unlockWrite()
+		if c.writes.close.writerIsAborted() {
+			return ErrClosed
+		}
+		if err := c.completeWriteDrainLocked(); err != nil {
+			return err
+		}
+		if err := c.sendFrameLocked(f); err != nil {
+			return err
+		}
+		return c.flush()
+	}
+	if f.Opcode == frame.Close {
+		c.closing.Store(true)
+		if !c.writes.close.queueClose(f.Payload) {
+			return ErrClosed
+		}
+		return c.tryCompleteWriteDrain()
+	}
+	return c.sendConcurrentControlFrame(f)
+}
+
+// sendConcurrentControlFrame materializes the complete frame because it queues
+// through UIO without holding the normal write lock or borrowing caller memory.
+func (c *Conn) sendConcurrentControlFrame(f frame.Frame) error {
+	if !frame.IsControl(f.Opcode) || len(f.Payload) > 125 {
+		return frame.ErrProtocol
+	}
+	var maskKey [4]byte
+	if c.isClient() {
+		if _, err := rand.Read(maskKey[:]); err != nil {
+			return err
+		}
+		f.Masked = true
+	}
+	wireSize := frameWireSize(len(f.Payload), f.Masked)
+	owned := uio.AcquireBuffer(wireSize)
+	dst := owned.AvailableBuffer()[:wireSize]
+	wire := frame.Append(dst[:0], f, maskKey)
+	owned.CommitWrite(len(wire))
+	heartbeat := c.heartbeat
+	if heartbeat != nil {
+		heartbeat.submitMu.Lock()
+	}
+	c.trackOutbound(wireSize)
+	n, err := c.raw.WriteOwned(owned)
+	err = c.finishFrameWrite(f.Opcode, n, wireSize, err)
+	if heartbeat != nil {
+		heartbeat.submitMu.Unlock()
+	}
+	if err != nil {
+		return err
+	}
+	return c.flush()
+}
+
+// sendFrameLocked requires connWriteState.mu. Server frames use header+borrowed
+// payload writev above the coalescing threshold; client frames are materialized
+// because RFC masking must not mutate caller-owned payload.
 func (c *Conn) sendFrameLocked(f frame.Frame) error {
+	if heartbeat := c.heartbeat; heartbeat != nil {
+		heartbeat.submitMu.Lock()
+		defer heartbeat.submitMu.Unlock()
+	}
+	return c.sendFrameSubmitted(f)
+}
+
+// sendFrameSubmitted requires heartbeat.submitMu when heartbeat is enabled, so
+// accepted byte positions follow the actual UIO submission order.
+func (c *Conn) sendFrameSubmitted(f frame.Frame) error {
 	if c.closed.Load() || (c.closing.Load() && f.Opcode != frame.Close) {
 		return ErrClosed
 	}
@@ -288,7 +500,7 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 		return frame.ErrMessageTooBig
 	}
 	if f.Opcode == frame.Close {
-		if c.writes.closeFrameWasSent() {
+		if c.writes.close.closeFrameWasSent() {
 			return nil
 		}
 	}
@@ -300,27 +512,8 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 		f.Masked = true
 	}
 	wireSize := frameWireSize(len(f.Payload), f.Masked)
-	if !c.reserveOutbound(wireSize) {
-		return ErrBackpressure
-	}
+	c.trackOutbound(wireSize)
 	c.markHeartbeatPingTarget(f)
-	state := c.dispatch
-	owner := int64(0)
-	if state != nil {
-		owner = state.writeBatch.ownerID()
-	}
-	if owner != 0 && owner == goid.Get() &&
-		!f.Masked && isDataFrame(f.Opcode) && wireSize <= dispatchWriteBatchMaxBytes {
-		if err := c.appendDispatchFrameLocked(f, wireSize, maskKey); err != nil {
-			c.releaseOutbound(wireSize)
-			return err
-		}
-		return nil
-	}
-	if err := c.flushDispatchWritesLocked(); err != nil {
-		c.releaseOutbound(wireSize)
-		return err
-	}
 	threshold := c.writeBufferedThreshold()
 	if f.Masked || (threshold > 0 && wireSize < threshold) {
 		owned := uio.AcquireBuffer(wireSize)
@@ -339,166 +532,95 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 	return c.finishFrameWrite(f.Opcode, n, wireSize, err)
 }
 
-func isDataFrame(opcode frame.OpCode) bool {
-	return opcode == frame.Text || opcode == frame.Binary || opcode == frame.Continuation
-}
-
-func (c *Conn) appendDispatchFrameLocked(f frame.Frame, wireSize int, maskKey [4]byte) error {
-	batch := &c.dispatch.writeBatch
-	if batch.buffer != nil && batch.buffer.Available() < wireSize {
-		if err := c.flushDispatchWritesLocked(); err != nil {
-			return err
+func (c *Conn) completeWriteDrainLocked() error {
+	if !c.writes.close.drainIsRequested() {
+		return nil
+	}
+	for {
+		payload := c.writes.close.takeClose()
+		if payload != nil {
+			err := c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
+			if err == nil {
+				err = c.flush()
+			}
+			if err != nil {
+				c.writes.close.abortDrain()
+				return err
+			}
+		}
+		if c.writes.close.completeDrain() {
+			return nil
 		}
 	}
-	if batch.buffer == nil {
-		capacity := dispatchWriteBatchSmallBytes
-		if wireSize > dispatchWriteBatchSmallBytes {
-			capacity = dispatchWriteBatchMaxBytes
-		}
-		batch.buffer = uio.AcquireBuffer(capacity)
-	}
-	dst := batch.buffer.AvailableBuffer()[:wireSize]
-	wire := frame.Append(dst[:0], f, maskKey)
-	batch.buffer.CommitWrite(len(wire))
-	return nil
 }
 
-func (c *Conn) beginDispatchWrites() (bool, error) {
-	if !c.writes.mu.TryLock() {
-		return false, nil
-	}
-	if err := c.finishWriteResponsibilitiesLocked(); err != nil {
-		c.writes.mu.Unlock()
-		return false, err
-	}
-	if c.closed.Load() || c.closing.Load() {
-		c.writes.mu.Unlock()
-		return false, nil
-	}
-	c.dispatch.writeBatch.begin(goid.Get())
-	c.writes.mu.Unlock()
-	return true, nil
-}
-
-func (c *Conn) endDispatchWrites() error {
-	owner := goid.Get()
-	if c.dispatch == nil || c.dispatch.writeBatch.ownerID() != owner {
-		return nil
-	}
-	c.dispatch.writeBatch.requestFinish()
-	return c.tryFinishWriteResponsibilities()
-}
-
-func (c *Conn) flushDispatchBatch() error {
-	return c.endDispatchWrites()
-}
-
-func (c *Conn) flushForeignDispatchWritesLocked() error {
-	if c.dispatch == nil {
-		if c.writes.drainIsRequested() {
-			return c.finishWriteResponsibilitiesLocked()
-		}
-		return nil
-	}
-	if c.dispatch.writeBatch.finishIsRequested() || c.writes.drainIsRequested() {
-		return c.finishWriteResponsibilitiesLocked()
-	}
-	owner := c.dispatch.writeBatch.ownerID()
-	if owner != 0 && owner == goid.Get() {
-		return nil
-	}
-	return c.flushDispatchWritesLocked()
-}
-
-func (c *Conn) finishDispatchWritesLocked() error {
-	if c.dispatch == nil || !c.dispatch.writeBatch.finishIsRequested() {
-		return nil
-	}
-	err := c.flushDispatchWritesLocked()
-	c.dispatch.writeBatch.complete()
-	return err
-}
-
-func (c *Conn) finishWriteResponsibilitiesLocked() error {
-	err := c.finishDispatchWritesLocked()
-	c.writes.completeDrain()
-	return err
-}
-
-func (c *Conn) tryFinishWriteResponsibilities() error {
-	finishDispatch := c.dispatch != nil && c.dispatch.writeBatch.finishIsRequested()
-	if !finishDispatch && !c.writes.drainIsRequested() {
+func (c *Conn) tryCompleteWriteDrain() error {
+	if !c.writes.close.drainIsRequested() {
 		return nil
 	}
 	if !c.writes.mu.TryLock() {
 		return nil
 	}
-	err := c.finishWriteResponsibilitiesLocked()
+	err := c.completeWriteDrainLocked()
 	c.writes.mu.Unlock()
 	return err
 }
 
 func (c *Conn) unlockWrite() {
 	c.writes.mu.Unlock()
-	finishDispatch := c.dispatch != nil && c.dispatch.writeBatch.finishIsRequested()
-	if finishDispatch || c.writes.drainIsRequested() {
-		if err := c.tryFinishWriteResponsibilities(); err != nil {
-			c.reportDispatchWriteError(err)
+	if c.writes.close.drainIsRequested() {
+		if err := c.tryCompleteWriteDrain(); err != nil {
+			c.setCloseError(err)
+			c.closing.Store(true)
+			c.abortTransport(err)
 		}
 	}
 	_, _ = c.tryCloseTransport()
 }
 
-func (c *Conn) lockWrite() {
-	c.writes.mu.Lock()
-}
+func (c *Conn) tryLockWrite() bool { return c.writes.mu.TryLock() }
 
-func (c *Conn) flushDispatchWritesLocked() error {
-	if c.dispatch == nil {
-		return nil
-	}
-	buffer := c.dispatch.writeBatch.takeBuffer()
-	if buffer == nil {
-		return nil
-	}
-	want := buffer.Len()
-	n, err := c.raw.WriteOwned(buffer)
-	return c.finishFrameWrite(0, n, want, err)
-}
-
+// finishFrameWrite reconciles progress accounting with a rejected or partial
+// transport write and translates UIO's connection-level limit to the UWS API.
 func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) error {
 	if err != nil {
-		c.releaseOutbound(want - n)
+		c.rollbackOutbound(want - n)
+		if errors.Is(err, uio.ErrOutboundOverflow) {
+			return ErrBackpressure
+		}
 		if errors.Is(err, net.ErrClosed) {
 			return ErrClosed
 		}
 		return err
 	}
 	if n != want {
-		c.releaseOutbound(want - n)
+		c.rollbackOutbound(want - n)
 		return io.ErrShortWrite
 	}
 	if opcode == frame.Close {
-		c.writes.markCloseFrameSent()
+		c.writes.close.markCloseFrameSent()
 	}
 	return nil
 }
 
 func (c *Conn) writeTransportOwned(buffer *uio.Buffer) error {
+	if heartbeat := c.heartbeat; heartbeat != nil {
+		heartbeat.submitMu.Lock()
+		defer heartbeat.submitMu.Unlock()
+	}
 	want := buffer.Len()
-	// Handshake bytes are not subject to message backpressure, but they still
-	// participate in graceful-close ordering on asynchronous transports.
-	c.pendingBytes.Add(int64(want))
+	// Handshake bytes participate in graceful-close ordering just like frames.
+	c.writes.close.pendingBytes.Add(int64(want))
 	if heartbeat := c.heartbeat; heartbeat != nil {
 		heartbeat.outboundAccepted.Add(uint64(want))
 	}
 	n, err := c.raw.WriteOwned(buffer)
 	if err != nil {
-		c.releaseOutbound(want - n)
+		c.rollbackOutbound(want - n)
 		return err
 	}
 	if n != want {
-		c.releaseOutbound(want - n)
+		c.rollbackOutbound(want - n)
 		return io.ErrShortWrite
 	}
 	return nil
@@ -517,42 +639,51 @@ func frameWireSize(payload int, masked bool) int {
 	return size
 }
 
-func (c *Conn) reserveOutbound(n int) bool {
-	limit := c.maxOutboundBytes()
-	for {
-		current := c.pendingBytes.Load()
-		if limit > 0 && current > int64(limit)-int64(n) {
-			return false
-		}
-		if c.pendingBytes.CompareAndSwap(current, current+int64(n)) {
-			if heartbeat := c.heartbeat; heartbeat != nil {
-				heartbeat.outboundAccepted.Add(uint64(n))
-			}
-			return true
-		}
+// trackOutbound records accepted wire positions used by graceful close and
+// heartbeat send detection. It intentionally performs no limit check.
+func (c *Conn) trackOutbound(n int) {
+	c.writes.close.pendingBytes.Add(int64(n))
+	if heartbeat := c.heartbeat; heartbeat != nil {
+		heartbeat.outboundAccepted.Add(uint64(n))
 	}
 }
 
-func (c *Conn) releaseOutbound(n int) {
+// reducePendingOutbound reconciles either transport retirement or a rejected
+// write against the same pending count without allowing a concurrent callback
+// to make that count negative.
+func (c *Conn) reducePendingOutbound(n int) int64 {
 	if n <= 0 {
-		return
+		return 0
 	}
 	for {
-		current := c.pendingBytes.Load()
+		current := c.writes.close.pendingBytes.Load()
 		if current == 0 {
-			return
+			return 0
 		}
 		remaining := current - int64(n)
 		if remaining < 0 {
 			remaining = 0
 		}
-		if c.pendingBytes.CompareAndSwap(current, remaining) {
-			if heartbeat := c.heartbeat; heartbeat != nil {
-				retired := heartbeat.outboundRetired.Add(uint64(current - remaining))
-				heartbeat.markPingSent(retired)
-			}
-			return
+		if c.writes.close.pendingBytes.CompareAndSwap(current, remaining) {
+			return current - remaining
 		}
+	}
+}
+
+// rollbackOutbound removes bytes not accepted by UIO. They did not leave the
+// socket queue, so they must not advance heartbeat's retired byte position.
+func (c *Conn) rollbackOutbound(n int) {
+	if rolledBack := c.reducePendingOutbound(n); rolledBack != 0 && c.heartbeat != nil {
+		c.heartbeat.outboundAccepted.Add(^uint64(rolledBack - 1))
+	}
+}
+
+// releaseOutbound advances protocol send progress only for UIO's OnOutbound
+// callback, which confirms bytes actually left its queue.
+func (c *Conn) releaseOutbound(n int) {
+	if retiredBytes := c.reducePendingOutbound(n); retiredBytes != 0 && c.heartbeat != nil {
+		retired := c.heartbeat.outboundRetired.Add(uint64(retiredBytes))
+		c.heartbeat.markPingSent(retired)
 	}
 }
 
@@ -572,6 +703,7 @@ func (heartbeat *heartbeatState) markPingSent(retired uint64) {
 	if heartbeat.pingOutstanding.Load() && heartbeat.pingSentAt == 0 &&
 		heartbeat.pingTarget != 0 && retired >= heartbeat.pingTarget {
 		heartbeat.pingSentAt = time.Now().UnixNano()
+		heartbeat.sendStalledAt = 0
 	}
 	heartbeat.mu.Unlock()
 }
@@ -583,6 +715,9 @@ func (heartbeat *heartbeatState) beginPing(now time.Time, nonce uint64) bool {
 		return false
 	}
 	heartbeat.pingQueuedAt = now.UnixNano()
+	if heartbeat.sendStalledAt != 0 {
+		heartbeat.pingQueuedAt = heartbeat.sendStalledAt
+	}
 	heartbeat.pingSentAt = 0
 	heartbeat.pingNonce = nonce
 	heartbeat.pingTarget = 0
@@ -605,6 +740,7 @@ func (heartbeat *heartbeatState) acknowledgePing(nonce uint64) bool {
 		return false
 	}
 	heartbeat.clearPingLocked()
+	heartbeat.sendStalledAt = 0
 	return true
 }
 
@@ -616,11 +752,26 @@ func (heartbeat *heartbeatState) cancelPing(nonce uint64) {
 	heartbeat.mu.Unlock()
 }
 
+// noteSendStall preserves the first failed or busy send attempt across retries.
+// A later accepted Ping inherits this queue deadline until OnOutbound proves
+// that it was actually sent.
+func (heartbeat *heartbeatState) noteSendStall(now time.Time) {
+	heartbeat.mu.Lock()
+	if !heartbeat.pingOutstanding.Load() && heartbeat.sendStalledAt == 0 {
+		heartbeat.sendStalledAt = now.UnixNano()
+	}
+	heartbeat.mu.Unlock()
+}
+
 func (heartbeat *heartbeatState) expirePing(now time.Time, timeout time.Duration) bool {
 	heartbeat.mu.Lock()
 	defer heartbeat.mu.Unlock()
 	if !heartbeat.pingOutstanding.Load() {
-		return false
+		if heartbeat.sendStalledAt == 0 || now.Sub(time.Unix(0, heartbeat.sendStalledAt)) < timeout {
+			return false
+		}
+		heartbeat.sendStalledAt = 0
+		return true
 	}
 	startedAt := heartbeat.pingQueuedAt
 	if heartbeat.pingSentAt != 0 {
@@ -630,9 +781,12 @@ func (heartbeat *heartbeatState) expirePing(now time.Time, timeout time.Duration
 		return false
 	}
 	heartbeat.clearPingLocked()
+	heartbeat.sendStalledAt = 0
 	return true
 }
 
+// clearPingLocked only cancels the current Ping attempt. A failed enqueue must
+// retain sendStalledAt so the next attempt cannot restart the send deadline.
 func (heartbeat *heartbeatState) clearPingLocked() {
 	heartbeat.pingOutstanding.Store(false)
 	heartbeat.pingQueuedAt = 0

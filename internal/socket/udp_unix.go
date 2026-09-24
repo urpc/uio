@@ -50,6 +50,7 @@ func RecvUDP(fd int, packet []byte, receive *UDPReceive) (int, error) {
 	return int(n), nil
 }
 
+// parse converts kernel sockaddr storage into a comparable allocation-free key.
 func (receive *UDPReceive) parse(addrLen uint32) error {
 	receive.Addr = UDPAddress{}
 	switch receive.raw.Addr.Family {

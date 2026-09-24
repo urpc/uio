@@ -757,6 +757,25 @@ func TestCompositeBufferAppendOwnedAndPeekVecN(t *testing.T) {
 	buffer.Reset()
 }
 
+func TestCompositeBufferAppendOwnedCoalesced(t *testing.T) {
+	var buffer CompositeBuffer
+	buffer.AppendOwnedCoalesced(CloneBuffer([]byte("first")), 4096)
+	buffer.AppendOwnedCoalesced(CloneBuffer([]byte("-second")), 4096)
+	if len(buffer.bufList) != 1 {
+		t.Fatalf("coalesced segment count = %d, want 1", len(buffer.bufList))
+	}
+	if capacity := buffer.bufList[0].Cap(); capacity < 4096 {
+		t.Fatalf("coalesced capacity = %d, want at least 4096", capacity)
+	}
+	if got := string(buffer.bufList[0].Bytes()); got != "first-second" {
+		t.Fatalf("coalesced payload = %q", got)
+	}
+	if got := buffer.Len(); got != len("first-second") {
+		t.Fatalf("Len = %d, want %d", got, len("first-second"))
+	}
+	buffer.Reset()
+}
+
 func TestCloneBuffersFrom(t *testing.T) {
 	buffer := CloneBuffersFrom([][]byte{[]byte("ab"), []byte("cde"), []byte("f")}, 3, 3)
 	defer ReleaseBuffer(buffer)

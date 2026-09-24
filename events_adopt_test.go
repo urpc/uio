@@ -2,10 +2,32 @@ package uio
 
 import (
 	"errors"
+	"io"
 	"net"
 	"testing"
 	"time"
 )
+
+func expectPeerClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	if err := conn.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	var buffer [1]byte
+	_, err := conn.Read(buffer[:])
+	if err == nil {
+		t.Fatal("peer remained open")
+	}
+	if timeout, ok := err.(net.Error); ok && timeout.Timeout() {
+		t.Fatalf("peer was not closed: %v", err)
+	}
+	if !errors.Is(err, io.EOF) && !errors.Is(err, net.ErrClosed) {
+		var operationError *net.OpError
+		if !errors.As(err, &operationError) {
+			t.Fatalf("peer read = %v, want closed connection", err)
+		}
+	}
+}
 
 func TestAdoptTransfersTCPConnection(t *testing.T) {
 	events := &Events{Pollers: 1}

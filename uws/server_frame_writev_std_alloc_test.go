@@ -14,8 +14,7 @@ func TestStdServerFrameWritevDoesNotAllocatePerPayload(t *testing.T) {
 	conn := &Conn{
 		raw: raw,
 		config: testServerConfig(&Server{
-			MaxFramePayload:  uint64(len(payload)),
-			MaxOutboundBytes: -1,
+			MaxFramePayload: uint64(len(payload)),
 		}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}

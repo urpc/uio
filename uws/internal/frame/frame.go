@@ -11,6 +11,7 @@ import (
 	"github.com/urpc/uio/internal/pool"
 )
 
+// OpCode identifies a WebSocket data or control frame kind.
 type OpCode byte
 
 const (
@@ -33,12 +34,15 @@ const (
 	maxPooledIncrementalPayload = 64 << 10
 )
 
+// parserPayloadBuffer owns payload bytes only when a frame spans input chunks.
 type parserPayloadBuffer struct {
 	data []byte
 }
 
 var parserPayloadPool = pool.New[*parserPayloadBuffer](maxPooledIncrementalPayload)
 
+// Frame is one validated wire frame. Borrowed payloads alias parser input and
+// are valid only during the callback that receives them.
 type Frame struct {
 	Fin      bool
 	RSV1     bool
@@ -48,6 +52,7 @@ type Frame struct {
 	Payload  []byte
 }
 
+// ParserConfig contains immutable wire-level validation policy.
 type ParserConfig struct {
 	// ExpectMask is true for a server receiving client frames and false for a
 	// client receiving server frames.
@@ -72,6 +77,9 @@ func parserMaxFramePayload(cfg *ParserConfig) uint64 {
 	return cfg.MaxFramePayload
 }
 
+// Parser incrementally decodes frames split across input chunks. Complete
+// frames should use ParseFrame directly; Parser retains payload only when a
+// frame crosses a chunk boundary.
 type Parser struct {
 	cfg         *ParserConfig // shared immutable owner configuration
 	header      [14]byte
@@ -90,6 +98,7 @@ type Parser struct {
 	payloadSize int
 }
 
+// NewParser returns an incremental parser initialized with cfg.
 func NewParser(cfg ParserConfig) *Parser {
 	p := &Parser{}
 	p.Init(&cfg)
@@ -103,6 +112,7 @@ func (p *Parser) Init(cfg *ParserConfig) {
 	p.cfg = cfg
 }
 
+// Reset releases retained payload and returns p to a frame boundary.
 func (p *Parser) Reset() {
 	p.releasePayload()
 	p.resetState()
@@ -308,6 +318,8 @@ func ParseFrame(src []byte, cfg *ParserConfig) (Frame, int, bool, error) {
 	return Frame{Fin: fin, RSV1: rsv1, Opcode: opcode, Masked: masked, Borrowed: true, Payload: payload}, total, true, nil
 }
 
+// prepareHeader validates the fixed two-byte prefix and determines the complete
+// header length before any payload storage is allocated.
 func (p *Parser) prepareHeader() error {
 	b0, b1 := p.header[0], p.header[1]
 	p.fin = b0&0x80 != 0
@@ -352,6 +364,8 @@ func (p *Parser) prepareHeader() error {
 	return nil
 }
 
+// finishHeader decodes extended length and mask fields after headerNeed bytes
+// are present, enforcing limits before converting payload length to int.
 func (p *Parser) finishHeader() error {
 	lengthCode := p.header[1] & 0x7f
 	switch lengthCode {
@@ -398,6 +412,8 @@ func initialPayloadCapacity(payloadLen uint64) int {
 	return initialPayloadBuffer
 }
 
+// growPayload keeps incremental payloads in a bounded size-classed pool and
+// moves oversized frames to ordinary GC-managed storage.
 func (p *Parser) growPayload(required int) {
 	if required <= cap(p.payload) {
 		return
@@ -478,6 +494,8 @@ func maxInt() int {
 	return int(^uint(0) >> 1)
 }
 
+// Message is one assembled text or binary message. Borrowed has the same
+// callback-scoped lifetime contract as Frame.Borrowed.
 type Message struct {
 	Opcode     OpCode
 	Payload    []byte
@@ -501,10 +519,13 @@ type Assembler struct {
 	payload    []byte
 }
 
+// NewAssembler creates an assembler with the same wire and message limit.
 func NewAssembler(maxMessage uint64) *Assembler {
 	return NewAssemblerWithLimits(maxMessage, maxMessage)
 }
 
+// NewAssemblerWithLimits separates the decompressed message bound from the
+// aggregate compressed-wire bound used before decompression.
 func NewAssemblerWithLimits(maxMessage, maxCompressedPayload uint64) *Assembler {
 	return &Assembler{cfg: &AssemblerConfig{
 		MaxMessage:           maxMessage,
@@ -520,6 +541,7 @@ func (a *Assembler) Init(cfg *AssemblerConfig) {
 	a.cfg = cfg
 }
 
+// Reset drops fragmented-message state and retained payload.
 func (a *Assembler) Reset() {
 	a.fragmented = false
 	a.opcode = 0
@@ -651,8 +673,11 @@ func assemblerValidateUTF8(cfg *AssemblerConfig) bool {
 	return cfg == nil || cfg.ValidateUTF8
 }
 
+// IsControl reports whether op is in the control-frame opcode range.
 func IsControl(op OpCode) bool { return op >= 0x8 }
 
+// Append appends a complete encoded frame to dst. Masked payload is copied and
+// masked in dst; the source payload is never modified.
 func Append(dst []byte, f Frame, maskKey [4]byte) []byte {
 	dst = AppendHeader(dst, f, maskKey)
 	start := len(dst)
@@ -663,6 +688,7 @@ func Append(dst []byte, f Frame, maskKey [4]byte) []byte {
 	return dst
 }
 
+// AppendHeader appends only the frame header, including mask key when present.
 func AppendHeader(dst []byte, f Frame, maskKey [4]byte) []byte {
 	first := byte(f.Opcode)
 	if f.Fin {
@@ -694,6 +720,7 @@ func AppendHeader(dst []byte, f Frame, maskKey [4]byte) []byte {
 	return dst
 }
 
+// ValidateClosePayload checks RFC close-code and UTF-8 reason constraints.
 func ValidateClosePayload(payload []byte) error {
 	if len(payload) == 0 {
 		return nil
@@ -711,6 +738,7 @@ func ValidateClosePayload(payload []byte) error {
 	return nil
 }
 
+// CloseCode returns the encoded code or 1005 when the frame carries none.
 func CloseCode(payload []byte) uint16 {
 	if len(payload) < 2 {
 		return 1005

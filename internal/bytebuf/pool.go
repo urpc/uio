@@ -18,6 +18,7 @@ package bytebuf
 
 import "github.com/urpc/uio/internal/pool"
 
+// bufferPoolKind remembers which retention policy must receive a released block.
 type bufferPoolKind uint8
 
 const (

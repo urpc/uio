@@ -67,12 +67,12 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 			events:     ev,
 			localAddr:  conn.LocalAddr(),
 			remoteAddr: conn.RemoteAddr(),
-			userdata:   userdata,
 		},
 		conn:     conn,
 		writeSig: make(chan struct{}, 1),
 		closeSig: make(chan struct{}),
 	}
+	fdc.SetUserdata(userdata)
 	fd := fdc.Fd()
 	if fd < 0 {
 		fdc.closeUnregistered()
@@ -85,13 +85,14 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 	return fdc, nil
 }
 
-// DialContext connects from outside event callbacks and allows cancellation
-// while resolving or establishing the network connection.
+// DialContext connects synchronously and allows cancellation while resolving
+// or establishing the network connection. Calling it from a connection
+// callback blocks that callback until dialing completes.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}
-	if ev.currentLoop() != nil {
+	if isEventLoopGoroutine() {
 		return nil, ErrDialOnEventLoop
 	}
 
@@ -125,7 +126,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		fdc.conn = conn
 	}
 
-	fdc.userdata = userdata
+	fdc.SetUserdata(userdata)
 	fdc.localAddr = lAddr
 	fdc.remoteAddr = rAddr
 	fdc.events = ev

@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
+// Package bytebuf provides pooled contiguous and segmented byte buffers with
+// explicit ownership transfer.
 package bytebuf
 
 // Simple byte buffer for marshaling data.
@@ -61,6 +63,8 @@ func (b *Buffer) Bytes() []byte { return b.buf[b.off:] }
 // The buffer is only valid until the next write operation on b.
 func (b *Buffer) AvailableBuffer() []byte { return b.buf[len(b.buf):] }
 
+// CommitWrite extends the readable length after a caller writes directly into
+// AvailableBuffer. It panics when n exceeds the advertised capacity.
 func (b *Buffer) CommitWrite(n int) {
 	if n < 0 || n > cap(b.buf)-len(b.buf) {
 		panic("bytebuf.Buffer: commit-write out of range")

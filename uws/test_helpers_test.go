@@ -63,6 +63,7 @@ type heartbeatHandler struct {
 type reentrantCloseHandler struct {
 	open    chan struct{}
 	closed  chan struct{}
+	closeMu sync.RWMutex
 	closeFn func()
 	once    sync.Once
 }
@@ -89,8 +90,9 @@ type writeProbeConn struct {
 type bufferedProbeConn struct {
 	writeProbeConn
 	inbound []byte
-	paused  bool
 }
+
+func (c *bufferedProbeConn) YieldRead() error { return c.Wake() }
 
 func (c *bufferedProbeConn) InboundBuffered() int { return len(c.inbound) }
 
@@ -109,13 +111,13 @@ func (c *bufferedProbeConn) Discard(n int) (int, error) {
 	return n, nil
 }
 
-func (c *bufferedProbeConn) IsReadPaused() bool { return c.paused }
-
 type segmentedProbeConn struct {
 	writeProbeConn
 	segments [][]byte
 	buffered int
 }
+
+func (c *segmentedProbeConn) YieldRead() error { return c.Wake() }
 
 func newSegmentedProbeConn(segments ...[]byte) *segmentedProbeConn {
 	c := &segmentedProbeConn{segments: segments}
@@ -167,17 +169,6 @@ func (c *segmentedProbeConn) Discard(n int) (int, error) {
 	return discarded, nil
 }
 
-type pauseAfterMessageHandler struct{ messages int }
-
-func (h *pauseAfterMessageHandler) OnOpen(*Conn) {}
-
-func (h *pauseAfterMessageHandler) OnMessage(conn *Conn, _ Message) {
-	h.messages++
-	conn.raw.(*bufferedProbeConn).paused = true
-}
-
-func (*pauseAfterMessageHandler) OnClose(*Conn, CloseEvent) {}
-
 type assemblerStateHandler struct {
 	assemblerVisible bool
 	messages         []string
@@ -191,38 +182,6 @@ func (h *assemblerStateHandler) OnMessage(conn *Conn, message Message) {
 }
 
 func (*assemblerStateHandler) OnClose(*Conn, CloseEvent) {}
-
-type queuedExecutor struct {
-	mu    sync.Mutex
-	tasks []func()
-}
-
-func (e *queuedExecutor) Submit(task func()) bool {
-	e.mu.Lock()
-	e.tasks = append(e.tasks, task)
-	e.mu.Unlock()
-	return true
-}
-
-func (e *queuedExecutor) runNext() bool {
-	e.mu.Lock()
-	if len(e.tasks) == 0 {
-		e.mu.Unlock()
-		return false
-	}
-	task := e.tasks[0]
-	e.tasks[0] = nil
-	e.tasks = e.tasks[1:]
-	e.mu.Unlock()
-	task()
-	return true
-}
-
-func (e *queuedExecutor) pending() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return len(e.tasks)
-}
 
 type recordingHandler struct {
 	mu       sync.Mutex
@@ -248,10 +207,6 @@ func (h *recordingHandler) OnClose(*Conn, CloseEvent) {
 	h.events = append(h.events, "close")
 	h.mu.Unlock()
 }
-
-type rejectingExecutor struct{}
-
-func (rejectingExecutor) Submit(func()) bool { return false }
 
 func (c *writeProbeConn) Write(payload []byte) (int, error) {
 	c.writes++
@@ -320,7 +275,7 @@ func (c *writeProbeConn) CloseWith(err error) error {
 }
 
 func completeTestOutbound(conn *Conn) {
-	pending := conn.pendingBytes.Load()
+	pending := conn.writes.close.pendingBytes.Load()
 	if pending > 0 {
 		conn.releaseOutbound(int(pending))
 	}
@@ -340,14 +295,23 @@ func (h *reentrantCloseHandler) OnOpen(*Conn) {
 func (*reentrantCloseHandler) OnMessage(*Conn, Message) {}
 
 func (h *reentrantCloseHandler) OnClose(*Conn, CloseEvent) {
-	if h.closeFn != nil {
-		h.closeFn()
+	h.closeMu.RLock()
+	closeFn := h.closeFn
+	h.closeMu.RUnlock()
+	if closeFn != nil {
+		closeFn()
 	}
 	h.once.Do(func() {
 		if h.closed != nil {
 			close(h.closed)
 		}
 	})
+}
+
+func (h *reentrantCloseHandler) setCloseFunc(closeFn func()) {
+	h.closeMu.Lock()
+	h.closeFn = closeFn
+	h.closeMu.Unlock()
 }
 
 func (h *streamHandler) OnOpen(conn *Conn) {

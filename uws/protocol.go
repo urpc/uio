@@ -18,6 +18,8 @@ import (
 	"github.com/urpc/uio/uws/internal/handshake"
 )
 
+// startHandshakeTimer advances the handshake epoch before installing a timer.
+// Epoch checks make callbacks from replaced timers harmless.
 func (c *Conn) startHandshakeTimer(timeout time.Duration) {
 	if timeout <= 0 {
 		timeout = DefaultHandshakeTimeout
@@ -41,6 +43,8 @@ func (c *Conn) startHandshakeTimer(timeout time.Duration) {
 	}
 }
 
+// watchHandshakeContext links one dial attempt to the same epoch as its timer.
+// Whichever completion path wins removes and stops the other callback.
 func (c *Conn) watchHandshakeContext(ctx context.Context) {
 	if ctx == nil || ctx.Done() == nil {
 		return
@@ -76,6 +80,9 @@ func (c *Conn) watchHandshakeContext(ctx context.Context) {
 	}
 }
 
+// expireHandshake wins only for the currently published state and epoch. It
+// detaches all handshake resources before closing the transport so OnClose
+// cannot observe half-cleaned state.
 func (c *Conn) expireHandshake(state *handshakeState, epoch uint64, cause error) {
 	if cause == nil {
 		cause = context.Canceled
@@ -86,82 +93,75 @@ func (c *Conn) expireHandshake(state *handshakeState, epoch uint64, cause error)
 		return
 	}
 	state.expired = true
-	state.epoch++
-	timer := state.timer
-	state.timer = nil
-	stopContext := state.contextStop
-	state.contextStop = nil
-	cleanup := state.cleanup
-	state.cleanup = nil
-	state.mu.Unlock()
+	resources := state.detachResourcesLocked()
 	c.handshake.CompareAndSwap(state, nil)
-	if timer != nil {
-		timer.Stop()
-	}
-	if stopContext != nil {
-		stopContext()
-	}
-	if cleanup != nil {
-		cleanup()
-	}
+	state.mu.Unlock()
+	resources.stop()
 	_ = c.raw.CloseWith(cause)
 }
 
+// stopHandshakeTimer tears down the complete handshake state on rejection or
+// transport close, including dial context hooks and hijack cleanup.
 func (c *Conn) stopHandshakeTimer() {
 	state := c.handshake.Load()
 	if state == nil {
 		return
 	}
 	state.mu.Lock()
-	state.epoch++
-	timer := state.timer
-	state.timer = nil
-	stopContext := state.contextStop
-	state.contextStop = nil
-	cleanup := state.cleanup
-	state.cleanup = nil
-	state.mu.Unlock()
+	state.expired = true
+	resources := state.detachResourcesLocked()
 	c.handshake.CompareAndSwap(state, nil)
-	if timer != nil {
-		timer.Stop()
-	}
-	if stopContext != nil {
-		stopContext()
-	}
-	if cleanup != nil {
-		cleanup()
-	}
+	state.mu.Unlock()
+	resources.stop()
 }
 
+// markOpened atomically transitions a live handshake to open and stops its
+// timeout sources. The state itself remains published through OnOpen so
+// Conn.Request can expose an adopted HTTP request during that callback.
 func (c *Conn) markOpened() bool {
 	state := c.handshake.Load()
 	if state == nil {
 		return false
 	}
 	state.mu.Lock()
-	if state.expired || c.closed.Load() {
+	if state.expired || c.handshake.Load() != state || c.opened.Load() || c.closed.Load() {
 		state.mu.Unlock()
 		return false
 	}
-	state.epoch++
-	timer := state.timer
-	state.timer = nil
-	stopContext := state.contextStop
-	state.contextStop = nil
-	cleanup := state.cleanup
-	state.cleanup = nil
+	resources := state.detachResourcesLocked()
 	c.opened.Store(true)
 	state.mu.Unlock()
-	if timer != nil {
-		timer.Stop()
-	}
-	if stopContext != nil {
-		stopContext()
-	}
-	if cleanup != nil {
-		cleanup()
-	}
+	resources.stop()
 	return true
+}
+
+type handshakeResources struct {
+	timer       *time.Timer
+	contextStop func() bool
+	cleanup     func()
+}
+
+// detachResourcesLocked invalidates timer/context callbacks while ownership of
+// the handshake state is still serialized by its mutex.
+func (state *handshakeState) detachResourcesLocked() handshakeResources {
+	state.epoch++
+	resources := handshakeResources{state.timer, state.contextStop, state.cleanup}
+	state.timer = nil
+	state.contextStop = nil
+	state.cleanup = nil
+	return resources
+}
+
+func (resources handshakeResources) stop() {
+	if resources.timer != nil {
+		resources.timer.Stop()
+	}
+	if resources.contextStop != nil {
+		resources.contextStop()
+	}
+	if resources.cleanup != nil {
+		resources.cleanup()
+	}
 }
 
 func (c *Conn) ensureHandshakeState() *handshakeState {
@@ -182,6 +182,9 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 	}
 }
 
+// readAvailable consumes borrowed UIO inbound chunks without copying complete
+// frames. It yields after maxFramesPerDataEvent callbacks so a hot connection
+// returns to the scheduler and cannot monopolize one worker.
 func (c *Conn) readAvailable() error {
 	frames := 0
 	for c.raw.InboundBuffered() > 0 {
@@ -205,9 +208,6 @@ func (c *Conn) readAvailable() error {
 				return err
 			}
 			frames++
-			if isReadPaused(c.raw) {
-				return errReadPaused
-			}
 			if frames >= maxFramesPerDataEvent {
 				return errReadBudget
 			}
@@ -216,18 +216,9 @@ func (c *Conn) readAvailable() error {
 		if consumed > 0 {
 			_, _ = c.raw.Discard(consumed)
 		}
-		if errors.Is(err, errReadPaused) {
-			return nil
-		}
 		if errors.Is(err, errReadBudget) {
-			if c.raw.InboundBuffered() == 0 {
-				return nil
-			}
-			if wakeErr := c.raw.Wake(); wakeErr != nil {
-				if c.closing.Load() || c.closed.Load() {
-					return nil
-				}
-				return fmt.Errorf("uws: schedule buffered read: %w", wakeErr)
+			if yieldErr := c.raw.YieldRead(); yieldErr != nil {
+				return fmt.Errorf("uws: yield buffered read: %w", yieldErr)
 			}
 			return nil
 		}
@@ -279,6 +270,8 @@ func releaseMessageAssembler(assembler *frame.Assembler) {
 	fragmentedMessagePool.Put(assembler)
 }
 
+// feedFrames keeps the zero-allocation ParseFrame path for complete frames and
+// acquires a stateful parser only when a frame spans inbound chunks.
 func (c *Conn) feedFrames(data []byte, emit func(frame.Frame) error) (int, error) {
 	if c.parser != nil {
 		consumed, err := c.parser.Feed(data, emit)
@@ -323,6 +316,9 @@ func (c *Conn) releaseParser() {
 	c.parser = nil
 }
 
+// consumeHandshake incrementally accumulates the bounded HTTP header, installs
+// negotiated compression, writes the server response, and then feeds any
+// bytes received after the header as WebSocket frames.
 func (c *Conn) consumeHandshake(data []byte) error {
 	state := c.handshake.Load()
 	if state == nil {
@@ -376,9 +372,7 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		c.config.heartbeatConnections.Store(c, c)
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
-	if err := c.dispatchOpen(); err != nil {
-		return err
-	}
+	c.notifyOpen()
 	if len(extra) > 0 {
 		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
 			return c.protocolClose(err)
@@ -387,6 +381,8 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	return nil
 }
 
+// consumeClientHandshake validates and parses the response once, negotiates
+// extensions from that result, and preserves post-header frame bytes.
 func (c *Conn) consumeClientHandshake() error {
 	state := c.handshake.Load()
 	if state == nil {
@@ -415,9 +411,7 @@ func (c *Conn) consumeClientHandshake() error {
 		return context.DeadlineExceeded
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
-	if err := c.dispatchOpen(); err != nil {
-		return err
-	}
+	c.notifyOpen()
 	if len(extra) > 0 {
 		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
 			return c.protocolClose(err)
@@ -438,16 +432,16 @@ func (c *Conn) rejectHandshake() {
 	_, _ = c.raw.Write([]byte(response))
 }
 
+// closeTransport requests graceful transport shutdown without waiting on a
+// streaming Writer. The current Writer inherits pending Close-frame work; the
+// raw connection closes only after that drain and all tracked bytes retire.
 func (c *Conn) closeTransport() error {
 	c.closing.Store(true)
-	c.writes.requestDrain()
-	if c.dispatch != nil {
-		c.dispatch.writeBatch.requestFinish()
+	if !c.writes.close.requestTransportClose() {
+		return nil
 	}
-	c.transportClosePending.Store(true)
-	dispatchErr := c.tryFinishWriteResponsibilities()
-	if dispatchErr != nil && !errors.Is(dispatchErr, net.ErrClosed) {
-		return dispatchErr
+	if err := c.tryCompleteWriteDrain(); err != nil && !errors.Is(err, net.ErrClosed) {
+		return err
 	}
 	if err := c.flush(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return err
@@ -481,7 +475,7 @@ func (c *Conn) startCloseTimer() {
 		state.timer.Stop()
 	}
 	state.timer = time.AfterFunc(c.closeTimeout(), func() {
-		_ = c.raw.CloseWith(io.ErrClosedPipe)
+		c.abortTransport(io.ErrClosedPipe)
 	})
 	state.mu.Unlock()
 }
@@ -498,24 +492,31 @@ func (c *Conn) ensureCloseTimer() {
 	}
 	if state.timer == nil {
 		state.timer = time.AfterFunc(c.closeTimeout(), func() {
-			_ = c.raw.CloseWith(io.ErrClosedPipe)
+			c.abortTransport(io.ErrClosedPipe)
 		})
 	}
 	state.mu.Unlock()
 }
 
+// tryCloseTransport claims shutdown once the Writer handoff and all accepted
+// wire bytes have completed. The claim is terminal even before UIO reports
+// OnClose, so another close request cannot close the transport again.
 func (c *Conn) tryCloseTransport() (bool, error) {
-	if !c.transportClosePending.Load() || c.writes.drainIsRequested() || c.pendingBytes.Load() != 0 {
-		return false, nil
-	}
-	if c.dispatch != nil && c.dispatch.writeBatch.finishIsRequested() {
-		return false, nil
-	}
-	if !c.transportClosePending.CompareAndSwap(true, false) {
+	if !c.writes.close.claimTransportClose() {
 		return false, nil
 	}
 	c.stopCloseTimer()
 	return true, c.raw.CloseWith(io.EOF)
+}
+
+// abortTransport claims the same terminal responsibility as a graceful drain.
+// A timer, failed Writer, and protocol error may race; only one reaches UIO.
+func (c *Conn) abortTransport(err error) {
+	if !c.writes.close.claimAbort() {
+		return
+	}
+	c.stopCloseTimer()
+	_ = c.raw.CloseWith(err)
 }
 
 func (c *Conn) stopCloseTimer() {
@@ -544,6 +545,9 @@ func (c *Conn) ensureCloseTimerState() *closeTimerState {
 	}
 }
 
+// acceptFrame bypasses assembler allocation for complete messages and control
+// frames. Fragmented state is pooled and released at every message boundary or
+// error.
 func (c *Conn) acceptFrame(f frame.Frame) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -570,6 +574,8 @@ func (c *Conn) releaseAssembler() {
 	c.assembler = nil
 }
 
+// acceptMessage delivers a borrowed payload. Compressed messages are expanded
+// under MaxMessageSize before UTF-8 validation and callback delivery.
 func (c *Conn) acceptMessage(message frame.Message) error {
 	if message.Compressed {
 		if c.compression == nil || c.compression.decoder == nil {
@@ -579,16 +585,18 @@ func (c *Conn) acceptMessage(message frame.Message) error {
 			if message.Opcode == frame.Text && c.utf8ValidationEnabled() && !utf8.Valid(payload) {
 				return frame.ErrInvalidUTF8
 			}
-			return c.enqueueMessage(Message{Type: messageType(message.Opcode), Payload: payload})
+			return c.notifyMessage(Message{Type: messageType(message.Opcode), Payload: payload})
 		})
 	}
-	return c.enqueueMessage(Message{Type: messageType(message.Opcode), Payload: message.Payload})
+	return c.notifyMessage(Message{Type: messageType(message.Opcode), Payload: message.Payload})
 }
 
+// acceptControl handles Ping/Pong/Close inline with frame order. Pong nonces
+// must match the outstanding heartbeat; arbitrary Pong frames do not reset it.
 func (c *Conn) acceptControl(f frame.Frame) error {
 	switch f.Opcode {
 	case frame.Ping:
-		return c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
+		return c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
 	case frame.Pong:
 		if c.heartbeat != nil && len(f.Payload) == 8 {
 			c.heartbeat.acknowledgePing(binary.BigEndian.Uint64(f.Payload))
@@ -601,7 +609,7 @@ func (c *Conn) acceptControl(f frame.Frame) error {
 			reason = string(f.Payload[2:])
 		}
 		c.setCloseReason(code, reason)
-		if err := c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: f.Payload}); err != nil && !errors.Is(err, ErrClosed) {
+		if err := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: f.Payload}); err != nil && !errors.Is(err, ErrClosed) {
 			return err
 		}
 		c.closing.Store(true)
@@ -611,6 +619,21 @@ func (c *Conn) acceptControl(f frame.Frame) error {
 	}
 }
 
+// ownedProtocolClose marks the one error path where the Close frame has taken
+// responsibility for transport shutdown. Other errors must reach UIO even if
+// the connection happens to be closing concurrently.
+type ownedProtocolClose struct{ cause error }
+
+func (err *ownedProtocolClose) Error() string { return err.cause.Error() }
+func (err *ownedProtocolClose) Unwrap() error { return err.cause }
+
+func protocolCloseOwnsTransport(err error) bool {
+	var owned *ownedProtocolClose
+	return errors.As(err, &owned)
+}
+
+// protocolClose maps parser/resource errors to RFC close codes, attempts to
+// flush the Close frame, and preserves both protocol and transport failures.
 func (c *Conn) protocolClose(err error) error {
 	c.setCloseError(err)
 	code := uint16(1002)
@@ -618,21 +641,19 @@ func (c *Conn) protocolClose(err error) error {
 		code = 1007
 	} else if errors.Is(err, frame.ErrMessageTooBig) || errors.Is(err, compress.ErrTooLarge) {
 		code = 1009
-	} else if errors.Is(err, ErrApplicationBackpressure) {
-		code = 1013
 	}
 	payload := []byte{byte(code >> 8), byte(code)}
-	writeErr := c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
+	writeErr := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 	c.closing.Store(true)
 	if writeErr != nil {
-		_ = c.raw.CloseWith(errors.Join(err, writeErr))
+		c.abortTransport(errors.Join(err, writeErr))
 		return errors.Join(err, writeErr)
 	}
 	if closeErr := c.closeTransport(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-		_ = c.raw.CloseWith(errors.Join(err, closeErr))
+		c.abortTransport(errors.Join(err, closeErr))
 		return errors.Join(err, closeErr)
 	}
-	return err
+	return &ownedProtocolClose{cause: err}
 }
 
 func messageType(op frame.OpCode) MessageType {

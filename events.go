@@ -26,23 +26,61 @@ import (
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
+// CompositeBuffer exposes UIO's pooled segmented buffer without introducing a
+// second public buffer type.
 type CompositeBuffer = bytebuf.CompositeBuffer
 
-type Events struct {
-	master        *eventLoop     // serving listener
-	workers       []*eventLoop   // serving connection
-	acceptor      *acceptor      // connection acceptor
-	waitGroup     sync.WaitGroup // wait for all eventLoop exit on shutdown
-	mux           sync.Mutex     // serializes initialization and shutdown publication
-	closing       atomic.Bool
-	ready         atomic.Bool    // Dial is allowed only after full initialization
-	startGoid     atomic.Int64   // lets Close detect the synchronous OnStart path
-	callbackGoids sync.Map       // std callback goroutines currently outside loops
-	callbackWG    sync.WaitGroup // std I/O goroutines still able to enter callbacks
+// IOTask is one serialized native connection I/O round.
+type IOTask interface {
+	RunTask()
+}
 
-	// Pollers is set up to start the given number of event-loop goroutine.
+// Executor schedules native connection I/O rounds. Both methods must return
+// promptly. SubmitBatch accepts a prefix and returns its length; every accepted
+// task must run exactly once. Accepted tasks must run asynchronously after the
+// submission method returns; inline execution would block the event loop and
+// is unsupported. The batch slice is callback-scoped, so an executor must copy
+// references it retains after SubmitBatch returns. Submit false means the task
+// was not run; a short SubmitBatch result means the rejected suffix was not run.
+// Rejection closes the affected connection.
+type Executor interface {
+	Submit(task IOTask) bool
+	SubmitBatch(tasks []IOTask) int
+}
+
+// readBuffer boxes a slice pointer so sync.Pool Put does not allocate an
+// interface copy of the slice header on every native read round.
+type readBuffer struct {
+	bytes []byte
+}
+
+// Events owns listeners, event loops, the native connection-task scheduler,
+// shared read buffers, and application callbacks for one server/dialer
+// lifecycle. Configure it before Serve; an Events value is not restartable.
+type Events struct {
+	master         *eventLoop     // serving listener
+	workers        []*eventLoop   // serving connection
+	acceptor       *acceptor      // connection acceptor
+	waitGroup      sync.WaitGroup // wait for all eventLoop exit on shutdown
+	mux            sync.Mutex     // serializes initialization and shutdown publication
+	closing        atomic.Bool
+	ready          atomic.Bool    // Dial is allowed only after full initialization
+	callbackWG     sync.WaitGroup // std I/O goroutines still able to enter callbacks
+	done           chan struct{}  // closed after OnStop and all owned work exits
+	doneOnce       sync.Once
+	closeReason    atomic.Pointer[error]
+	ioPool         *ioTaskPool
+	readPool       sync.Pool
+	readBufferSize int
+
+	// Pollers is the number of event-loop goroutines.
 	// The default value is 4, capped by runtime.NumCPU().
 	Pollers int
+
+	// Executor supplies the native connection-round scheduler. When nil, UIO
+	// creates a taskgo typed task queue with its built-in concurrency. When set,
+	// the executor lifecycle remains the caller's responsibility.
+	Executor Executor
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
 	// The default value is false.
@@ -52,48 +90,55 @@ type Events struct {
 	// The default value is false.
 	LockOSThread bool
 
-	// MaxBufferSize is the maximum number of bytes that can be read from the remote when the readable event comes.
-	// The default value is 4KB.
+	// MaxBufferSize is the buffer size of each socket read. Native connection
+	// tasks may perform multiple reads per readiness event. The default is 4 KiB.
 	MaxBufferSize int
 
-	// WriteBufferedThreshold enabled when value is greater than 0, writes will go into the outbound buffer instead of attempting to send them out immediately,
-	// unless the outbound buffer reaches the threshold or the flush function is manually called.
-	//
-	// If you have multiple Write call requirements, opening it will improve write performance because it reduces the number of system calls by merging multiple write operations to improve performance.
-	// The default value is 0.
+	// WriteBufferedThreshold makes native callback writes smaller than this value
+	// join the connection's current outbound batch instead of attempting an
+	// immediate syscall. A connection task always flushes its batch before it
+	// finishes. Zero disables size-based buffering; a negative value also keeps
+	// it disabled. The stdio/Windows backend already writes through its dedicated
+	// asynchronous writer and does not use this threshold. The default is zero.
 	WriteBufferedThreshold int
 
 	// MaxOutboundBuffered limits accepted but unsent payload bytes per
-	// connection. Zero disables the byte limit.
+	// connection. Native transports pause that connection's reads at 75% of the
+	// limit and resume them at 50%. A write that would push buffered unsent data
+	// beyond the limit returns ErrOutboundOverflow. Zero disables the limit.
 	MaxOutboundBuffered int
 
-	// MaxPendingWrites limits write tasks not yet consumed by a connection's
-	// event loop. Values <= 0 use a default of 1024.
-	MaxPendingWrites int
-
-	// MaxInboundBuffered limits unread payload retained per connection. Zero
-	// disables the limit.
+	// MaxInboundBuffered limits payload left unread after a callback returns.
+	// Exceeding it closes the connection with ErrInboundOverflow. Zero disables
+	// the limit.
 	MaxInboundBuffered int
 
-	// OnOpen fires when a new connection has been opened.
+	// OnOpen fires after registration. Lifecycle and data callbacks are
+	// serialized per connection, while callbacks for different connections may
+	// run concurrently.
 	OnOpen func(c Conn)
 
-	// OnData fires when a socket receives data from the remote.
+	// OnData fires when inbound data is available. Inbound access methods are
+	// valid only for this callback invocation.
 	OnData func(c Conn) error
 
-	// OnClose fires when a connection has been closed.
+	// OnClose is the final callback for a connection and never overlaps its
+	// OnOpen or OnData callback.
 	OnClose func(c Conn, err error)
 
-	// OnInbound when any bytes read by a socket, it triggers the inbound event.
+	// OnInbound reports bytes read from the socket before OnData and shares its
+	// inbound-access scope.
 	OnInbound func(c Conn, readBytes int)
 
-	// OnOutbound when any bytes write to a socket, it triggers the outbound event.
+	// OnOutbound reports bytes successfully written to the socket. It may run on
+	// a backend writer goroutine and does not grant inbound-buffer access.
 	OnOutbound func(c Conn, writeBytes int)
 
-	// OnStart it triggers on the server initialized.
+	// OnStart runs synchronously after initialization and before the master
+	// listener loop begins polling.
 	OnStart func(ev *Events)
 
-	// OnStop it triggers on the server closed.
+	// OnStop runs once after Serve has stopped its loops and connection tasks.
 	OnStop func(ev *Events)
 }
 
@@ -101,27 +146,25 @@ type Events struct {
 // Serve without an address starts a dial-only Events.
 func (ev *Events) Serve(addrs ...string) (err error) {
 	if ev.closing.Load() {
+		ev.finishLifecycle(net.ErrClosed)
 		return net.ErrClosed
 	}
 
 	// initialize events
 	if err = ev.initEvents(addrs); nil != err {
+		ev.finishLifecycle(err)
 		return err
 	}
 
-	// OnStart runs before master.Serve, but Close must still avoid waiting on
-	// the goroutine that will become the master loop.
-	ev.startGoid.Store(currentGoroutineID())
 	if ev.OnStart != nil {
 		ev.OnStart(ev)
 	}
-	ev.startGoid.Store(0)
 
 	defer func() {
-		// trigger OnStop event.
 		if ev.OnStop != nil {
 			ev.OnStop(ev)
 		}
+		ev.finishLifecycle(err)
 	}()
 
 	// Serve the listener loop on the caller goroutine.
@@ -129,24 +172,42 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 	ev.waitGroup.Done()
 	ev.initiateClose(err)
 	ev.waitGroup.Wait()
+	if ev.ioPool != nil {
+		ev.ioPool.stop()
+	}
 	ev.callbackWG.Wait()
 	return err
 }
 
+// Close publishes shutdown and returns without waiting. Use Wait or the return
+// of Serve as the lifecycle join point.
 func (ev *Events) Close(err error) error {
-	onLoop := ev.initiateClose(err)
-	// Waiting from a callback would make that callback wait for itself.
-	if !onLoop {
-		ev.waitGroup.Wait()
-		ev.callbackWG.Wait()
+	ev.initiateClose(err)
+	return nil
+}
+
+// Wait blocks until Serve has stopped every loop and connection task, all
+// stdio I/O goroutines have exited, and OnStop has returned. Wait may be called
+// before Serve; Close before Serve completes it immediately. It must not be
+// called from a callback that is itself part of the lifecycle being joined.
+func (ev *Events) Wait() error {
+	ev.mux.Lock()
+	done := ev.ensureDoneLocked()
+	ev.mux.Unlock()
+	<-done
+	if reason := ev.closeReason.Load(); reason != nil {
+		return *reason
 	}
 	return nil
 }
 
+// initEvents builds configuration, loops, and listeners under one publication
+// lock so Close cannot observe a partially initialized wait group.
 func (ev *Events) initEvents(addrs []string) (err error) {
 
 	ev.mux.Lock()
 	defer ev.mux.Unlock()
+	ev.ensureDoneLocked()
 	if ev.closing.Load() {
 		return net.ErrClosed
 	}
@@ -174,16 +235,17 @@ func (ev *Events) initEvents(addrs []string) (err error) {
 	return nil
 }
 
-func (ev *Events) initiateClose(err error) bool {
+// initiateClose seals every loop queue after publishing closing. It never waits
+// for callbacks or workers, so it is safe from every callback context.
+func (ev *Events) initiateClose(err error) {
 	ev.mux.Lock()
-	defer ev.mux.Unlock()
-	callerGoid := currentGoroutineID()
-	_, inExternalCallback := ev.callbackGoids.Load(callerGoid)
-	onLoop := ev.currentLoop() != nil || ev.startGoid.Load() == callerGoid || inExternalCallback
+	done := ev.ensureDoneLocked()
 	// Publish closing before sealing queues so producers reject new work.
 	if !ev.closing.CompareAndSwap(false, true) {
-		return onLoop
+		ev.mux.Unlock()
+		return
 	}
+	ev.recordCloseReason(err)
 	ev.ready.Store(false)
 	if ev.master != nil {
 		ev.master.beginStop(err)
@@ -193,22 +255,31 @@ func (ev *Events) initiateClose(err error) bool {
 			worker.beginStop(err)
 		}
 	}
-	return onLoop
+	idle := ev.master == nil && len(ev.workers) == 0
+	ev.mux.Unlock()
+	if idle {
+		ev.doneOnce.Do(func() { close(done) })
+	}
 }
 
-func (ev *Events) enterExternalCallback() int64 {
-	id := currentGoroutineID()
-	ev.callbackGoids.Store(id, struct{}{})
-	return id
+func (ev *Events) ensureDoneLocked() chan struct{} {
+	if ev.done == nil {
+		ev.done = make(chan struct{})
+	}
+	return ev.done
 }
 
-func (ev *Events) leaveExternalCallback(id int64) {
-	ev.callbackGoids.Delete(id)
+func (ev *Events) recordCloseReason(err error) {
+	reason := err
+	ev.closeReason.CompareAndSwap(nil, &reason)
 }
 
-func (ev *Events) finishExternalCallback(id int64) {
-	ev.callbackGoids.Delete(id)
-	ev.callbackWG.Done()
+func (ev *Events) finishLifecycle(err error) {
+	ev.recordCloseReason(err)
+	ev.mux.Lock()
+	done := ev.ensureDoneLocked()
+	ev.mux.Unlock()
+	ev.doneOnce.Do(func() { close(done) })
 }
 
 func (ev *Events) rollbackInit(err error) {
@@ -227,6 +298,9 @@ func (ev *Events) rollbackInit(err error) {
 		_ = ev.master.poller.Close(err)
 	}
 	ev.waitGroup.Wait()
+	if ev.ioPool != nil {
+		ev.ioPool.stop()
+	}
 	ev.callbackWG.Wait()
 }
 
@@ -240,15 +314,22 @@ func (ev *Events) initConfig() error {
 	if ev.MaxBufferSize <= 0 {
 		ev.MaxBufferSize = 1024 * 4
 	}
-
-	if ev.MaxPendingWrites <= 0 {
-		ev.MaxPendingWrites = 1024
+	if ev.readBufferSize == 0 {
+		ev.readBufferSize = ev.MaxBufferSize
+		size := ev.readBufferSize
+		ev.readPool.New = func() any { return &readBuffer{bytes: make([]byte, size)} }
 	}
 
 	return nil
 }
 
+// initLoops creates one shared connection scheduler, a master listener loop,
+// and Pollers worker loops. Startup rollback closes every successfully created
+// poller before returning an error.
 func (ev *Events) initLoops() (err error) {
+	// Native Unix always uses connection tasks. An injected Executor owns
+	// scheduling when present; otherwise UIO creates its default taskgo queue.
+	ev.ioPool = newIOTaskPool(ev.Executor)
 
 	// create main loop
 	if ev.master, err = newEventLoop(ev); nil != err {
@@ -322,6 +403,8 @@ const (
 	registerCompleted
 )
 
+// registerRequest coordinates DialContext cancellation with loop registration.
+// The CAS winner decides whether the new fd is returned or closed.
 type registerRequest struct {
 	ctx   context.Context
 	state atomic.Uint32
@@ -334,6 +417,10 @@ func (request *registerRequest) cause() error {
 	return context.Canceled
 }
 
+// addConnContext synchronously waits for loop registration while allowing the
+// caller's context to cancel. Cancellation never returns ownership: a request
+// already executing on the loop closes the connection when it observes the
+// canceled state.
 func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
 	if fdc.loop == nil || ev.closing.Load() {
 		fdc.closeUnregistered()
@@ -348,7 +435,8 @@ func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
 	if fdc.loop.inLoop() {
 		return fdc.loop.registerConn(fdc)
 	}
-	// External Dial returns only after registration and OnOpen complete.
+	// External Dial returns after registration. Native OnOpen runs in the
+	// connection task; stdio invokes it synchronously during registration.
 	t := acquireTask(registerTask, fdc)
 	t.done = make(chan error, 1)
 	done := t.done
@@ -385,13 +473,14 @@ func (ev *Events) closeConn(fdc *fdConn, err error) {
 	fdc.requestClose(err)
 }
 
-func (ev *Events) submitAccepted(fdc *fdConn) bool {
+func (ev *Events) submitAccepted(fdc *fdConn, tcp bool) bool {
 	if fdc.loop == nil || ev.closing.Load() {
 		fdc.closeUnregistered()
 		return false
 	}
 	// The listener loop never waits for a worker's OnOpen callback.
 	t := acquireTask(registerTask, fdc)
+	t.acceptedTCP = tcp
 	if !fdc.loop.submitTask(t) {
 		releaseTask(t)
 		fdc.closeUnregistered()
@@ -400,31 +489,23 @@ func (ev *Events) submitAccepted(fdc *fdConn) bool {
 	return true
 }
 
-func (ev *Events) currentLoop() *eventLoop {
-	if ev.master != nil && ev.master.inLoop() {
-		return ev.master
-	}
-	for _, worker := range ev.workers {
-		if worker != nil && worker.inLoop() {
-			return worker
-		}
-	}
-	return nil
-}
-
 func (ev *Events) onData(fdc *fdConn) error {
 	if nil != ev.OnData {
 		return ev.OnData(fdc)
 	}
 	// discard all received bytes if not set OnData.
 	//
+	started := fdc.beginInboundCallback()
 	_, _ = fdc.Discard(-1)
+	fdc.endInboundCallback(started)
 	return nil
 }
 
 func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 	if readBytes > 0 && ev.OnInbound != nil {
+		started := fdc.beginInboundCallback()
 		ev.OnInbound(fdc, readBytes)
+		fdc.endInboundCallback(started)
 	}
 }
 

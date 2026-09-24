@@ -8,21 +8,6 @@ import (
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
-func TestBackpressureRejectsBeforeFrameAllocation(t *testing.T) {
-	conn, _ := newBackpressuredConn()
-	payload := make([]byte, DefaultMaxFramePayload)
-	var sendErr error
-	allocations := testing.AllocsPerRun(1, func() {
-		sendErr = conn.SendBinary(payload)
-	})
-	if sendErr != ErrBackpressure {
-		t.Fatalf("SendBinary error = %v, want %v", sendErr, ErrBackpressure)
-	}
-	if allocations != 0 {
-		t.Fatalf("backpressured send allocations = %v, want 0", allocations)
-	}
-}
-
 func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
 	wire := frame.Append(nil, frame.Frame{
 		Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, 1024),
@@ -46,8 +31,7 @@ func TestServerFrameScratchReusesAllocation(t *testing.T) {
 	conn := &Conn{
 		raw: &writeProbeConn{},
 		config: testServerConfig(&Server{
-			MaxFramePayload:  1024,
-			MaxOutboundBytes: -1,
+			MaxFramePayload: 1024,
 		}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
@@ -68,8 +52,7 @@ func TestClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	conn := &Conn{
 		raw: &writeProbeConn{},
 		config: testDialerConfig(&Dialer{
-			MaxFramePayload:  1024,
-			MaxOutboundBytes: -1,
+			MaxFramePayload: 1024,
 		}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
@@ -91,8 +74,7 @@ func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	conn := &Conn{
 		raw: &writeProbeConn{},
 		config: testDialerConfig(&Dialer{
-			MaxFramePayload:  payloadSize,
-			MaxOutboundBytes: -1,
+			MaxFramePayload: payloadSize,
 		}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, payloadSize)}
@@ -114,9 +96,8 @@ func TestTextWriterValidationDoesNotAllocatePerPayload(t *testing.T) {
 	conn := &Conn{
 		raw: &writeProbeConn{},
 		config: testServerConfig(&Server{
-			MaxFramePayload:  uint64(len(payload)),
-			MaxMessageSize:   1 << 30,
-			MaxOutboundBytes: -1,
+			MaxFramePayload: uint64(len(payload)),
+			MaxMessageSize:  1 << 30,
 		}),
 	}
 	conn.opened.Store(true)

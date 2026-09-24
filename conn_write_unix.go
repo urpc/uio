@@ -36,17 +36,18 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 	if conn.isClosing() {
 		return 0, net.ErrClosed
 	}
-	// queuedWrites prevents a callback write from overtaking accepted external
-	// writes that the loop has not consumed yet.
-	if conn.loop.inLoop() && conn.queuedWrites.Load() == 0 {
+	if conn.directOwner() {
 		return conn.writeOnLoop(data)
+	}
+	if conn.isDatagram() {
+		return conn.queueUDPWrite(bytebuf.CloneBuffer(data), len(data))
 	}
 	// This fast rejection belongs after the direct path: data sent straight to
 	// the kernel never counts against the user-space payload limit.
 	if limit := conn.events.MaxOutboundBuffered; limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
-	if err := conn.precheckQueuedWrite(len(data)); err != nil {
+	if err := conn.precheckOutbound(len(data)); err != nil {
 		return 0, err
 	}
 	owned := bytebuf.CloneBuffer(data)
@@ -67,13 +68,16 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 	if conn.isClosing() {
 		return 0, net.ErrClosed
 	}
-	if conn.loop.inLoop() && conn.queuedWrites.Load() == 0 {
+	if conn.isDatagram() {
+		return 0, errUnsupported
+	}
+	if conn.directOwner() {
 		return conn.writevOnLoop(vec, total)
 	}
 	if limit := conn.events.MaxOutboundBuffered; limit > 0 && total > limit {
 		return 0, ErrOutboundOverflow
 	}
-	if err := conn.precheckQueuedWrite(total); err != nil {
+	if err := conn.precheckOutbound(total); err != nil {
 		return 0, err
 	}
 	owned := bytebuf.CloneBuffers(vec, total)
@@ -93,21 +97,84 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
 	}
-	if conn.loop.inLoop() && conn.queuedWrites.Load() == 0 {
+	if conn.directOwner() {
 		if conn.isDatagram() {
 			defer bytebuf.ReleaseBuffer(owned)
 			return conn.sendUDPOnLoop(owned.Bytes())
 		}
 		return conn.writeOwnedOnLoop(owned, size)
 	}
+	if conn.isDatagram() {
+		return conn.queueUDPWrite(owned, size)
+	}
 	return conn.queueOwnedWrite(owned, size)
 }
 
-func (conn *fdConn) precheckQueuedWrite(size int) error {
-	// queueOwnedWrite repeats these checks after cloning to close races.
-	if limit := conn.events.MaxPendingWrites; limit > 0 && conn.queuedWrites.Load() >= int64(limit) {
-		return ErrTaskQueueFull
+// queueUDPWrite transfers one datagram to the owning loop and waits for the
+// nonblocking send result. The admission lock also orders it before a later
+// CloseWith. A callback on another loop cannot wait without risking a cycle.
+func (conn *fdConn) queueUDPWrite(owned *Buffer, size int) (int, error) {
+	if isEventLoopGoroutine() {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, ErrUDPWriteOnEventLoop
 	}
+	t := acquireTask(udpWriteTask, conn)
+	t.udpPayload = owned
+	t.udpDone = make(chan udpWriteResult, 1)
+	done := t.udpDone
+	conn.submitMu.Lock()
+	if conn.loop == nil || conn.events == nil || conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+		conn.submitMu.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		releaseTask(t)
+		return 0, net.ErrClosed
+	}
+	if !conn.reservePending(int64(size)) {
+		conn.submitMu.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		releaseTask(t)
+		return 0, ErrOutboundOverflow
+	}
+	if !conn.loop.pushTask(t) {
+		conn.pending.Add(-int64(size))
+		conn.submitMu.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		releaseTask(t)
+		return 0, net.ErrClosed
+	}
+	conn.submitMu.Unlock()
+	conn.loop.notify()
+	result := <-done
+	return result.n, result.err
+}
+
+func (conn *fdConn) settleUDPWrite(size int64) {
+	for {
+		pending := conn.pending.Load()
+		if pending == 0 {
+			return // closeOnLoop already cleared the connection's accounting.
+		}
+		remaining := pending - size
+		if remaining < 0 {
+			remaining = 0
+		}
+		if conn.pending.CompareAndSwap(pending, remaining) {
+			return
+		}
+	}
+}
+
+func (conn *fdConn) runUDPWriteTask(owned *Buffer) udpWriteResult {
+	defer bytebuf.ReleaseBuffer(owned)
+	defer conn.settleUDPWrite(int64(owned.Len()))
+	if conn.isClosedOnLoop() || (conn.udp.server != nil && conn.udp.server.isClosedOnLoop()) {
+		return udpWriteResult{err: net.ErrClosed}
+	}
+	n, err := conn.sendUDPOnLoop(owned.Bytes())
+	return udpWriteResult{n: n, err: err}
+}
+
+func (conn *fdConn) precheckOutbound(size int) error {
 	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
 		pending := conn.pending.Load()
 		if int64(size) > limit-pending {
@@ -117,40 +184,29 @@ func (conn *fdConn) precheckQueuedWrite(size int) error {
 	return nil
 }
 
+// queueOwnedWrite is the cross-goroutine write path. Ownership has already
+// moved into owned, so submitMu only covers admission, accounting, and pointer
+// insertion; payload allocation and copying never happen under the lock.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
 	if limit := conn.events.MaxOutboundBuffered; limit > 0 && size > limit {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, ErrOutboundOverflow
 	}
 	// Allocation and the only payload copy have already happened off-lock.
-	t := acquireTask(writeTask, conn)
-	t.buf = owned
 	conn.submitMu.Lock()
-	if conn.closing.Load() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.loop == nil || conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
 		conn.submitMu.Unlock()
-		releaseTask(t)
+		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
-	}
-	if conn.queuedWrites.Load() >= int64(conn.events.MaxPendingWrites) {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return 0, ErrTaskQueueFull
 	}
 	if !conn.reservePending(int64(size)) {
 		conn.submitMu.Unlock()
-		releaseTask(t)
+		bytebuf.ReleaseBuffer(owned)
 		return 0, ErrOutboundOverflow
 	}
-	conn.queuedWrites.Add(1)
-	if !conn.loop.pushTask(t) {
-		conn.queuedWrites.Add(-1)
-		conn.pending.Add(-int64(size))
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return 0, net.ErrClosed
-	}
+	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
-	conn.loop.notify()
+	conn.scheduleIO(ioEventWrite)
 	return size, nil
 }
 
@@ -172,7 +228,7 @@ func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
 	if conn.reservePending(size) {
 		return true, nil
 	}
-	if conn.outbound.Empty() || conn.writeBlocked {
+	if conn.outboundEmpty() || conn.writeBlocked() {
 		return false, nil
 	}
 	if _, err := conn.flushOnLoop(); err != nil {
@@ -181,13 +237,16 @@ func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
 	return conn.reservePending(size), nil
 }
 
+// writeOnLoop is the task-owner fast path. It lends caller memory directly to
+// the non-blocking syscall when no batching is active and copies only an unsent
+// suffix that must outlive the call.
 func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	if conn.isDatagram() {
 		return conn.sendUDPOnLoop(data)
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outbound.Empty() || (threshold > 0 && len(data) < threshold) {
-		// Batching or an existing tail requires one copy into loop-owned storage.
+	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && len(data) < threshold) {
+		// Batching or an existing tail requires one copy into connection-owned storage.
 		reserved, err := conn.reservePendingAfterFlush(int64(len(data)))
 		if err != nil {
 			return 0, err
@@ -195,8 +254,9 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		if !reserved {
 			return 0, ErrOutboundOverflow
 		}
+		conn.submitMu.Lock()
 		_, _ = conn.outbound.Write(data)
-		conn.loop.touch(conn)
+		conn.submitMu.Unlock()
 		return len(data), nil
 	}
 
@@ -225,18 +285,22 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		return written, ErrOutboundOverflow
 	}
 	// Only the unsent suffix must survive after Write returns.
+	conn.submitMu.Lock()
 	_, _ = conn.outbound.Write(remaining)
-	conn.writeBlocked = written == 0
-	conn.loop.touch(conn)
+	conn.submitMu.Unlock()
+	conn.setWriteBlocked(written == 0)
 	return len(data), nil
 }
 
+// writevOnLoop mirrors writeOnLoop for scatter/gather input. A partial syscall
+// is collapsed into one owned suffix so later retries do not retain caller
+// slices or an unbounded vector list.
 func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	if conn.isDatagram() {
 		return 0, errUnsupported
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outbound.Empty() || (threshold > 0 && total < threshold) {
+	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && total < threshold) {
 		reserved, err := conn.reservePendingAfterFlush(int64(total))
 		if err != nil {
 			return 0, err
@@ -244,8 +308,9 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		if !reserved {
 			return 0, ErrOutboundOverflow
 		}
+		conn.submitMu.Lock()
 		_, _ = conn.outbound.Writev(vec)
-		conn.loop.touch(conn)
+		conn.submitMu.Unlock()
 		return total, nil
 	}
 	written, err := socket.Writev(conn.fd, vec)
@@ -272,15 +337,19 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return written, ErrOutboundOverflow
 	}
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
+	conn.submitMu.Lock()
 	conn.outbound.AppendOwned(owned)
-	conn.writeBlocked = written == 0
-	conn.loop.touch(conn)
+	conn.submitMu.Unlock()
+	conn.setWriteBlocked(written == 0)
 	return total, nil
 }
 
+// writeOwnedOnLoop consumes owned on every return path. During a corked read
+// round, the first small frame keeps zero-copy ownership and later frames are
+// coalesced into pooled blocks to keep the final writev batch short.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outbound.Empty() || (threshold > 0 && size < threshold) {
+	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold) {
 		reserved, err := conn.reservePendingAfterFlush(int64(size))
 		if err != nil {
 			bytebuf.ReleaseBuffer(owned)
@@ -290,8 +359,14 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			bytebuf.ReleaseBuffer(owned)
 			return 0, ErrOutboundOverflow
 		}
-		conn.outbound.AppendOwned(owned)
-		conn.loop.touch(conn)
+		conn.submitMu.Lock()
+		if conn.corked && !conn.outbound.Empty() && size < conn.events.readBufferSize {
+			targetCapacity := min(64<<10, conn.events.readBufferSize*2)
+			conn.outbound.AppendOwnedCoalesced(owned, targetCapacity)
+		} else {
+			conn.outbound.AppendOwned(owned)
+		}
+		conn.submitMu.Unlock()
 		return size, nil
 	}
 
@@ -324,12 +399,16 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	if written > 0 {
 		owned.Discard(written)
 	}
+	conn.submitMu.Lock()
 	conn.outbound.AppendOwned(owned)
-	conn.writeBlocked = written == 0
-	conn.loop.touch(conn)
+	conn.submitMu.Unlock()
+	conn.setWriteBlocked(written == 0)
 	return size, nil
 }
 
+// sendUDPOnLoop preserves datagram atomicity. A blocked datagram is reported to
+// the caller rather than queued as a stream suffix, and a partial result is
+// fatal because retrying it would create a different packet.
 func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
 	if conn.udp.remote == nil {
 		written, err = syscall.Write(conn.fd, data)
@@ -366,109 +445,88 @@ func isUDPSendBlocked(err error) bool {
 func (conn *fdConn) failDirectWrite(err error) {
 	// Once a syscall has made the byte stream unusable, queued writes must not
 	// be appended ahead of the close task or flushed during close.
-	conn.writeFailed = true
+	conn.markWriteFailed()
 	conn.requestClose(err)
-}
-
-func (conn *fdConn) runWriteTask(t *task) {
-	conn.queuedWrites.Add(-1)
-	size := t.buf.Len()
-	if conn.closed {
-		conn.pending.Add(-int64(size))
-		return
-	}
-	if conn.writeFailed {
-		// Keep accepted bytes pending until close reports them as unflushed;
-		// releaseTask still releases the task's owned buffer immediately.
-		return
-	}
-	if conn.isDatagram() {
-		data := t.buf.Bytes()
-		written, err := conn.sendUDPOnLoop(data)
-		conn.pending.Add(-int64(written))
-		if err != nil {
-			conn.requestClose(err)
-		}
-		return
-	}
-	// AppendOwned transfers the producer buffer without another payload copy.
-	conn.outbound.AppendOwned(t.buf)
-	t.buf = nil
-	conn.loop.touch(conn)
 }
 
 func (conn *fdConn) Flush() error {
 	if conn.isClosing() {
 		return net.ErrClosed
 	}
-	if conn.loop.inLoop() && conn.queuedWrites.Load() == 0 {
-		_, err := conn.flushOnLoop()
-		if err == nil {
-			err = conn.updateInterest()
-		}
-		return err
-	}
-	// Outside the loop, Flush is a FIFO barrier and returns after submission.
-	t := acquireTask(flushTask, conn)
-	conn.submitMu.Lock()
-	if conn.closing.Load() || !conn.loop.pushTask(t) {
-		conn.submitMu.Unlock()
-		releaseTask(t)
+	if conn.loop == nil || conn.loop.stopping.Load() {
 		return net.ErrClosed
 	}
-	conn.submitMu.Unlock()
-	conn.loop.notify()
+	if conn.isDatagram() {
+		return nil
+	}
+	if conn.directOwner() {
+		_, err := conn.flushOnLoop()
+		return err
+	}
+	// Outside the task, Flush is a FIFO barrier and returns after scheduling
+	// the connection's next I/O round.
+	conn.scheduleIO(ioEventWrite)
 	return nil
 }
 
-func (conn *fdConn) runFlushTask() error {
-	if conn.closed {
-		return net.ErrClosed
-	}
-	_, err := conn.flushOnLoop()
-	if err == nil {
-		err = conn.updateInterest()
-	}
-	return err
-}
-
+// flushOnLoop drains a bounded number of bytes and writev calls while holding
+// submitMu, which prevents external producers from modifying the vector list.
+// EAGAIN leaves the queue intact and sets writeBlocked until a writable edge.
 func (conn *fdConn) flushOnLoop() (int, error) {
+	conn.submitMu.Lock()
 	if conn.isDatagram() || conn.outbound.Empty() {
+		conn.submitMu.Unlock()
 		return 0, nil
 	}
-	if conn.writeBlocked {
+	if conn.writeBlocked() {
 		// Once EAGAIN is observed, only a Writable event should retry the fd.
+		conn.submitMu.Unlock()
 		return 0, nil
 	}
 	var vecStorage [nativeWriteVecLimit][]byte
 	totalWritten := 0
+	var writeErr error
 	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.outbound.Empty(); calls++ {
 		vec, _ := conn.outbound.PeekVecN(vecStorage[:0], len(vecStorage))
 		written, err := socket.Writev(conn.fd, vec)
 		if err != nil {
 			if isWouldBlock(err) {
-				conn.writeBlocked = true
-				return totalWritten, nil
+				conn.setWriteBlocked(true)
+				break
 			}
-			return totalWritten, err
+			writeErr = err
+			break
 		}
 		if written == 0 {
-			conn.writeBlocked = true
-			return totalWritten, nil
+			conn.setWriteBlocked(true)
+			break
 		}
 		conn.outbound.Discard(written)
 		conn.pending.Add(-int64(written))
 		totalWritten += written
-		conn.events.onSocketBytesWrite(conn, written)
 	}
 	if conn.outbound.Empty() {
-		conn.writeBlocked = false
+		conn.setWriteBlocked(false)
+	}
+	conn.submitMu.Unlock()
+	if totalWritten > 0 {
+		conn.events.onSocketBytesWrite(conn, totalWritten)
+	}
+	if writeErr != nil {
+		return totalWritten, writeErr
 	}
 	return totalWritten, nil
 }
 
+func (conn *fdConn) outboundEmpty() bool {
+	conn.submitMu.Lock()
+	empty := conn.outbound.Empty()
+	conn.submitMu.Unlock()
+	return empty
+}
+
 func (conn *fdConn) updateInterest() error {
-	if conn.closed || (conn.udp != nil && conn.udp.server != nil) {
+	if conn.close.isReleased() || (conn.udp != nil && conn.udp.server != nil) {
 		return nil
 	}
 	want := conn.desiredInterest()
@@ -482,6 +540,8 @@ func (conn *fdConn) updateInterest() error {
 	return nil
 }
 
+// desiredInterest applies per-connection read hysteresis and arms writable
+// only while user-space output remains. It runs exclusively on the event loop.
 func (conn *fdConn) desiredInterest() poller.Interest {
 	if conn.isDatagram() {
 		return poller.Readable
@@ -502,7 +562,7 @@ func (conn *fdConn) desiredInterest() poller.Interest {
 	if !conn.throttled {
 		want |= poller.Readable
 	}
-	if !conn.outbound.Empty() {
+	if !conn.outboundEmpty() {
 		want |= poller.Writable
 	}
 	if want == 0 {
@@ -510,6 +570,16 @@ func (conn *fdConn) desiredInterest() poller.Interest {
 		want = poller.Writable
 	}
 	return want
+}
+
+// readShouldStop reports whether this connection filled its outbound limit.
+// The interest side applies the same limit through hysteresis, so the read
+// round and poller registration cannot disagree.
+func (conn *fdConn) readShouldStop() bool {
+	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
+		return conn.pending.Load() >= limit
+	}
+	return false
 }
 
 func (conn *fdConn) OutboundBuffered() int { return int(conn.pending.Load()) }

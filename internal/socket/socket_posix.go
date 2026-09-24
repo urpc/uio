@@ -91,6 +91,8 @@ func SetLinger(fd, secs int) error {
 	return unix.SetsockoptLinger(fd, syscall.SOL_SOCKET, syscall.SO_LINGER, &l)
 }
 
+// DupNetConn duplicates conn's descriptor so UIO can assume ownership without
+// changing the lifetime of the caller's net.Conn during handoff.
 func DupNetConn(conn net.Conn) (int, error) {
 	sc, ok := conn.(interface {
 		SyscallConn() (syscall.RawConn, error)

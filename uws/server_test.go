@@ -196,7 +196,7 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 	conn.heartbeat.mu.Lock()
 	pingTarget := conn.heartbeat.pingTarget
 	conn.heartbeat.mu.Unlock()
-	if conn.pendingBytes.Load() == 0 || pingTarget == 0 {
+	if conn.writes.close.pendingBytes.Load() == 0 || pingTarget == 0 {
 		t.Fatal("heartbeat ping was not tracked in the outbound queue")
 	}
 	server.connections.Store(conn, conn)
@@ -207,6 +207,126 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 	case <-raw.closed:
 	case <-time.After(testIOTimeout()):
 		t.Fatal("connection with a permanently queued ping did not close")
+	}
+}
+
+func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
+	server := NewServer(nil)
+	server.HeartbeatTimeout = 20 * time.Millisecond
+	server.CloseTimeout = 5 * time.Millisecond
+	raw := newScriptedConn()
+	raw.writeErr = uio.ErrOutboundOverflow
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	server.connections.Store(conn, conn)
+	first := time.Now()
+	for i := 0; i < 4; i++ {
+		at := first.Add(time.Duration(i) * server.HeartbeatTimeout / 4)
+		if !scanHeartbeat(&server.connections, at, server.HeartbeatTimeout, make(chan struct{})) {
+			t.Fatal("heartbeat scanner stopped")
+		}
+		if conn.closing.Load() || conn.heartbeat.pingOutstanding.Load() || raw.closes != 0 {
+			t.Fatalf("attempt %d: heartbeat closed early or retained an unsent Ping", i)
+		}
+		conn.heartbeat.mu.Lock()
+		stalledAt := conn.heartbeat.sendStalledAt
+		conn.heartbeat.mu.Unlock()
+		if stalledAt != first.UnixNano() {
+			t.Fatalf("attempt %d: stalled at %d, want %d", i, stalledAt, first.UnixNano())
+		}
+		if accepted, retired := conn.heartbeat.outboundAccepted.Load(), conn.heartbeat.outboundRetired.Load(); accepted != 0 || retired != 0 {
+			t.Fatalf("attempt %d: rejected Ping counted as sent: accepted=%d retired=%d", i, accepted, retired)
+		}
+	}
+	if raw.writes != 4 {
+		t.Fatalf("failed Ping writes = %d, want 4", raw.writes)
+	}
+	if !scanHeartbeat(&server.connections, first.Add(server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{})) {
+		t.Fatal("heartbeat scanner stopped")
+	}
+	if raw.closes != 1 || !conn.closing.Load() {
+		t.Fatalf("stalled connection = closes:%d closing:%v, want 1/true", raw.closes, conn.closing.Load())
+	}
+	if info := conn.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
+		t.Fatalf("heartbeat close info = %+v", info)
+	}
+}
+
+func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
+	server := NewServer(nil)
+	server.HeartbeatTimeout = 20 * time.Millisecond
+	raw := newScriptedConn()
+	raw.writeErr = uio.ErrOutboundOverflow
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	server.connections.Store(conn, conn)
+	first := time.Now()
+	scanHeartbeat(&server.connections, first, server.HeartbeatTimeout, make(chan struct{}))
+	raw.writeErr = nil
+	scanHeartbeat(&server.connections, first.Add(server.HeartbeatTimeout/2), server.HeartbeatTimeout, make(chan struct{}))
+	conn.heartbeat.mu.Lock()
+	queuedAt := conn.heartbeat.pingQueuedAt
+	conn.heartbeat.mu.Unlock()
+	if queuedAt != first.UnixNano() || !conn.heartbeat.pingOutstanding.Load() {
+		t.Fatalf("successful retry queued at %d, want first stalled time %d", queuedAt, first.UnixNano())
+	}
+	pending := conn.writes.close.pendingBytes.Load()
+	if pending == 0 {
+		t.Fatal("successful retry did not queue a Ping")
+	}
+	conn.releaseOutbound(int(pending))
+	conn.heartbeat.mu.Lock()
+	sentAt, stalledAt := conn.heartbeat.pingSentAt, conn.heartbeat.sendStalledAt
+	conn.heartbeat.mu.Unlock()
+	if sentAt == 0 || stalledAt != 0 {
+		t.Fatalf("sent Ping did not switch deadlines: sent=%d stalled=%d", sentAt, stalledAt)
+	}
+}
+
+func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
+	server := NewServer(nil)
+	failure := errors.New("heartbeat write failed")
+	raw := newScriptedConn()
+	raw.writeErr = failure
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	server.connections.Store(conn, conn)
+	scanHeartbeat(&server.connections, time.Now(), time.Second, make(chan struct{}))
+	if raw.closes != 1 || !conn.closing.Load() {
+		t.Fatalf("failed heartbeat = closes:%d closing:%v", raw.closes, conn.closing.Load())
+	}
+	if info := conn.closeInfo(); !errors.Is(info.Err, failure) {
+		t.Fatalf("close error = %v, want %v", info.Err, failure)
+	}
+}
+
+func TestHeartbeatBusyWriterHasFiniteSendDeadline(t *testing.T) {
+	server := NewServer(nil)
+	server.HeartbeatTimeout = 20 * time.Millisecond
+	server.CloseTimeout = time.Millisecond
+	raw := newScriptedConn()
+	raw.closed = make(chan struct{})
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	writer, err := conn.BeginMessage(BinaryMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.fail(ErrClosed)
+	server.connections.Store(conn, conn)
+	first := time.Now()
+	scanHeartbeat(&server.connections, first, server.HeartbeatTimeout, make(chan struct{}))
+	if conn.closing.Load() || conn.heartbeat.pingOutstanding.Load() {
+		t.Fatal("busy Writer caused an immediate heartbeat close or Ping")
+	}
+	scanHeartbeat(&server.connections, first.Add(2*server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{}))
+	select {
+	case <-raw.closed:
+	case <-time.After(testIOTimeout()):
+		t.Fatal("busy Writer postponed heartbeat timeout indefinitely")
+	}
+	if raw.closes != 1 {
+		t.Fatalf("transport closes = %d, want 1", raw.closes)
 	}
 }
 
@@ -225,7 +345,7 @@ func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
 	if err != nil || !attempted {
 		t.Fatalf("queue heartbeat ping: attempted=%v err=%v", attempted, err)
 	}
-	pending := conn.pendingBytes.Load()
+	pending := conn.writes.close.pendingBytes.Load()
 	conn.releaseOutbound(int(pending))
 	conn.heartbeat.mu.Lock()
 	sentAt := conn.heartbeat.pingSentAt
@@ -237,7 +357,7 @@ func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
 	if err := conn.SendBinary([]byte("later")); err != nil {
 		t.Fatal(err)
 	}
-	if conn.pendingBytes.Load() == 0 {
+	if conn.writes.close.pendingBytes.Load() == 0 {
 		t.Fatal("later business write did not remain queued")
 	}
 	server.connections.Store(conn, conn)
@@ -573,7 +693,7 @@ func TestServerLifecycleEdges(t *testing.T) {
 	handler := &recordingHandler{}
 	opened := &Conn{raw: openedRaw, config: testServerConfig(server), handler: handler}
 	opened.opened.Store(true)
-	opened.pendingBytes.Store(8)
+	opened.writes.close.pendingBytes.Store(8)
 	openedRaw.userdata = opened
 	server.connections.Store(opened, opened)
 	server.onOutbound(openedRaw, 8)
@@ -586,24 +706,5 @@ func TestServerLifecycleEdges(t *testing.T) {
 	defer handler.mu.Unlock()
 	if got := strings.Join(handler.events, ","); got != "close" {
 		t.Fatalf("close events = %q", got)
-	}
-}
-
-func TestServerPreservesDisabledOutboundLimitDuringServe(t *testing.T) {
-	events := &uio.Events{}
-	if err := events.Close(nil); err != nil {
-		t.Fatal(err)
-	}
-	server := NewServer(nil)
-	server.Events = events
-	server.MaxOutboundBytes = -1
-	if err := server.Serve(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Serve() error = %v, want %v", err, net.ErrClosed)
-	}
-	if server.MaxOutboundBytes != -1 {
-		t.Fatalf("MaxOutboundBytes = %d, want -1", server.MaxOutboundBytes)
-	}
-	if got := (&Conn{config: testServerConfig(server)}).maxOutboundBytes(); got != -1 {
-		t.Fatalf("connection outbound limit = %d, want -1", got)
 	}
 }

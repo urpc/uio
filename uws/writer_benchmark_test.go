@@ -26,8 +26,7 @@ func BenchmarkClientMaskedFrameWrite(b *testing.B) {
 			conn := &Conn{
 				raw: &writeProbeConn{},
 				config: testDialerConfig(&Dialer{
-					MaxFramePayload:  uint64(size),
-					MaxOutboundBytes: -1,
+					MaxFramePayload: uint64(size),
 				}),
 			}
 			message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, size)}
@@ -49,8 +48,7 @@ func BenchmarkServerUnmaskedFrameWrite(b *testing.B) {
 			conn := &Conn{
 				raw: &writeProbeConn{},
 				config: testServerConfig(&Server{
-					MaxFramePayload:  uint64(size),
-					MaxOutboundBytes: -1,
+					MaxFramePayload: uint64(size),
 				}),
 			}
 			message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, size)}

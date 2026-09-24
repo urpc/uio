@@ -263,7 +263,7 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	}
 	select {
 	case <-clientHandler.closed:
-	case <-time.After(time.Second):
+	case <-time.After(testIOTimeout()):
 		t.Fatal("Dialer.Close did not call OnClose")
 	}
 }
@@ -465,17 +465,6 @@ func TestDialerCustomLimitsAndExtensions(t *testing.T) {
 		defaults.compressionLevel() != -1 {
 		t.Fatal("dialer defaults changed")
 	}
-	if got := (&Conn{config: testDialerConfig(defaults)}).maxOutboundBytes(); got != DefaultMaxOutboundBytes {
-		t.Fatalf("default outbound limit = %d, want %d", got, DefaultMaxOutboundBytes)
-	}
-	dialer.MaxOutboundBytes = -1
-	if got := (&Conn{config: testDialerConfig(dialer)}).maxOutboundBytes(); got != -1 {
-		t.Fatalf("disabled outbound limit = %d, want -1", got)
-	}
-	dialer.MaxOutboundBytes = 123
-	if got := (&Conn{config: testDialerConfig(dialer)}).maxOutboundBytes(); got != 123 {
-		t.Fatalf("custom outbound limit = %d, want 123", got)
-	}
 	if err := defaults.Close(nil); err != nil {
 		t.Fatalf("Dialer.Close with nil Events = %v", err)
 	}
@@ -500,7 +489,6 @@ func TestDialerDisableUTF8CheckConfiguresConnection(t *testing.T) {
 
 func TestDialerCallbacksHandleLifecycleEdges(t *testing.T) {
 	dialer := NewDialer()
-	dialer.dispatchBudget.configure(defaultMaxPendingTotalMessages, defaultMaxPendingTotalBytes)
 
 	invalid := newScriptedConn()
 	dialer.onOpen(invalid)
@@ -550,9 +538,9 @@ func TestDialerCallbacksHandleLifecycleEdges(t *testing.T) {
 	opened := &Conn{raw: openedRaw, config: testDialerConfig(dialer), handler: handler}
 	opened.opened.Store(true)
 	openedRaw.userdata = opened
-	opened.pendingBytes.Store(8)
+	opened.writes.close.pendingBytes.Store(8)
 	dialer.onOutbound(openedRaw, 8)
-	if opened.pendingBytes.Load() != 0 {
+	if opened.writes.close.pendingBytes.Load() != 0 {
 		t.Fatal("onOutbound did not release pending bytes")
 	}
 	dialer.onClose(openedRaw, io.EOF)
@@ -594,7 +582,7 @@ func TestDialerCloseBeforeAsyncOnOpenAttachesPendingConnection(t *testing.T) {
 	}
 }
 
-func TestDialerHandshakeFailureCallsOnClose(t *testing.T) {
+func TestDialerHandshakeFailureCallsOnCloseSynchronously(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -727,11 +715,9 @@ func TestDialerDeadlineClosesRealPendingHandshake(t *testing.T) {
 	}
 }
 
-func TestDialerHandshakeFailureUsesExecutor(t *testing.T) {
-	executor := &queuedExecutor{}
+func TestDialerHandshakeFailureCallsOnClose(t *testing.T) {
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
 	dialer := NewDialer()
-	dialer.Executor = executor
 	raw := newScriptedConn()
 	raw.userdata = &dialSetup{handler: handler, key: testKey}
 	dialer.onOpen(raw)
@@ -740,18 +726,7 @@ func TestDialerHandshakeFailureUsesExecutor(t *testing.T) {
 	dialer.onClose(raw, nil)
 
 	if !conn.IsClosed() {
-		t.Fatal("handshake failure did not close connection before OnClose dispatch")
-	}
-	if got := executor.pending(); got != 1 {
-		t.Fatalf("executor tasks = %d, want 1", got)
-	}
-	select {
-	case info := <-handler.closed:
-		t.Fatalf("OnClose ran before executor: %+v", info)
-	default:
-	}
-	if !executor.runNext() {
-		t.Fatal("executor did not run OnClose")
+		t.Fatal("handshake failure did not close connection before OnClose")
 	}
 	select {
 	case info := <-handler.closed:
@@ -759,6 +734,6 @@ func TestDialerHandshakeFailureUsesExecutor(t *testing.T) {
 			t.Fatalf("OnClose error = %v, want %v", info.Err, ErrClosed)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("executor did not deliver OnClose")
+		t.Fatal("OnClose was not delivered")
 	}
 }

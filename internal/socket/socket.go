@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+// Package socket contains platform-specific descriptor and socket operations
+// used by UIO's native transports.
 package socket
 
 import (

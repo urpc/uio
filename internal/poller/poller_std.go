@@ -9,6 +9,9 @@ import (
 	"time"
 )
 
+// NetPoller is a lifecycle and wake primitive for blocking-I/O builds. Socket
+// readiness comes from per-connection goroutines, so Wait only services queued
+// event-loop commands and shutdown.
 type NetPoller struct {
 	waker  chan struct{} // capacity one coalesces repeated wakeups
 	closed chan struct{}
@@ -18,6 +21,10 @@ type NetPoller struct {
 	closeOnce   sync.Once
 }
 
+// SetEdgeTriggered is a no-op because blocking transports have no readiness mode.
+func (poller *NetPoller) SetEdgeTriggered(int, bool) {}
+
+// NewNetPoller creates a channel-backed command waker.
 func NewNetPoller() (*NetPoller, error) {
 	return &NetPoller{
 		waker: make(chan struct{}, 1), closed: make(chan struct{}),
@@ -48,6 +55,8 @@ func (poller *NetPoller) validateInterest(want Interest) error {
 
 func (poller *NetPoller) Remove(int, Interest) error { return nil }
 
+// Wait blocks for a command wake, timeout, or terminal close. It never returns
+// socket events on this backend.
 func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
 	if timeout == 0 {
 		select {
@@ -88,6 +97,7 @@ func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
 	}
 }
 
+// Wake coalesces repeated notifications in a capacity-one channel.
 func (poller *NetPoller) Wake() error {
 	select {
 	case poller.waker <- struct{}{}:
@@ -96,6 +106,7 @@ func (poller *NetPoller) Wake() error {
 	return nil
 }
 
+// Close publishes the terminal reason exactly once and releases all waiters.
 func (poller *NetPoller) Close(err error) error {
 	poller.closeOnce.Do(func() {
 		poller.mu.Lock()
@@ -106,6 +117,7 @@ func (poller *NetPoller) Close(err error) error {
 	return nil
 }
 
+// Closed reports whether Close has run.
 func (poller *NetPoller) Closed() bool {
 	select {
 	case <-poller.closed:
@@ -115,6 +127,7 @@ func (poller *NetPoller) Closed() bool {
 	}
 }
 
+// Serve is retained as a compatibility wrapper around Wait.
 func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()

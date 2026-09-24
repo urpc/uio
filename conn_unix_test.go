@@ -10,7 +10,9 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +26,96 @@ type testConnection struct {
 	conn *fdConn
 	peer int
 	stop func()
+}
+
+type nativeTaskExecutor struct{}
+
+func (nativeTaskExecutor) Submit(task IOTask) bool {
+	go task.RunTask()
+	return true
+}
+
+func (executor nativeTaskExecutor) SubmitBatch(tasks []IOTask) int {
+	for _, task := range tasks {
+		executor.Submit(task)
+	}
+	return len(tasks)
+}
+
+type rejectingNativeExecutor struct{}
+
+func (rejectingNativeExecutor) Submit(IOTask) bool       { return false }
+func (rejectingNativeExecutor) SubmitBatch([]IOTask) int { return 0 }
+
+func TestDirectOwnerIsConnectionScoped(t *testing.T) {
+	loop := &eventLoop{}
+	owner := currentGoroutineID()
+	loop.loopGoid.Store(owner)
+	stream := &fdConn{commonConn: commonConn{loop: loop}}
+	if stream.directOwner() {
+		t.Fatal("loop owner incorrectly owns a stream connection task")
+	}
+	datagram := &fdConn{commonConn: commonConn{loop: loop}, udp: &unixUDPState{}}
+	if !datagram.directOwner() {
+		t.Fatal("loop owner cannot write its datagram")
+	}
+	stream.ioOwner.Store(owner)
+	if !stream.directOwner() {
+		t.Fatal("stream task owner cannot write its connection")
+	}
+	stream.ioOwner.Store(0)
+	loop.loopGoid.Store(0)
+	if datagram.directOwner() {
+		t.Fatal("datagram remained loop-owned after loop exit")
+	}
+}
+
+type handoffNativeExecutor struct {
+	submitted atomic.Int32
+	firstDone chan struct{}
+}
+
+func (executor *handoffNativeExecutor) Submit(task IOTask) bool {
+	if executor.submitted.Add(1) == 1 {
+		go func() {
+			task.RunTask()
+			close(executor.firstDone)
+		}()
+		return true
+	}
+	go task.RunTask()
+	return true
+}
+
+func (executor *handoffNativeExecutor) SubmitBatch(tasks []IOTask) int {
+	for _, task := range tasks {
+		executor.Submit(task)
+	}
+	return len(tasks)
+}
+
+type batchNativeExecutor struct {
+	taskCalls   atomic.Int32
+	batchCalls  atomic.Int32
+	rejectAfter int
+}
+
+func (executor *batchNativeExecutor) Submit(task IOTask) bool {
+	executor.taskCalls.Add(1)
+	go task.RunTask()
+	return true
+}
+
+func (executor *batchNativeExecutor) SubmitBatch(tasks []IOTask) int {
+	executor.batchCalls.Add(1)
+	accepted := len(tasks)
+	if executor.rejectAfter >= 0 {
+		accepted = min(accepted, executor.rejectAfter)
+	}
+	for _, task := range tasks[:accepted] {
+		go task.RunTask()
+	}
+	return accepted
 }
 
 func newTestConnection(t *testing.T, events *Events) testConnection {
@@ -108,24 +200,19 @@ func readPeer(t *testing.T, fd int, size int) []byte {
 	return result
 }
 
-func TestCallbacksStayOnLoopAndCallbackCloseIsOrdered(t *testing.T) {
+func TestCallbacksStaySerializedAndCallbackCloseIsOrdered(t *testing.T) {
 	var mu sync.Mutex
 	var sequence []string
-	var loopID int64
 	closed := make(chan error, 1)
 	cause := errors.New("callback close")
 	events := &Events{Pollers: 1}
 	events.OnOpen = func(Conn) {
 		mu.Lock()
-		loopID = currentGoroutineID()
 		sequence = append(sequence, "open")
 		mu.Unlock()
 	}
 	events.OnData = func(conn Conn) error {
 		mu.Lock()
-		if currentGoroutineID() != loopID {
-			t.Errorf("OnData ran on a different goroutine")
-		}
 		sequence = append(sequence, "data")
 		mu.Unlock()
 		_, _ = conn.Discard(-1)
@@ -133,9 +220,6 @@ func TestCallbacksStayOnLoopAndCallbackCloseIsOrdered(t *testing.T) {
 	}
 	events.OnClose = func(_ Conn, err error) {
 		mu.Lock()
-		if currentGoroutineID() != loopID {
-			t.Errorf("OnClose ran on a different goroutine")
-		}
 		sequence = append(sequence, "close")
 		mu.Unlock()
 		closed <- err
@@ -165,19 +249,16 @@ func TestCallbacksStayOnLoopAndCallbackCloseIsOrdered(t *testing.T) {
 	}
 }
 
-func TestDialRejectedOnEventLoopCallback(t *testing.T) {
+func TestDialAllowedFromConnectionCallback(t *testing.T) {
 	dialResult := make(chan error, 1)
 	events := &Events{Pollers: 1}
 	events.OnData = func(conn Conn) error {
-		started := time.Now()
 		dialed, err := events.Dial("tcp://127.0.0.1:1", nil)
 		if dialed != nil {
 			_ = dialed.Close()
 		}
-		if !errors.Is(err, ErrDialOnEventLoop) {
-			dialResult <- fmt.Errorf("callback Dial error = %v", err)
-		} else if time.Since(started) > 100*time.Millisecond {
-			dialResult <- fmt.Errorf("callback Dial returned too slowly")
+		if errors.Is(err, ErrDialOnEventLoop) {
+			dialResult <- fmt.Errorf("callback Dial was rejected as event-loop work")
 		} else {
 			dialResult <- nil
 		}
@@ -200,6 +281,594 @@ func TestDialRejectedOnEventLoopCallback(t *testing.T) {
 	}
 	if got := string(readPeer(t, testConn.peer, 2)); got != "ok" {
 		t.Fatalf("same-loop response = %q", got)
+	}
+}
+
+func TestConnectionTaskSlowCallbackDoesNotBlockOtherConnection(t *testing.T) {
+	started := make(chan *fdConn, 1)
+	release := make(chan struct{})
+	fastDone := make(chan struct{}, 1)
+	var slow atomic.Pointer[fdConn]
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		fdc := conn.(*fdConn)
+		if slow.Load() == fdc {
+			select {
+			case started <- fdc:
+			default:
+			}
+			<-release
+		}
+		payload := conn.PeekChunk()
+		if len(payload) > 0 {
+			_, _ = conn.Write(payload)
+			_, _ = conn.Discard(-1)
+		}
+		if slow.Load() != fdc {
+			select {
+			case fastDone <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+
+	first, firstRegistered := startTestConnection(t, events)
+	second, secondRegistered := startTestConnection(t, events)
+	if err := <-firstRegistered; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-secondRegistered; err != nil {
+		t.Fatal(err)
+	}
+	slow.Store(first.conn)
+	if _, err := unix.Write(first.peer, []byte("slow")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("slow callback did not start")
+	}
+	if _, err := unix.Write(second.peer, []byte("fast")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readPeer(t, second.peer, len("fast"))); got != "fast" {
+		t.Fatalf("fast connection received %q", got)
+	}
+	select {
+	case <-fastDone:
+	case <-time.After(time.Second):
+		t.Fatal("fast callback was blocked by slow callback")
+	}
+	close(release)
+	if got := string(readPeer(t, first.peer, len("slow"))); got != "slow" {
+		t.Fatalf("slow connection received %q", got)
+	}
+}
+
+func TestConnectionTaskUsesExternalExecutor(t *testing.T) {
+	events := &Events{Pollers: 1, Executor: nativeTaskExecutor{}}
+	opened := make(chan struct{}, 1)
+	events.OnOpen = func(Conn) { opened <- struct{}{} }
+	events.OnData = func(conn Conn) error {
+		data := conn.PeekChunk()
+		_, err := conn.Write(data)
+		_, _ = conn.Discard(-1)
+		return err
+	}
+	testConn := newTestConnection(t, events)
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("external executor did not run connection task")
+	}
+	if _, err := unix.Write(testConn.peer, []byte("external")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readPeer(t, testConn.peer, len("external"))); got != "external" {
+		t.Fatalf("external executor echo = %q", got)
+	}
+}
+
+func TestConnectionTaskUsesBatchExecutorFastPath(t *testing.T) {
+	executor := &batchNativeExecutor{rejectAfter: -1}
+	opened := make(chan struct{}, 1)
+	processed := make(chan struct{}, 1)
+	events := &Events{Pollers: 1, Executor: executor}
+	events.OnOpen = func(Conn) { opened <- struct{}{} }
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(-1)
+		processed <- struct{}{}
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	select {
+	case <-opened:
+	case <-time.After(time.Second):
+		t.Fatal("batch executor did not run OnOpen")
+	}
+	deadline := time.Now().Add(time.Second)
+	for testConn.conn.scheduled.Load() {
+		if time.Now().After(deadline) {
+			t.Fatal("OnOpen connection task did not finish")
+		}
+		runtime.Gosched()
+	}
+	if _, err := unix.Write(testConn.peer, []byte("batch")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-processed:
+	case <-time.After(time.Second):
+		t.Fatal("batch executor did not run connection task")
+	}
+	if calls := executor.batchCalls.Load(); calls == 0 {
+		t.Fatal("readiness event did not use SubmitBatch")
+	}
+}
+
+func TestBatchExecutorPartialRejection(t *testing.T) {
+	executor := &batchNativeExecutor{rejectAfter: 1}
+	opened := make(chan Conn, 1)
+	closed := make(chan Conn, 1)
+	events := &Events{
+		OnOpen:  func(conn Conn) { opened <- conn },
+		OnClose: func(conn Conn, _ error) { closed <- conn },
+	}
+	pool := newIOTaskPool(executor)
+	loop := &eventLoop{ioPool: pool}
+	first := &fdConn{commonConn: commonConn{events: events, loop: loop}}
+	first.pendingEvents.Store(ioEventOpen)
+	first.scheduled.Store(true)
+	if !loop.acquireIO() {
+		t.Fatal("failed to reserve first connection task")
+	}
+	second := &fdConn{commonConn: commonConn{events: events, loop: loop}}
+	second.close.phase.Store(closeResourcesReleased)
+	second.pendingEvents.Store(ioEventClose)
+	second.scheduled.Store(true)
+	if !loop.acquireIO() {
+		t.Fatal("failed to reserve second connection task")
+	}
+
+	if !pool.submitBatch([]IOTask{first, second}) {
+		t.Fatal("batch submission was rejected by the I/O pool")
+	}
+	select {
+	case conn := <-opened:
+		if conn != first {
+			t.Fatalf("opened connection = %p, want %p", conn, first)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("accepted task did not run")
+	}
+	select {
+	case conn := <-closed:
+		if conn != second {
+			t.Fatalf("closed connection = %p, want %p", conn, second)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("rejected batch suffix was not closed")
+	}
+	pool.stop()
+	if calls := executor.batchCalls.Load(); calls != 1 {
+		t.Fatalf("SubmitBatch calls = %d, want 1", calls)
+	}
+	if calls := executor.taskCalls.Load(); calls != 0 {
+		t.Fatalf("single Submit calls = %d, want 0", calls)
+	}
+}
+
+func TestConnectionTaskHandoffPublishesNewOwnerAfterPreviousTask(t *testing.T) {
+	executor := &handoffNativeExecutor{firstDone: make(chan struct{})}
+	owner := make(chan bool, 1)
+	events := &Events{Pollers: 1, Executor: executor}
+	events.OnOpen = func(conn Conn) {
+		if err := conn.Wake(); err != nil {
+			owner <- false
+		}
+	}
+	events.OnData = func(conn Conn) error {
+		<-executor.firstDone
+		fdc := conn.(*fdConn)
+		owner <- fdc.ioOwner.Load() == currentGoroutineID()
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	select {
+	case correct := <-owner:
+		if !correct {
+			t.Fatal("previous connection task cleared the next task owner")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connection task handoff did not complete")
+	}
+	_ = testConn.conn.Close()
+}
+
+func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
+	closed := make(chan error, 1)
+	events := &Events{Pollers: 1, Executor: rejectingNativeExecutor{}}
+	events.OnClose = func(_ Conn, err error) { closed <- err }
+	testConn, registered := startTestConnection(t, events)
+	if err := <-registered; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("executor rejection close error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d loopState=%d queued=%v stopped=%v",
+			testConn.conn.scheduled.Load(), testConn.conn.close.phase.Load(),
+			testConn.conn.loop.ioState.Load(), testConn.conn.loop.hasPendingTasks(), testConn.conn.loop.stopping.Load())
+	}
+}
+
+func TestRejectedIOTaskReleasesScheduleBeforeClose(t *testing.T) {
+	events := &Events{Pollers: 1}
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.poller.Close(nil)
+	defer loop.ioPool.stop()
+	conn := &fdConn{fd: -1, commonConn: commonConn{events: events, loop: loop}}
+	if !loop.acquireIO() {
+		t.Fatal("loop did not reserve the rejected task")
+	}
+	conn.scheduled.Store(true)
+	conn.handleIOSubmitFailure(net.ErrClosed)
+	if conn.scheduled.Load() {
+		t.Fatal("rejected task still owned the connection after requesting close")
+	}
+	batch := loop.tasks.Drain()
+	if batch == nil || batch.Value.kind != closeTask || batch.Value.conn != conn {
+		t.Fatal("rejected task did not enqueue the connection close")
+	}
+	releaseTask(batch.Value)
+}
+
+func TestRejectedTaskWaitsForPublishedCloseCause(t *testing.T) {
+	closed := make(chan error, 1)
+	wantErr := errors.New("close cause")
+	loop := &eventLoop{ioIdle: make(chan struct{})}
+	conn := &fdConn{commonConn: commonConn{
+		events: &Events{OnClose: func(_ Conn, err error) { closed <- err }},
+		loop:   loop,
+	}}
+	conn.close.phase.Store(closeResourcesReleased)
+	conn.pendingEvents.Store(ioEventOpen)
+	conn.scheduled.Store(true)
+	if !loop.acquireIO() {
+		t.Fatal("failed to reserve earlier task")
+	}
+	conn.handleIOSubmitFailure(net.ErrClosed)
+	select {
+	case err := <-closed:
+		t.Fatalf("earlier rejected task delivered OnClose before its cause: %v", err)
+	default:
+	}
+	if phase := conn.close.phase.Load(); phase != closeResourcesReleased {
+		t.Fatalf("close phase = %d before final callback", phase)
+	}
+
+	conn.submitMu.Lock()
+	conn.setDeferredCloseLocked(wantErr)
+	conn.submitMu.Unlock()
+	conn.pendingEvents.Store(ioEventClose)
+	conn.scheduled.Store(true)
+	loop.acquireCloseIO()
+	conn.handleIOSubmitFailure(net.ErrClosed)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("OnClose error = %v, want %v", err, wantErr)
+		}
+	default:
+		t.Fatal("final rejected task did not deliver OnClose")
+	}
+}
+
+func TestExternalExecutorShutdownWaitsForConnectionTask(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	events := &Events{Pollers: 1, Executor: nativeTaskExecutor{}}
+	events.OnData = func(conn Conn) error {
+		close(started)
+		<-release
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connection task did not start")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		testConn.stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+		t.Fatal("shutdown returned while external executor task was active")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not finish after external executor task returned")
+	}
+}
+
+func TestNilShutdownCauseClosesBlockedConnectionTask(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan error, 1)
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		close(started)
+		<-release
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+	events.OnClose = func(_ Conn, err error) { closed <- err }
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connection task did not start")
+	}
+	testConn.conn.loop.beginStop(nil)
+	close(release)
+	select {
+	case err := <-closed:
+		if err != nil {
+			t.Fatalf("OnClose error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("nil shutdown cause lost the deferred close")
+	}
+	if phase := testConn.conn.close.phase.Load(); phase != closeCallbackDelivered {
+		t.Fatalf("close phase = %d, want callback delivered", phase)
+	}
+}
+
+func TestShutdownRetainsTaskErrorAfterNilCloseRequest(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan error, 1)
+	wantErr := errors.New("callback failed during shutdown")
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		close(started)
+		<-release
+		_, _ = conn.Discard(-1)
+		return wantErr
+	}
+	events.OnClose = func(_ Conn, err error) { closed <- err }
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connection task did not start")
+	}
+	testConn.conn.loop.beginStop(nil)
+	deadline := time.Now().Add(time.Second)
+	for !testConn.conn.isClosing() {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("shutdown did not mark the connection closing")
+		}
+		runtime.Gosched()
+	}
+	close(release)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("OnClose error = %v, want %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback error was lost during shutdown")
+	}
+}
+
+func TestShutdownWaitsForTaskBehindQueuedRefresh(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan struct{}, 1)
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		close(started)
+		<-release
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+	events.OnClose = func(Conn, error) { closed <- struct{}{} }
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connection task did not start")
+	}
+	refresh := acquireTask(refreshTask, testConn.conn)
+	if !testConn.conn.loop.submitTask(refresh) {
+		releaseTask(refresh)
+		close(release)
+		t.Fatal("refresh task was rejected before shutdown")
+	}
+	testConn.conn.loop.beginStop(nil)
+	deadline := time.Now().Add(time.Second)
+	for !testConn.conn.loop.ioStopped() {
+		if time.Now().After(deadline) {
+			close(release)
+			t.Fatal("loop did not enter shutdown")
+		}
+		runtime.Gosched()
+	}
+	if testConn.conn.isClosedOnLoop() {
+		close(release)
+		t.Fatal("loop released the fd while its connection task was active")
+	}
+	select {
+	case <-closed:
+		close(release)
+		t.Fatal("OnClose overlapped the active callback")
+	default:
+	}
+	close(release)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("OnClose was not delivered after task completion")
+	}
+}
+
+func TestDeferredTransportCauseSurvivesShutdownHandoff(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	closed := make(chan error, 1)
+	wantErr := errors.New("transport failed")
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		close(started)
+		<-release
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+	events.OnClose = func(_ Conn, err error) { closed <- err }
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("block")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("connection task did not start")
+	}
+	testConn.conn.requestClose(wantErr)
+	deadline := time.Now().Add(time.Second)
+	for {
+		testConn.conn.submitMu.Lock()
+		deferred := testConn.conn.close.deferred != nil
+		testConn.conn.submitMu.Unlock()
+		if deferred {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("transport cause was not deferred")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	testConn.conn.loop.beginStop(nil)
+	close(release)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, wantErr) {
+			t.Fatalf("OnClose error = %v, want %v", err, wantErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("deferred transport cause was not delivered")
+	}
+}
+
+func TestConnectionTaskStopsReadingWhileCallbackIsBlocked(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var calls atomic.Int32
+	events := &Events{Pollers: 1, MaxBufferSize: 4}
+	events.OnData = func(conn Conn) error {
+		if calls.Add(1) == 1 {
+			close(started)
+			<-release
+		}
+		_, _ = conn.Discard(-1)
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("four")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first callback did not start")
+	}
+	if _, err := unix.Write(testConn.peer, []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("callbacks while blocked = %d, want 1", got)
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got < 2 {
+		t.Fatalf("callbacks after release = %d, want at least 2", got)
+	}
+}
+
+func TestConnectionTaskRedeliversReadAfterRoundBudget(t *testing.T) {
+	const total = (2 << 20) + 123
+	var received atomic.Int64
+	done := make(chan struct{}, 1)
+	events := &Events{Pollers: 1, MaxBufferSize: 4096}
+	events.OnData = func(conn Conn) error {
+		n := conn.InboundBuffered()
+		if _, err := conn.Discard(-1); err != nil {
+			return err
+		}
+		if received.Add(int64(n)) >= total {
+			select {
+			case done <- struct{}{}:
+			default:
+			}
+		}
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	payload := make([]byte, total)
+	go func() {
+		for len(payload) > 0 {
+			n, err := unix.Write(testConn.peer, payload)
+			if n > 0 {
+				payload = payload[n:]
+			}
+			if err != nil && !isWouldBlock(err) {
+				return
+			}
+			if n == 0 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("redelivery received %d/%d bytes", received.Load(), total)
 	}
 }
 
@@ -250,37 +919,6 @@ func TestExternalWritevCopiesOnceWithoutMutatingCallerVector(t *testing.T) {
 	}
 }
 
-func TestOutboundLimitsRejectWithoutChangingAcceptedBytes(t *testing.T) {
-	opened := make(chan *fdConn, 1)
-	releaseOpen := make(chan struct{})
-	events := &Events{Pollers: 1, MaxOutboundBuffered: 4, MaxPendingWrites: 8}
-	events.OnOpen = func(conn Conn) {
-		opened <- conn.(*fdConn)
-		<-releaseOpen
-	}
-
-	testConn, registered := startTestConnection(t, events)
-	conn := <-opened
-	data := []byte("1234")
-	if n, err := conn.Write(data); err != nil || n != 4 {
-		t.Fatalf("first Write = %d, %v", n, err)
-	}
-	if n, err := conn.Write([]byte("5")); !errors.Is(err, ErrOutboundOverflow) || n != 0 {
-		t.Fatalf("overflow Write = %d, %v", n, err)
-	}
-	if got := conn.OutboundBuffered(); got != 4 {
-		t.Fatalf("OutboundBuffered = %d", got)
-	}
-	copy(data, "xxxx")
-	close(releaseOpen)
-	if err := <-registered; err != nil {
-		t.Fatal(err)
-	}
-	if got := string(readPeer(t, testConn.peer, 4)); got != "1234" {
-		t.Fatalf("peer received %q", got)
-	}
-}
-
 func TestOutboundLimitDoesNotRejectImmediateLoopWrite(t *testing.T) {
 	result := make(chan error, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 4}
@@ -296,28 +934,6 @@ func TestOutboundLimitDoesNotRejectImmediateLoopWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := string(readPeer(t, testConn.peer, 8)); got != "12345678" {
-		t.Fatalf("peer received %q", got)
-	}
-}
-
-func TestPendingWriteTaskLimit(t *testing.T) {
-	opened := make(chan *fdConn, 1)
-	releaseOpen := make(chan struct{})
-	events := &Events{Pollers: 1, MaxOutboundBuffered: 1024, MaxPendingWrites: 1}
-	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn); <-releaseOpen }
-	testConn, registered := startTestConnection(t, events)
-	conn := <-opened
-	if _, err := conn.Write([]byte("one")); err != nil {
-		t.Fatal(err)
-	}
-	if n, err := conn.Write([]byte("two")); !errors.Is(err, ErrTaskQueueFull) || n != 0 {
-		t.Fatalf("second Write = %d, %v", n, err)
-	}
-	close(releaseOpen)
-	if err := <-registered; err != nil {
-		t.Fatal(err)
-	}
-	if got := string(readPeer(t, testConn.peer, 3)); got != "one" {
 		t.Fatalf("peer received %q", got)
 	}
 }
@@ -347,9 +963,8 @@ func TestFlushTaskIsAWriteBarrier(t *testing.T) {
 	if got := string(readPeer(t, testConn.peer, 2)); got != "AB" {
 		t.Fatalf("peer received %q", got)
 	}
-	first, second := <-outbound, <-outbound
-	if first != 1 || second != 1 {
-		t.Fatalf("OnOutbound calls = %d, %d", first, second)
+	if got := <-outbound; got != 2 {
+		t.Fatalf("OnOutbound bytes = %d, want batched 2", got)
 	}
 }
 
@@ -379,9 +994,6 @@ func TestCallbackThresholdBatchesWithoutTasks(t *testing.T) {
 	case extra := <-outbound:
 		t.Fatalf("threshold write used an extra flush of %d bytes", extra)
 	default:
-	}
-	if testConn.conn.queuedWrites.Load() != 0 || testConn.conn.loop.tasks.HasPending() {
-		t.Fatal("callback threshold write created a queued task")
 	}
 }
 
@@ -621,31 +1233,11 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 	}
 }
 
-func TestFlushTouchedUsesBudgetAndReleasesLargeStorage(t *testing.T) {
-	loop := &eventLoop{events: &Events{}}
-	connections := make([]fdConn, touchedBudget+1)
-	for index := range connections {
-		connections[index].closed = true
-		loop.touch(&connections[index])
-	}
-	loop.flushTouched()
-	if loop.touchedHead != touchedBudget || !loop.hasTouched() {
-		t.Fatalf("touched progress = %d/%d", loop.touchedHead, len(loop.touched))
-	}
-	if connections[touchedBudget].touched != true {
-		t.Fatal("unprocessed connection lost its touched marker")
-	}
-	loop.flushTouched()
-	if loop.hasTouched() || len(loop.touched) != 0 || cap(loop.touched) != 0 {
-		t.Fatalf("drained touched storage len/cap = %d/%d", len(loop.touched), cap(loop.touched))
-	}
-}
-
 func TestConcurrentWriteAndCloseDoesNotLoseAcceptedData(t *testing.T) {
 	opened := make(chan *fdConn, 1)
 	releaseOpen := make(chan struct{})
 	closed := make(chan error, 1)
-	events := &Events{Pollers: 1, MaxOutboundBuffered: 1 << 20, MaxPendingWrites: 128}
+	events := &Events{Pollers: 1, MaxOutboundBuffered: 1 << 20}
 	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn); <-releaseOpen }
 	events.OnClose = func(_ Conn, err error) { closed <- err }
 	testConn, registered := startTestConnection(t, events)
@@ -718,8 +1310,8 @@ func TestConcurrentWriteAndCloseDoesNotLoseAcceptedData(t *testing.T) {
 			t.Fatalf("accepted message %q was not sent", message)
 		}
 	}
-	if pending, queued := conn.pending.Load(), conn.queuedWrites.Load(); pending != 0 || queued != 0 {
-		t.Fatalf("counters after Close = pending %d, queued %d", pending, queued)
+	if pending := conn.pending.Load(); pending != 0 {
+		t.Fatalf("pending bytes after Close = %d", pending)
 	}
 }
 
@@ -851,8 +1443,8 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 	}
 	select {
 	case <-dialOpened:
-	default:
-		t.Fatal("Dial returned before OnOpen")
+	case <-time.After(time.Second):
+		t.Fatal("OnOpen was not delivered")
 	}
 	if n, err := dialed.Write([]byte("ping")); err != nil || n != 4 {
 		t.Fatalf("Dial connection Write = %d, %v", n, err)
@@ -1048,5 +1640,41 @@ func TestUDPChildCloseDoesNotCloseSharedServer(t *testing.T) {
 	case <-childClosed:
 	case <-time.After(time.Second):
 		t.Fatal("remaining UDP child did not close on shutdown")
+	}
+}
+
+func TestReadRoundCorksRepliesToOneFlush(t *testing.T) {
+	events := &Events{Pollers: 1, MaxBufferSize: 4}
+	outbound := make(chan int, 8)
+	events.OnData = func(conn Conn) error {
+		data := conn.PeekChunk()
+		if _, err := conn.Write(data); err != nil {
+			return err
+		}
+		_, err := conn.Discard(-1)
+		return err
+	}
+	events.OnOutbound = func(_ Conn, written int) { outbound <- written }
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("12345678")); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(readPeer(t, testConn.peer, 8)); got != "12345678" {
+		t.Fatalf("peer received %q", got)
+	}
+	// Eight bytes arrive as two 4-byte reads; both replies must leave the
+	// socket in one writev, not one syscall per message.
+	select {
+	case written := <-outbound:
+		if written != 8 {
+			t.Fatalf("first OnOutbound = %d bytes, want the corked 8", written)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for the corked flush")
+	}
+	select {
+	case extra := <-outbound:
+		t.Fatalf("corked round produced an extra %d-byte write", extra)
+	default:
 	}
 }

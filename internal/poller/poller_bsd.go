@@ -18,6 +18,9 @@ const (
 	errorEvents = unix.EV_EOF | unix.EV_ERROR
 )
 
+// NetPoller wraps kqueue plus a non-blocking pipe used to wake the owner for
+// queued control work. waiters delays descriptor release until event
+// conversion has finished.
 type NetPoller struct {
 	kqfd      int
 	wakeRead  int
@@ -27,11 +30,13 @@ type NetPoller struct {
 	waiters int        // includes readiness-event conversion after kevent
 
 	closed      atomic.Bool
+	edgeFD      map[int]bool
 	closeReason atomic.Pointer[error]
 	releaseOnce sync.Once
 	rawEvents   [1024]unix.Kevent_t
 }
 
+// NewNetPoller creates kqueue and registers the read end of its wake pipe.
 func NewNetPoller() (*NetPoller, error) {
 	kqfd, err := unix.Kqueue()
 	if err != nil {
@@ -51,12 +56,23 @@ func NewNetPoller() (*NetPoller, error) {
 			return nil, err
 		}
 	}
-	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1]}
+	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1], edgeFD: make(map[int]bool)}
 	if err = poller.change(waker[0], readEvents, unix.EV_ADD); err != nil {
 		poller.release()
 		return nil, err
 	}
 	return poller, nil
+}
+
+// SetEdgeTriggered selects EV_CLEAR for future application registrations.
+func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
+	poller.mu.Lock()
+	if enabled {
+		poller.edgeFD[fd] = true
+	} else {
+		delete(poller.edgeFD, fd)
+	}
+	poller.mu.Unlock()
 }
 
 // Add registers a descriptor.
@@ -84,6 +100,8 @@ func (poller *NetPoller) modify(fd int, previous, want Interest) error {
 	return poller.modifyLocked(fd, previous, want)
 }
 
+// modifyLocked translates one logical interest transition into the minimum set
+// of independent kqueue filter changes.
 func (poller *NetPoller) modifyLocked(fd int, previous, want Interest) error {
 	if previous&Readable != 0 && want&Readable == 0 {
 		if err := poller.deleteFilter(fd, readEvents); err != nil {
@@ -126,10 +144,14 @@ func (poller *NetPoller) removeLocked(fd int, previous Interest) error {
 	if previous&Writable != 0 {
 		errs = append(errs, poller.deleteFilter(fd, writeEvents))
 	}
+	delete(poller.edgeFD, fd)
 	return errors.Join(errs...)
 }
 
 func (poller *NetPoller) change(fd int, filter, flags int64) error {
+	if poller.edgeFD[fd] && flags&unix.EV_ADD != 0 {
+		flags |= unix.EV_CLEAR
+	}
 	event := makeKevent(fd, filter, flags)
 	_, err := unix.Kevent(poller.kqfd, []unix.Kevent_t{event}, nil, nil)
 	return err
@@ -144,6 +166,8 @@ func (poller *NetPoller) deleteFilter(fd int, filter int64) error {
 	return err
 }
 
+// Wait converts one kqueue batch into normalized events. timeout is in
+// milliseconds; a negative value blocks indefinitely and zero polls.
 func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	// Register before kevent so Close cannot release descriptors still in use.
 	poller.mu.Lock()
@@ -179,7 +203,8 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 			continue
 		}
 		if count == len(out) {
-			// Level triggering will report readiness again on the next Wait.
+			// Event loops provide an output batch as large as rawEvents. Smaller
+			// callers intentionally discard the excess notification.
 			continue
 		}
 		var events Events
@@ -195,6 +220,7 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	return count, nil
 }
 
+// Wake interrupts Wait by writing one byte to the non-blocking wake pipe.
 func (poller *NetPoller) Wake() error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
@@ -222,6 +248,8 @@ func (poller *NetPoller) drainWake() {
 	}
 }
 
+// Close publishes the terminal reason and interrupts Wait. The last waiter
+// releases kqueue and both pipe descriptors.
 func (poller *NetPoller) Close(err error) error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
@@ -239,6 +267,7 @@ func (poller *NetPoller) Close(err error) error {
 	return poller.wakeLocked()
 }
 
+// Closed reports whether Close has published the terminal state.
 func (poller *NetPoller) Closed() bool { return poller.closed.Load() }
 
 func (poller *NetPoller) closeError() error {
@@ -272,6 +301,7 @@ func (poller *NetPoller) finishWait() {
 	poller.mu.Unlock()
 }
 
+// Serve is retained as a compatibility wrapper around Wait.
 func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()

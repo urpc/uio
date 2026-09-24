@@ -27,32 +27,16 @@ const (
 	DefaultMaxFramePayload = 16 << 20
 	// DefaultMaxMessageSize is the default decompressed message size limit.
 	DefaultMaxMessageSize = 64 << 20
-	// DefaultMaxOutboundBytes is the default accepted but unsent wire byte
-	// limit. It includes room for the largest legal frame header so a maximum
-	// sized default frame is not rejected before reaching the transport.
-	DefaultMaxOutboundBytes = DefaultMaxFramePayload + 14
 	// DefaultCloseTimeout is the default graceful close handshake timeout.
 	DefaultCloseTimeout = 5 * time.Second
 	// DefaultHandshakeTimeout is the default HTTP upgrade timeout.
 	DefaultHandshakeTimeout = 10 * time.Second
 
-	// defaultMaxPendingMessages limits queued OnMessage callbacks for one
-	// connection when an Executor is configured.
-	defaultMaxPendingMessages = 16 << 10
-	// defaultMaxPendingBytes limits copied message payload queued for one
-	// connection when an Executor is configured.
-	defaultMaxPendingBytes = 64 << 20
-	// defaultMaxPendingTotalMessages limits queued OnMessage callbacks across
-	// one Server or Dialer when an Executor is configured.
-	defaultMaxPendingTotalMessages int64 = 1 << 20
-	// defaultMaxPendingTotalBytes limits copied message payload queued across
-	// one Server or Dialer when an Executor is configured.
-	defaultMaxPendingTotalBytes int64 = 4 << 30
-	// defaultWriteBufferedThreshold enables direct callback writes up to this
-	// size before UIO falls back to its asynchronous write path.
+	// defaultWriteBufferedThreshold lets UIO coalesce small WebSocket frames in
+	// the connection task's outbound buffer.
 	defaultWriteBufferedThreshold = 4 << 10
-	// maxFramesPerDataEvent bounds frame callbacks handled in one I/O turn so
-	// a busy connection cannot starve other connections on the same loop.
+	// maxFramesPerDataEvent bounds frame callbacks handled in one connection
+	// task turn so a busy connection cannot starve other runnable connections.
 	maxFramesPerDataEvent = 64
 )
 
@@ -61,12 +45,11 @@ var (
 	ErrClosed = errors.New("uws: connection closed")
 	// ErrNotReady reports an operation attempted before the handshake completes.
 	ErrNotReady = errors.New("uws: handshake not complete")
-	// ErrBackpressure reports that the transport outbound queue is full.
+	// ErrBackpressure reports that the UIO connection outbound queue is full.
 	ErrBackpressure = errors.New("uws: outbound queue is full")
-	// ErrApplicationBackpressure reports that the Executor mailbox is full.
-	ErrApplicationBackpressure = errors.New("uws: application queue is full")
-	// ErrExecutorRejected reports that Executor.Submit rejected a callback.
-	ErrExecutorRejected = errors.New("uws: executor rejected callback")
+	// ErrWriteBusy reports that a streaming Writer currently owns the
+	// connection's write path.
+	ErrWriteBusy = errors.New("uws: connection writer is busy")
 	// ErrWriterClosed reports an operation on a closed message writer.
 	ErrWriterClosed = errors.New("uws: message writer is closed")
 	// ErrServerStarted reports a second attempt to run a Server listener after
@@ -75,24 +58,7 @@ var (
 	// ErrProtocol reports a WebSocket protocol violation.
 	ErrProtocol   = frame.ErrProtocol
 	errReadBudget = errors.New("uws: read budget exhausted")
-	errReadPaused = errors.New("uws: reads paused")
 )
-
-// Executor runs application callbacks outside the I/O event loop. Submit must
-// return promptly and reports false when a bounded worker queue is full.
-type Executor interface {
-	// Submit schedules callback and reports whether it was accepted.
-	Submit(func()) bool
-}
-
-type readPauseProbe interface {
-	IsReadPaused() bool
-}
-
-func isReadPaused(raw uio.Conn) bool {
-	probe, ok := raw.(readPauseProbe)
-	return ok && probe.IsReadPaused()
-}
 
 // Message is one complete text or binary WebSocket message.
 type Message struct {
@@ -126,8 +92,7 @@ type Handler interface {
 	// OnMessage receives complete messages in wire order.
 	OnMessage(*Conn, Message)
 	// OnClose is called once after the transport closes. A client handshake
-	// failure may call it without a preceding OnOpen. If Executor rejects
-	// dispatch, pending callbacks, including OnClose, may be dropped.
+	// failure may call it without a preceding OnOpen.
 	OnClose(*Conn, CloseEvent)
 }
 

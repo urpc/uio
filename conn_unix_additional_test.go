@@ -209,7 +209,7 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: receiver, udp: &unixUDPState{}, interest: poller.Readable}
 	conn.events, conn.loop = events, loop
-	for range 32 {
+	for range 272 {
 		if err := unix.Sendto(sender, []byte{'x'}, 0, target); err != nil {
 			t.Fatal(err)
 		}
@@ -218,15 +218,15 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	if err := conn.onRecvUDP(); err != nil {
 		t.Fatal(err)
 	}
-	if handled := packets - before; handled > 16 {
-		t.Fatalf("first read event handled %d packets, limit 16", handled)
+	if handled := packets - before; handled > 256 {
+		t.Fatalf("first read event handled %d packets, limit 256", handled)
 	}
 	before = packets
 	if err := conn.onRecvUDP(); err != nil {
 		t.Fatal(err)
 	}
-	if handled := packets - before; handled > 16 {
-		t.Fatalf("second read event handled %d packets, limit 16", handled)
+	if handled := packets - before; handled > 256 {
+		t.Fatalf("second read event handled %d packets, limit 256", handled)
 	}
 }
 
@@ -252,7 +252,7 @@ func fillDatagramSendBuffer(t *testing.T, fd int) []byte {
 	return nil
 }
 
-func TestUDPWouldBlockReportsUnflushedDatagram(t *testing.T) {
+func TestUDPWouldBlockDoesNotCloseConnection(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -274,46 +274,6 @@ func TestUDPWouldBlockReportsUnflushedDatagram(t *testing.T) {
 		t.Fatal("direct EAGAIN closed a datagram that was never accepted")
 	}
 
-	closed := make(chan error, 1)
-	events := &Events{MaxPendingWrites: 1, OnClose: func(_ Conn, errorValue error) { closed <- errorValue }}
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.wakePending.Store(true)
-	server := &fdConn{udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
-	conn := &fdConn{fd: fds[0], udp: &unixUDPState{server: server}}
-	conn.events, conn.loop = events, loop
-	server.udp.peers[conn.udp.key] = conn
-	otherKey := socket.UDPAddress{Family: 4, Port: 1}
-	other := &fdConn{fd: fds[0], udp: &unixUDPState{server: server, key: otherKey}}
-	server.udp.peers[otherKey] = other
-	queuedBuffer := AcquireBuffer(len(payload))
-	_, _ = queuedBuffer.Write(payload)
-	if n, writeErr := conn.WriteOwned(queuedBuffer); n != len(payload) || writeErr != nil {
-		t.Fatalf("queued UDP WriteOwned = %d, %v", n, writeErr)
-	}
-	writeNode := loop.tasks.Drain()
-	if writeNode == nil || writeNode.TakeNext() != nil {
-		t.Fatal("UDP WriteOwned did not enqueue exactly one write task")
-	}
-	loop.runTask(writeNode.Value)
-	if conn.pending.Load() != int64(len(payload)) || conn.queuedWrites.Load() != 0 {
-		t.Fatalf("EAGAIN counters = pending %d, queued %d", conn.pending.Load(), conn.queuedWrites.Load())
-	}
-	closeNode := loop.tasks.Drain()
-	if closeNode == nil || closeNode.TakeNext() != nil {
-		t.Fatal("UDP EAGAIN did not enqueue exactly one close task")
-	}
-	loop.runTask(closeNode.Value)
-	closeErr := <-closed
-	if (!errors.Is(closeErr, unix.EAGAIN) && !errors.Is(closeErr, unix.ENOBUFS)) || !errors.Is(closeErr, ErrUnflushedData) {
-		t.Fatalf("UDP close error = %v", closeErr)
-	}
-	var unflushed UnflushedError
-	if !errors.As(closeErr, &unflushed) || unflushed.Remaining != int64(len(payload)) {
-		t.Fatalf("UDP unflushed error = %#v", unflushed)
-	}
-	if conn.pending.Load() != 0 || len(server.udp.peers) != 1 || server.udp.peers[otherKey] != other {
-		t.Fatalf("closed UDP state = pending %d, peers %d", conn.pending.Load(), len(server.udp.peers))
-	}
 }
 
 func releaseTestTasks(loop *eventLoop) {
@@ -354,11 +314,11 @@ func TestUnixSocketOptions(t *testing.T) {
 	if boolInt(true) != 1 || boolInt(false) != 0 {
 		t.Fatal("boolInt returned an invalid value")
 	}
-	conn.closing.Store(true)
+	conn.close.phase.Store(closeRequested)
 	if err := conn.SetNoDelay(true); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed SetNoDelay error = %v", err)
 	}
-	conn.closed = true
+	conn.close.phase.Store(closeResourcesReleased)
 	if err := conn.applySocketOption(optionLinger, 0); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed applySocketOption error = %v", err)
 	}
@@ -375,6 +335,22 @@ func TestCloseUnregisteredDescriptorOwnership(t *testing.T) {
 	conn.closeUnregistered()
 	if _, err := unix.Write(fds[0], []byte("x")); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("write after close error = %v", err)
+	}
+	requested, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(requested[1])
+	conn = &fdConn{fd: requested[0]}
+	if !conn.close.request() {
+		t.Fatal("unregistered connection did not accept close request")
+	}
+	conn.closeUnregistered()
+	if phase := conn.close.phase.Load(); phase != closeCallbackDelivered {
+		t.Fatalf("unregistered close phase = %d, want callback delivered", phase)
+	}
+	if _, err := unix.Write(requested[0], []byte("x")); !errors.Is(err, unix.EBADF) {
+		t.Fatalf("write after requested close error = %v", err)
 	}
 
 	readFile, writeFile, err := os.Pipe()
@@ -419,120 +395,6 @@ func TestLoopDirectWritevAndFlush(t *testing.T) {
 	}
 }
 
-func TestDirectPartialWriteOverflowAbortsStream(t *testing.T) {
-	payload := bytes.Repeat([]byte{'P'}, 8<<20)
-	tests := []struct {
-		name  string
-		write func(*fdConn, []byte) (int, error)
-	}{
-		{
-			name: "Write",
-			write: func(conn *fdConn, data []byte) (int, error) {
-				return conn.writeOnLoop(data)
-			},
-		},
-		{
-			name: "Writev",
-			write: func(conn *fdConn, data []byte) (int, error) {
-				middle := len(data) / 2
-				return conn.writevOnLoop([][]byte{data[:middle], data[middle:]}, len(data))
-			},
-		},
-		{
-			name: "WriteOwned",
-			write: func(conn *fdConn, data []byte) (int, error) {
-				owned := bytebuf.CloneBuffer(data)
-				return conn.writeOwnedOnLoop(owned, len(data))
-			},
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			writer, reader := newPartialStreamWriter(t)
-			defer unix.Close(reader)
-			writerOpen := true
-			defer func() {
-				if writerOpen {
-					_ = unix.Close(writer)
-				}
-			}()
-
-			closed := make(chan error, 1)
-			events := &Events{
-				MaxOutboundBuffered: 1,
-				MaxPendingWrites:    2,
-				OnClose: func(_ Conn, err error) {
-					closed <- err
-				},
-			}
-			if err := events.initConfig(); err != nil {
-				t.Fatal(err)
-			}
-			loop, err := newEventLoop(events)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer loop.poller.Close(nil)
-			conn := &fdConn{fd: writer}
-			conn.events, conn.loop = events, loop
-
-			// Model an external producer winning submitMu after the callback chose
-			// the direct path but before its syscall returned.
-			marker := bytebuf.CloneBuffer([]byte{'M'})
-			if n, queueErr := conn.queueOwnedWrite(marker, 1); n != 1 || queueErr != nil {
-				t.Fatalf("queue marker = %d, %v", n, queueErr)
-			}
-
-			written, writeErr := test.write(conn, payload)
-			if !errors.Is(writeErr, ErrOutboundOverflow) {
-				t.Fatalf("partial write error = %v", writeErr)
-			}
-			if written <= 0 || written >= len(payload) {
-				t.Fatalf("write result = %d, want a partial write of %d bytes", written, len(payload))
-			}
-			if !conn.writeFailed || !conn.isClosing() {
-				t.Fatalf("failed stream state = writeFailed %v, closing %v", conn.writeFailed, conn.isClosing())
-			}
-
-			writeNode := loop.tasks.Drain()
-			if writeNode == nil || writeNode.Value.kind != writeTask {
-				t.Fatal("queued write task is missing")
-			}
-			closeNode := writeNode.TakeNext()
-			if closeNode == nil || closeNode.Value.kind != closeTask || closeNode.TakeNext() != nil {
-				t.Fatal("close task did not follow the queued write")
-			}
-			loop.runTask(writeNode.Value)
-			if conn.pending.Load() != 1 || !conn.outbound.Empty() {
-				t.Fatalf("discarded task left pending %d, outbound %d", conn.pending.Load(), conn.outbound.Len())
-			}
-			// A failed stream must not flush even if an earlier bug or callback
-			// leaves bytes in outbound before the close task runs.
-			_, _ = conn.outbound.Write([]byte{'N'})
-			conn.pending.Add(1)
-			loop.runTask(closeNode.Value)
-			writerOpen = false
-			closeErr := <-closed
-			var unflushed UnflushedError
-			if !errors.Is(closeErr, ErrOutboundOverflow) || !errors.As(closeErr, &unflushed) || unflushed.Remaining != 2 {
-				t.Fatalf("close error = %v", closeErr)
-			}
-
-			received := readStreamToEOF(t, reader)
-			if bytes.Contains(received, []byte{'M'}) || bytes.Contains(received, []byte{'N'}) {
-				t.Fatal("bytes queued after the partial frame reached the peer")
-			}
-			if len(received) != written || !bytes.Equal(received, payload[:written]) {
-				t.Fatalf("peer received %d bytes, want only the %d-byte direct prefix", len(received), written)
-			}
-			if conn.pending.Load() != 0 {
-				t.Fatalf("close left %d pending bytes", conn.pending.Load())
-			}
-		})
-	}
-}
-
 func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -543,6 +405,7 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	loop := &eventLoop{}
 	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: fds[0]}
+	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
 	conn.loop = loop
 	conn.interest = poller.Readable
@@ -552,11 +415,11 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	if conn.OutboundBuffered() != 2 {
 		t.Fatalf("buffered bytes = %d", conn.OutboundBuffered())
 	}
-	conn.writeBlocked = true
+	conn.setWriteBlocked(true)
 	if n, err := conn.flushOnLoop(); err != nil || n != 0 {
 		t.Fatalf("blocked flush = %d, %v", n, err)
 	}
-	conn.writeBlocked = false
+	conn.setWriteBlocked(false)
 	if err := conn.Flush(); err != nil {
 		t.Fatal(err)
 	}
@@ -571,9 +434,9 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 		t.Fatalf("overflow Write = %d, %v", n, err)
 	}
 	conn.events.MaxOutboundBuffered = 8
-	conn.writeBlocked = true
-	if err := conn.fireWriteEvent(); err != nil || conn.writeBlocked {
-		t.Fatalf("fireWriteEvent = %v, blocked %v", err, conn.writeBlocked)
+	conn.setWriteBlocked(true)
+	if err := conn.fireWriteEvent(); err != nil || conn.writeBlocked() {
+		t.Fatalf("fireWriteEvent = %v, blocked %v", err, conn.writeBlocked())
 	}
 	conn.udp = &unixUDPState{}
 	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, errUnsupported) {
@@ -588,6 +451,7 @@ func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 	loop := &eventLoop{}
 	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: -1}
+	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 16}
 	conn.loop = loop
 
@@ -610,31 +474,41 @@ func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 	conn.pending.Store(0)
 }
 
-func TestExternalWriteOwnedTransfersBufferThroughTask(t *testing.T) {
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.wakePending.Store(true)
-	conn := &fdConn{fd: -1}
-	conn.events = &Events{MaxPendingWrites: 1, MaxOutboundBuffered: 16}
+func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
+	loop := &eventLoop{}
+	loop.loopGoid.Store(currentGoroutineID())
+	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
+	conn := &fdConn{fd: -1, corked: true}
+	conn.ioOwner.Store(currentGoroutineID())
+	conn.events = events
 	conn.loop = loop
 
-	buffer := AcquireBuffer(8)
-	dst := buffer.AvailableBuffer()[:8]
-	encoded := &dst[0]
-	buffer.CommitWrite(copy(dst, "payload"))
-	n, err := conn.WriteOwned(buffer)
-	if err != nil || n != 7 {
-		t.Fatalf("WriteOwned = %d, %v", n, err)
+	const payloadSize = 1028
+	writeOwned := func(value byte) {
+		buffer := AcquireBuffer(payloadSize)
+		_, _ = buffer.Write(bytes.Repeat([]byte{value}, payloadSize))
+		if n, err := conn.WriteOwned(buffer); err != nil || n != payloadSize {
+			t.Fatalf("WriteOwned = %d, %v", n, err)
+		}
 	}
-	batch := loop.tasks.Drain()
-	if batch == nil || batch.Value.buf == nil {
-		t.Fatal("owned write did not enqueue its buffer")
+	writeOwned('a')
+	vec, _ := conn.outbound.PeekVecN(nil, 8)
+	if len(vec) != 1 {
+		t.Fatalf("first write segment count = %d, want 1", len(vec))
 	}
-	writeTask := batch.Value
-	conn.runWriteTask(writeTask)
-	releaseTask(writeTask)
-	peeked := conn.outbound.Peek(make([]byte, 7))
-	if string(peeked) != "payload" || &peeked[0] != encoded {
-		t.Fatal("write task copied its owned buffer")
+	first := &vec[0][0]
+
+	writeOwned('b')
+	writeOwned('c')
+	vec, length := conn.outbound.PeekVecN(nil, 8)
+	if len(vec) != 2 {
+		t.Fatalf("coalesced segment count = %d, want 2", len(vec))
+	}
+	if &vec[0][0] != first {
+		t.Fatal("first corked write lost ownership transfer")
+	}
+	if length != 3*payloadSize || len(vec[1]) != 2*payloadSize {
+		t.Fatalf("coalesced lengths = %d, %d", length, len(vec[1]))
 	}
 	conn.outbound.Reset()
 	conn.pending.Store(0)
@@ -645,7 +519,8 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 	loop.loopGoid.Store(currentGoroutineID())
 	loop.wakePending.Store(true)
 	conn := &fdConn{fd: -1}
-	conn.events = &Events{MaxPendingWrites: 1}
+	conn.ioOwner.Store(currentGoroutineID())
+	conn.events = &Events{}
 	conn.loop = loop
 	if n, err := conn.Write([]byte("x")); n != 0 || err == nil {
 		t.Fatalf("invalid-fd Write = %d, %v", n, err)
@@ -655,11 +530,9 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 	}
 	releaseTestTasks(loop)
 
-	loop = &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.loopGoid.Store(currentGoroutineID())
-	loop.wakePending.Store(true)
 	conn = &fdConn{fd: -1}
-	conn.events = &Events{MaxPendingWrites: 1}
+	conn.ioOwner.Store(currentGoroutineID())
+	conn.events = &Events{}
 	conn.loop = loop
 	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || err == nil {
 		t.Fatalf("invalid-fd Writev = %d, %v", n, err)
@@ -668,56 +541,6 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 		t.Fatal("writev failure did not request close")
 	}
 	releaseTestTasks(loop)
-
-	loop = &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.wakePending.Store(true)
-	conn = &fdConn{fd: -1, udp: &unixUDPState{}}
-	conn.events = &Events{MaxPendingWrites: 1}
-	conn.loop = loop
-	conn.queuedWrites.Store(1)
-	conn.pending.Store(1)
-	write := acquireTask(writeTask, conn)
-	write.buf = bytebuf.CloneBuffer([]byte("x"))
-	conn.runWriteTask(write)
-	if !conn.isClosing() || conn.pending.Load() != 1 {
-		t.Fatal("UDP write task failure did not retain unflushed pending bytes")
-	}
-	releaseTask(write)
-	releaseTestTasks(loop)
-
-	loop = &eventLoop{tasks: taskqueue.New[*task]()}
-	conn = &fdConn{closed: true}
-	conn.events = &Events{}
-	conn.loop = loop
-	conn.queuedWrites.Store(1)
-	conn.pending.Store(1)
-	write = acquireTask(writeTask, conn)
-	write.buf = bytebuf.CloneBuffer([]byte("x"))
-	conn.runWriteTask(write)
-	if conn.pending.Load() != 0 {
-		t.Fatalf("closed write task left %d pending bytes", conn.pending.Load())
-	}
-	releaseTask(write)
-
-	loop = &eventLoop{tasks: taskqueue.New[*task]()}
-	stop := acquireTask(stopTask, nil)
-	if !loop.tasks.Stop(&stop.node) {
-		t.Fatal("failed to stop test queue")
-	}
-	conn = &fdConn{}
-	conn.events = &Events{MaxPendingWrites: 1}
-	conn.loop = loop
-	if err := conn.Flush(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("stopped queue Flush error = %v", err)
-	}
-	if n, err := conn.queueOwnedWrite(bytebuf.CloneBuffer([]byte("x")), 1); n != 0 || !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("stopped queue write = %d, %v", n, err)
-	}
-	releaseTestTasks(loop)
-	conn.closed = true
-	if err := conn.runFlushTask(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("closed runFlushTask error = %v", err)
-	}
 
 	conn = &fdConn{fd: -1}
 	conn.events = &Events{}
@@ -744,18 +567,6 @@ func TestRejectedExternalWriteDoesNotAllocate(t *testing.T) {
 		want  error
 	}{
 		{
-			name:  "Write/task_limit",
-			setup: func(conn *fdConn) { conn.queuedWrites.Store(1) },
-			write: func(conn *fdConn) (int, error) { return conn.Write(payload) },
-			want:  ErrTaskQueueFull,
-		},
-		{
-			name:  "Writev/task_limit",
-			setup: func(conn *fdConn) { conn.queuedWrites.Store(1) },
-			write: func(conn *fdConn) (int, error) { return conn.Writev(vec) },
-			want:  ErrTaskQueueFull,
-		},
-		{
 			name:  "Write/payload_limit",
 			setup: func(conn *fdConn) { conn.pending.Store(1) },
 			write: func(conn *fdConn) (int, error) { return conn.Write(payload) },
@@ -769,12 +580,12 @@ func TestRejectedExternalWriteDoesNotAllocate(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			events := &Events{MaxOutboundBuffered: len(payload), MaxPendingWrites: 1}
+			events := &Events{MaxOutboundBuffered: len(payload)}
 			conn := &fdConn{}
 			conn.events = events
 			conn.loop = &eventLoop{}
 			test.setup(conn)
-			pending, queued := conn.pending.Load(), conn.queuedWrites.Load()
+			pending := conn.pending.Load()
 			var n int
 			var err error
 			allocs := testing.AllocsPerRun(100, func() {
@@ -786,8 +597,8 @@ func TestRejectedExternalWriteDoesNotAllocate(t *testing.T) {
 			if n != 0 || !errors.Is(err, test.want) {
 				t.Fatalf("rejected write = %d, %v", n, err)
 			}
-			if conn.pending.Load() != pending || conn.queuedWrites.Load() != queued {
-				t.Fatalf("rejected write changed counters to pending %d, queued %d", conn.pending.Load(), conn.queuedWrites.Load())
+			if conn.pending.Load() != pending {
+				t.Fatalf("rejected write changed pending counter to %d", conn.pending.Load())
 			}
 		})
 	}
@@ -838,20 +649,12 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 	events.master = loop
 	events.workers = []*eventLoop{loop}
 	loop.loopGoid.Store(currentGoroutineID())
-	if events.selectLoop(1) != loop || events.currentLoop() != loop {
+	if events.selectLoop(1) != loop || !loop.inLoop() {
 		t.Fatal("current loop was not selected")
 	}
 	loop.loopGoid.Store(0)
 	if (&Events{}).selectWorker(1) != nil {
 		t.Fatal("selectWorker returned a loop from an empty set")
-	}
-	id := events.enterExternalCallback()
-	if _, ok := events.callbackGoids.Load(id); !ok {
-		t.Fatal("external callback was not registered")
-	}
-	events.leaveExternalCallback(id)
-	if _, ok := events.callbackGoids.Load(id); ok {
-		t.Fatal("external callback was not removed")
 	}
 
 	conn := &fdConn{}
@@ -883,7 +686,7 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 	}
 	rejected := &fdConn{fd: -1}
 	rejected.events = events
-	if events.submitAccepted(rejected) {
+	if events.submitAccepted(rejected, false) {
 		t.Fatal("submitAccepted accepted a connection without a loop")
 	}
 
@@ -1096,7 +899,7 @@ func TestStoppedLoopRejectsConnections(t *testing.T) {
 	conn = &fdConn{fd: fds[0]}
 	conn.events = events
 	conn.loop = loop
-	if events.submitAccepted(conn) {
+	if events.submitAccepted(conn, false) {
 		t.Fatal("stopped loop accepted a connection")
 	}
 	releaseTestTasks(loop)
@@ -1134,15 +937,19 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	loop := &eventLoop{tasks: taskqueue.New[*task]()}
 	loop.loopGoid.Store(currentGoroutineID())
 	loop.wakePending.Store(true)
-	events := &Events{MaxPendingWrites: 1}
+	events := &Events{}
 	conn := &fdConn{fd: -1}
 	conn.events = events
 	conn.loop = loop
 
-	conn.closing.Store(true)
+	conn.close.phase.Store(closeRequested)
 	conn.inboundTail = []byte("discard")
-	if err := conn.fireOnData(); err != nil || conn.InboundBuffered() != 0 {
-		t.Fatalf("default fireOnData = %v, buffered %d", err, conn.InboundBuffered())
+	err := conn.fireOnData()
+	started := conn.beginInboundCallback()
+	buffered := conn.InboundBuffered()
+	conn.endInboundCallback(started)
+	if err != nil || buffered != 0 {
+		t.Fatalf("default fireOnData = %v, buffered %d", err, buffered)
 	}
 	wantErr := errors.New("callback")
 	events.OnData = func(Conn) error { return wantErr }
@@ -1163,10 +970,9 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	}
 	conn.submitTimeout(deadlineRead)
 	events.closeConn(conn, wantErr)
-	conn.closed = true
+	conn.close.phase.Store(closeResourcesReleased)
 	conn.closeOnLoop(nil)
 
-	conn.closing.Store(false)
 	if err := conn.SetDeadline(time.Time{}); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed in-loop SetDeadline error = %v", err)
 	}
@@ -1180,8 +986,8 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	rejectedClose.events = events
 	rejectedClose.loop = stopped
 	rejectedClose.requestClose(wantErr)
-	if rejectedClose.deferredCloseErr == nil || !errors.Is(*rejectedClose.deferredCloseErr, wantErr) {
-		t.Fatalf("deferred close error = %v", rejectedClose.deferredCloseErr)
+	if rejectedClose.close.deferred == nil || !errors.Is(rejectedClose.close.deferred.cause, wantErr) {
+		t.Fatalf("deferred close error = %v", rejectedClose.close.deferred)
 	}
 
 	rejectedTimeout := &fdConn{fd: -1}

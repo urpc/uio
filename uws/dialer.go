@@ -28,9 +28,6 @@ type Dialer struct {
 	MaxFramePayload uint64
 	// MaxMessageSize bounds a complete message after decompression.
 	MaxMessageSize uint64
-	// MaxOutboundBytes bounds accepted but unsent wire bytes per connection.
-	// Zero uses DefaultMaxOutboundBytes; a negative value disables this limit.
-	MaxOutboundBytes int
 	// EnableCompression offers RFC 7692 permessage-deflate.
 	EnableCompression bool
 	// CompressionLevel selects the flate level. Zero uses default compression.
@@ -44,10 +41,6 @@ type Dialer struct {
 	// HandshakeTimeout bounds the HTTP upgrade handshake. A zero value uses
 	// DefaultHandshakeTimeout.
 	HandshakeTimeout time.Duration
-	// Executor dispatches OnOpen, OnMessage, and OnClose callbacks away from
-	// the I/O event loop. A nil executor preserves synchronous callbacks. If
-	// Submit rejects, remaining callbacks are dropped rather than run on the loop.
-	Executor Executor
 
 	startOnce       sync.Once
 	closeMu         sync.Mutex
@@ -58,7 +51,6 @@ type Dialer struct {
 	started         chan struct{}
 	startResult     error
 	startResultOnce sync.Once
-	dispatchBudget  pendingBudget
 	config          *connConfig
 }
 
@@ -140,8 +132,7 @@ func (d *Dialer) Dial(ctx context.Context, addr string, handler Handler) (*Conn,
 
 // Close permanently stops the dialer, cancels in-flight connection attempts,
 // and requests closure of established connections. Subsequent Dial calls
-// return the first close cause. OnClose reports connection completion unless
-// the configured Executor rejects dispatch.
+// return the first close cause. OnClose reports connection completion.
 func (d *Dialer) Close(err error) error {
 	d.closeMu.Lock()
 	if d.closed {
@@ -168,6 +159,8 @@ func (d *Dialer) Close(err error) error {
 	return events.Close(err)
 }
 
+// start initializes the shared dial-only Events exactly once. The first caller
+// waits until OnStart publishes success; later callers observe the same result.
 func (d *Dialer) start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
@@ -190,7 +183,6 @@ func (d *Dialer) start(ctx context.Context) error {
 		}
 		events := d.Events
 		configureWriteBuffer(events)
-		d.dispatchBudget.configure(defaultMaxPendingTotalMessages, defaultMaxPendingTotalBytes)
 		d.config = newDialerConnConfig(d)
 		oldOnStart := events.OnStart
 		events.OnStart = func(events *uio.Events) {
@@ -250,6 +242,8 @@ func (d *Dialer) closedCause() error {
 	return d.closeErr
 }
 
+// newAttemptContext combines the caller's deadline with the Dialer's lifecycle
+// cancellation. cleanup detaches both AfterFunc hooks exactly once.
 func (d *Dialer) newAttemptContext(parent context.Context) (context.Context, func(), error) {
 	if parent == nil {
 		parent = context.Background()
@@ -315,9 +309,6 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		config:  config,
 		handler: setup.handler,
 	}
-	if setup.handler != nil {
-		conn.dispatch = newDispatchState(config.executor, defaultMaxPendingMessages, defaultMaxPendingBytes, config.dispatchBudget)
-	}
 	conn.handshake.Store(&handshakeState{
 		clientKey: setup.key,
 		cleanup:   setup.cleanup,
@@ -331,7 +322,7 @@ func (d *Dialer) onData(raw uio.Conn) error {
 		return ErrClosed
 	}
 	err := conn.readAvailable()
-	if err != nil && conn.closing.Load() {
+	if protocolCloseOwnsTransport(err) {
 		return nil
 	}
 	return err
@@ -344,6 +335,8 @@ func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 	}
 }
 
+// onClose also handles failure before OnOpen has replaced dialSetup userdata
+// with *Conn. Both paths converge on exactly one handler notification.
 func (d *Dialer) onClose(raw uio.Conn, err error) {
 	conn, _ := raw.Userdata().(*Conn)
 	if conn == nil {
@@ -377,7 +370,7 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		if info.Err == nil {
 			info.Err = err
 		}
-		conn.dispatchClose(info)
+		conn.notifyClose(info)
 		return
 	}
 	if !conn.closed.CompareAndSwap(false, true) {
@@ -388,7 +381,7 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 	if info.Err == nil {
 		info.Err = err
 	}
-	conn.dispatchClose(info)
+	conn.notifyClose(info)
 }
 
 func (d *Dialer) maxFramePayload() uint64 {
@@ -419,6 +412,8 @@ func (d *Dialer) compressionLevel() int {
 	return d.CompressionLevel
 }
 
+// dialSetup bridges synchronous TCP setup and asynchronous WebSocket handshake
+// callbacks. attachOnce prevents Dial and OnOpen races from replacing raw.
 type dialSetup struct {
 	context.Context
 	cleanup    func()

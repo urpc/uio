@@ -17,7 +17,6 @@ type connConfig struct {
 	assembler frame.AssemblerConfig
 
 	maxHeaderBytes         int
-	maxOutboundBytes       int
 	writeBufferedThreshold int
 	closeTimeout           time.Duration
 	handshakeTimeout       time.Duration
@@ -29,14 +28,14 @@ type connConfig struct {
 	subprotocols []string
 	checkOrigin  func(*http.Request) bool
 	handler      Handler
-	executor     Executor
 
-	dispatchBudget       *pendingBudget
 	heartbeatConnections *sync.Map
 	heartbeatInterval    time.Duration
 	heartbeatTimeout     time.Duration
 }
 
+// newServerConnConfig resolves defaults and copies mutable slices so every
+// accepted connection observes one immutable startup snapshot.
 func newServerConnConfig(server *Server) *connConfig {
 	maxHeader := server.MaxHeaderBytes
 	if maxHeader <= 0 {
@@ -49,10 +48,6 @@ func newServerConnConfig(server *Server) *connConfig {
 	maxMessage := server.MaxMessageSize
 	if maxMessage == 0 {
 		maxMessage = DefaultMaxMessageSize
-	}
-	maxOutbound := server.MaxOutboundBytes
-	if maxOutbound == 0 {
-		maxOutbound = DefaultMaxOutboundBytes
 	}
 	closeTimeout := server.CloseTimeout
 	if closeTimeout <= 0 {
@@ -79,7 +74,6 @@ func newServerConnConfig(server *Server) *connConfig {
 			MaxMessage: maxMessage, MaxCompressedPayload: maxFrame, ValidateUTF8: !server.DisableUTF8Check,
 		},
 		maxHeaderBytes:             maxHeader,
-		maxOutboundBytes:           maxOutbound,
 		writeBufferedThreshold:     effectiveWriteBufferedThreshold(server.Events),
 		closeTimeout:               closeTimeout,
 		handshakeTimeout:           handshakeTimeout,
@@ -89,8 +83,6 @@ func newServerConnConfig(server *Server) *connConfig {
 		subprotocols:               append([]string(nil), server.Subprotocols...),
 		checkOrigin:                server.CheckOrigin,
 		handler:                    server.Handler,
-		executor:                   server.Executor,
-		dispatchBudget:             &server.dispatchBudget,
 		heartbeatInterval:          server.HeartbeatInterval,
 		heartbeatTimeout:           heartbeatTimeout,
 	}
@@ -100,6 +92,8 @@ func newServerConnConfig(server *Server) *connConfig {
 	return config
 }
 
+// newDialerConnConfig freezes the dialer's protocol and timeout policy for all
+// connections created during its single lifecycle.
 func newDialerConnConfig(dialer *Dialer) *connConfig {
 	maxHeader := dialer.MaxHeaderBytes
 	if maxHeader <= 0 {
@@ -107,10 +101,6 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 	}
 	maxFrame := dialer.maxFramePayload()
 	maxMessage := dialer.maxMessageSize()
-	maxOutbound := dialer.MaxOutboundBytes
-	if maxOutbound == 0 {
-		maxOutbound = DefaultMaxOutboundBytes
-	}
 	closeTimeout := dialer.CloseTimeout
 	if closeTimeout <= 0 {
 		closeTimeout = DefaultCloseTimeout
@@ -127,15 +117,12 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 			MaxMessage: maxMessage, MaxCompressedPayload: maxFrame, ValidateUTF8: !dialer.DisableUTF8Check,
 		},
 		maxHeaderBytes:         maxHeader,
-		maxOutboundBytes:       maxOutbound,
 		writeBufferedThreshold: effectiveWriteBufferedThreshold(dialer.Events),
 		closeTimeout:           closeTimeout,
 		handshakeTimeout:       handshakeTimeout,
 		compressionEnabled:     dialer.EnableCompression,
 		compressionLevel:       compressionLevel,
 		subprotocols:           append([]string(nil), dialer.Subprotocols...),
-		executor:               dialer.Executor,
-		dispatchBudget:         &dialer.dispatchBudget,
 	}
 }
 

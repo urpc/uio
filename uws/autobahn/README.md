@@ -75,5 +75,6 @@ Autobahn. Strict JSON tools such as `jq` may reject those five wirelogs; use
 the generated HTML or `index.json` for machine-readable result status.
 
 Autobahn is a protocol conformance suite, not a load or resource-exhaustion
-benchmark. UWS backpressure, slow-client, executor, and high-connection-count
-behavior is covered separately by unit and Linux performance tests.
+benchmark. UIO transport backpressure, UWS slow-client behavior,
+connection-task scheduling, and high-connection-count behavior are covered
+separately by unit and Linux performance tests.

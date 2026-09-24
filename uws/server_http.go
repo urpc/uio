@@ -22,6 +22,8 @@ const (
 	httpErrorEarlyData        = "unexpected data before WebSocket upgrade"
 )
 
+// httpUpgrade freezes the validated net/http request and negotiated response
+// until the adopted socket reaches its UIO OnOpen callback.
 type httpUpgrade struct {
 	request     handshake.Request
 	protocol    string
@@ -106,6 +108,9 @@ func prepareHTTPUpgrade(request handshake.Request, config *connConfig) (*httpUpg
 	}, nil
 }
 
+// openHTTPConnection completes an already validated hijacked upgrade after UIO
+// owns the descriptor. handshakeState remains published through notifyOpen so
+// Conn.Request is valid for that callback, then the whole state is released.
 func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 	raw := conn.raw
 	upgrade := state.upgrade
@@ -136,9 +141,7 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 	if conn.heartbeat != nil {
 		conn.config.heartbeatConnections.Store(conn, conn)
 	}
-	if err := conn.dispatchOpen(); err != nil {
-		_ = raw.CloseWith(err)
-	}
+	conn.notifyOpen()
 }
 
 func writeHTTPError(writer http.ResponseWriter, status int, message string) {

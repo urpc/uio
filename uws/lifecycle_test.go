@@ -3,9 +3,11 @@ package uws
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,11 +33,48 @@ type closeFromMessageHandler struct {
 
 type lifecycleEchoHandler struct{}
 
+type slowConnectionHandler struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+type blockingCloseConnectionHandler struct {
+	opens   atomic.Int32
+	started chan struct{}
+	release chan struct{}
+}
+
 type goroutineExecutor struct{}
 
-func (goroutineExecutor) Submit(task func()) bool {
-	go task()
+func (goroutineExecutor) Submit(task uio.IOTask) bool {
+	go task.RunTask()
 	return true
+}
+
+func (executor goroutineExecutor) SubmitBatch(tasks []uio.IOTask) int {
+	for _, task := range tasks {
+		executor.Submit(task)
+	}
+	return len(tasks)
+}
+
+type switchableExecutor struct{ reject atomic.Bool }
+
+func (executor *switchableExecutor) Submit(task uio.IOTask) bool {
+	if executor.reject.Load() {
+		return false
+	}
+	go task.RunTask()
+	return true
+}
+
+func (executor *switchableExecutor) SubmitBatch(tasks []uio.IOTask) int {
+	for index, task := range tasks {
+		if !executor.Submit(task) {
+			return index
+		}
+	}
+	return len(tasks)
 }
 
 func (lifecycleEchoHandler) OnOpen(*Conn) {}
@@ -44,9 +83,35 @@ func (lifecycleEchoHandler) OnMessage(conn *Conn, message Message) {
 }
 func (lifecycleEchoHandler) OnClose(*Conn, CloseEvent) {}
 
-func TestExecutorWritesFlushAutomatically(t *testing.T) {
+func (h *slowConnectionHandler) OnOpen(*Conn) {}
+func (h *slowConnectionHandler) OnMessage(conn *Conn, message Message) {
+	if string(message.Payload) == "slow" {
+		close(h.started)
+		<-h.release
+	}
+	_ = conn.SendBinary(message.Payload)
+}
+func (*slowConnectionHandler) OnClose(*Conn, CloseEvent) {}
+
+func (h *blockingCloseConnectionHandler) OnOpen(conn *Conn) {
+	if h.opens.Add(1) == 1 {
+		conn.SetUserdata("slow")
+	}
+}
+func (*blockingCloseConnectionHandler) OnMessage(conn *Conn, message Message) {
+	_ = conn.SendBinary(message.Payload)
+}
+func (h *blockingCloseConnectionHandler) OnClose(conn *Conn, _ CloseEvent) {
+	if conn.Userdata() != "slow" {
+		return
+	}
+	close(h.started)
+	<-h.release
+}
+
+func TestUIOExecutorWritesFlushAutomatically(t *testing.T) {
 	_, addr, _ := startConfiguredLifecycleTestServer(t, lifecycleEchoHandler{}, func(server *Server) {
-		server.Executor = goroutineExecutor{}
+		server.Events.Executor = goroutineExecutor{}
 	})
 	dialer := NewDialer()
 	handler := &clientHandler{
@@ -65,7 +130,7 @@ func TestExecutorWritesFlushAutomatically(t *testing.T) {
 		t.Fatal("client did not open")
 	}
 
-	payload := []byte("executor auto flush")
+	payload := []byte("uio executor auto flush")
 	if err = client.SendBinary(payload); err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +140,111 @@ func TestExecutorWritesFlushAutomatically(t *testing.T) {
 			t.Fatalf("echo = %d/%q, want %d/%q", message.Type, message.Payload, BinaryMessage, payload)
 		}
 	case <-time.After(lifecycleTestTimeout()):
-		t.Fatal("executor write was not flushed automatically")
+		t.Fatal("UIO executor write was not flushed automatically")
 	}
+}
+
+func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
+	handler := &slowConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
+	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
+	})
+	dialer := NewDialer()
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	newClient := func() (*Conn, *clientHandler) {
+		clientHandler := &clientHandler{
+			open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
+		}
+		client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-clientHandler.open:
+		case <-time.After(lifecycleTestTimeout()):
+			t.Fatal("client did not open")
+		}
+		return client, clientHandler
+	}
+	slow, slowClientHandler := newClient()
+	fast, fastClientHandler := newClient()
+	if err := slow.SendBinary([]byte("slow")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.started:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("slow callback did not start")
+	}
+	if err := fast.SendBinary([]byte("fast")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-fastClientHandler.message:
+		if string(message.Payload) != "fast" {
+			t.Fatalf("fast echo = %q", message.Payload)
+		}
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("slow connection blocked fast connection")
+	}
+	select {
+	case <-slowClientHandler.message:
+		t.Fatal("slow connection completed before release")
+	default:
+	}
+	close(handler.release)
+	select {
+	case message := <-slowClientHandler.message:
+		if string(message.Payload) != "slow" {
+			t.Fatalf("slow echo = %q", message.Payload)
+		}
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("slow connection did not resume")
+	}
+}
+
+func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
+	handler := &blockingCloseConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
+	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
+	})
+	dialer := NewDialer()
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	newClient := func() (*Conn, *clientHandler) {
+		clientHandler := &clientHandler{
+			open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
+		}
+		client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-clientHandler.open:
+		case <-time.After(lifecycleTestTimeout()):
+			t.Fatal("client did not open")
+		}
+		return client, clientHandler
+	}
+	slow, _ := newClient()
+	fast, fastHandler := newClient()
+	if err := slow.raw.CloseWith(io.EOF); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.started:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("slow OnClose did not start")
+	}
+	if err := fast.SendBinary([]byte("fast")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-fastHandler.message:
+		if string(message.Payload) != "fast" {
+			t.Fatalf("fast echo = %q", message.Payload)
+		}
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("blocking OnClose stopped the other connection")
+	}
+	close(handler.release)
 }
 
 func (h *closeFromMessageHandler) OnOpen(*Conn) { close(h.open) }
@@ -114,10 +282,10 @@ func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure
 	_ = probe.Close()
 
 	server := NewServer(handler)
+	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
 	if configure != nil {
 		configure(server)
 	}
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
 	started := make(chan struct{})
 	server.Events.OnStart = func(*uio.Events) { close(started) }
 	done := make(chan struct{})
@@ -148,7 +316,7 @@ func TestDialerCloseIsReentrantFromOnClose(t *testing.T) {
 		open:   make(chan struct{}),
 		closed: make(chan struct{}),
 	}
-	handler.closeFn = func() { _ = dialer.Close(nil) }
+	handler.setCloseFunc(func() { _ = dialer.Close(nil) })
 	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", handler); err != nil {
 		t.Fatal(err)
 	}
@@ -183,7 +351,7 @@ func TestServerCloseIsReentrantFromOnClose(t *testing.T) {
 		closed: make(chan struct{}),
 	}
 	server, addr, _ := startLifecycleTestServer(t, handler)
-	handler.closeFn = func() { _ = server.Close(nil) }
+	handler.setCloseFunc(func() { _ = server.Close(nil) })
 
 	clientHandler := &clientHandler{
 		open:    make(chan struct{}),
@@ -216,6 +384,43 @@ func TestServerCloseIsReentrantFromOnClose(t *testing.T) {
 	case <-handler.closed:
 	case <-time.After(lifecycleTestTimeout()):
 		t.Fatal("server OnClose was not called")
+	}
+}
+
+func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
+	executor := &switchableExecutor{}
+	handler := &reentrantCloseHandler{open: make(chan struct{}), closed: make(chan struct{})}
+	server, addr, serveDone := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
+		server.Events.Executor = executor
+	})
+	handler.setCloseFunc(func() { _ = server.Close(nil) })
+	dialer := NewDialer()
+	clientHandler := &clientHandler{
+		open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
+	}
+	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	select {
+	case <-handler.open:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("server connection did not open")
+	}
+	executor.reject.Store(true)
+	if err := client.raw.CloseWith(io.EOF); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-handler.closed:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("rejected final task deadlocked reentrant OnClose")
+	}
+	select {
+	case <-serveDone:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("reentrant OnClose did not stop server")
 	}
 }
 

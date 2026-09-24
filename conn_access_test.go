@@ -31,22 +31,40 @@ func TestInboundAccessPanicsOutsideCallback(t *testing.T) {
 	}
 }
 
-func TestInboundAccessAllowsOwnerAndExternalCallbacks(t *testing.T) {
+func TestInboundAccessAllowsCurrentConnectionCallback(t *testing.T) {
 	events := &Events{}
 	loop := &eventLoop{}
 	conn := &commonConn{events: events, loop: loop, inboundTail: []byte("x")}
 
-	loop.loopGoid.Store(currentGoroutineID())
+	started := conn.beginInboundCallback()
 	if conn.InboundBuffered() != 1 {
-		t.Fatal("owner loop could not access inbound data")
+		t.Fatal("current connection callback could not access inbound data")
 	}
-	loop.loopGoid.Store(0)
+	conn.endInboundCallback(started)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("inbound access after callback did not panic")
+		}
+	}()
+	conn.InboundBuffered()
+}
 
-	id := events.enterExternalCallback()
-	if conn.InboundBuffered() != 1 {
-		t.Fatal("registered external callback could not access inbound data")
+func TestInboundAccessIsConnectionScoped(t *testing.T) {
+	events := &Events{}
+	loop := &eventLoop{}
+	first := &commonConn{events: events, loop: loop, inboundTail: []byte("a")}
+	second := &commonConn{events: events, loop: loop, inboundTail: []byte("b")}
+	started := first.beginInboundCallback()
+	defer first.endInboundCallback(started)
+	if first.InboundBuffered() != 1 {
+		t.Fatal("own inbound access was rejected")
 	}
-	events.leaveExternalCallback(id)
+	defer func() {
+		if recover() == nil {
+			t.Fatal("cross-connection inbound access did not panic")
+		}
+	}()
+	second.InboundBuffered()
 }
 
 func TestUserdataMayBeSerializedOutsideCallback(t *testing.T) {
@@ -61,18 +79,18 @@ func BenchmarkInboundAccessAssertion(b *testing.B) {
 	events := &Events{}
 	loop := &eventLoop{}
 	conn := &commonConn{events: events, loop: loop}
-	b.Run("owner-loop", func(b *testing.B) {
-		loop.loopGoid.Store(currentGoroutineID())
+	b.Run("current-callback", func(b *testing.B) {
+		started := conn.beginInboundCallback()
 		for b.Loop() {
 			conn.InboundBuffered()
 		}
-		loop.loopGoid.Store(0)
+		conn.endInboundCallback(started)
 	})
-	b.Run("external-callback", func(b *testing.B) {
-		id := events.enterExternalCallback()
+	b.Run("current-callback-repeat", func(b *testing.B) {
+		started := conn.beginInboundCallback()
 		for b.Loop() {
 			conn.InboundBuffered()
 		}
-		events.leaveExternalCallback(id)
+		conn.endInboundCallback(started)
 	})
 }

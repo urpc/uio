@@ -1,3 +1,4 @@
+// Package extension parses and negotiates WebSocket extension headers.
 package extension
 
 import (
@@ -10,10 +11,13 @@ import (
 
 const perMessageDeflate = "permessage-deflate"
 
+// NegotiateServer selects permessage-deflate with no context takeover.
 func NegotiateServer(values []string, enabled bool) (compress.Params, string, error) {
 	return NegotiateServerWithPolicy(values, enabled, true)
 }
 
+// NegotiateServerWithPolicy validates the first supported offer and returns
+// both normalized parameters and the exact response extension value.
 func NegotiateServerWithPolicy(values []string, enabled, noContextTakeover bool) (compress.Params, string, error) {
 	if !enabled {
 		return compress.Params{}, "", nil
@@ -58,6 +62,8 @@ func NegotiateServerWithPolicy(values []string, enabled, noContextTakeover bool)
 	return compress.Params{}, "", nil
 }
 
+// NegotiateClient validates that the server response contains at most one
+// supported extension and no permessage-deflate response unless requested.
 func NegotiateClient(values []string, requested bool) (compress.Params, error) {
 	if !requested {
 		if len(values) != 0 {
@@ -94,6 +100,8 @@ func NegotiateClient(values []string, requested bool) (compress.Params, error) {
 	return negotiated, nil
 }
 
+// parseParams rejects duplicates and normalizes RFC 7692 window-bit syntax;
+// zero ClientMaxWindowBits represents the offer's permitted valueless form.
 func parseParams(parts []string) (compress.Params, error) {
 	params := compress.Params{Level: -1}
 	seen := make(map[string]bool, len(parts))

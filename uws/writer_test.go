@@ -15,39 +15,32 @@ import (
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
-func TestConnectionOutboundBudgetRecoversAfterRelease(t *testing.T) {
-	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 100}
+func TestTransportBackpressureMapsToUWSError(t *testing.T) {
+	raw := newScriptedConn()
+	raw.writeErr = uio.ErrOutboundOverflow
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
 	payload := bytes.Repeat([]byte("x"), 50)
+	if err := conn.SendBinary(payload); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("SendBinary() error = %v, want %v", err, ErrBackpressure)
+	}
+	if pending := conn.writes.close.pendingBytes.Load(); pending != 0 {
+		t.Fatalf("pending bytes = %d, want 0", pending)
+	}
+	raw.writeErr = nil
 	if err := conn.SendBinary(payload); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.SendBinary(payload); err != ErrBackpressure {
-		t.Fatalf("second SendBinary() error = %v, want %v", err, ErrBackpressure)
-	}
-	conn.releaseOutbound(len(payload) + 2)
-	if err := conn.SendBinary(payload); err != nil {
-		t.Fatalf("SendBinary() after release = %v", err)
-	}
-	if raw.writes != 2 {
-		t.Fatalf("writes = %d, want 2", raw.writes)
-	}
-	wantWritevs := 0
-	if raw.writevs != wantWritevs {
-		t.Fatalf("vectored writes = %d, want %d", raw.writevs, wantWritevs)
+		t.Fatalf("SendBinary() after recovery = %v", err)
 	}
 }
 
 func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
 	raw := &writeProbeConn{}
 	server := &Server{
-		Events:           &uio.Events{WriteBufferedThreshold: 64},
-		MaxFramePayload:  1024,
-		MaxMessageSize:   1024,
-		MaxOutboundBytes: 1 << 20,
+		Events:          &uio.Events{WriteBufferedThreshold: 64},
+		MaxFramePayload: 1024,
+		MaxMessageSize:  1024,
 	}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -69,10 +62,9 @@ func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
 	disabled := &Conn{
 		raw: disabledRaw,
 		config: testServerConfig(&Server{
-			Events:           &uio.Events{WriteBufferedThreshold: -1},
-			MaxFramePayload:  1024,
-			MaxMessageSize:   1024,
-			MaxOutboundBytes: 1 << 20,
+			Events:          &uio.Events{WriteBufferedThreshold: -1},
+			MaxFramePayload: 1024,
+			MaxMessageSize:  1024,
 		}),
 	}
 	disabled.opened.Store(true)
@@ -81,14 +73,6 @@ func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
 	}
 	if disabledRaw.writes != 1 || disabledRaw.writevs != 1 {
 		t.Fatalf("disabled coalescing transport calls = Write:%d Writev:%d, want 1/1", disabledRaw.writes, disabledRaw.writevs)
-	}
-}
-
-func TestDefaultOutboundBudgetCoversMaximumFrame(t *testing.T) {
-	server := NewServer(nil)
-	conn := &Conn{config: testServerConfig(server)}
-	if got := conn.maxOutboundBytes(); got < DefaultMaxFramePayload+14 {
-		t.Fatalf("default outbound budget = %d, want at least %d", got, DefaultMaxFramePayload+14)
 	}
 }
 
@@ -113,9 +97,8 @@ func TestFrameWireSizesAndServerWrites(t *testing.T) {
 	conn := &Conn{
 		raw: &writeProbeConn{},
 		config: testServerConfig(&Server{
-			MaxFramePayload:  DefaultMaxFramePayload,
-			MaxMessageSize:   DefaultMaxMessageSize,
-			MaxOutboundBytes: DefaultMaxOutboundBytes,
+			MaxFramePayload: DefaultMaxFramePayload,
+			MaxMessageSize:  DefaultMaxMessageSize,
 		}),
 	}
 	conn.opened.Store(true)
@@ -127,35 +110,9 @@ func TestFrameWireSizesAndServerWrites(t *testing.T) {
 	}
 }
 
-func TestBackpressureRejectsBeforeFrameWork(t *testing.T) {
-	conn, raw := newBackpressuredConn()
-	payload := make([]byte, DefaultMaxFramePayload)
-	if err := conn.SendBinary(payload); !errors.Is(err, ErrBackpressure) {
-		t.Fatalf("SendBinary error = %v, want %v", err, ErrBackpressure)
-	}
-	if raw.writes != 0 {
-		t.Fatalf("backpressured send writes = %d, want 0", raw.writes)
-	}
-}
-
-func newBackpressuredConn() (*Conn, *writeProbeConn) {
-	raw := &writeProbeConn{}
-	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload:  DefaultMaxFramePayload,
-			MaxMessageSize:   DefaultMaxMessageSize,
-			MaxOutboundBytes: 1,
-		}),
-	}
-	conn.opened.Store(true)
-	conn.pendingBytes.Store(1)
-	return conn, raw
-}
-
 func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 4, MaxOutboundBytes: 1 << 20}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 4}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
@@ -170,9 +127,82 @@ func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 	}
 }
 
+func TestStreamingWriterMakesOtherSendsFailFast(t *testing.T) {
+	conn := testServerConn(newScriptedConn())
+	writer, err := conn.BeginMessage(BinaryMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checks := []struct {
+		name string
+		call func() error
+	}{
+		{name: "send", call: func() error { return conn.SendBinary([]byte("x")) }},
+		{name: "ping", call: func() error { return conn.Ping(nil) }},
+		{name: "close", call: func() error { return conn.Close(1000, "") }},
+		{name: "writer", call: func() error {
+			_, err := conn.BeginMessage(BinaryMessage)
+			return err
+		}},
+	}
+	for _, check := range checks {
+		t.Run(check.name, func(t *testing.T) {
+			started := time.Now()
+			if err := check.call(); !errors.Is(err, ErrWriteBusy) {
+				t.Fatalf("error = %v, want %v", err, ErrWriteBusy)
+			}
+			if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+				t.Fatalf("operation blocked for %v", elapsed)
+			}
+		})
+	}
+	_ = writer.fail(ErrClosed)
+}
+
+func TestStreamingWriterAllowsInboundPing(t *testing.T) {
+	raw := newScriptedConn()
+	conn := testServerConn(raw)
+	writer, err := conn.BeginMessage(BinaryMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte("ping")}); err != nil {
+		t.Fatal(err)
+	}
+	if conn.closing.Load() {
+		t.Fatal("ping closed connection while streaming writer was active")
+	}
+	if len(raw.written) != 1 || raw.written[0][0]&0x0f != byte(frame.Pong) {
+		t.Fatalf("written frames = %x, want pong", raw.written)
+	}
+	_ = writer.fail(ErrClosed)
+}
+
+func TestStreamingWriterHandsInboundCloseToWriterRelease(t *testing.T) {
+	raw := newScriptedConn()
+	conn := testServerConn(raw)
+	writer, err := conn.BeginMessage(BinaryMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := []byte{0x03, 0xe8}
+	if err = conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload}); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.written) != 0 {
+		t.Fatalf("close frame bypassed active writer: %x", raw.written)
+	}
+	if err = writer.Close(); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Writer.Close error = %v, want %v", err, ErrClosed)
+	}
+	if len(raw.written) != 1 || raw.written[0][0]&0x0f != byte(frame.Close) {
+		t.Fatalf("written frames = %x, want close", raw.written)
+	}
+}
+
 func TestUncompressedWriterValidatesText(t *testing.T) {
 	raw := &writeProbeConn{closed: make(chan struct{})}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
@@ -195,13 +225,12 @@ func TestUncompressedWriterValidatesText(t *testing.T) {
 }
 
 func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
-	raw := newScriptedConn()
+	raw := &failNthWriteConn{scriptedConn: newScriptedConn(), failAt: 2, err: uio.ErrOutboundOverflow}
 	conn := &Conn{
 		raw: raw,
 		config: testServerConfig(&Server{
-			MaxFramePayload:  4,
-			MaxMessageSize:   1024,
-			MaxOutboundBytes: 8,
+			MaxFramePayload: 4,
+			MaxMessageSize:  1024,
 		}),
 	}
 	conn.opened.Store(true)
@@ -215,8 +244,8 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 	if closeErr := writer.Close(); !errors.Is(closeErr, ErrBackpressure) {
 		t.Fatalf("Writer.Close error = %v, want ErrBackpressure", closeErr)
 	}
-	if len(raw.written) != 1 {
-		t.Fatalf("transport writes = %d, want only the first non-FIN fragment", len(raw.written))
+	if len(raw.written) != 2 {
+		t.Fatalf("transport writes = %d, want one successful and one rejected fragment", len(raw.written))
 	}
 	if raw.written[0][0]&0x80 != 0 {
 		t.Fatalf("first fragment unexpectedly has FIN set: %#x", raw.written[0][0])
@@ -226,7 +255,7 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 	}
 	lockAvailable := make(chan struct{})
 	go func() {
-		conn.lockWrite()
+		conn.writes.mu.Lock()
 		conn.unlockWrite()
 		close(lockAvailable)
 	}()
@@ -243,9 +272,8 @@ func TestCompressedWriterFailureDoesNotEmitMoreFrames(t *testing.T) {
 	conn := &Conn{
 		raw: raw,
 		config: testServerConfig(&Server{
-			MaxFramePayload:  4,
-			MaxMessageSize:   1024,
-			MaxOutboundBytes: 1 << 20,
+			MaxFramePayload: 4,
+			MaxMessageSize:  1024,
 		}),
 		compression: &compressionState{encoder: compress.NewEncoder(-1, true)},
 	}
@@ -345,7 +373,6 @@ func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 	server := &Server{
 		MaxFramePayload:  1024,
 		MaxMessageSize:   1024,
-		MaxOutboundBytes: 1 << 20,
 		DisableUTF8Check: true,
 	}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
@@ -370,7 +397,7 @@ func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 
 func TestCompressedWriterAbortsIncompleteText(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, MaxOutboundBytes: 1 << 20}
+	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
 	conn := &Conn{
 		raw:    raw,
 		config: testServerConfig(server),

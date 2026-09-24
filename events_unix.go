@@ -79,10 +79,10 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 			events:     ev,
 			localAddr:  localAddr,
 			remoteAddr: remoteAddr,
-			userdata:   userdata,
 		},
 		fd: fd,
 	}
+	fdc.SetUserdata(userdata)
 	fdc.loop = ev.selectLoop(fd)
 	if err = ev.addConn(fdc); err != nil {
 		return nil, err
@@ -90,13 +90,13 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 	return fdc, nil
 }
 
-// DialContext connects from outside event callbacks and allows cancellation
-// while resolving or establishing the network connection.
+// DialContext connects synchronously from any goroutine except an event loop
+// and allows cancellation while resolving or establishing the connection.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}
-	if ev.currentLoop() != nil {
+	if isEventLoopGoroutine() {
 		return nil, ErrDialOnEventLoop
 	}
 
@@ -139,7 +139,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 
 	fdc := &fdConn{}
 	fdc.fd = nfd
-	fdc.userdata = userdata
+	fdc.SetUserdata(userdata)
 	fdc.localAddr = lAddr
 	fdc.remoteAddr = rAddr
 	fdc.events = ev

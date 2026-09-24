@@ -1,3 +1,4 @@
+// Package handshake parses, validates, and builds RFC 6455 HTTP upgrades.
 package handshake
 
 import (
@@ -23,12 +24,15 @@ var (
 	ErrNotUpgrade = errors.New("websocket: not an upgrade request")
 )
 
+// ServerOptions controls request size and application origin policy.
 type ServerOptions struct {
 	MaxHeaderBytes int
 	CheckOrigin    func(*http.Request) bool
 	Subprotocols   []string
 }
 
+// Request is the validated subset of an HTTP upgrade needed to build the
+// response and negotiate WebSocket features.
 type Request struct {
 	HTTP         *http.Request
 	Key          string
@@ -36,6 +40,9 @@ type Request struct {
 	Extensions   []string
 }
 
+// ParseServerRequest parses one complete HTTP/1.1 header from data. It returns
+// io.ErrUnexpectedEOF while the bounded header is incomplete and reports the
+// consumed byte count so callers can preserve early WebSocket frames.
 func ParseServerRequest(data []byte, options ServerOptions) (Request, int, error) {
 	maxBytes := options.MaxHeaderBytes
 	if maxBytes <= 0 {
@@ -102,6 +109,7 @@ func ValidateServerRequest(req *http.Request, options ServerOptions) (Request, e
 	}, nil
 }
 
+// BuildServerResponse allocates and returns an RFC 6455 upgrade response.
 func BuildServerResponse(req Request, selectedSubprotocol string, extensions string) []byte {
 	return AppendServerResponse(make([]byte, 0, ServerResponseSize(selectedSubprotocol, extensions)), req, selectedSubprotocol, extensions)
 }
@@ -148,6 +156,8 @@ func AppendServerResponse(dst []byte, req Request, selectedSubprotocol, extensio
 	return append(dst, "\r\n"...)
 }
 
+// SelectSubprotocol returns the first valid supported protocol also offered by
+// the peer, preserving server preference order.
 func SelectSubprotocol(offered, supported []string) string {
 	for _, want := range supported {
 		if !validToken(want) {
@@ -162,6 +172,7 @@ func SelectSubprotocol(offered, supported []string) string {
 	return ""
 }
 
+// BuildClientRequest validates inputs and builds one HTTP/1.1 upgrade request.
 func BuildClientRequest(target *url.URL, key string, protocols []string, extensions string) ([]byte, error) {
 	if target == nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return nil, ErrBadRequest

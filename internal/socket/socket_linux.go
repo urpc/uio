@@ -19,8 +19,6 @@ package socket
 import (
 	"os"
 	"syscall"
-
-	"golang.org/x/sys/unix"
 )
 
 // SetKeepAlivePeriod sets period between keep-alives.
@@ -35,16 +33,4 @@ func SetKeepAlivePeriod(fd int, secs int) error {
 		return os.NewSyscallError("setsockopt", err)
 	}
 	return nil
-}
-
-// Writev calls writev() on Linux.
-func Writev(fd int, iov [][]byte) (int, error) {
-	switch len(iov) {
-	case 0:
-		return 0, nil
-	case 1:
-		return syscall.Write(fd, iov[0])
-	default:
-		return unix.Writev(fd, iov)
-	}
 }
