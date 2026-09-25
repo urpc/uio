@@ -204,51 +204,52 @@ func main() {
 
 ```
 
-## tcpkali2 Benchmark (2026-09-20)
+## tcpkali2 Benchmark (2026-09-25)
 
 The following results use [tcpkali2 0.4.0](https://github.com/limpo1989/tcpkali2)
 on a dual-socket Xeon E5-2690 v3 host with 48 logical CPUs. Server and client
 CPU resources were isolated with `taskset`: the server used all 24 logical
 CPUs in NUMA node 0 (`0-11,24-35`) and tcpkali2 used all 24 logical CPUs in
 NUMA node 1 (`12-23,36-47`). Both events and stdio ran with `GOMAXPROCS=24`;
-events additionally used 24 pollers, while tcpkali2 used `-w 24`.
+events additionally used 24 pollers, while tcpkali2 used `-w 24`. On Linux,
+events collects stream readiness on its shared data poller, so the pollers
+handle accept, registration and close rather than stream readiness.
 
 The load used 1,000 loopback connections, a 3-second warmup, a 10-second
 measurement window, 1 KiB random messages, `--pipeline`, and the default
 TCP_NODELAY setting. Each table row is the run with the median request rate
-from three runs. Every run completed with a 100% success rate and zero
-connection errors. The UWS server had compression disabled. P99 is saturated
-pipeline latency, not idle single-request latency. UIO revision `cfee206` was
-built with Go 1.27.1 on Ubuntu 22.04.5 with Linux 6.8.0.
-
-These numbers are not directly comparable with the previous tcpkali2 0.3.0
-table. tcpkali2 v0.4.0 uses larger pipeline batches and batched statistics,
-and the previous table did not isolate equal server/client CPU budgets.
+from three runs, and the runs of all eight configurations were interleaved.
+Every run completed with a 100% success rate and zero connection errors. The
+UWS server had compression disabled. P99 is saturated pipeline latency, not
+idle single-request latency. UIO revision `b23241d` (taskgo v1.5.0) was built
+with Go 1.27.1 on Ubuntu 22.04.5 with Linux 6.8.0.
 
 Plain TCP was run with:
 
 ```bash
-GOMAXPROCS=24 taskset -c 0-11,24-35 ./server
+GOMAXPROCS=24 taskset -c 0-11,24-35 ./echo -pollers 24 -buffer 4096
 
 taskset -c 12-23,36-47 tcpkali2 -w 24 -c 1000 \
   --connect-rate 2000 -T 10s --warmup 3s -s 1024 \
   --pipeline 127.0.0.1:9527
 ```
 
-The events server sets `Pollers` to 24. Both backends were tested with the
-default 4 KiB `MaxBufferSize` and a custom 16 KiB value. The UWS run adds
-`--websocket` and targets port `19701`.
+`./echo` is built from `examples/bench/echo`, with `-tags stdio` for the stdio
+backend. Both backends were tested with the default 4 KiB `MaxBufferSize` and
+a custom 16 KiB value (`-buffer 16384`). The UWS server runs the
+`uws/examples/echo` handler with the same `Pollers` and `MaxBufferSize`
+settings; the UWS run adds `--websocket` and targets port `19701`.
 
 | Service | Backend | MaxBufferSize | Server CPUs | Requests/s | Avg latency | P99 latency | Bandwidth | Peak RSS |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| UIO TCP echo | events | 4 KiB | 24 | 5,555,553 | 5.74 ms | 14.05 ms | 11,378 MB/s | 7.5 MiB |
-| UIO TCP echo | events | 16 KiB | 24 | 9,946,995 | 2.38 ms | 7.04 ms | 20,371 MB/s | 8.0 MiB |
-| UIO TCP echo | stdio | 4 KiB | 24 | 8,938,151 | 3.53 ms | 10.66 ms | 18,305 MB/s | 56.2 MiB |
-| UIO TCP echo | stdio | 16 KiB | 24 | 9,652,034 | 3.24 ms | 9.68 ms | 19,767 MB/s | 84.5 MiB |
-| UWS echo | events | 4 KiB | 24 | 5,520,194 | 4.16 ms | 13.67 ms | 11,305 MB/s | 32.4 MiB |
-| UWS echo | events | 16 KiB | 24 | 5,486,905 | 4.18 ms | 14.01 ms | 11,237 MB/s | 32.3 MiB |
-| UWS echo | stdio | 4 KiB | 24 | 5,377,469 | 4.33 ms | 14.24 ms | 11,013 MB/s | 81.0 MiB |
-| UWS echo | stdio | 16 KiB | 24 | 5,388,815 | 4.27 ms | 14.34 ms | 11,036 MB/s | 105.6 MiB |
+| UIO TCP echo | events | 4 KiB | 24 | 8,902,695 | 3.53 ms | 4.92 ms | 18,233 MB/s | 12.5 MiB |
+| UIO TCP echo | events | 16 KiB | 24 | 9,816,081 | 2.94 ms | 5.71 ms | 20,103 MB/s | 12.5 MiB |
+| UIO TCP echo | stdio | 4 KiB | 24 | 8,981,015 | 3.51 ms | 10.58 ms | 18,393 MB/s | 56.6 MiB |
+| UIO TCP echo | stdio | 16 KiB | 24 | 9,686,031 | 3.20 ms | 9.56 ms | 19,837 MB/s | 83.4 MiB |
+| UWS echo | events | 4 KiB | 24 | 5,471,521 | 4.17 ms | 14.38 ms | 11,206 MB/s | 31.7 MiB |
+| UWS echo | events | 16 KiB | 24 | 5,435,586 | 4.21 ms | 14.46 ms | 11,132 MB/s | 32.0 MiB |
+| UWS echo | stdio | 4 KiB | 24 | 5,369,671 | 4.33 ms | 14.44 ms | 10,997 MB/s | 76.4 MiB |
+| UWS echo | stdio | 16 KiB | 24 | 5,364,657 | 4.28 ms | 14.26 ms | 10,987 MB/s | 108.8 MiB |
 
 Bandwidth is aggregate application traffic in both directions. Peak RSS was
 sampled every 100 ms during the selected median-throughput run. stdio's
@@ -257,15 +258,17 @@ higher memory use and scale with the number of live connections.
 
 ### Selection guidance
 
-- `MaxBufferSize` materially affects plain TCP batching. Raising events from
-  4 KiB to 16 KiB improved TCP echo throughput by about 79%, while stdio
-  improved by about 8%. With both tuned to 16 KiB, events was about 3% faster,
-  had lower latency, and used roughly one tenth of stdio's RSS.
-- For UWS, events is about 2.7% faster than stdio in this test, with slightly
-  lower latency and roughly 60% lower RSS at 4 KiB. Raising `MaxBufferSize` to
-  16 KiB did not materially improve either backend for the 1 KiB WebSocket
-  workload, and increased stdio RSS by about 30%, so 4 KiB remains the better
-  choice for this profile.
+- `MaxBufferSize` still helps plain TCP batching. Raising it from 4 KiB to
+  16 KiB improved TCP echo throughput by about 10% for events and about 8% for
+  stdio. At 4 KiB the two backends are within 1% of each other, and events has
+  less than half of stdio's P99 latency. With both tuned to 16 KiB, events was
+  about 1% faster, had lower average and P99 latency, and used about one
+  seventh of stdio's RSS.
+- For UWS, events is about 2% faster than stdio in this test, with slightly
+  lower average latency, about the same P99, and roughly 60% lower RSS at
+  4 KiB. Raising `MaxBufferSize` to 16 KiB did not materially improve either
+  backend for the 1 KiB WebSocket workload, and increased stdio RSS by about
+  40%, so 4 KiB remains the better choice for this profile.
 - Tune `MaxBufferSize` against the application protocol and payload. Larger
   reads reduce syscall and callback overhead for streaming TCP, but they are
   not a universal throughput improvement.
