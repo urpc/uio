@@ -104,9 +104,10 @@ event loop because peers share the socket. An external UDP `Write` or
 event loop returns `ErrUDPWriteOnEventLoop` to avoid a wait cycle. The
 `stdio`/Windows backend instead uses dedicated blocking read/write goroutines
 per connection; `Executor` does not apply there. Without an external executor,
-native UIO uses taskgo with a resident target of roughly `2 * runtime.GOMAXPROCS(0)`
-workers, a `512 * runtime.GOMAXPROCS(0)` concurrency ceiling for queued slow
-callbacks, and a 30-second idle retention window.
+native UIO uses taskgo, which keeps about one running worker per P
+(`runtime.GOMAXPROCS(0)`) while callbacks use the CPU and adds workers, up to a
+`512 * runtime.GOMAXPROCS(0)` ceiling, while callbacks block; idle workers are
+retained for 30 seconds so their grown stacks are reused.
 
 `Events.Dial` and `Events.DialContext` perform synchronous resolution and
 connection setup. Calls from an event-loop goroutine return
