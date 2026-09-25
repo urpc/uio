@@ -473,6 +473,13 @@ func (conn *fdConn) Flush() error {
 // submitMu, which prevents external producers from modifying the vector list.
 // EAGAIN leaves the queue intact and sets writeBlocked until a writable edge.
 func (conn *fdConn) flushOnLoop() (int, error) {
+	// pending is incremented before a producer publishes its buffer and
+	// decremented only after the corresponding bytes leave outbound. A zero
+	// value therefore proves that there is no stream payload to flush, while
+	// avoiding the submitMu round trip on the common empty path.
+	if !conn.isDatagram() && conn.pending.Load() == 0 {
+		return 0, nil
+	}
 	conn.submitMu.Lock()
 	if conn.isDatagram() || conn.outbound.Empty() {
 		conn.submitMu.Unlock()
@@ -519,10 +526,11 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 }
 
 func (conn *fdConn) outboundEmpty() bool {
-	conn.submitMu.Lock()
-	empty := conn.outbound.Empty()
-	conn.submitMu.Unlock()
-	return empty
+	// Queue admission reserves pending bytes before appending the owned buffer;
+	// flush retires the bytes only after removing them. This makes pending a
+	// conservative, lock-free empty check for stream connections. Callers still
+	// take submitMu before inspecting or mutating the segment list itself.
+	return conn.pending.Load() == 0
 }
 
 func (conn *fdConn) updateInterest() error {

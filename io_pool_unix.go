@@ -7,6 +7,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/limpo1989/taskgo"
@@ -14,15 +15,16 @@ import (
 
 const ioRejectWorkers = 4
 
-// ioTaskPool wraps the default typed taskgo queue or a caller-supplied Executor.
+// ioTaskPool wraps the default taskgo scheduler or a caller-supplied Executor.
 // It owns UIO shutdown/rejection accounting, but input and output bytes always
 // remain owned by their connection rather than the scheduler queue.
 type ioTaskPool struct {
 	executor Executor
-	owned    *taskgo.Task[IOTask]
+	owned    *taskgo.Task[*fdConn]
 	rejected *taskgo.Task[IOTask]
 	mu       sync.Mutex
-	stopped  bool
+	stopped  atomic.Bool
+	track    bool // external executors need a join counter; owned taskgo drains itself
 	tasks    sync.WaitGroup
 	stopOnce sync.Once
 }
@@ -30,18 +32,16 @@ type ioTaskPool struct {
 func newIOTaskPool(executor Executor) *ioTaskPool {
 	pool := &ioTaskPool{executor: executor}
 	if pool.executor == nil {
-		workers := runtime.NumCPU() * 512
-		// taskgo starts near 2*GOMAXPROCS workers and can grow toward this
-		// hard ceiling when callbacks block. Retain grown stacks across bursts.
-		pool.owned = taskgo.NewTask(
-			func(task IOTask) {
-				defer pool.tasks.Done()
-				task.(*fdConn).runIOTask()
-			},
-			taskgo.WithConcurrency(workers),
+		// taskgo keeps a small resident worker set for short callbacks and
+		// expands only when slow callbacks leave queued connections behind.
+		// The high ceiling protects unrelated connections without imposing a
+		// fixed goroutine cost on the normal echo path.
+		pool.owned = taskgo.NewTask(func(conn *fdConn) { pool.run(conn) },
+			taskgo.WithConcurrency(512*runtime.GOMAXPROCS(0)),
 			taskgo.WithMaxIdle(30*time.Second),
 		)
-		pool.executor = pool.owned
+	} else {
+		pool.track = true
 	}
 	return pool
 }
@@ -51,6 +51,15 @@ func newIOTaskPool(executor Executor) *ioTaskPool {
 func (pool *ioTaskPool) submit(conn *fdConn) bool {
 	if pool == nil || conn == nil {
 		return false
+	}
+	if pool.owned != nil {
+		if pool.stopped.Load() {
+			return false
+		}
+		if !pool.owned.Submit(conn) {
+			pool.rejectBatch([]IOTask{conn})
+		}
+		return true
 	}
 	if !pool.start(1) {
 		return false
@@ -67,6 +76,17 @@ func (pool *ioTaskPool) submitBatch(tasks []IOTask) bool {
 	if pool == nil || len(tasks) == 0 {
 		return pool != nil
 	}
+	if pool.owned != nil {
+		if pool.stopped.Load() {
+			return false
+		}
+		for _, task := range tasks {
+			if !pool.owned.Submit(task.(*fdConn)) {
+				pool.rejectBatch([]IOTask{task})
+			}
+		}
+		return true
+	}
 	if !pool.start(len(tasks)) {
 		return false
 	}
@@ -76,10 +96,41 @@ func (pool *ioTaskPool) submitBatch(tasks []IOTask) bool {
 	return true
 }
 
+// submitConnBatch is the allocation-free readiness path for the owned typed
+// queue. External executors still receive the public IOTask slice through the
+// loop-owned scratch buffer.
+func (pool *ioTaskPool) submitConnBatch(conns []*fdConn, args []IOTask) bool {
+	if pool == nil || len(conns) == 0 {
+		return pool != nil
+	}
+	if pool.owned != nil {
+		if pool.stopped.Load() {
+			return false
+		}
+		accepted := pool.owned.SubmitBatch(conns)
+		if accepted != len(conns) {
+			pool.rejectBatch(connTasks(conns[accepted:]))
+		}
+		return true
+	}
+	if cap(args) < len(conns) {
+		args = make([]IOTask, len(conns))
+	} else {
+		args = args[:len(conns)]
+	}
+	for index, conn := range conns {
+		args[index] = conn
+	}
+	return pool.submitBatch(args)
+}
+
 func (pool *ioTaskPool) start(count int) bool {
+	if !pool.track {
+		return !pool.stopped.Load()
+	}
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
-	if pool.stopped {
+	if pool.stopped.Load() {
 		return false
 	}
 	pool.tasks.Add(count)
@@ -89,12 +140,38 @@ func (pool *ioTaskPool) start(count int) bool {
 // run executes one task accepted by an injected executor and releases its
 // shutdown accounting reference.
 func (pool *ioTaskPool) run(conn *fdConn) {
-	defer pool.tasks.Done()
+	if pool.track {
+		defer pool.tasks.Done()
+	}
 	conn.runIOTask()
 }
 
 func (pool *ioTaskPool) rejectBatch(tasks []IOTask) {
 	if len(tasks) == 0 {
+		return
+	}
+	if !pool.track {
+		// The owned queue drains accepted work during Stop. A false admission
+		// result can therefore only be a stop race. Before the private failure
+		// queue is stopped, keep rejected callbacks off the poller; after the
+		// owned queue has begun stopping, finish the close handoff directly.
+		if pool.stopped.Load() {
+			for _, task := range tasks {
+				task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
+			}
+			return
+		}
+		pool.mu.Lock()
+		if pool.rejected == nil {
+			pool.rejected = taskgo.NewTask(func(task IOTask) {
+				task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
+			}, taskgo.WithConcurrency(ioRejectWorkers))
+		}
+		queue := pool.rejected
+		pool.mu.Unlock()
+		if accepted := queue.SubmitBatch(tasks); accepted != len(tasks) {
+			panic("uio: owned I/O failure queue stopped before rejected tasks completed")
+		}
 		return
 	}
 	pool.mu.Lock()
@@ -115,17 +192,27 @@ func (pool *ioTaskPool) rejectBatch(tasks []IOTask) {
 	}
 }
 
+func connTasks(conns []*fdConn) []IOTask {
+	tasks := make([]IOTask, len(conns))
+	for index, conn := range conns {
+		tasks[index] = conn
+	}
+	return tasks
+}
+
 // stop rejects future work and waits for every accepted task. UIO stops only
-// the default taskgo queue; an injected executor's lifecycle belongs to caller.
+// its own scheduler; an injected executor's lifecycle belongs to caller.
 func (pool *ioTaskPool) stop() {
 	if pool == nil {
 		return
 	}
 	pool.stopOnce.Do(func() {
 		pool.mu.Lock()
-		pool.stopped = true
+		pool.stopped.Store(true)
 		pool.mu.Unlock()
-		pool.tasks.Wait()
+		if pool.track {
+			pool.tasks.Wait()
+		}
 		if pool.owned != nil {
 			_ = pool.owned.Stop(context.Background())
 		}

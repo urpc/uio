@@ -105,13 +105,12 @@ block the event loop or callbacks for other connections. UWS does not add a
 second executor mailbox or copy message payloads between schedulers.
 
 Set `server.Events.Executor` or `dialer.Events.Executor` to provide the UIO
-connection-task scheduler. Without one, UIO creates a typed taskgo queue with
-maximum concurrency `512 * runtime.NumCPU()` and a 30-second idle retirement
-window.
+connection-task scheduler. Without one, UIO uses taskgo with a resident target
+of roughly `2 * runtime.GOMAXPROCS(0)` workers, a `512 * runtime.GOMAXPROCS(0)` ceiling
+for queued slow callbacks, and a 30-second idle retention window.
 The executor's typed `Submit` and `SubmitBatch` methods must return promptly and
 must not execute tasks inline; rejection closes the affected connection. UIO
-uses a taskgo typed queue by default. A custom taskgo scheduler can be installed
-directly:
+A custom taskgo scheduler can still be installed directly:
 
 ```go
 workers := runtime.NumCPU() * 512

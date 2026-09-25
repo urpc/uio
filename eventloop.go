@@ -49,7 +49,8 @@ type eventLoop struct {
 	ioIdle      chan struct{}
 	ioIdleOnce  sync.Once
 	taskBatch   *taskqueue.Node[*task] // private FIFO remainder owned by this loop
-	ioReady     []IOTask               // newly runnable connections in this poll batch
+	ioReady     []*fdConn              // newly runnable connections in this poll batch
+	ioReadyArgs []IOTask               // scratch only when an external Executor is used
 	wakePending atomic.Bool            // coalesces producer wakeups
 	stopping    atomic.Bool
 	loopGoid    atomic.Int64
@@ -78,7 +79,8 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		fdMap:       newFdMap(),
 		evbuf:       make([]poller.Event, eventBatch),
 		tasks:       taskqueue.New[*task](),
-		ioReady:     make([]IOTask, 0, eventBatch),
+		ioReady:     make([]*fdConn, 0, eventBatch),
+		ioReadyArgs: make([]IOTask, 0, eventBatch),
 		ioIdle:      make(chan struct{}),
 	}, nil
 }
@@ -326,14 +328,15 @@ func (loop *eventLoop) submitIOReady() {
 	if len(loop.ioReady) == 0 {
 		return
 	}
-	tasks := loop.ioReady
+	connections := loop.ioReady
 	loop.ioReady = loop.ioReady[:0]
-	if !loop.ioPool.submitBatch(tasks) {
-		for _, task := range tasks {
-			task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
+	if !loop.ioPool.submitConnBatch(connections, loop.ioReadyArgs) {
+		for _, conn := range connections {
+			conn.handleIOSubmitFailure(net.ErrClosed)
 		}
 	}
-	clear(tasks)
+	loop.ioReadyArgs = loop.ioReadyArgs[:0]
+	clear(connections)
 }
 
 func (loop *eventLoop) shutdown(err error) {

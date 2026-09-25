@@ -6,6 +6,7 @@ package uio
 // connection-task pool is intentionally absent on this backend.
 type ioTaskPool struct{}
 
-func newIOTaskPool(Executor) *ioTaskPool           { return nil }
-func (pool *ioTaskPool) stop()                     {}
-func (pool *ioTaskPool) submitBatch([]IOTask) bool { return false }
+func newIOTaskPool(Executor) *ioTaskPool                          { return nil }
+func (pool *ioTaskPool) stop()                                    {}
+func (pool *ioTaskPool) submitBatch([]IOTask) bool                { return false }
+func (pool *ioTaskPool) submitConnBatch([]*fdConn, []IOTask) bool { return false }

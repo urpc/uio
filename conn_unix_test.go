@@ -1358,6 +1358,7 @@ func TestBackpressureHysteresis(t *testing.T) {
 	}
 	conn.pending.Store(50)
 	conn.outbound.Reset()
+	conn.pending.Store(0)
 	if got := conn.desiredInterest(); got != poller.Readable {
 		t.Fatalf("low-water interest = %v", got)
 	}
