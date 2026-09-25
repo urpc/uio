@@ -6,6 +6,10 @@ const ioEventOpen uint32 = 1 << 16
 const ioEventRead uint32 = 1
 const ioEventWake uint32 = 1 << 17
 
+// prepareAccepted has nothing to do here: std listeners configure accepted
+// sockets through the net package before the connection reaches a loop.
+func (conn *fdConn) prepareAccepted() {}
+
 func (conn *fdConn) scheduleIO(events uint32) {
 	if events&ioEventOpen != 0 {
 		conn.fireOnOpen()

@@ -40,6 +40,7 @@ type fdConn struct {
 	outbound   bytebuf.CompositeBuffer // protected by submitMu
 	throttled  bool                    // loop-owned read-interest hysteresis
 	corked     bool                    // task-owned read-round batching flag
+	accepted   bool                    // accepted TCP; its open task applies the default options
 	writeState atomic.Uint32           // blocked/failed flags shared with loop
 	interest   poller.Interest         // event-loop-owned registered interest
 
@@ -206,6 +207,19 @@ func (conn *fdConn) noteIO(events uint32) bool {
 	return true
 }
 
+// prepareAccepted marks an accepted TCP connection whose default socket
+// options are still to be applied. The open task applies them, off the event
+// loop and before OnOpen, so a loop registering a connection storm spends one
+// epoll_ctl per connection instead of four syscalls.
+func (conn *fdConn) prepareAccepted() { conn.accepted = true }
+
+func (conn *fdConn) applyAcceptedOptions() {
+	conn.accepted = false
+	_ = conn.applySocketOption(optionNoDelay, 1)
+	_ = conn.applySocketOption(optionKeepAlive, 1)
+	_ = conn.applySocketOption(optionKeepAlivePeriod, defaultTCPKeepAliveSecs)
+}
+
 func (conn *fdConn) scheduleRefresh() {
 	if conn.loop == nil || conn.loop.stopping.Load() {
 		return
@@ -313,6 +327,9 @@ func (conn *fdConn) runIOTask() {
 		return
 	}
 	if events&ioEventOpen != 0 {
+		if conn.accepted {
+			conn.applyAcceptedOptions()
+		}
 		conn.fireOnOpen()
 	}
 	if !conn.isClosing() && events&ioEventWrite != 0 {
@@ -408,7 +425,10 @@ func (conn *fdConn) setSocketOption(kind socketOptionKind, value int) error {
 	if conn.isClosing() {
 		return net.ErrClosed
 	}
-	if conn.loop.inLoop() {
+	// The loop and the connection's own task may both apply options directly:
+	// descriptor teardown waits for a running task, so the fd cannot change
+	// under the task, and neither caller would wait on the loop queue.
+	if conn.loop.inLoop() || conn.directOwner() {
 		return conn.applySocketOption(kind, value)
 	}
 	// External callers wait for the loop result; no submission lock covers I/O.

@@ -239,9 +239,7 @@ func (loop *eventLoop) runTask(t *task) {
 
 func (loop *eventLoop) runRegisterTask(t *task) error {
 	if t.acceptedTCP {
-		_ = t.conn.applySocketOption(optionNoDelay, 1)
-		_ = t.conn.applySocketOption(optionKeepAlive, 1)
-		_ = t.conn.applySocketOption(optionKeepAlivePeriod, defaultTCPKeepAliveSecs)
+		t.conn.prepareAccepted()
 	}
 	request := t.registration
 	if request == nil {

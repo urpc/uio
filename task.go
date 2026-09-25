@@ -57,7 +57,7 @@ type task struct {
 	err          error
 	done         chan error
 	registration *registerRequest
-	acceptedTCP  bool // configure accepted TCP sockets on the worker loop
+	acceptedTCP  bool // accepted TCP socket: apply the default socket options
 	udpPayload   *Buffer
 	udpDone      chan udpWriteResult
 
