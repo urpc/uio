@@ -75,6 +75,9 @@ func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
 	poller.mu.Unlock()
 }
 
+// SetTag is accepted for interface parity; kqueue events report a zero tag.
+func (poller *NetPoller) SetTag(int, uint32) {}
+
 // Add registers a descriptor.
 func (poller *NetPoller) Add(fd int, want Interest) error {
 	return poller.modify(fd, 0, want)

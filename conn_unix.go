@@ -41,6 +41,7 @@ type fdConn struct {
 	throttled  bool                    // loop-owned read-interest hysteresis
 	corked     bool                    // task-owned read-round batching flag
 	accepted   bool                    // accepted TCP; its open task applies the default options
+	pollTag    uint32                  // registration generation echoed by the data poller
 	writeState atomic.Uint32           // blocked/failed flags shared with loop
 	interest   poller.Interest         // event-loop-owned registered interest
 
@@ -182,6 +183,25 @@ func (conn *fdConn) scheduleIO(events uint32) {
 	}
 }
 
+// markOpenPending makes the open event pending before a stream becomes
+// visible to its poller. The shared data poller may see the stream's first
+// bytes and submit its task before the loop schedules the open event; that
+// task then takes both events and still runs OnOpen before it reads.
+func (conn *fdConn) markOpenPending() { conn.pendingEvents.Or(ioEventOpen) }
+
+// clearOpenPending withdraws the open event of a stream that failed to
+// register.
+func (conn *fdConn) clearOpenPending() { conn.pendingEvents.And(^ioEventOpen) }
+
+// scheduleOpen submits the task for a pending open event unless the data
+// poller already has. Noting ioEventOpen again would run OnOpen twice if that
+// task has already taken it.
+func (conn *fdConn) scheduleOpen() {
+	if conn.pendingEvents.Load()&ioEventOpen != 0 {
+		conn.scheduleIO(0)
+	}
+}
+
 // noteIO folds readiness into this connection and reports whether the caller
 // acquired responsibility for submitting its single in-flight task.
 func (conn *fdConn) noteIO(events uint32) bool {
@@ -205,6 +225,30 @@ func (conn *fdConn) noteIO(events uint32) bool {
 		return false
 	}
 	return true
+}
+
+// watchTags generates registration tags. Zero means untagged.
+var watchTags atomic.Uint32
+
+// watcher returns the poller watching this descriptor: the shared data poller
+// for streams when the backend has one, otherwise the owning loop's poller.
+func (conn *fdConn) watcher() *poller.NetPoller {
+	if data := conn.events.dataPlane(); data != nil && !conn.isDatagram() {
+		return data
+	}
+	return conn.loop.poller
+}
+
+// assignWatchTag gives a new registration its own tag, so readiness reported
+// for an earlier connection on the same descriptor number is not delivered to
+// this one.
+func (conn *fdConn) assignWatchTag() uint32 {
+	tag := watchTags.Add(1)
+	if tag == 0 {
+		tag = watchTags.Add(1)
+	}
+	conn.pollTag = tag
+	return tag
 }
 
 // prepareAccepted marks an accepted TCP connection whose default socket

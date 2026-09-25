@@ -541,7 +541,7 @@ func (conn *fdConn) updateInterest() error {
 	if want == conn.interest {
 		return nil
 	}
-	if err := conn.loop.poller.Modify(conn.fd, conn.interest, want); err != nil {
+	if err := conn.watcher().Modify(conn.fd, conn.interest, want); err != nil {
 		return err
 	}
 	conn.interest = want

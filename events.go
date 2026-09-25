@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/poller"
 )
 
 // CompositeBuffer exposes UIO's pooled segmented buffer without introducing a
@@ -70,11 +71,14 @@ type Events struct {
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]
 	ioPool         *ioTaskPool
+	data           *dataPoller // shared stream readiness, when the backend has one
 	readPool       sync.Pool
 	readBufferSize int
 
 	// Pollers is the number of event-loop goroutines.
-	// The default value is 4, capped by runtime.NumCPU().
+	// The default value is 4, capped by runtime.NumCPU(). On Linux, stream
+	// readiness is collected by one shared data poller instead, so Pollers
+	// sizes accept, registration, close, deadline and UDP work.
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
@@ -172,6 +176,7 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 	ev.waitGroup.Done()
 	ev.initiateClose(err)
 	ev.waitGroup.Wait()
+	ev.closeDataPoller(err)
 	if ev.ioPool != nil {
 		ev.ioPool.stop()
 	}
@@ -298,10 +303,28 @@ func (ev *Events) rollbackInit(err error) {
 		_ = ev.master.poller.Close(err)
 	}
 	ev.waitGroup.Wait()
+	ev.closeDataPoller(err)
 	if ev.ioPool != nil {
 		ev.ioPool.stop()
 	}
 	ev.callbackWG.Wait()
+}
+
+// dataPlane returns the shared poller that watches stream connections, or
+// nil when each event loop watches its own.
+func (ev *Events) dataPlane() *poller.NetPoller {
+	if ev == nil || ev.data == nil {
+		return nil
+	}
+	return ev.data.watcher()
+}
+
+// closeDataPoller runs after every loop has stopped, so no stream is still
+// registered with the shared poller or able to register.
+func (ev *Events) closeDataPoller(err error) {
+	if ev.data != nil {
+		ev.data.close(err)
+	}
 }
 
 func (ev *Events) initConfig() error {
@@ -331,8 +354,17 @@ func (ev *Events) initLoops() (err error) {
 	// scheduling when present; otherwise UIO creates its default taskgo queue.
 	ev.ioPool = newIOTaskPool(ev.Executor)
 
+	// The shared stream poller starts before the loops that register with it.
+	if ev.data, err = newDataPoller(ev); err != nil {
+		return err
+	}
+	if ev.data != nil {
+		ev.data.start(ev)
+	}
+
 	// create main loop
 	if ev.master, err = newEventLoop(ev); nil != err {
+		ev.closeDataPoller(err)
 		return err
 	}
 
@@ -343,6 +375,7 @@ func (ev *Events) initLoops() (err error) {
 			for _, worker := range ev.workers[:idx] {
 				_ = worker.poller.Close(err)
 			}
+			ev.closeDataPoller(err)
 			return err
 		}
 	}

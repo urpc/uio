@@ -39,9 +39,13 @@ const (
 
 // Event is one normalized readiness notification. A backend may use level or
 // edge triggering; users must follow the registration contract of that fd.
+// Tag echoes the value set with SetTag when the fd was registered, so a
+// consumer that races with descriptor reuse can recognize a stale event.
+// Backends that cannot carry it report zero.
 type Event struct {
 	FD     int
 	Events Events
+	Tag    uint32
 }
 
 var errInvalidInterest = errors.New("poller: empty interest")

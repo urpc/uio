@@ -34,7 +34,9 @@ go get github.com/urpc/uio
 
 type Events struct {
 	// Pollers is the number of event-loop goroutines.
-	// The default value is 4, capped by runtime.NumCPU().
+	// The default value is 4, capped by runtime.NumCPU(). On Linux, stream
+	// readiness is collected by one shared data poller instead, so Pollers
+	// sizes accept, registration, close, deadline and UDP work.
 	Pollers int
 
 	// Executor optionally supplies an asynchronous native connection-task
@@ -94,11 +96,21 @@ type Events struct {
 
 Basic Echo Server
 
-On native Unix, stream event loops collect readiness, manage descriptors, and
-apply interest changes. Stream socket I/O and callbacks run in serialized
-connection tasks on the configured `Executor` or UIO's typed taskgo queue. One
-blocked stream connection therefore does not block its poller or another
-connection. Native UDP callbacks and datagram sends remain on their owning
+On native Unix, event loops accept connections, manage descriptors, and apply
+interest changes. Stream socket I/O and callbacks run in serialized connection
+tasks on the configured `Executor` or UIO's typed taskgo queue. One blocked
+stream connection therefore does not block its poller or another connection.
+On Linux, stream readiness is not collected by the event loops but by one
+shared data poller: every stream is registered with a single epoll instance
+whose waiter hands runnable connections to the task pool in arrival order.
+Loops that each watched a share of the streams kept blocking in `epoll_wait`,
+gave up their P each time, and under load waited for another one while their
+connections' input sat in the kernel, so latency depended on which loop owned
+a connection. With the shared poller, `Pollers` sizes the control plane
+(accept, registration, close, deadlines, UDP) and no longer changes the
+latency of stream traffic. Hosts with 48 or more CPUs run one extra waiter per
+24 CPUs on the same epoll instance. On BSD and macOS each event loop still
+watches its own streams. Native UDP callbacks and datagram sends remain on their owning
 event loop because peers share the socket. An external UDP `Write` or
 `WriteOwned` waits for that loop's nonblocking send result; a call from another
 event loop returns `ErrUDPWriteOnEventLoop` to avoid a wait cycle. The

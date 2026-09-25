@@ -24,6 +24,9 @@ type NetPoller struct {
 // SetEdgeTriggered is a no-op because blocking transports have no readiness mode.
 func (poller *NetPoller) SetEdgeTriggered(int, bool) {}
 
+// SetTag is accepted for interface parity; blocking backends have no events.
+func (poller *NetPoller) SetTag(int, uint32) {}
+
 // NewNetPoller creates a channel-backed command waker.
 func NewNetPoller() (*NetPoller, error) {
 	return &NetPoller{

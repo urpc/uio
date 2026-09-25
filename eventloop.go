@@ -391,7 +391,7 @@ func (loop *eventLoop) getConn(fd int) *fdConn { return loop.fdMap.Get(fd) }
 func (loop *eventLoop) listen(fd int) error    { return loop.poller.Add(fd, poller.Readable) }
 func (loop *eventLoop) delConn(conn *fdConn) {
 	loop.fdMap.Delete(conn.Fd())
-	_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
+	_ = conn.watcher().Remove(conn.Fd(), conn.currentInterest())
 }
 func (loop *eventLoop) modRead(conn *fdConn) error {
 	return loop.modifyInterest(conn, poller.Readable)
@@ -407,38 +407,51 @@ func (loop *eventLoop) modifyInterest(conn *fdConn, want poller.Interest) error 
 	if previous == want {
 		return nil
 	}
-	if err := loop.poller.Modify(conn.Fd(), previous, want); err != nil {
+	if err := conn.watcher().Modify(conn.Fd(), previous, want); err != nil {
 		return err
 	}
 	conn.setInterest(want)
 	return nil
 }
 
+// registeredForTest, when a test sets it, runs on the loop after a connection
+// is added to its poller and before the loop schedules its open event.
+var registeredForTest func(*fdConn)
+
 // registerConn publishes the fd before poller registration so every delivered
 // event can resolve it. Failure unwinds both publications before closing the fd.
 func (loop *eventLoop) registerConn(conn *fdConn) error {
 	// Publish before Watch so every delivered event can resolve the fd.
 	fd := conn.Fd()
-	loop.poller.SetEdgeTriggered(fd, !conn.isDatagram())
+	watcher := conn.watcher()
+	watcher.SetEdgeTriggered(fd, !conn.isDatagram())
+	watcher.SetTag(fd, conn.assignWatchTag())
 	if err := loop.fdMap.Put(fd, conn); err != nil {
 		conn.closeUnregistered()
 		return err
 	}
 	interest := conn.initialInterest()
-	if err := loop.poller.Add(fd, interest); err != nil {
+	if !conn.isDatagram() {
+		conn.markOpenPending()
+	}
+	if err := watcher.Add(fd, interest); err != nil {
+		conn.clearOpenPending()
 		loop.fdMap.Delete(fd)
-		_ = loop.poller.Remove(fd, interest)
+		_ = watcher.Remove(fd, interest)
 		conn.closeUnregistered()
 		return err
 	}
+	if registeredForTest != nil {
+		registeredForTest(conn)
+	}
 	conn.setInterest(interest)
 	// Datagram callbacks and shared socket state stay on the loop. Stream
-	// callbacks run in their serialized connection task. Stdio's scheduleIO
+	// callbacks run in their serialized connection task. Stdio's scheduleOpen
 	// starts its dedicated blocking I/O loops after OnOpen below.
 	if conn.isDatagram() {
 		conn.fireOnOpen()
 	} else {
-		conn.scheduleIO(ioEventOpen)
+		conn.scheduleOpen()
 	}
 	if !conn.isClosing() {
 		conn.afterRegister()

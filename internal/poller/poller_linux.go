@@ -30,9 +30,16 @@ type NetPoller struct {
 
 	closed      atomic.Bool
 	edgeFD      map[int]bool
+	tags        map[int]uint32
 	closeReason atomic.Pointer[error]
 	releaseOnce sync.Once
-	rawEvents   [1024]unix.EpollEvent
+	batch       Batch
+}
+
+// Batch is a kernel event buffer. Wait uses the poller's own; goroutines that
+// wait on one poller concurrently each pass their own to WaitBatch.
+type Batch struct {
+	rawEvents [1024]unix.EpollEvent
 }
 
 // NewNetPoller creates epoll and registers its internal level-triggered waker.
@@ -46,7 +53,7 @@ func NewNetPoller() (*NetPoller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &NetPoller{epfd: epfd, wakefd: wakefd, edgeFD: make(map[int]bool)}
+	poller := &NetPoller{epfd: epfd, wakefd: wakefd, edgeFD: make(map[int]bool), tags: make(map[int]uint32)}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
@@ -65,6 +72,18 @@ func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
 		poller.edgeFD[fd] = true
 	} else {
 		delete(poller.edgeFD, fd)
+	}
+	poller.mu.Unlock()
+}
+
+// SetTag attaches tag to future registrations and modifications of fd. Wait
+// reports it with every event for fd; zero clears it.
+func (poller *NetPoller) SetTag(fd int, tag uint32) {
+	poller.mu.Lock()
+	if tag != 0 {
+		poller.tags[fd] = tag
+	} else {
+		delete(poller.tags, fd)
 	}
 	poller.mu.Unlock()
 }
@@ -88,6 +107,7 @@ func (poller *NetPoller) Remove(fd int, _ Interest) error {
 	}
 	err := unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_DEL, fd, nil)
 	delete(poller.edgeFD, fd)
+	delete(poller.tags, fd)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
 		return nil
 	}
@@ -107,7 +127,7 @@ func (poller *NetPoller) control(fd int, want Interest, operation int) error {
 		return poller.closedError()
 	}
 	if err := unix.EpollCtl(poller.epfd, operation, fd, &unix.EpollEvent{
-		Fd: int32(fd), Events: poller.epollEvents(fd, want),
+		Fd: int32(fd), Pad: int32(poller.tags[fd]), Events: poller.epollEvents(fd, want),
 	}); err != nil {
 		return err
 	}
@@ -134,6 +154,12 @@ func (poller *NetPoller) epollEvents(fd int, want Interest) uint32 {
 // Wait converts one epoll batch into normalized events. timeout is in
 // milliseconds; a negative value blocks indefinitely and zero polls.
 func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
+	return poller.WaitBatch(&poller.batch, out, timeout)
+}
+
+// WaitBatch is Wait with a caller-owned kernel buffer. epoll hands each ready
+// edge to one waiter, so several goroutines can share one poller this way.
+func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int, error) {
 	// Register before entering epoll_wait so Close wakes instead of releasing
 	// descriptors that this call can still access.
 	poller.mu.Lock()
@@ -146,7 +172,7 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	poller.waiters++
 	poller.mu.Unlock()
 	defer poller.finishWait()
-	n, err := unix.EpollWait(poller.epfd, poller.rawEvents[:], timeout)
+	n, err := unix.EpollWait(poller.epfd, batch.rawEvents[:], timeout)
 	if poller.closed.Load() {
 		return 0, poller.closeError()
 	}
@@ -157,7 +183,7 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 		return 0, err
 	}
 	count := 0
-	for _, event := range poller.rawEvents[:n] {
+	for _, event := range batch.rawEvents[:n] {
 		fd := int(event.Fd)
 		if fd == poller.wakefd {
 			poller.drainWake()
@@ -175,7 +201,7 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 		if event.Events&writeEvents != 0 {
 			events |= WriteEvents
 		}
-		out[count] = Event{FD: fd, Events: events}
+		out[count] = Event{FD: fd, Events: events, Tag: uint32(event.Pad)}
 		count++
 	}
 	return count, nil
