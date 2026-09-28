@@ -21,7 +21,7 @@ func (raw *controlledPongConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 		close(raw.pongStarted)
 		<-raw.releasePong
 		if raw.rejectPong {
-			uio.ReleaseBuffer(buffer)
+			// An overflowed buffer stays the caller's, like the real transport.
 			return 0, uio.ErrOutboundOverflow
 		}
 	}

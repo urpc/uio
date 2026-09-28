@@ -137,12 +137,27 @@ func (p *Parser) resetState() {
 // AtFrameBoundary reports whether p has no incremental frame state.
 func (p *Parser) AtFrameBoundary() bool { return p.headerLen == 0 }
 
+// Sink receives the frames a Parser completes. A connection can implement it
+// on its own pointer, which Feed's func parameter cannot do without a closure.
+type Sink interface {
+	AcceptFrame(Frame) error
+}
+
+type emitFunc func(Frame) error
+
+func (emit emitFunc) AcceptFrame(f Frame) error { return emit(f) }
+
 // Feed consumes as much of src as possible. It preserves incomplete frame
 // state between calls and invokes emit once for every complete frame.
 func (p *Parser) Feed(src []byte, emit func(Frame) error) (int, error) {
 	if emit == nil {
 		return 0, errors.New("websocket: nil frame callback")
 	}
+	return p.FeedTo(src, emitFunc(emit))
+}
+
+// FeedTo is Feed with frames delivered to sink.
+func (p *Parser) FeedTo(src []byte, sink Sink) (int, error) {
 	consumed := 0
 	for consumed < len(src) {
 		if p.headerLen == 0 {
@@ -151,7 +166,7 @@ func (p *Parser) Feed(src []byte, emit func(Frame) error) (int, error) {
 				return consumed, err
 			}
 			if complete {
-				if err := emit(frame); err != nil {
+				if err := sink.AcceptFrame(frame); err != nil {
 					return consumed + size, err
 				}
 				consumed += size
@@ -226,18 +241,17 @@ func (p *Parser) Feed(src []byte, emit func(Frame) error) (int, error) {
 				return consumed, err
 			}
 		}
-		if err := emitParserFrame(emit, f, payloadBuf, payloadSize); err != nil {
+		if err := emitParserFrame(sink, f, payloadBuf, payloadSize); err != nil {
 			return consumed, err
 		}
 	}
 	return consumed, nil
 }
 
-// fastFrame handles a complete frame already present in src without creating a
-// payload buffer. The caller owns src for the duration of emit; incremental
-// frames continue through the stateful path below.
 // ParseFrame parses one complete frame directly from src without retaining
-// state. complete is false when src does not contain the entire frame.
+// state. complete is false when src does not contain the entire frame. The
+// payload's capacity ends with the frame, so appending to it cannot overwrite
+// the input that follows.
 func ParseFrame(src []byte, cfg *ParserConfig) (Frame, int, bool, error) {
 	if len(src) < 2 {
 		return Frame{}, 0, false, nil
@@ -306,7 +320,7 @@ func ParseFrame(src []byte, cfg *ParserConfig) (Frame, int, bool, error) {
 	if masked {
 		copy(maskKey[:], src[headerSize-4:headerSize])
 	}
-	payload := src[headerSize:total]
+	payload := src[headerSize:total:total]
 	if masked {
 		unmask(payload, maskKey, 0)
 	}
@@ -472,9 +486,9 @@ func releaseParserPayload(buffer *parserPayloadBuffer, poolSize int) {
 	parserPayloadPool.Put(buffer, poolSize)
 }
 
-func emitParserFrame(emit func(Frame) error, frame Frame, buffer *parserPayloadBuffer, poolSize int) error {
+func emitParserFrame(sink Sink, frame Frame, buffer *parserPayloadBuffer, poolSize int) error {
 	defer releaseParserPayload(buffer, poolSize)
-	return emit(frame)
+	return sink.AcceptFrame(frame)
 }
 
 func validOpcode(op OpCode) bool {

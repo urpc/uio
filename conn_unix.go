@@ -22,28 +22,32 @@ import (
 // descriptor registration, deadlines, and interest. At most one connection
 // task owns stream socket I/O and callbacks, while submitMu admits concurrent
 // producers into the connection-owned outbound queue.
+//
+// The layout keeps what a connection turn touches in the first lines and the
+// whole value within the 256-byte size class, whose objects are line aligned.
 type fdConn struct {
 	commonConn
-	fd  int
-	udp *unixUDPState // nil for stream connections
-
-	// submitMu orders cross-goroutine submissions and protects outbound while a
-	// worker round and an external producer overlap.
-	submitMu      sync.Mutex
-	close         connCloseState
-	pending       atomic.Int64  // accepted payload not yet written
+	fd            int
 	pendingEvents atomic.Uint32 // coalesced readiness and synthetic events
 	scheduled     atomic.Bool   // exactly one task is queued or running
 	ioOwner       atomic.Int64  // current task goroutine, zero while idle
+	writeState    atomic.Uint32 // blocked/failed flags shared with loop
 	readStalled   atomic.Bool   // ET read work owed after yield/backpressure
+	pending       atomic.Int64  // accepted payload not yet written
 
-	outbound   bytebuf.CompositeBuffer // protected by submitMu
-	throttled  bool                    // loop-owned read-interest hysteresis
-	corked     bool                    // task-owned read-round batching flag
-	accepted   bool                    // accepted TCP; its open task applies the default options
-	pollTag    uint32                  // registration generation echoed by the data poller
-	writeState atomic.Uint32           // blocked/failed flags shared with loop
-	interest   poller.Interest         // event-loop-owned registered interest
+	// submitMu orders cross-goroutine submissions and protects outbound while a
+	// worker round and an external producer overlap.
+	submitMu sync.Mutex
+	close    connCloseState
+	outbound bytebuf.CompositeBuffer // protected by submitMu
+	udp      *unixUDPState           // nil for stream connections
+
+	pollTag   uint32          // registration generation echoed by the data poller
+	interest  poller.Interest // event-loop-owned registered interest
+	throttled bool            // loop-owned read-interest hysteresis
+	corked    bool            // task-owned read-round batching flag
+	accepted  bool            // accepted TCP; its open task applies the default options
+	internal  bool            // framework-owned endpoint, not a user connection
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
 }
@@ -136,7 +140,8 @@ func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 		if !enabled {
 			next &^= flag
 		}
-		if conn.writeState.CompareAndSwap(old, next) {
+		// Every flush clears the blocked flag; most find it clear already.
+		if next == old || conn.writeState.CompareAndSwap(old, next) {
 			return
 		}
 	}
@@ -203,17 +208,14 @@ func (conn *fdConn) scheduleOpen() {
 }
 
 // noteIO folds readiness into this connection and reports whether the caller
-// acquired responsibility for submitting its single in-flight task.
+// acquired responsibility for submitting its single in-flight task. The
+// scheduled claim is the last step: once it is visible a task must run, since
+// closeOnLoop hands teardown to whichever task holds it.
 func (conn *fdConn) noteIO(events uint32) bool {
 	if conn.isClosing() || conn.loop == nil || conn.loop.stopping.Load() || conn.loop.ioPool == nil {
 		return false
 	}
-	for {
-		old := conn.pendingEvents.Load()
-		if conn.pendingEvents.CompareAndSwap(old, old|events) {
-			break
-		}
-	}
+	conn.pendingEvents.Or(events)
 	if conn.scheduled.Load() {
 		return false
 	}
@@ -284,7 +286,7 @@ func (conn *fdConn) takeIOEvents() uint32 {
 // wins the idle-to-scheduled transition. Deferred close returns to the loop
 // only after no task can still touch connection-owned buffers.
 func (conn *fdConn) finishIOTask() {
-	if !conn.loop.ioStopped() && conn.pendingEvents.Load() != 0 && conn.close.phase.Load() != closeCallbackDelivered {
+	if conn.pendingEvents.Load() != 0 && !conn.loop.ioStopped() && conn.close.phase.Load() != closeCallbackDelivered {
 		if !conn.loop.ioPool.submit(conn) {
 			conn.handleIOSubmitFailure(net.ErrClosed)
 		}
@@ -295,14 +297,11 @@ func (conn *fdConn) finishIOTask() {
 	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
 	conn.submitMu.Unlock()
 	rescheduled := false
-	if !conn.loop.ioStopped() && conn.pendingEvents.Load() != 0 && conn.scheduled.CompareAndSwap(false, true) {
+	if conn.pendingEvents.Load() != 0 && !conn.loop.ioStopped() && conn.scheduled.CompareAndSwap(false, true) {
 		rescheduled = true // the current reservation moves to the next turn
 		if !conn.loop.ioPool.submit(conn) {
 			conn.handleIOSubmitFailure(net.ErrClosed)
 		}
-	}
-	if !rescheduled {
-		conn.loop.releaseIO()
 	}
 	if hasDeferredClose {
 		t := acquireTask(closeTask, conn)
@@ -312,6 +311,11 @@ func (conn *fdConn) finishIOTask() {
 			releaseTask(t)
 			// The stopped loop's shutdown pass owns final fd teardown.
 		}
+	}
+	// Released last: shutdown joins turns through this count, so nothing of
+	// this turn may touch the connection or its loop afterwards.
+	if !rescheduled {
+		conn.loop.releaseIO()
 	}
 }
 
@@ -359,6 +363,7 @@ func (conn *fdConn) setDeferredCloseLocked(err error) {
 func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
 	defer func() {
+		conn.corked = false // a callback panic may have left a round corked
 		conn.ioOwner.Store(0)
 		conn.finishIOTask()
 	}()
@@ -406,17 +411,34 @@ func (conn *fdConn) runIOTask() {
 		}
 	}
 	if conn.needsInterestRefresh(events) {
-		conn.scheduleRefresh()
+		if conn.canRedeliverRead(events) {
+			// A read round that only yielded leaves nothing for the loop to
+			// change: the next turn is queued here instead of through it.
+			conn.readStalled.Store(false)
+			conn.pendingEvents.Or(ioEventRead | ioEventWake)
+		} else {
+			conn.scheduleRefresh()
+		}
 	}
 }
 
-// RunTask implements IOTask for injected executors. The pool owns shutdown and
-// rejection accounting; the executor contract guarantees asynchronous dispatch.
+// canRedeliverRead reports whether a stalled read may be handed straight to
+// the next turn. Only the refresh command may change registered interest, so
+// this holds only when the interest the loop would compute is unchanged:
+// no outbound limit to throttle reads, nothing left to write, and no writable
+// edge whose interest may need disarming.
+func (conn *fdConn) canRedeliverRead(events uint32) bool {
+	return conn.readStalled.Load() && events&ioEventWrite == 0 && conn.events.MaxOutboundBuffered <= 0 &&
+		conn.outboundEmpty() && !conn.writeBlocked() && !conn.isClosing()
+}
+
+// RunTask implements IOTask for injected executors. The executor contract
+// guarantees asynchronous dispatch; the loop's ioState counts the turn.
 func (conn *fdConn) RunTask() {
 	if conn.loop == nil || conn.loop.ioPool == nil {
 		return
 	}
-	conn.loop.ioPool.run(conn)
+	conn.runIOTask()
 }
 
 func (conn *fdConn) needsInterestRefresh(events uint32) bool {
@@ -580,16 +602,22 @@ func (conn *fdConn) fireWriteEvent() error {
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
 	holder := conn.events.readPool.Get().(*readBuffer)
-	buffer := holder.bytes
-	defer conn.events.readPool.Put(holder)
-	totalRead := 0
 	// A read round is corked: replies the callbacks enqueue accumulate in
 	// outbound and are flushed once when the event ends, so a burst of reads
 	// costs one writev instead of one syscall per reply.
 	conn.corked = true
-	defer func() { conn.corked = false }()
+	err := conn.readRound(holder.bytes)
+	conn.corked = false
+	conn.events.readPool.Put(holder)
+	return err
+}
+
+// readRound is onRead's body. It has many exits, which would keep deferred
+// cleanup from being open-coded, so onRead does the cleanup around it.
+func (conn *fdConn) readRound(buffer []byte) error {
+	totalRead := 0
 	for calls := 0; calls < 256 && totalRead < 1<<20; calls++ {
-		n, err := syscall.Read(conn.fd, buffer)
+		n, err := socket.Recv(conn.fd, buffer)
 		if err != nil {
 			if isWouldBlock(err) {
 				return nil
@@ -888,12 +916,7 @@ func (conn *fdConn) scheduleCloseCallback(err error) {
 	conn.submitMu.Lock()
 	conn.setDeferredCloseLocked(err)
 	conn.submitMu.Unlock()
-	for {
-		old := conn.pendingEvents.Load()
-		if conn.pendingEvents.CompareAndSwap(old, old|ioEventClose) {
-			break
-		}
-	}
+	conn.pendingEvents.Or(ioEventClose)
 	if !conn.scheduled.CompareAndSwap(false, true) {
 		return
 	}

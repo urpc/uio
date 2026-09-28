@@ -8,8 +8,14 @@ import (
 
 func TestUnmaskMatchesBytewiseReference(t *testing.T) {
 	key := [4]byte{0x12, 0x34, 0x56, 0x78}
+	sizes := make([]int, 0, 150)
+	for size := 0; size <= 137; size++ {
+		sizes = append(sizes, size)
+	}
+	// Larger payloads reach the unrolled vector loop and its tails.
+	sizes = append(sizes, 159, 160, 161, 255, 256, 257, 1023, 1024, 1025, 4099)
 	for offset := 0; offset < len(key); offset++ {
-		for size := 0; size <= 137; size++ {
+		for _, size := range sizes {
 			payload := make([]byte, size)
 			for i := range payload {
 				payload[i] = byte(i*31 + size)
@@ -27,7 +33,7 @@ func TestUnmaskMatchesBytewiseReference(t *testing.T) {
 
 func BenchmarkUnmask(b *testing.B) {
 	key := [4]byte{0x12, 0x34, 0x56, 0x78}
-	for _, size := range []int{1, 4, 7, 8, 16, 64, 256, 1024, 4096} {
+	for _, size := range []int{1, 4, 7, 8, 16, 64, 96, 128, 192, 256, 1024, 4096} {
 		b.Run(fmt.Sprintf("%d/optimized", size), func(b *testing.B) {
 			payload := make([]byte, size)
 			b.SetBytes(int64(size))

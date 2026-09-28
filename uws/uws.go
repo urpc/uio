@@ -35,9 +35,15 @@ const (
 	// defaultWriteBufferedThreshold lets UIO coalesce small WebSocket frames in
 	// the connection task's outbound buffer.
 	defaultWriteBufferedThreshold = 4 << 10
-	// maxFramesPerDataEvent bounds frame callbacks handled in one connection
-	// task turn so a busy connection cannot starve other runnable connections.
-	maxFramesPerDataEvent = 64
+	// The blocks of a read round's write batch hold about two reads' worth of
+	// replies, like the transport's own coalescing blocks.
+	minWriteBatchBlock = 4 << 10
+	maxWriteBatchBlock = 64 << 10
+	// maxFramesPerDataEvent bounds frame callbacks handled for one read chunk
+	// so a busy connection cannot starve other runnable connections. It sits
+	// well above the frames one read usually carries: stopping inside a chunk
+	// costs a whole extra connection turn, with a read and a write of its own.
+	maxFramesPerDataEvent = 1024
 )
 
 var (
@@ -100,6 +106,22 @@ func configureWriteBuffer(events *uio.Events) {
 	if events.WriteBufferedThreshold == 0 {
 		events.WriteBufferedThreshold = defaultWriteBufferedThreshold
 	}
+}
+
+// writeBatchBlockSize sizes write batch blocks from the transport's read size.
+func writeBatchBlockSize(events *uio.Events) int {
+	readSize := 4 << 10 // uio's MaxBufferSize default
+	if events != nil && events.MaxBufferSize > 0 {
+		readSize = events.MaxBufferSize
+	}
+	return min(max(2*readSize, minWriteBatchBlock), maxWriteBatchBlock)
+}
+
+func maxOutboundBuffered(events *uio.Events) int {
+	if events == nil {
+		return 0
+	}
+	return events.MaxOutboundBuffered
 }
 
 func effectiveWriteBufferedThreshold(events *uio.Events) int {

@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -1003,4 +1004,142 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 		t.Fatal("stale timeout closed the connection")
 	}
 	releaseTestTasks(stopped)
+}
+
+func TestWriteOwnedOverflowReturnsOwnership(t *testing.T) {
+	// External submission path: the outbound limit is full, so nothing is
+	// accepted and the buffer must remain the caller's.
+	conn := &fdConn{}
+	conn.events = &Events{MaxOutboundBuffered: 8}
+	conn.loop = &eventLoop{}
+	conn.pending.Store(8)
+	buffer := AcquireBuffer(8)
+	buffer.CommitWrite(copy(buffer.AvailableBuffer()[:7], "payload"))
+	n, err := conn.WriteOwned(buffer)
+	if n != 0 || !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	if buffer.Len() != 7 || string(buffer.Bytes()) != "payload" {
+		t.Fatal("overflowed buffer was consumed")
+	}
+	ReleaseBuffer(buffer)
+
+	// Task-owner path with batching: the same contract.
+	loop := &eventLoop{}
+	loop.loopGoid.Store(currentGoroutineID())
+	owner := &fdConn{fd: -1}
+	owner.ioOwner.Store(currentGoroutineID())
+	owner.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
+	owner.loop = loop
+	owner.pending.Store(8)
+	owned := AcquireBuffer(8)
+	owned.CommitWrite(copy(owned.AvailableBuffer()[:7], "payload"))
+	n, err = owner.WriteOwned(owned)
+	if n != 0 || !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("task-owner WriteOwned = %d, %v", n, err)
+	}
+	if owned.Len() != 7 || string(owned.Bytes()) != "payload" {
+		t.Fatal("overflowed task-owner buffer was consumed")
+	}
+	ReleaseBuffer(owned)
+}
+
+// fillStreamSendBuffer leaves the stream socket refusing further writes.
+func fillStreamSendBuffer(t *testing.T, fd int) {
+	t.Helper()
+	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.SetNonblock(fd, true); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 4096)
+	for range 1 << 16 {
+		n, err := unix.Write(fd, payload)
+		if err == unix.EAGAIN {
+			return
+		}
+		if err != nil {
+			t.Fatalf("fill stream socket = %d, %v", n, err)
+		}
+	}
+	t.Fatal("stream socket did not reach EAGAIN")
+}
+
+func TestWriteOwnedBlockedSocketOverflowReturnsOwnership(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	fillStreamSendBuffer(t, fds[0])
+
+	loop := &eventLoop{}
+	loop.loopGoid.Store(currentGoroutineID())
+	conn := &fdConn{fd: fds[0]}
+	conn.ioOwner.Store(currentGoroutineID())
+	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
+	conn.loop = loop
+
+	buffer := AcquireBuffer(8)
+	buffer.CommitWrite(copy(buffer.AvailableBuffer()[:7], "payload"))
+	n, err := conn.WriteOwned(buffer)
+	if n != 0 || !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("WriteOwned = %d, %v", n, err)
+	}
+	// Nothing reached the socket and nothing entered the queue: the caller
+	// keeps ownership, exactly like every other ErrOutboundOverflow.
+	if buffer.Len() != 7 || string(buffer.Bytes()) != "payload" {
+		t.Fatal("overflowed buffer was consumed")
+	}
+	if conn.isClosing() {
+		t.Fatal("pure overflow closed the stream")
+	}
+	ReleaseBuffer(buffer)
+}
+
+func TestWriteOwnedPartialWriteDespiteLimitReportsShortWrite(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	// AF_UNIX flow control charges the sender until the peer reads, and it
+	// only becomes predictable when both queues are small.
+	if err := unix.SetsockoptInt(fds[1], unix.SOL_SOCKET, unix.SO_RCVBUF, 8192); err != nil {
+		t.Fatal(err)
+	}
+	fillStreamSendBuffer(t, fds[0])
+	// Drain one whole fill chunk: Linux frees queue slots per skb, so a
+	// partial read would not admit new bytes.
+	readPeer(t, fds[1], 4096)
+
+	// The close request must not need a running poller: a stopped queue parks
+	// the close task like it would in a shutting-down loop.
+	loop := &eventLoop{tasks: taskqueue.New[*task]()}
+	stop := acquireTask(stopTask, nil)
+	if !loop.tasks.Stop(&stop.node) {
+		t.Fatal("failed to stop test loop")
+	}
+	loop.loopGoid.Store(currentGoroutineID())
+	defer releaseTestTasks(loop)
+	conn := &fdConn{fd: fds[0]}
+	conn.ioOwner.Store(currentGoroutineID())
+	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
+	conn.loop = loop
+
+	buffer := AcquireBuffer(8192)
+	buffer.CommitWrite(copy(buffer.AvailableBuffer()[:8192], make([]byte, 8192)))
+	n, err := conn.WriteOwned(buffer)
+	if n <= 0 || n >= 8192 {
+		t.Fatalf("WriteOwned wrote %d of 8192, want a partial write", n)
+	}
+	if errors.Is(err, ErrOutboundOverflow) || !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("partial write error = %v, want io.ErrShortWrite", err)
+	}
+	if !conn.isClosing() {
+		t.Fatal("broken partial frame did not close the stream")
+	}
 }

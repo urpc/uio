@@ -43,6 +43,10 @@ func (s *stdFrameSink) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return written, nil
 }
 
+func (s *stdFrameSink) ReserveOutbound(int) ([]byte, error) {
+	return nil, uio.ErrReserveUnsupported
+}
+
 func TestStdServerFrameUsesSingleTransportCopy(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xa5}, 1<<20)
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}

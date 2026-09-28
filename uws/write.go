@@ -243,7 +243,7 @@ func (c *Conn) tryHeartbeatPing(now time.Time) (bool, error) {
 	err := c.sendFrameSubmitted(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: payload[:]})
 	heartbeat.submitMu.Unlock()
 	if err == nil {
-		err = c.flush()
+		err = c.flushLocked()
 	}
 	if err != nil {
 		heartbeat.cancelPing(nonce)
@@ -275,7 +275,7 @@ func (c *Conn) tryHeartbeatClose(code uint16, reason string) bool {
 		c.setCloseReason(code, reason)
 		err = c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 		if err == nil {
-			err = c.flush()
+			err = c.flushLocked()
 		}
 		if err == nil {
 			c.closing.Store(true)
@@ -333,7 +333,7 @@ func (c *Conn) Close(code uint16, reason string) error {
 		c.unlockWrite()
 		return err
 	}
-	if err := c.flush(); err != nil {
+	if err := c.flushLocked(); err != nil {
 		c.unlockWrite()
 		c.abortTransport(err)
 		return err
@@ -355,6 +355,12 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 	}
 	if !c.tryLockWrite() {
 		return ErrWriteBusy
+	}
+	if c.batching.Load() {
+		if batched, err := c.batchMessageLocked(opcode, payload); batched {
+			c.unlockWrite()
+			return err
+		}
 	}
 	defer c.unlockWrite()
 	if err := c.completeWriteDrainLocked(); err != nil {
@@ -409,12 +415,14 @@ func (c *Conn) sendFrame(f frame.Frame) error {
 	if err := c.sendFrameLocked(f); err != nil {
 		return err
 	}
-	return c.flush()
+	return c.flushLocked()
 }
 
 // sendProtocolControlFrame preserves protocol progress when a Writer owns the
 // normal write lock: Close is handed off, while Ping/Pong use an owned frame
-// that can be safely queued concurrently by UIO.
+// that can be safely queued concurrently by UIO — unless the write batch holds
+// frames accepted earlier, which the control frame must neither overtake nor
+// spend the outbound room of.
 func (c *Conn) sendProtocolControlFrame(f frame.Frame) error {
 	if !c.opened.Load() {
 		return ErrNotReady
@@ -433,7 +441,7 @@ func (c *Conn) sendProtocolControlFrame(f frame.Frame) error {
 		if err := c.sendFrameLocked(f); err != nil {
 			return err
 		}
-		return c.flush()
+		return c.flushLocked()
 	}
 	if f.Opcode == frame.Close {
 		c.closing.Store(true)
@@ -442,7 +450,95 @@ func (c *Conn) sendProtocolControlFrame(f frame.Frame) error {
 		}
 		return c.tryCompleteWriteDrain()
 	}
+	if order := c.batchOrder.Load(); order != nil && order.held.Load() {
+		// A momentary lock holder (a streaming Writer or a concurrent sender)
+		// left accepted frames batched: park this frame and the batch hand-off
+		// submits it right after them. A hand-off that finished in between
+		// clears the gate, and the frame must not wait for whoever holds the
+		// lock now.
+		parked, err := c.parkControlFrame(order, f)
+		if err != nil {
+			return err
+		}
+		if parked {
+			if c.writes.mu.TryLock() {
+				c.unlockWrite()
+			}
+			return nil
+		}
+	}
 	return c.sendConcurrentControlFrame(f)
+}
+
+// parkControlFrame materializes a control frame and parks it behind the batch
+// only while the batch still holds the gate. It reports false, having kept
+// nothing, when the batch left while the frame was materialized: the caller
+// then submits the frame directly instead of letting it wait for the next
+// batch hand-off, which a long-lived Writer might defer indefinitely. Only
+// UIO's connection task reaches this path.
+func (c *Conn) parkControlFrame(order *batchOrderState, f frame.Frame) (bool, error) {
+	if !frame.IsControl(f.Opcode) || len(f.Payload) > 125 {
+		return false, frame.ErrProtocol
+	}
+	var maskKey [4]byte
+	if c.isClient() {
+		if _, err := rand.Read(maskKey[:]); err != nil {
+			return false, err
+		}
+		f.Masked = true
+	}
+	wireSize := frameWireSize(len(f.Payload), f.Masked)
+	owned := uio.AcquireBuffer(wireSize)
+	dst := owned.AvailableBuffer()[:wireSize]
+	wire := frame.Append(dst[:0], f, maskKey)
+	owned.CommitWrite(len(wire))
+	// The hand-off clears the gate before it takes this lock to drain the
+	// queue, so a frame that observes the gate set here is always still in the
+	// queue when that drain runs. Counting the frame and publishing it to the
+	// queue must share this critical section: a drain that rejects the frame
+	// rolls its bytes back, which is only correct once they were counted.
+	order.mu.Lock()
+	if !order.held.Load() {
+		order.mu.Unlock()
+		uio.ReleaseBuffer(owned)
+		return false, nil
+	}
+	order.parked = append(order.parked, owned)
+	c.trackOutbound(wireSize)
+	order.mu.Unlock()
+	return true, nil
+}
+
+// drainPendingControlsLocked submits control frames parked behind the batch.
+// It requires writes.mu and runs after the batch itself. A transport at its
+// outbound limit drops a parked Pong rather than the connection: the peer's
+// next Ping retries the keepalive.
+func (c *Conn) drainPendingControlsLocked() error {
+	order := c.batchOrder.Load()
+	if order == nil {
+		return nil
+	}
+	order.mu.Lock()
+	if len(order.parked) == 0 {
+		order.mu.Unlock()
+		return nil
+	}
+	controls := order.parked
+	order.parked = nil
+	order.mu.Unlock()
+	for _, owned := range controls {
+		want := owned.Len()
+		n, err := c.raw.WriteOwned(owned)
+		if errors.Is(err, uio.ErrOutboundOverflow) {
+			uio.ReleaseBuffer(owned)
+			_ = c.finishFrameWrite(frame.Pong, 0, want, err)
+			continue
+		}
+		if err := c.finishFrameWrite(frame.Pong, n, want, err); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // sendConcurrentControlFrame materializes the complete frame because it queues
@@ -469,6 +565,10 @@ func (c *Conn) sendConcurrentControlFrame(f frame.Frame) error {
 	}
 	c.trackOutbound(wireSize)
 	n, err := c.raw.WriteOwned(owned)
+	if errors.Is(err, uio.ErrOutboundOverflow) {
+		// Nothing was accepted; the buffer stays ours.
+		uio.ReleaseBuffer(owned)
+	}
 	err = c.finishFrameWrite(f.Opcode, n, wireSize, err)
 	if heartbeat != nil {
 		heartbeat.submitMu.Unlock()
@@ -512,15 +612,56 @@ func (c *Conn) sendFrameSubmitted(f frame.Frame) error {
 		f.Masked = true
 	}
 	wireSize := frameWireSize(len(f.Payload), f.Masked)
+	threshold := c.writeBufferedThreshold()
+	small := threshold > 0 && wireSize < threshold
+	if small && !c.streaming && c.batching.Load() && c.batchHasRoom(wireSize) {
+		joined, err := c.batchFrame(f, maskKey, wireSize)
+		if err != nil {
+			return err
+		}
+		if joined {
+			c.trackOutbound(wireSize)
+			c.markHeartbeatPingTarget(f)
+			return c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
+		}
+		// A full transport kept an earlier batch queued; the pre-flush below
+		// reports the backpressure for this frame alone.
+	}
+	// Frames batched earlier go first, so this one cannot overtake them.
+	if c.batch != nil {
+		if err := c.flushBatchLocked(); err != nil {
+			return err
+		}
+		if c.batch != nil {
+			// The transport is at its outbound limit; the batch keeps the
+			// accepted frames and this one reports the backpressure for itself.
+			return ErrBackpressure
+		}
+	}
 	c.trackOutbound(wireSize)
 	c.markHeartbeatPingTarget(f)
-	threshold := c.writeBufferedThreshold()
-	if f.Masked || (threshold > 0 && wireSize < threshold) {
+	if f.Masked || small {
+		if small {
+			// Inside the connection's own task the frame is encoded straight
+			// into the outbound queue: one copy of the payload, no buffer of
+			// its own to acquire and release.
+			dst, err := c.raw.ReserveOutbound(wireSize)
+			if err == nil {
+				frame.Append(dst[:0], f, maskKey)
+				return c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
+			}
+			if err != uio.ErrReserveUnsupported {
+				return c.finishFrameWrite(f.Opcode, 0, wireSize, err)
+			}
+		}
 		owned := uio.AcquireBuffer(wireSize)
 		dst := owned.AvailableBuffer()[:wireSize]
 		wire := frame.Append(dst[:0], f, maskKey)
 		owned.CommitWrite(len(wire))
 		n, err := c.raw.WriteOwned(owned)
+		if errors.Is(err, uio.ErrOutboundOverflow) {
+			uio.ReleaseBuffer(owned)
+		}
 		return c.finishFrameWrite(f.Opcode, n, wireSize, err)
 	}
 	scratch := acquireServerFrameScratch()
@@ -532,6 +673,176 @@ func (c *Conn) sendFrameSubmitted(f frame.Frame) error {
 	return c.finishFrameWrite(f.Opcode, n, wireSize, err)
 }
 
+// batchMessageLocked is send for the common message of a batching read round:
+// small, uncompressed, from a server with no heartbeat or close in progress.
+// It makes send's checks and appends the frame to the batch in one step. It
+// reports false, having done nothing, for any message it does not cover.
+func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, error) {
+	config := c.config
+	if config == nil || config.client || c.heartbeat != nil || c.compression != nil ||
+		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
+		return false, nil
+	}
+	size := uint64(len(payload))
+	if size > config.assembler.MaxMessage || size > config.parser.MaxFramePayload {
+		return false, nil
+	}
+	wireSize := frameWireSize(len(payload), false)
+	if config.writeBufferedThreshold <= 0 || wireSize >= config.writeBufferedThreshold || !c.batchHasRoom(wireSize) {
+		return false, nil
+	}
+	if opcode == frame.Text && config.assembler.ValidateUTF8 && !utf8.Valid(payload) {
+		return true, frame.ErrInvalidUTF8
+	}
+	batch := c.batch
+	if batch != nil && batch.Available() < wireSize {
+		if err := c.flushBatchLocked(); err != nil {
+			return true, err
+		}
+		if c.batch != nil {
+			// A full transport kept the old batch queued; this message must
+			// take the ordered path below instead of overwriting it.
+			return false, nil
+		}
+		batch = nil
+	}
+	if batch == nil {
+		batch = uio.AcquireBuffer(max(wireSize, c.batchBlockSize()))
+		c.batch = batch
+		c.batchOrderState().held.Store(true)
+	}
+	c.writes.close.pendingBytes.Add(int64(wireSize))
+	dst := frame.AppendHeader(batch.AvailableBuffer()[:0], frame.Frame{Fin: true, Opcode: opcode, Payload: payload}, [4]byte{})
+	copy(dst[len(dst):wireSize], payload)
+	batch.CommitWrite(wireSize)
+	return true, nil
+}
+
+func (c *Conn) batchBlockSize() int {
+	if c.config == nil || c.config.batchBlockSize <= 0 {
+		return writeBatchBlockSize(nil)
+	}
+	return c.config.batchBlockSize
+}
+
+// batchHasRoom reports whether a small frame may join the write batch without
+// taking the connection past its outbound limit. A frame that would goes the
+// direct way, which reports the backpressure for that frame alone.
+func (c *Conn) batchHasRoom(wireSize int) bool {
+	limit := c.maxOutbound()
+	if limit <= 0 {
+		return true
+	}
+	batched := 0
+	if c.batch != nil {
+		batched = c.batch.Len()
+	}
+	return c.raw.OutboundBuffered()+batched+wireSize <= limit
+}
+
+// batchFrame encodes a small frame into the write batch, which carries a read
+// round's replies to the transport in one hand-off. It requires writes.mu.
+// Only a round with more than one frame batches, so blocks are sized for many.
+// It reports false, having queued nothing, when a full transport refused the
+// previous batch: that batch keeps its place and the frame must not overtake it.
+func (c *Conn) batchFrame(f frame.Frame, maskKey [4]byte, wireSize int) (bool, error) {
+	batch := c.batch
+	if batch != nil && batch.Available() < wireSize {
+		if err := c.flushBatchLocked(); err != nil {
+			return false, err
+		}
+		if c.batch != nil {
+			// A full transport kept the old batch queued; this frame must take
+			// the ordered path instead of overwriting it.
+			return false, nil
+		}
+		batch = nil
+	}
+	if batch == nil {
+		batch = uio.AcquireBuffer(max(wireSize, c.batchBlockSize()))
+		c.batch = batch
+		c.batchOrderState().held.Store(true)
+	}
+	frame.Append(batch.AvailableBuffer()[:0], f, maskKey)
+	batch.CommitWrite(wireSize)
+	return true, nil
+}
+
+// flushBatchLocked hands the batched frames to the transport and submits any
+// control frames parked behind them. It requires writes.mu. Their senders were
+// already told they were accepted, so a transport that refuses them leaves a
+// broken stream and is aborted — except a full outbound limit, where the batch
+// stays queued until the transport drains and releases it. A nil error with
+// c.batch still set means the batch kept its place; callers must not overwrite
+// it.
+func (c *Conn) flushBatchLocked() error {
+	batch := c.batch
+	if batch == nil {
+		return c.drainPendingControlsLocked()
+	}
+	c.batch = nil
+	want := batch.Len()
+	n, err := c.raw.WriteOwned(batch)
+	if errors.Is(err, uio.ErrOutboundOverflow) {
+		// The limit filled between these frames' acceptance and this hand-off:
+		// a lock-bypassing control frame or a direct write took the room. The
+		// bytes were never accepted, so the buffer is still ours; keep it first
+		// in line and retry once the transport retires bytes.
+		c.batch = batch
+		order := c.batchOrderState()
+		order.held.Store(true)
+		order.retry.Store(true)
+		return nil
+	}
+	// The batch left the transport queue below the batch gate only once every
+	// byte is either accepted or gone for good. The gate must be cleared
+	// before drainPendingControlsLocked takes the parked queue's lock: a
+	// control frame that checks the gate under that lock either sees it set —
+	// and is in the queue for this drain — or sees it clear and submits
+	// directly instead of waiting for the next hand-off.
+	if order := c.batchOrder.Load(); order != nil {
+		order.held.Store(false)
+	}
+	if err = c.finishFrameWrite(frame.Continuation, n, want, err); err != nil && !errors.Is(err, ErrClosed) {
+		c.setCloseError(err)
+		c.closing.Store(true)
+		c.abortTransport(err)
+		return err
+	}
+	if err != nil {
+		return err
+	}
+	return c.drainPendingControlsLocked()
+}
+
+// flushLocked hands any batched frames to the transport and then asks it to
+// send what it holds. It requires writes.mu; callers without it use flush.
+func (c *Conn) flushLocked() error {
+	if err := c.flushBatchLocked(); err != nil {
+		return err
+	}
+	return c.flush()
+}
+
+// beginWriteBatch makes the small frames sent from now on join the write
+// batch until the read round ends. Only the connection's own read path calls
+// it, so a plain load sees whether this round already did.
+func (c *Conn) beginWriteBatch() {
+	if !c.batching.Load() {
+		c.batching.Store(true)
+	}
+}
+
+// endWriteBatch closes a read round's write batch. Whoever holds writes.mu
+// hands the batch over when it releases the lock, so a busy lock only defers
+// the hand-off to that holder.
+func (c *Conn) endWriteBatch() {
+	c.batching.Store(false)
+	if c.writes.mu.TryLock() {
+		c.unlockWrite()
+	}
+}
+
 func (c *Conn) completeWriteDrainLocked() error {
 	if !c.writes.close.drainIsRequested() {
 		return nil
@@ -541,7 +852,7 @@ func (c *Conn) completeWriteDrainLocked() error {
 		if payload != nil {
 			err := c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 			if err == nil {
-				err = c.flush()
+				err = c.flushLocked()
 			}
 			if err != nil {
 				c.writes.close.abortDrain()
@@ -562,12 +873,26 @@ func (c *Conn) tryCompleteWriteDrain() error {
 		return nil
 	}
 	err := c.completeWriteDrainLocked()
-	c.writes.mu.Unlock()
+	c.releaseWriteLock()
 	return err
 }
 
-func (c *Conn) unlockWrite() {
+// releaseWriteLock hands over a batch no read round will close any more before
+// the lock goes: once the round has ended, only a lock holder can. The flush
+// also submits control frames parked behind the batch.
+func (c *Conn) releaseWriteLock() {
+	if !c.batching.Load() {
+		_ = c.flushBatchLocked()
+	}
 	c.writes.mu.Unlock()
+}
+
+func (c *Conn) unlockWrite() {
+	c.releaseWriteLock()
+	// Both follow-ups below are flagged in flags; an open connection has none.
+	if c.writes.close.flags.Load()&(closeDrainRequested|transportPhaseMask) == 0 {
+		return
+	}
 	if c.writes.close.drainIsRequested() {
 		if err := c.tryCompleteWriteDrain(); err != nil {
 			c.setCloseError(err)
@@ -615,6 +940,9 @@ func (c *Conn) writeTransportOwned(buffer *uio.Buffer) error {
 		heartbeat.outboundAccepted.Add(uint64(want))
 	}
 	n, err := c.raw.WriteOwned(buffer)
+	if errors.Is(err, uio.ErrOutboundOverflow) {
+		uio.ReleaseBuffer(buffer)
+	}
 	if err != nil {
 		c.rollbackOutbound(want - n)
 		return err
@@ -679,12 +1007,30 @@ func (c *Conn) rollbackOutbound(n int) {
 }
 
 // releaseOutbound advances protocol send progress only for UIO's OnOutbound
-// callback, which confirms bytes actually left its queue.
+// callback, which confirms bytes actually left its queue. Retiring bytes may
+// also free room for a batch the limit refused, which it retries here.
 func (c *Conn) releaseOutbound(n int) {
 	if retiredBytes := c.reducePendingOutbound(n); retiredBytes != 0 && c.heartbeat != nil {
 		retired := c.heartbeat.outboundRetired.Add(uint64(retiredBytes))
 		c.heartbeat.markPingSent(retired)
 	}
+	if order := c.batchOrder.Load(); order != nil && order.retry.Load() {
+		c.retryBatchHandoff(order)
+	}
+}
+
+// retryBatchHandoff resubmits a batch the outbound limit refused once the
+// transport drained. It never waits for the write lock: whoever holds it hands
+// the batch over on release anyway.
+func (c *Conn) retryBatchHandoff(order *batchOrderState) {
+	if !c.writes.mu.TryLock() {
+		return
+	}
+	_ = c.flushBatchLocked()
+	if c.batch == nil {
+		order.retry.Store(false)
+	}
+	c.unlockWrite()
 }
 
 func (c *Conn) markHeartbeatPingTarget(f frame.Frame) {

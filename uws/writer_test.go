@@ -244,8 +244,8 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 	if closeErr := writer.Close(); !errors.Is(closeErr, ErrBackpressure) {
 		t.Fatalf("Writer.Close error = %v, want ErrBackpressure", closeErr)
 	}
-	if len(raw.written) != 2 {
-		t.Fatalf("transport writes = %d, want one successful and one rejected fragment", len(raw.written))
+	if len(raw.written) != 1 {
+		t.Fatalf("transport writes = %d, want only the successful first fragment", len(raw.written))
 	}
 	if raw.written[0][0]&0x80 != 0 {
 		t.Fatalf("first fragment unexpectedly has FIN set: %#x", raw.written[0][0])

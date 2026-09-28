@@ -22,3 +22,6 @@
 go.work
 
 */bin
+# OS / IDE
+.DS_Store
+.idea/

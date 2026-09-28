@@ -5,6 +5,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/urpc/uio/internal/fdmap"
 	"github.com/urpc/uio/internal/poller"
@@ -31,29 +32,41 @@ func newFdMap() *fdmap.Map[fdConn] {
 	return fdmap.NewMap[fdConn]()
 }
 
+// cacheLineSize separates fields that every connection turn writes from the
+// read-mostly fields next to them, so reading the latter does not keep
+// missing on a line other CPUs just modified.
+const cacheLineSize = 64
+
 // eventLoop is the sole owner of poller registration, descriptor teardown,
 // socket options, deadlines, and interest changes for its connections. Native
 // stream I/O and callbacks run in ioPool tasks and communicate back through the
 // MPSC task queue; they never call epoll/kqueue control operations directly.
 type eventLoop struct {
-	events *Events
-	poller *poller.NetPoller
-	buffer []byte
-	fdMap  *fdmap.Map[fdConn]
-	evbuf  []poller.Event
-
+	// Read-mostly state consulted by connection turns on every CPU.
+	events      *Events
+	poller      *poller.NetPoller
+	fdMap       *fdmap.Map[fdConn]
 	tasks       *taskqueue.Queue[*task] // public MPSC queue
 	ioPool      *ioTaskPool
 	ioPoolOwner bool
-	ioState     atomic.Uint64 // stop bit plus scheduled connection-turn count
+	stopping    atomic.Bool
+	loopGoid    atomic.Int64
+
+	_       [cacheLineSize]byte
+	ioState atomic.Uint64 // stop bit plus scheduled connection-turn count
+	_       [cacheLineSize - 8]byte
+
+	wakePending atomic.Bool // coalesces producer wakeups
+
+	// Loop-owned.
+	yield       bool // hand the P to just-woken workers; see Serve
+	buffer      []byte
+	evbuf       []poller.Event
 	ioIdle      chan struct{}
 	ioIdleOnce  sync.Once
 	taskBatch   *taskqueue.Node[*task] // private FIFO remainder owned by this loop
 	ioReady     []*fdConn              // newly runnable connections in this poll batch
 	ioReadyArgs []IOTask               // scratch only when an external Executor is used
-	wakePending atomic.Bool            // coalesces producer wakeups
-	stopping    atomic.Bool
-	loopGoid    atomic.Int64
 	stopErr     error
 }
 
@@ -75,6 +88,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		poller:      netPoller,
 		ioPool:      ioPool,
 		ioPoolOwner: owner,
+		yield:       events.Pollers > 1,
 		buffer:      make([]byte, events.MaxBufferSize),
 		fdMap:       newFdMap(),
 		evbuf:       make([]poller.Event, eventBatch),
@@ -86,19 +100,17 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 }
 
 func (loop *eventLoop) acquireIO() bool {
-	for {
-		state := loop.ioState.Load()
-		if state&ioStopBit != 0 {
-			return false
-		}
-		if loop.ioState.CompareAndSwap(state, state+1) {
-			return true
-		}
+	// One add rather than a load and compare-and-swap: this line moves
+	// between CPUs on every turn, and a failed CAS would move it again.
+	if loop.ioState.Add(1)&ioStopBit != 0 {
+		loop.releaseIO()
+		return false
 	}
+	return true
 }
 
 // Final close callbacks may be scheduled after the shutdown barrier. Their
-// lifetime is joined by ioPool.stop, rather than by the fd teardown barrier.
+// lifetime is joined by waitIODrained, rather than by the fd teardown barrier.
 func (loop *eventLoop) acquireCloseIO() { loop.ioState.Add(1) }
 
 func (loop *eventLoop) releaseIO() {
@@ -108,6 +120,19 @@ func (loop *eventLoop) releaseIO() {
 }
 
 func (loop *eventLoop) ioStopped() bool { return loop.ioState.Load()&ioStopBit != 0 }
+
+// waitIODrained joins every connection turn counted by this loop, including
+// close callbacks scheduled after the shutdown barrier. It runs once per loop
+// during shutdown, so a short polling backoff costs nothing on the data path.
+func (loop *eventLoop) waitIODrained() {
+	delay := 20 * time.Microsecond
+	for loop.ioState.Load()&^ioStopBit != 0 {
+		time.Sleep(delay)
+		if delay < 2*time.Millisecond {
+			delay *= 2
+		}
+	}
+}
 
 func (loop *eventLoop) stopIO() {
 	if loop.ioIdle == nil {
@@ -305,7 +330,12 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 		for _, event := range loop.evbuf[:n] {
 			handler.OnEvent(loop.poller, event.FD, event.Events)
 		}
-		loop.submitIOReady()
+		if loop.submitIOReady() && loop.yield {
+			// As the shared data poller's waiters do: run the workers just
+			// woken on this P now instead of holding it in the next wait,
+			// while the other loops keep watching their connections.
+			runtime.Gosched()
+		}
 	}
 
 	if result == nil {
@@ -322,9 +352,9 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 // submitIOReady hands one readiness batch to the connection scheduler. The
 // slice is loop-owned and immediately reused, so external batch executors must
 // copy any task references retained after SubmitBatch returns.
-func (loop *eventLoop) submitIOReady() {
+func (loop *eventLoop) submitIOReady() bool {
 	if len(loop.ioReady) == 0 {
-		return
+		return false
 	}
 	connections := loop.ioReady
 	loop.ioReady = loop.ioReady[:0]
@@ -335,6 +365,7 @@ func (loop *eventLoop) submitIOReady() {
 	}
 	loop.ioReadyArgs = loop.ioReadyArgs[:0]
 	clear(connections)
+	return true
 }
 
 func (loop *eventLoop) shutdown(err error) {
@@ -355,6 +386,7 @@ func (loop *eventLoop) shutdown(err error) {
 		}
 	}
 	if loop.ioPoolOwner {
+		loop.waitIODrained()
 		loop.ioPool.stop()
 	}
 }

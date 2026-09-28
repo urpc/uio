@@ -49,19 +49,27 @@ func newDataPoller(ev *Events) (*dataPoller, error) {
 // dataWaitersOverride fixes the waiter count in tests; zero means automatic.
 var dataWaitersOverride int
 
-// dataWaiters is how many goroutines wait on the shared poller. One of them
-// dispatches about a million events per second, roughly what 24 CPUs of the
-// lightest request/response traffic produce, so most servers need exactly one.
-// More waiters only split the load into goroutines that block more often.
+// dataWaiters is how many goroutines wait on the shared poller. epoll hands
+// each ready edge to one waiter, so a second waiter collects the next batch
+// while the first one is still folding its events in and handing them to the
+// executor, instead of letting input sit in the kernel for that long. That
+// matters most for executors whose submissions are not free. Beyond two per
+// 24 Ps, more waiters only split the load into goroutines that block more
+// often.
 func dataWaiters() int {
 	if dataWaitersOverride > 0 {
 		return dataWaitersOverride
 	}
-	return max(1, runtime.GOMAXPROCS(0)/24)
+	procs := runtime.GOMAXPROCS(0)
+	if procs < 4 {
+		return 1
+	}
+	return max(2, procs/12)
 }
 
 func (data *dataPoller) start(ev *Events) {
-	for range dataWaiters() {
+	waiters := dataWaiters()
+	for range waiters {
 		waiter := &dataWaiter{
 			evbuf: make([]poller.Event, eventBatch),
 			ready: make([]*fdConn, 0, eventBatch),
@@ -74,7 +82,7 @@ func (data *dataPoller) start(ev *Events) {
 				runtime.LockOSThread()
 				defer runtime.UnlockOSThread()
 			}
-			if err := data.serve(waiter); err != nil {
+			if err := data.serve(waiter, waiters > 1); err != nil {
 				ev.initiateClose(err)
 			}
 		}()
@@ -86,7 +94,14 @@ func (data *dataPoller) start(ev *Events) {
 // and the kernel reuse its number for a new connection, after epoll_wait has
 // returned an event for it. The tag keeps such an event from reaching the new
 // connection before its open task.
-func (data *dataPoller) serve(waiter *dataWaiter) error {
+//
+// With more than one waiter, a waiter that handed tasks to the executor
+// yields before it waits again. The executor's wake-ups queue the workers on
+// this waiter's P, and epoll_wait would keep that P in a system call until the
+// runtime retakes it; yielding runs them at once while another waiter keeps
+// watching the poller. A lone waiter must not yield: it would queue behind
+// the very workers it woke.
+func (data *dataPoller) serve(waiter *dataWaiter, yield bool) error {
 	for {
 		n, err := data.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
 		if data.poller.Closed() {
@@ -96,7 +111,9 @@ func (data *dataPoller) serve(waiter *dataWaiter) error {
 			return err
 		}
 		data.dispatch(waiter, waiter.evbuf[:n])
-		data.submit(waiter)
+		if data.submit(waiter) && yield {
+			runtime.Gosched()
+		}
 	}
 }
 
@@ -114,9 +131,9 @@ func (data *dataPoller) dispatch(waiter *dataWaiter, events []poller.Event) {
 	}
 }
 
-func (data *dataPoller) submit(waiter *dataWaiter) {
+func (data *dataPoller) submit(waiter *dataWaiter) bool {
 	if len(waiter.ready) == 0 {
-		return
+		return false
 	}
 	connections := waiter.ready
 	waiter.ready = waiter.ready[:0]
@@ -127,6 +144,7 @@ func (data *dataPoller) submit(waiter *dataWaiter) {
 	}
 	waiter.args = waiter.args[:0]
 	clear(connections)
+	return true
 }
 
 // close stops the waiters once every loop has deregistered its connections.

@@ -177,11 +177,26 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 	ev.initiateClose(err)
 	ev.waitGroup.Wait()
 	ev.closeDataPoller(err)
-	if ev.ioPool != nil {
-		ev.ioPool.stop()
-	}
+	ev.stopIOPool()
 	ev.callbackWG.Wait()
 	return err
+}
+
+// stopIOPool joins every connection turn the loops counted, including close
+// callbacks scheduled while they shut down, and then stops the scheduler.
+func (ev *Events) stopIOPool() {
+	if ev.ioPool == nil {
+		return
+	}
+	if ev.master != nil {
+		ev.master.waitIODrained()
+	}
+	for _, worker := range ev.workers {
+		if worker != nil {
+			worker.waitIODrained()
+		}
+	}
+	ev.ioPool.stop()
 }
 
 // Close publishes shutdown and returns without waiting. Use Wait or the return
@@ -304,9 +319,7 @@ func (ev *Events) rollbackInit(err error) {
 	}
 	ev.waitGroup.Wait()
 	ev.closeDataPoller(err)
-	if ev.ioPool != nil {
-		ev.ioPool.stop()
-	}
+	ev.stopIOPool()
 	ev.callbackWG.Wait()
 }
 

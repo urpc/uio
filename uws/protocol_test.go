@@ -434,11 +434,11 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 	var primaryWire []byte
 	for i := 0; i < primaryFrames; i++ {
 		primaryWire = frame.Append(primaryWire, frame.Frame{
-			Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte{0, byte(i)},
+			Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte{0, byte(i >> 8), byte(i)},
 		}, [4]byte{1, 2, 3, 4})
 	}
 	peerWire := frame.Append(nil, frame.Frame{
-		Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte{1, 0},
+		Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte{1, 0, 0},
 	}, [4]byte{4, 3, 2, 1})
 	if _, err = primary.Write(primaryWire); err != nil {
 		t.Fatal(err)
@@ -452,12 +452,12 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 	for nextPrimary < primaryFrames || !peerReceived {
 		select {
 		case message := <-handler.messages:
-			if message.Type != BinaryMessage || len(message.Payload) != 2 {
+			if message.Type != BinaryMessage || len(message.Payload) != 3 {
 				t.Fatalf("unexpected message = %+v", message)
 			}
 			switch message.Payload[0] {
 			case 0:
-				if got := int(message.Payload[1]); got != nextPrimary {
+				if got := int(message.Payload[1])<<8 | int(message.Payload[2]); got != nextPrimary {
 					t.Fatalf("primary message index = %d, want %d", got, nextPrimary)
 				}
 				nextPrimary++

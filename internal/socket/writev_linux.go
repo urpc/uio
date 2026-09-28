@@ -4,23 +4,21 @@ package socket
 
 import (
 	"runtime"
-	"syscall"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
 
 const stackWritevLimit = 64
 
-// Writev invokes SYS_WRITEV with stack-backed iovecs for UIO's common batches.
-// x/sys reserves only eight iovecs and allocates when a corked read round
-// produces a larger batch.
+// Writev writes a stream socket's buffers with one sendmsg and stack-backed
+// iovecs for UIO's common batches. x/sys reserves only eight iovecs and
+// allocates when a corked read round produces a larger batch.
 func Writev(fd int, buffers [][]byte) (int, error) {
 	switch len(buffers) {
 	case 0:
 		return 0, nil
 	case 1:
-		return syscall.Write(fd, buffers[0])
+		return Send(fd, buffers[0])
 	}
 	if len(buffers) > stackWritevLimit {
 		return unix.Writev(fd, buffers)
@@ -34,17 +32,9 @@ func Writev(fd int, buffers [][]byte) (int, error) {
 		}
 	}
 	// Keep the runtime's syscall enter/exit accounting. These sockets are
-	// non-blocking, but writev can still contend in the kernel under load and
+	// non-blocking, but a send can still contend in the kernel under load and
 	// hiding that interval from the scheduler hurts CPU efficiency.
-	written, _, errno := unix.Syscall(
-		unix.SYS_WRITEV,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&iovecs[0])),
-		uintptr(len(iovecs)),
-	)
+	written, err := sendmsgIovecs(fd, iovecs)
 	runtime.KeepAlive(buffers)
-	if errno != 0 {
-		return int(written), errno
-	}
-	return int(written), nil
+	return written, err
 }

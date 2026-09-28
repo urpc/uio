@@ -94,6 +94,11 @@ func (c *scriptedConn) Writev(buffers [][]byte) (int, error) {
 }
 
 func (c *scriptedConn) WriteOwned(buffer *uio.Buffer) (int, error) {
+	if c.writeErr != nil && errors.Is(c.writeErr, uio.ErrOutboundOverflow) {
+		// The transport contract returns an overflowed buffer unconsumed.
+		c.writes++
+		return 0, c.writeErr
+	}
 	payload := append([]byte(nil), buffer.Bytes()...)
 	uio.ReleaseBuffer(buffer)
 	c.writes++

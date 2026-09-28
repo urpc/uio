@@ -146,11 +146,25 @@ type Conn interface {
 	// Notice: non-blocking interface, should not be used as you use std.
 	Writev(vec [][]byte) (int, error)
 
-	// WriteOwned submits buffer without copying and always consumes its
-	// ownership, including when it returns an error. For UDP, one buffer is sent
-	// as one datagram. Native UDP writes from another event loop return
-	// ErrUDPWriteOnEventLoop.
+	// WriteOwned submits buffer without copying and consumes its ownership on
+	// every return path except ErrOutboundOverflow, which accepts nothing and
+	// returns the buffer to the caller to resubmit or release. A direct write
+	// that partially reached the socket and then could not queue its suffix
+	// reports io.ErrShortWrite instead: that buffer is consumed and the stream
+	// is being closed, so the partial frame is never resubmitted. For UDP, one
+	// buffer is sent as one datagram. Native UDP writes from another event loop
+	// return ErrUDPWriteOnEventLoop.
 	WriteOwned(buffer *Buffer) (int, error)
+
+	// ReserveOutbound appends n bytes to the connection's outbound queue and
+	// returns them for the caller to fill in place, so an encoder writes
+	// straight into the queue instead of into a buffer that is copied again.
+	// It works only in a native stream connection's own callback, where the
+	// queue is sent after the callback returns; elsewhere it reserves nothing
+	// and returns ErrReserveUnsupported, and the caller writes another way.
+	// Every reserved byte must be written before the callback returns and
+	// before the next Flush.
+	ReserveOutbound(n int) ([]byte, error)
 
 	// Flush schedules buffered data for writing without waiting for socket I/O.
 	// Writes accepted before Flush remain ordered before later writes.
@@ -177,6 +191,7 @@ var (
 	ErrUnflushedData       = errors.New("uio: connection closed with unflushed data")
 	ErrDialOnEventLoop     = errors.New("uio: Dial cannot run on an event loop")
 	ErrUDPWriteOnEventLoop = errors.New("uio: UDP write cannot wait on another event loop")
+	ErrReserveUnsupported  = errors.New("uio: outbound reservation needs the connection's own callback")
 )
 
 // UnflushedError reports payload accepted by the framework but not sent before
@@ -193,32 +208,29 @@ func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 
 // commonConn contains transport-independent identity and inbound storage.
 // inboundTail is a borrowed current-read slice; inbound owns only bytes that a
-// callback left unread before that slice had to be reused.
+// callback left unread before that slice had to be reused. Fields every data
+// callback touches come first so they share a cache line; the addresses are
+// read only on request.
 type commonConn struct {
-	events      *Events                     // events
-	loop        *eventLoop                  // event loop
-	localAddr   net.Addr                    // local address
-	remoteAddr  net.Addr                    // remote address
-	userdata    atomic.Pointer[userdataBox] // user-defined data
-	inboundGoid atomic.Int64                // current inbound callback owner
-	inbound     bytebuf.CompositeBuffer     // inbound buffer
-	inboundTail []byte                      // inbound tail buffer
-	internal    bool                        // framework-owned endpoint, not a user connection
+	events      *Events                 // events
+	loop        *eventLoop              // event loop
+	inboundGoid atomic.Int64            // current inbound callback owner
+	userdata    any                     // user-defined data; see Conn.SetUserdata
+	inboundTail []byte                  // inbound tail buffer
+	inbound     bytebuf.CompositeBuffer // inbound buffer
+	localAddr   net.Addr                // local address
+	remoteAddr  net.Addr                // remote address
 }
-
-// userdataBox lets atomic.Pointer publish an arbitrary interface value.
-type userdataBox struct{ value any }
 
 func (fc *commonConn) LocalAddr() net.Addr  { return fc.localAddr }
 func (fc *commonConn) RemoteAddr() net.Addr { return fc.remoteAddr }
-func (fc *commonConn) Userdata() any {
-	value := fc.userdata.Load()
-	if value == nil {
-		return nil
-	}
-	return value.value
-}
-func (fc *commonConn) SetUserdata(value any) { fc.userdata.Store(&userdataBox{value: value}) }
+
+// Userdata is read on every data callback. Callers already serialize it with
+// SetUserdata, and connection turns are ordered by the scheduler, so it is a
+// plain field: boxing it for atomic publication cost a pointer chase, and a
+// cache miss, per callback.
+func (fc *commonConn) Userdata() any         { return fc.userdata }
+func (fc *commonConn) SetUserdata(value any) { fc.userdata = value }
 
 // Callback ownership is a contract check for borrowed inbound slices, not a
 // lock. Native tasks and std callbackMu serialize access before entering here.

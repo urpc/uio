@@ -30,6 +30,21 @@ func (c *Conn) BeginMessage(typ MessageType) (*Writer, error) {
 		c.unlockWrite()
 		return nil, err
 	}
+	// Frames the read round batched before this Writer took the lock keep
+	// their place: hand them over now, so the Writer's tenure leaves nothing
+	// for a lock-bypassing Pong to overtake and no batch can accrue behind it.
+	if err := c.flushBatchLocked(); err != nil {
+		c.unlockWrite()
+		return nil, err
+	}
+	if c.batch != nil {
+		// The outbound limit kept an accepted batch queued for retry. A
+		// Writer would only meet that backpressure on its first write and
+		// abort the connection, costing the batch its retry: report the
+		// backpressure to the caller instead of creating the Writer.
+		c.unlockWrite()
+		return nil, ErrBackpressure
+	}
 	if c.closed.Load() || c.closing.Load() {
 		c.unlockWrite()
 		return nil, ErrClosed
@@ -38,6 +53,7 @@ func (c *Conn) BeginMessage(typ MessageType) (*Writer, error) {
 	if typ == BinaryMessage {
 		opcode = frame.Binary
 	}
+	c.streaming = true
 	writer := &Writer{conn: c, opcode: opcode, first: true}
 	if c.compression != nil && c.compression.encoder != nil {
 		stream, err := c.compression.encoder.NewStream(writer.emitCompressed)
@@ -155,12 +171,13 @@ func (w *Writer) Close() error {
 		err = w.conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: opcode})
 	}
 	if err == nil {
-		err = w.conn.flush()
+		err = w.conn.flushLocked()
 	}
 	if err != nil {
 		return w.fail(err)
 	}
 	w.closed = true
+	w.conn.streaming = false
 	w.conn.unlockWrite()
 	return nil
 }
@@ -181,6 +198,7 @@ func (w *Writer) fail(err error) error {
 	if w.stream != nil {
 		w.stream.Abort()
 	}
+	w.conn.streaming = false
 	w.conn.unlockWrite()
 	if w.conn.raw != nil && !protocolClosePending {
 		w.conn.abortTransport(w.failure)

@@ -230,6 +230,11 @@ func (c *writeProbeConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return n, nil
 }
 
+// ReserveOutbound sends probes down the owned-write path, which they count.
+func (c *writeProbeConn) ReserveOutbound(int) ([]byte, error) {
+	return nil, uio.ErrReserveUnsupported
+}
+
 func (c *writeProbeConn) Flush() error {
 	c.flushes++
 	return nil

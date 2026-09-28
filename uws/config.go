@@ -18,6 +18,8 @@ type connConfig struct {
 
 	maxHeaderBytes         int
 	writeBufferedThreshold int
+	maxOutbound            int // the transport's MaxOutboundBuffered
+	batchBlockSize         int
 	closeTimeout           time.Duration
 	handshakeTimeout       time.Duration
 
@@ -75,6 +77,8 @@ func newServerConnConfig(server *Server) *connConfig {
 		},
 		maxHeaderBytes:             maxHeader,
 		writeBufferedThreshold:     effectiveWriteBufferedThreshold(server.Events),
+		maxOutbound:                maxOutboundBuffered(server.Events),
+		batchBlockSize:             writeBatchBlockSize(server.Events),
 		closeTimeout:               closeTimeout,
 		handshakeTimeout:           handshakeTimeout,
 		compressionEnabled:         server.EnableCompression,
@@ -118,6 +122,8 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 		},
 		maxHeaderBytes:         maxHeader,
 		writeBufferedThreshold: effectiveWriteBufferedThreshold(dialer.Events),
+		maxOutbound:            maxOutboundBuffered(dialer.Events),
+		batchBlockSize:         writeBatchBlockSize(dialer.Events),
 		closeTimeout:           closeTimeout,
 		handshakeTimeout:       handshakeTimeout,
 		compressionEnabled:     dialer.EnableCompression,

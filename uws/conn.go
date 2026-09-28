@@ -14,7 +14,9 @@ import (
 
 // Conn is an established or handshaking WebSocket connection. UIO serializes
 // protocol and handler callbacks per connection; atomics here coordinate
-// external writers, timers, heartbeat scanning, and transport callbacks.
+// external writers, timers, heartbeat scanning, and transport callbacks. The
+// fields every message touches come first, so they share as few cache lines
+// as the struct's size class allows.
 type Conn struct {
 	raw         uio.Conn
 	config      *connConfig
@@ -27,13 +29,51 @@ type Conn struct {
 	closed  atomic.Bool
 	closing atomic.Bool
 
-	userData any
-	metadata atomic.Pointer[connMetadata]
+	readFrames int32       // frames delivered in the current read round
+	batching   atomic.Bool // a read round is batching the small frames it sends
+	streaming  bool        // a Writer owns writes.mu; guarded by writes.mu
 
-	writes     connWriteState
+	batch     *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
+	heartbeat *heartbeatState
+	writes    connWriteState
+
+	userData   any
+	metadata   atomic.Pointer[connMetadata]
 	handshake  atomic.Pointer[handshakeState]
-	heartbeat  *heartbeatState
 	closeTimer atomic.Pointer[closeTimerState]
+
+	// batchOrder carries the batching-ordering state that only the write
+	// batch and lock-bypassing control frames touch. It is allocated when a
+	// connection first batches a read round, so connections that never batch
+	// keep the struct in its hot 192-byte shape.
+	batchOrder atomic.Pointer[batchOrderState]
+}
+
+// batchOrderState orders lock-bypassing control frames after an accepted write
+// batch: held marks a batch that frames must not overtake, retry marks a batch
+// the outbound limit refused, and mu guards the parked frames themselves.
+type batchOrderState struct {
+	held   atomic.Bool
+	retry  atomic.Bool
+	mu     sync.Mutex
+	parked []*uio.Buffer
+}
+
+var batchOrderPool sync.Pool
+
+func (c *Conn) batchOrderState() *batchOrderState {
+	if state := c.batchOrder.Load(); state != nil {
+		return state
+	}
+	state, _ := batchOrderPool.Get().(*batchOrderState)
+	if state == nil {
+		state = &batchOrderState{}
+	}
+	if c.batchOrder.CompareAndSwap(nil, state) {
+		return state
+	}
+	batchOrderPool.Put(state)
+	return c.batchOrder.Load()
 }
 
 // connWriteState serializes frame construction and streaming Writer ownership.
@@ -49,10 +89,10 @@ type connWriteState struct {
 // streaming Writer may own mu throughout both. transitionMu only protects
 // short state transitions; it never covers socket I/O or application work.
 type connCloseProgress struct {
-	transitionMu sync.Mutex
-	pendingClose *pendingCloseFrame
 	pendingBytes atomic.Int64
 	flags        atomic.Uint32
+	transitionMu sync.Mutex
+	pendingClose *pendingCloseFrame
 }
 
 const (
@@ -256,6 +296,13 @@ func (c *Conn) maxMessageSize() uint64 {
 		return DefaultMaxMessageSize
 	}
 	return c.config.assembler.MaxMessage
+}
+
+func (c *Conn) maxOutbound() int {
+	if c.config == nil {
+		return 0
+	}
+	return c.config.maxOutbound
 }
 
 func (c *Conn) writeBufferedThreshold() int {

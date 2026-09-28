@@ -19,6 +19,7 @@
 package uio
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync"
@@ -56,6 +57,7 @@ type fdConn struct {
 	writeBytes int
 	closing    atomic.Bool
 	callbackMu sync.Mutex // serializes OnData, Wake, and OnClose
+	internal   bool       // framework-owned endpoint, not a user connection
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -267,7 +269,13 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		if limit := fc.events.MaxOutboundBuffered; limit > 0 && len(p) > limit {
 			return 0, ErrOutboundOverflow
 		}
-		return fc.WriteOwned(bytebuf.CloneBuffer(p))
+		owned := bytebuf.CloneBuffer(p)
+		n, err := fc.WriteOwned(owned)
+		if errors.Is(err, ErrOutboundOverflow) {
+			// The clone never entered the queue, so Write still owns it.
+			bytebuf.ReleaseBuffer(owned)
+		}
+		return n, err
 	}
 
 	fc.mux.Lock()
@@ -391,6 +399,15 @@ func releaseStdBuffers(buffers []*bytebuf.Buffer) {
 	}
 }
 
+// ReserveOutbound is unsupported: the dedicated writer goroutine may detach
+// outbound at any moment, so bytes cannot be left in it to be filled later.
+func (fc *fdConn) ReserveOutbound(int) ([]byte, error) {
+	if fc.isClosing() {
+		return nil, net.ErrClosed
+	}
+	return nil, ErrReserveUnsupported
+}
+
 func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 	if owned == nil {
 		return 0, nil
@@ -417,7 +434,7 @@ func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 	}
 	if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
 		fc.mux.Unlock()
-		bytebuf.ReleaseBuffer(owned)
+		// An overflowed buffer was never accepted, so it remains the caller's.
 		return 0, ErrOutboundOverflow
 	}
 	fc.outbound.AppendOwned(owned)

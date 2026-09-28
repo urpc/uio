@@ -28,11 +28,23 @@ const (
 
 // Ordinary copied payloads stay bounded at 64 KiB. Explicit owned buffers may
 // retain a frame up to 16 MiB without expanding retention for every Write.
-var bufferPool = pool.New[*Buffer](64 << 10)
+const maxCopiedBlock = 64 << 10
+
+var bufferPool = pool.New[*Buffer](maxCopiedBlock)
 var largeOwnedBufferPool = pool.New[*Buffer](16 << 20)
 
 func getBuffer(capacity int) *Buffer {
 	return getBufferFrom(bufferPool, defaultBufferPool, capacity)
+}
+
+// getBlock returns an empty block for bytes copied into a composite buffer.
+// Blocks too large for the ordinary pool come from the owned pool, so a large
+// copied write is still reused instead of allocated every time.
+func getBlock(capacity int) *Buffer {
+	if capacity > maxCopiedBlock {
+		return getBufferFrom(largeOwnedBufferPool, ownedBufferPool, capacity)
+	}
+	return getBuffer(capacity)
 }
 
 func getBufferFrom(owner *pool.Pool[*Buffer], kind bufferPoolKind, capacity int) *Buffer {

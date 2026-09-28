@@ -102,14 +102,17 @@ tasks on the configured `Executor` or UIO's typed taskgo queue. One blocked
 stream connection therefore does not block its poller or another connection.
 On Linux, stream readiness is not collected by the event loops but by one
 shared data poller: every stream is registered with a single epoll instance
-whose waiter hands runnable connections to the task pool in arrival order.
+whose waiters hand runnable connections to the task pool in arrival order.
 Loops that each watched a share of the streams kept blocking in `epoll_wait`,
 gave up their P each time, and under load waited for another one while their
 connections' input sat in the kernel, so latency depended on which loop owned
 a connection. With the shared poller, `Pollers` sizes the control plane
 (accept, registration, close, deadlines, UDP) and no longer changes the
-latency of stream traffic. Hosts with 48 or more CPUs run one extra waiter per
-24 CPUs on the same epoll instance. On BSD and macOS each event loop still
+latency of stream traffic. With 4 or more Ps two waiters share the epoll
+instance, one more per 12 Ps beyond 24, so one of them collects the next batch
+while another is still handing its batch to the executor; a waiter that
+submitted work yields its P to the workers it woke before waiting again. On
+BSD and macOS each event loop still
 watches its own streams. Native UDP callbacks and datagram sends remain on their owning
 event loop because peers share the socket. An external UDP `Write` or
 `WriteOwned` waits for that loop's nonblocking send result; a call from another
@@ -157,7 +160,12 @@ inbound chunk without copying it. Process the returned slice before calling
 
 For encoders that can write into caller-provided storage, `AcquireBuffer` and
 `Conn.WriteOwned` avoid copying the encoded result into asynchronous outbound
-storage. `WriteOwned` consumes the buffer on both success and failure:
+storage. `WriteOwned` consumes the buffer on both success and failure, with one
+exception: `ErrOutboundOverflow` means nothing was accepted, so the buffer
+remains the caller's to resubmit or release. When a direct write partially
+reached the socket and the remainder cannot be queued, the error is
+`io.ErrShortWrite` instead: that buffer is consumed and the stream is closing,
+so the partial frame is never resubmitted:
 
 ```go
 buffer := uio.AcquireBuffer(size)
@@ -169,6 +177,23 @@ if err != nil {
 }
 buffer.CommitWrite(n)
 _, err = conn.WriteOwned(buffer)
+```
+
+Inside a native stream connection's own callback, `Conn.ReserveOutbound`
+goes one step further: it appends the requested bytes to the connection's
+outbound queue and returns them for the encoder to fill in place, so a round
+of small replies shares a few pooled blocks and is sent with one write when the
+callback returns. Fill every reserved byte before the callback returns or
+flushes. Elsewhere, including on the `stdio` backend, it returns
+`ErrReserveUnsupported` and the caller falls back to another write:
+
+```go
+dst, err := conn.ReserveOutbound(size)
+if errors.Is(err, uio.ErrReserveUnsupported) {
+	// not in the connection's callback: encode into a buffer and WriteOwned it
+} else if err == nil {
+	encode(dst)
+}
 ```
 
 ```go

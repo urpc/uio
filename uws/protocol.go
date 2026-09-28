@@ -183,11 +183,21 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 }
 
 // readAvailable consumes borrowed UIO inbound chunks without copying complete
-// frames. It yields after maxFramesPerDataEvent callbacks so a hot connection
-// returns to the scheduler and cannot monopolize one worker.
+// frames. It yields after maxFramesPerDataEvent callbacks for one chunk so a
+// hot connection returns to the scheduler and cannot monopolize one worker.
+// A round that carries several frames batches the small replies they send and
+// hands them to the transport together when it ends.
 func (c *Conn) readAvailable() error {
-	frames := 0
-	for c.raw.InboundBuffered() > 0 {
+	err := c.readRound()
+	if c.batching.Load() {
+		c.endWriteBatch()
+	}
+	return err
+}
+
+func (c *Conn) readRound() error {
+	c.readFrames = 0
+	for {
 		data := c.raw.PeekChunk()
 		if len(data) == 0 {
 			return nil
@@ -203,33 +213,85 @@ func (c *Conn) readAvailable() error {
 			continue
 		}
 
-		consumed, err := c.feedFrames(data, func(f frame.Frame) error {
-			if err := c.acceptFrame(f); err != nil {
-				return err
-			}
-			frames++
-			if frames >= maxFramesPerDataEvent {
-				return errReadBudget
-			}
-			return nil
-		})
+		consumed, err := c.consumeFrames(data)
 		if consumed > 0 {
 			_, _ = c.raw.Discard(consumed)
 		}
-		if errors.Is(err, errReadBudget) {
-			if yieldErr := c.raw.YieldRead(); yieldErr != nil {
-				return fmt.Errorf("uws: yield buffered read: %w", yieldErr)
-			}
-			return nil
-		}
 		if err != nil {
+			if err == errReadBudget || errors.Is(err, errReadBudget) {
+				if yieldErr := c.raw.YieldRead(); yieldErr != nil {
+					return fmt.Errorf("uws: yield buffered read: %w", yieldErr)
+				}
+				return nil
+			}
 			return c.protocolClose(err)
 		}
 		if consumed == 0 {
 			return nil
 		}
 	}
+}
+
+// connFrameSink delivers a read round's frames to its connection and charges
+// them against the round's budget. It is the Conn itself, so handing it to the
+// incremental parser as a frame.Sink allocates nothing.
+type connFrameSink Conn
+
+func (sink *connFrameSink) AcceptFrame(f frame.Frame) error {
+	c := (*Conn)(sink)
+	if err := c.acceptFrame(f); err != nil {
+		return err
+	}
+	c.readFrames++
+	if c.readFrames >= maxFramesPerDataEvent {
+		return errReadBudget
+	}
 	return nil
+}
+
+// consumeFrames is feedFrames for a read round: complete frames are parsed in
+// place and delivered without an intermediate callback, and only a frame that
+// spans input chunks takes a pooled incremental parser.
+func (c *Conn) consumeFrames(data []byte) (int, error) {
+	sink := (*connFrameSink)(c)
+	if c.parser != nil {
+		c.beginWriteBatch()
+		consumed, err := c.parser.FeedTo(data, sink)
+		if err != nil || c.parser.AtFrameBoundary() {
+			releaseIncrementalParser(c.parser)
+			c.parser = nil
+		}
+		return consumed, err
+	}
+	cfg := c.frameParserConfig()
+	consumed := 0
+	for consumed < len(data) {
+		parsed, size, complete, err := frame.ParseFrame(data[consumed:], cfg)
+		if err != nil {
+			return consumed, err
+		}
+		if !complete {
+			c.beginWriteBatch()
+			parser := acquireIncrementalParser(cfg)
+			n, err := parser.FeedTo(data[consumed:], sink)
+			consumed += n
+			if err != nil || parser.AtFrameBoundary() {
+				releaseIncrementalParser(parser)
+			} else {
+				c.parser = parser
+			}
+			return consumed, err
+		}
+		consumed += size
+		if consumed < len(data) {
+			// More input follows this frame: batch the round's replies.
+			c.beginWriteBatch()
+		}
+		if err := sink.AcceptFrame(parsed); err != nil {
+			return consumed, err
+		}
+	}
+	return consumed, nil
 }
 
 // Complete frames bypass this pool; only state spanning input reads is stored.
@@ -552,8 +614,22 @@ func (c *Conn) acceptFrame(f frame.Frame) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
-	if c.assembler == nil && (frame.IsControl(f.Opcode) || ((f.Opcode == frame.Text || f.Opcode == frame.Binary) && f.Fin)) {
-		return frame.AcceptSingle(f, &c.config.assembler, c.acceptControl, c.acceptMessage)
+	if c.assembler == nil {
+		if f.Fin && !f.RSV1 && (f.Opcode == frame.Binary || f.Opcode == frame.Text) {
+			// A complete uncompressed message, the common case: the checks
+			// frame.AcceptSingle makes for it, without its callbacks.
+			cfg := &c.config.assembler
+			if cfg.MaxMessage != 0 && uint64(len(f.Payload)) > cfg.MaxMessage {
+				return frame.ErrMessageTooBig
+			}
+			if f.Opcode == frame.Text && cfg.ValidateUTF8 && !utf8.Valid(f.Payload) {
+				return frame.ErrInvalidUTF8
+			}
+			return c.notifyMessage(Message{Type: messageType(f.Opcode), Payload: f.Payload})
+		}
+		if frame.IsControl(f.Opcode) || ((f.Opcode == frame.Text || f.Opcode == frame.Binary) && f.Fin) {
+			return frame.AcceptSingle(f, &c.config.assembler, c.acceptControl, c.acceptMessage)
+		}
 	}
 	if c.assembler == nil {
 		c.assembler = acquireMessageAssembler(&c.config.assembler)
@@ -596,7 +672,14 @@ func (c *Conn) acceptMessage(message frame.Message) error {
 func (c *Conn) acceptControl(f frame.Frame) error {
 	switch f.Opcode {
 	case frame.Ping:
-		return c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
+		err := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
+		if errors.Is(err, ErrBackpressure) {
+			// The outbound limit is full: the Pong cannot be sent now and must
+			// not close the connection over it. Dropping it loses only this
+			// keepalive exchange; the peer's next Ping retries.
+			return nil
+		}
+		return err
 	case frame.Pong:
 		if c.heartbeat != nil && len(f.Payload) == 8 {
 			c.heartbeat.acknowledgePing(binary.BigEndian.Uint64(f.Payload))
@@ -628,6 +711,12 @@ func (err *ownedProtocolClose) Error() string { return err.cause.Error() }
 func (err *ownedProtocolClose) Unwrap() error { return err.cause }
 
 func protocolCloseOwnsTransport(err error) bool {
+	if err == nil {
+		return false
+	}
+	if _, ok := err.(*ownedProtocolClose); ok {
+		return true
+	}
 	var owned *ownedProtocolClose
 	return errors.As(err, &owned)
 }

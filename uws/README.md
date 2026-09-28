@@ -98,6 +98,21 @@ small frames can share transport storage and a flush. Ping, Close, and
 threshold is preserved; use a negative value to disable this small-frame
 coalescing policy.
 
+When one read carries several frames, the replies their callbacks send below
+that threshold are encoded into a single batch and handed to UIO together when
+the frames of that read have been delivered, so a pipelining client costs one
+transport hand-off and one write per read rather than per message. A send from
+another goroutine during that time joins the batch in order. A control frame
+that must bypass the write lock (a Pong under an open streaming Writer) is
+submitted directly only while no batch is pending; otherwise it is parked and
+handed over right after the batch, so it can neither overtake accepted frames
+nor spend their outbound room. If the transport's outbound limit refuses the
+batch hand-off, the accepted frames stay queued and the hand-off is retried as
+the limit drains. On native
+transports a lone frame's reply is encoded straight into the connection's
+outbound queue. Either way `Events.MaxOutboundBuffered` still applies per
+message.
+
 On native Unix transports, UIO runs the complete per-connection path as one
 serialized connection task: socket I/O, WebSocket parsing and decompression,
 then `OnOpen`, `OnMessage`, or `OnClose`. A slow connection therefore does not

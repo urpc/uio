@@ -38,6 +38,9 @@ func (b *CompositeBuffer) Empty() bool {
 // Len returns the number of bytes of the unread portion of the buffer;
 func (b *CompositeBuffer) Len() int { return b.length }
 
+// Blocks returns how many blocks hold the unread bytes.
+func (b *CompositeBuffer) Blocks() int { return len(b.bufList) }
+
 // Cap returns the capacity of the buffer's underlying byte slice, that is, the
 // total space allocated for the buffer's data.
 func (b *CompositeBuffer) Cap() (capacity int) {
@@ -156,6 +159,69 @@ func (b *CompositeBuffer) AppendOwnedCoalesced(buffer *Buffer, targetCapacity in
 	putBuffer(buffer)
 	b.bufList = append(b.bufList, coalesced)
 	b.length += size
+}
+
+// Reserve appends n bytes and returns them for the caller to fill in place.
+// They stay in the tail block when it has room; otherwise a new block is
+// started, exactly sized when the buffer is empty and at least blockSize
+// otherwise, so a burst of small reservations shares a few large blocks.
+func (b *CompositeBuffer) Reserve(n, blockSize int) []byte {
+	if n <= 0 {
+		return nil
+	}
+	if count := len(b.bufList); count > 0 {
+		last := b.bufList[count-1]
+		if start := len(last.buf); cap(last.buf)-start >= n {
+			last.buf = last.buf[:start+n]
+			b.length += n
+			return last.buf[start : start+n : start+n]
+		}
+	}
+	size := n
+	if len(b.bufList) > 0 && size < blockSize {
+		size = blockSize
+	}
+	block := getBlock(size)
+	block.buf = block.buf[:n]
+	b.bufList = append(b.bufList, block)
+	b.length += n
+	return block.buf[:n:n]
+}
+
+// WritevCoalesced appends the contents of vec. Once the tail block is full it
+// continues in a new block sized like Reserve's, so small appends share blocks
+// instead of taking one pooled block each.
+func (b *CompositeBuffer) WritevCoalesced(vec [][]byte, blockSize int) int {
+	total := 0
+	for _, segment := range vec {
+		total += len(segment)
+	}
+	if total == 0 {
+		return 0
+	}
+	var last *Buffer
+	if count := len(b.bufList); count > 0 {
+		last = b.bufList[count-1]
+	}
+	remaining := total
+	for _, segment := range vec {
+		for len(segment) > 0 {
+			if last == nil || len(last.buf) == cap(last.buf) {
+				size := remaining
+				if len(b.bufList) > 0 && size < blockSize {
+					size = blockSize
+				}
+				last = getBlock(size)
+				b.bufList = append(b.bufList, last)
+			}
+			n := min(cap(last.buf)-len(last.buf), len(segment))
+			last.buf = append(last.buf, segment[:n]...)
+			segment = segment[n:]
+			remaining -= n
+		}
+	}
+	b.length += total
+	return total
 }
 
 // WriteByte appends the byte c to the buffer, growing the buffer as needed.

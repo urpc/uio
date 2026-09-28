@@ -3,6 +3,7 @@
 package uio
 
 import (
+	"errors"
 	"io"
 	"net"
 	"syscall"
@@ -40,7 +41,13 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 		return conn.writeOnLoop(data)
 	}
 	if conn.isDatagram() {
-		return conn.queueUDPWrite(bytebuf.CloneBuffer(data), len(data))
+		owned := bytebuf.CloneBuffer(data)
+		n, err := conn.queueUDPWrite(owned, len(data))
+		if errors.Is(err, ErrOutboundOverflow) {
+			// The clone never entered the queue, so Write still owns it.
+			bytebuf.ReleaseBuffer(owned)
+		}
+		return n, err
 	}
 	// This fast rejection belongs after the direct path: data sent straight to
 	// the kernel never counts against the user-space payload limit.
@@ -51,7 +58,12 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 		return 0, err
 	}
 	owned := bytebuf.CloneBuffer(data)
-	return conn.queueOwnedWrite(owned, len(data))
+	n, err := conn.queueOwnedWrite(owned, len(data))
+	if errors.Is(err, ErrOutboundOverflow) {
+		// The clone never entered the queue, so Write still owns it.
+		bytebuf.ReleaseBuffer(owned)
+	}
+	return n, err
 }
 
 func (conn *fdConn) Writev(vec [][]byte) (int, error) {
@@ -81,7 +93,12 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 		return 0, err
 	}
 	owned := bytebuf.CloneBuffers(vec, total)
-	return conn.queueOwnedWrite(owned, total)
+	n, err := conn.queueOwnedWrite(owned, total)
+	if errors.Is(err, ErrOutboundOverflow) {
+		// The clone never entered the queue, so Writev still owns it.
+		bytebuf.ReleaseBuffer(owned)
+	}
+	return n, err
 }
 
 func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
@@ -110,6 +127,38 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 	return conn.queueOwnedWrite(owned, size)
 }
 
+// ReserveOutbound is the task-owner encoding path: the reserved bytes are part
+// of outbound as soon as it returns, and only the owner flushes outbound while
+// its task runs, so the caller can fill them after submitMu is released.
+func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
+	if n <= 0 {
+		return nil, nil
+	}
+	if conn.isClosing() {
+		return nil, net.ErrClosed
+	}
+	if conn.isDatagram() || !conn.directOwner() {
+		return nil, ErrReserveUnsupported
+	}
+	reserved, err := conn.reservePendingAfterFlush(int64(n))
+	if err != nil {
+		return nil, err
+	}
+	if !reserved {
+		return nil, ErrOutboundOverflow
+	}
+	conn.submitMu.Lock()
+	buffer := conn.outbound.Reserve(n, conn.coalesceBlockSize())
+	conn.submitMu.Unlock()
+	return buffer, nil
+}
+
+// coalesceBlockSize is the block size that small writes batched in one task
+// share: one read round's replies usually fit in one of them.
+func (conn *fdConn) coalesceBlockSize() int {
+	return min(64<<10, conn.events.readBufferSize*2)
+}
+
 // queueUDPWrite transfers one datagram to the owning loop and waits for the
 // nonblocking send result. The admission lock also orders it before a later
 // CloseWith. A callback on another loop cannot wait without risking a cycle.
@@ -131,8 +180,9 @@ func (conn *fdConn) queueUDPWrite(owned *Buffer, size int) (int, error) {
 	}
 	if !conn.reservePending(int64(size)) {
 		conn.submitMu.Unlock()
-		bytebuf.ReleaseBuffer(owned)
 		releaseTask(t)
+		// The datagram was not queued and not sent: ownership returns to the
+		// caller like every other ErrOutboundOverflow.
 		return 0, ErrOutboundOverflow
 	}
 	if !conn.loop.pushTask(t) {
@@ -187,9 +237,9 @@ func (conn *fdConn) precheckOutbound(size int) error {
 // queueOwnedWrite is the cross-goroutine write path. Ownership has already
 // moved into owned, so submitMu only covers admission, accounting, and pointer
 // insertion; payload allocation and copying never happen under the lock.
+// ErrOutboundOverflow accepts nothing and returns owned to the caller.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
 	if limit := conn.events.MaxOutboundBuffered; limit > 0 && size > limit {
-		bytebuf.ReleaseBuffer(owned)
 		return 0, ErrOutboundOverflow
 	}
 	// Allocation and the only payload copy have already happened off-lock.
@@ -201,7 +251,6 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 	}
 	if !conn.reservePending(int64(size)) {
 		conn.submitMu.Unlock()
-		bytebuf.ReleaseBuffer(owned)
 		return 0, ErrOutboundOverflow
 	}
 	conn.outbound.AppendOwned(owned)
@@ -212,10 +261,14 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 
 func (conn *fdConn) reservePending(size int64) bool {
 	// Both callback partial writes and external producers reserve this counter.
+	limit := int64(conn.events.MaxOutboundBuffered)
+	if limit <= 0 {
+		conn.pending.Add(size)
+		return true
+	}
 	for {
 		old := conn.pending.Load()
-		limit := int64(conn.events.MaxOutboundBuffered)
-		if limit > 0 && size > limit-old {
+		if size > limit-old {
 			return false
 		}
 		if conn.pending.CompareAndSwap(old, old+size) {
@@ -261,7 +314,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	}
 
 	// The common callback path lends caller memory directly to the kernel.
-	written, err := syscall.Write(conn.fd, data)
+	written, err := socket.Send(conn.fd, data)
 	if written < 0 {
 		written = 0
 	}
@@ -273,22 +326,30 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 			return written, err
 		}
 	}
-	conn.events.onSocketBytesWrite(conn, written)
 	if written == len(data) {
+		conn.events.onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := data[written:]
 	if !conn.reservePending(int64(len(remaining))) {
-		if written > 0 {
-			conn.failDirectWrite(ErrOutboundOverflow)
+		if written == 0 {
+			// Nothing left the socket: pure overflow.
+			return 0, ErrOutboundOverflow
 		}
-		return written, ErrOutboundOverflow
+		// A partial payload is on the wire and its suffix cannot be queued:
+		// the stream is broken, so report a short write, not an overflow.
+		conn.events.onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
 	}
 	// Only the unsent suffix must survive after Write returns.
 	conn.submitMu.Lock()
 	_, _ = conn.outbound.Write(remaining)
 	conn.submitMu.Unlock()
 	conn.setWriteBlocked(written == 0)
+	// Reported once the suffix is accounted, so OnOutbound never observes a
+	// transient empty queue in the middle of this write.
+	conn.events.onSocketBytesWrite(conn, written)
 	return len(data), nil
 }
 
@@ -309,7 +370,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 			return 0, ErrOutboundOverflow
 		}
 		conn.submitMu.Lock()
-		_, _ = conn.outbound.Writev(vec)
+		conn.outbound.WritevCoalesced(vec, conn.coalesceBlockSize())
 		conn.submitMu.Unlock()
 		return total, nil
 	}
@@ -325,28 +386,40 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 			return written, err
 		}
 	}
-	conn.events.onSocketBytesWrite(conn, written)
 	if written == total {
+		conn.events.onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := total - written
 	if !conn.reservePending(int64(remaining)) {
-		if written > 0 {
-			conn.failDirectWrite(ErrOutboundOverflow)
+		if written == 0 {
+			// Nothing left the socket: pure overflow.
+			return 0, ErrOutboundOverflow
 		}
-		return written, ErrOutboundOverflow
+		// A partial vector is on the wire and its suffix cannot be queued:
+		// the stream is broken, so report a short write, not an overflow.
+		conn.events.onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
 	}
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
 	conn.submitMu.Lock()
 	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
 	conn.setWriteBlocked(written == 0)
+	conn.events.onSocketBytesWrite(conn, written)
 	return total, nil
 }
 
-// writeOwnedOnLoop consumes owned on every return path. During a corked read
+// writeOwnedOnLoop consumes owned on every return path except
+// ErrOutboundOverflow, which accepts nothing and returns the buffer to the
+// caller; a partial direct write that cannot queue its suffix reports
+// io.ErrShortWrite and consumes the buffer instead. During a corked read
 // round, the first small frame keeps zero-copy ownership and later frames are
-// coalesced into pooled blocks to keep the final writev batch short.
+// coalesced into pooled blocks to keep the final writev batch short. Buffers
+// up to half a coalescing block are copied, which also keeps a queue that the
+// peer is slow to drain from holding many mostly empty blocks; a larger buffer
+// already carries many frames and keeps its own writev segment.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
 	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold) {
@@ -356,13 +429,11 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			return 0, err
 		}
 		if !reserved {
-			bytebuf.ReleaseBuffer(owned)
 			return 0, ErrOutboundOverflow
 		}
 		conn.submitMu.Lock()
-		if conn.corked && !conn.outbound.Empty() && size < conn.events.readBufferSize {
-			targetCapacity := min(64<<10, conn.events.readBufferSize*2)
-			conn.outbound.AppendOwnedCoalesced(owned, targetCapacity)
+		if conn.corked && !conn.outbound.Empty() && size <= conn.coalesceBlockSize()/2 {
+			conn.outbound.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
 		} else {
 			conn.outbound.AppendOwned(owned)
 		}
@@ -370,7 +441,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		return size, nil
 	}
 
-	written, err := syscall.Write(conn.fd, owned.Bytes())
+	written, err := socket.Send(conn.fd, owned.Bytes())
 	if written < 0 {
 		written = 0
 	}
@@ -383,18 +454,25 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			return written, err
 		}
 	}
-	conn.events.onSocketBytesWrite(conn, written)
 	if written == size {
 		bytebuf.ReleaseBuffer(owned)
+		conn.events.onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := size - written
 	if !conn.reservePending(int64(remaining)) {
-		bytebuf.ReleaseBuffer(owned)
-		if written > 0 {
-			conn.failDirectWrite(ErrOutboundOverflow)
+		if written == 0 {
+			// Nothing left the socket: pure overflow, so the buffer returns
+			// to the caller like every other ErrOutboundOverflow.
+			return 0, ErrOutboundOverflow
 		}
-		return written, ErrOutboundOverflow
+		// A partial frame is on the wire and its suffix cannot be queued:
+		// the stream is broken, so the buffer is consumed and the caller is
+		// told the write was short rather than merely overflowed.
+		bytebuf.ReleaseBuffer(owned)
+		conn.events.onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
 	}
 	if written > 0 {
 		owned.Discard(written)
@@ -403,6 +481,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
 	conn.setWriteBlocked(written == 0)
+	conn.events.onSocketBytesWrite(conn, written)
 	return size, nil
 }
 
@@ -490,27 +569,12 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 		conn.submitMu.Unlock()
 		return 0, nil
 	}
-	var vecStorage [nativeWriteVecLimit][]byte
-	totalWritten := 0
+	var totalWritten int
 	var writeErr error
-	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.outbound.Empty(); calls++ {
-		vec, _ := conn.outbound.PeekVecN(vecStorage[:0], len(vecStorage))
-		written, err := socket.Writev(conn.fd, vec)
-		if err != nil {
-			if isWouldBlock(err) {
-				conn.setWriteBlocked(true)
-				break
-			}
-			writeErr = err
-			break
-		}
-		if written == 0 {
-			conn.setWriteBlocked(true)
-			break
-		}
-		conn.outbound.Discard(written)
-		conn.pending.Add(-int64(written))
-		totalWritten += written
+	if conn.outbound.Blocks() == 1 {
+		totalWritten, writeErr = conn.writeOutboundBlockLocked()
+	} else {
+		totalWritten, writeErr = conn.writevOutboundLocked()
 	}
 	if conn.outbound.Empty() {
 		conn.setWriteBlocked(false)
@@ -521,6 +585,59 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 	}
 	if writeErr != nil {
 		return totalWritten, writeErr
+	}
+	return totalWritten, nil
+}
+
+// writeOutboundBlockLocked flushes an outbound queue of one block, the usual
+// shape after a round of small replies, with plain write and no vector.
+func (conn *fdConn) writeOutboundBlockLocked() (int, error) {
+	totalWritten := 0
+	for calls := 0; calls < 16 && !conn.outbound.Empty(); calls++ {
+		written, err := socket.Send(conn.fd, conn.outbound.PeekChunk())
+		if err != nil {
+			if isWouldBlock(err) {
+				conn.setWriteBlocked(true)
+				return totalWritten, nil
+			}
+			return totalWritten, err
+		}
+		if written <= 0 {
+			conn.setWriteBlocked(true)
+			return totalWritten, nil
+		}
+		conn.outbound.Discard(written)
+		conn.pending.Add(-int64(written))
+		totalWritten += written
+	}
+	return totalWritten, nil
+}
+
+// writevOutboundLocked drains a multi-block queue in bounded writev batches.
+// Its vector is kept out of flushOnLoop's frame, which would otherwise clear
+// it on every flush.
+//
+//go:noinline
+func (conn *fdConn) writevOutboundLocked() (int, error) {
+	var vecStorage [nativeWriteVecLimit][]byte
+	totalWritten := 0
+	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.outbound.Empty(); calls++ {
+		vec, _ := conn.outbound.PeekVecN(vecStorage[:0], len(vecStorage))
+		written, err := socket.Writev(conn.fd, vec)
+		if err != nil {
+			if isWouldBlock(err) {
+				conn.setWriteBlocked(true)
+				break
+			}
+			return totalWritten, err
+		}
+		if written == 0 {
+			conn.setWriteBlocked(true)
+			break
+		}
+		conn.outbound.Discard(written)
+		conn.pending.Add(-int64(written))
+		totalWritten += written
 	}
 	return totalWritten, nil
 }
