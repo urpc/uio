@@ -613,7 +613,10 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	server := NewServer(serverHandler)
 	server.HeartbeatInterval = 10 * time.Millisecond
-	server.HeartbeatTimeout = 250 * time.Millisecond
+	// The timeout must survive a starved CI runner: with 250ms a pong delayed
+	// by scheduling could close a client that responded promptly in program
+	// order, which is exactly what this test asserts cannot happen.
+	server.HeartbeatTimeout = 2 * time.Second
 	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
@@ -654,7 +657,18 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 		t.Fatal("responsive heartbeat client was closed")
 	default:
 	}
-	if err = client.SendText([]byte("alive")); err != nil {
+	// A send racing the connection's own task may report its documented
+	// transient busies; the message must still go out.
+	for deadline := time.Now().Add(testIOTimeout()); ; {
+		if err = client.SendText([]byte("alive")); err == nil || !errors.Is(err, ErrWriteBusy) {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -662,6 +676,8 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 		if string(message.Payload) != "world" {
 			t.Fatalf("heartbeat echo = %q", message.Payload)
 		}
+	case <-clientHandler.closed:
+		t.Fatal("responsive client was closed while waiting for its echo")
 	case <-time.After(testIOTimeout()):
 		t.Fatal("responsive client stopped receiving messages")
 	}

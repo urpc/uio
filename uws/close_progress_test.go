@@ -137,11 +137,11 @@ func TestWriterFailureRacesProtocolClose(t *testing.T) {
 		close(start)
 		wg.Wait()
 		completeTestOutbound(conn)
-		if raw.closes != 1 || conn.writes.close.phase() != transportCloseClaimed {
-			t.Fatalf("iteration %d: closes = %d, phase = %d", i, raw.closes, conn.writes.close.phase())
-		}
-		if conn.writes.close.hasPendingClose() || conn.writes.close.drainIsRequested() {
-			t.Fatalf("iteration %d: Close frame handoff was not cleared", i)
+		state := &conn.writes.close
+		if raw.closes != 1 || state.phase() != transportCloseClaimed {
+			t.Fatalf("iteration %d: closes = %d, phase = %d, pendingClose = %v, drainRequested = %v, frameSent = %v, aborted = %v, pendingBytes = %d",
+				i, raw.closes, state.phase(), state.hasPendingClose(), state.drainIsRequested(),
+				state.closeFrameWasSent(), state.writerIsAborted(), state.pendingBytes.Load())
 		}
 	}
 }
