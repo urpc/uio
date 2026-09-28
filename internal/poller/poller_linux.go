@@ -25,8 +25,9 @@ type NetPoller struct {
 	epfd   int
 	wakefd int
 
-	mu      sync.Mutex // protects waiters and descriptor lifetime
+	mu      sync.Mutex // protects waiters, wakers and descriptor lifetime
 	waiters int        // includes readiness-event conversion after epoll_wait
+	wakers  []*Batch   // waiters Close raises on their private descriptor
 
 	closed      atomic.Bool
 	edgeFD      map[int]bool
@@ -37,9 +38,18 @@ type NetPoller struct {
 }
 
 // Batch is a kernel event buffer. Wait uses the poller's own; goroutines that
-// wait on one poller concurrently each pass their own to WaitBatch.
+// wait on one poller concurrently each pass their own to WaitBatch, and a
+// Batch belongs to the poller it first waited on.
+//
+// A batch also owns the waiter's private wake descriptor. The shared wakefd is
+// drained by whichever waiter observes it first, and a wake-up that another
+// waiter consumes between this waiter's kernel wake-up and its readiness
+// re-check would put it back to sleep — with an unbounded wait, forever. Close
+// therefore raises every waiter on a descriptor only that waiter drains.
 type Batch struct {
 	rawEvents [1024]unix.EpollEvent
+	wakefd    int
+	haveWake  bool
 }
 
 // NewNetPoller creates epoll and registers its internal level-triggered waker.
@@ -161,13 +171,32 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 // edge to one waiter, so several goroutines can share one poller this way.
 func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int, error) {
 	// Register before entering epoll_wait so Close wakes instead of releasing
-	// descriptors that this call can still access.
+	// descriptors that this call can still access. The registration and the
+	// private wake descriptor are published under the same lock Close reads,
+	// so a waiter is either seen by Close or observes the closed poller.
 	poller.mu.Lock()
 	if poller.closed.Load() {
 		poller.release()
 		err := poller.closeError()
 		poller.mu.Unlock()
 		return 0, err
+	}
+	if !batch.haveWake {
+		wakefd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
+		if err != nil {
+			poller.mu.Unlock()
+			return 0, err
+		}
+		if err = unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
+			Fd: int32(wakefd), Events: readEvents,
+		}); err != nil {
+			_ = unix.Close(wakefd)
+			poller.mu.Unlock()
+			return 0, err
+		}
+		batch.wakefd = wakefd
+		batch.haveWake = true
+		poller.wakers = append(poller.wakers, batch)
 	}
 	poller.waiters++
 	poller.mu.Unlock()
@@ -187,6 +216,12 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 		fd := int(event.Fd)
 		if fd == poller.wakefd {
 			poller.drainWake()
+			continue
+		}
+		if fd == batch.wakefd {
+			// The private descriptor belongs to this waiter alone, so
+			// draining it can never take a wake-up from anyone else.
+			drainWakeFD(fd)
 			continue
 		}
 		if count == len(out) {
@@ -219,10 +254,16 @@ func (poller *NetPoller) Wake() error {
 }
 
 func (poller *NetPoller) wakeLocked() error {
-	// eventfd is only a wake signal; its counter carries no application data.
+	return raiseWake(poller.wakefd)
+}
+
+// raiseWake makes fd readable for epoll. eventfd is only a wake signal; its
+// counter carries no application data, so a saturated counter (EAGAIN) already
+// guarantees the wake.
+func raiseWake(fd int) error {
 	var value [8]byte
 	binary.NativeEndian.PutUint64(value[:], 1)
-	_, err := unix.Write(poller.wakefd, value[:])
+	_, err := unix.Write(fd, value[:])
 	if errors.Is(err, unix.EAGAIN) {
 		return nil
 	}
@@ -230,8 +271,12 @@ func (poller *NetPoller) wakeLocked() error {
 }
 
 func (poller *NetPoller) drainWake() {
+	drainWakeFD(poller.wakefd)
+}
+
+func drainWakeFD(fd int) {
 	var value [8]byte
-	_, _ = unix.Read(poller.wakefd, value[:])
+	_, _ = unix.Read(fd, value[:])
 }
 
 // Close publishes the terminal reason and interrupts Wait. Descriptor release
@@ -242,8 +287,12 @@ func (poller *NetPoller) Close(err error) error {
 	if poller.closed.Load() {
 		return nil
 	}
-	// Publish the reason before closed, then wake an active waiter. The last
-	// waiter releases descriptors after it finishes converting events.
+	// Publish the reason before closed, then raise every registered waiter on
+	// its own descriptor: the shared wakefd is drained by whichever waiter
+	// observes it first, and a wake-up taken by one waiter between another's
+	// kernel wake-up and its readiness re-check would park that waiter for
+	// good. The last waiter releases descriptors after it finishes converting
+	// events.
 	reason := err
 	poller.closeReason.Store(&reason)
 	poller.closed.Store(true)
@@ -251,7 +300,10 @@ func (poller *NetPoller) Close(err error) error {
 		poller.release()
 		return nil
 	}
-	return poller.wakeLocked()
+	for _, waiter := range poller.wakers {
+		_ = raiseWake(waiter.wakefd)
+	}
+	return nil
 }
 
 // Closed reports whether Close has published the terminal state.
@@ -273,6 +325,14 @@ func (poller *NetPoller) closedError() error {
 
 func (poller *NetPoller) release() {
 	poller.releaseOnce.Do(func() {
+		for _, waiter := range poller.wakers {
+			_ = unix.Close(waiter.wakefd)
+			// The owner can no longer be inside WaitBatch, so the batch can
+			// forget the descriptor instead of ever touching it again.
+			waiter.wakefd = 0
+			waiter.haveWake = false
+		}
+		poller.wakers = nil
 		_ = unix.Close(poller.wakefd)
 		_ = unix.Close(poller.epfd)
 	})

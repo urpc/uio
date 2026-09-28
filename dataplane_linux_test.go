@@ -215,3 +215,38 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 	}
 	return total, nil
 }
+
+// TestDataPollerCloseStopsAllWaiters mirrors the CI shape that parked a
+// waiter: several goroutines share the stream poller, no stream traffic ever
+// wakes them, and Close must still join every one of them promptly.
+func TestDataPollerCloseStopsAllWaiters(t *testing.T) {
+	previous := dataWaitersOverride
+	dataWaitersOverride = 3
+	t.Cleanup(func() { dataWaitersOverride = previous })
+
+	for i := 0; i < 50; i++ {
+		events := &Events{Pollers: 1}
+		started := make(chan struct{})
+		events.OnStart = func(*Events) { close(started) }
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- events.Serve("") }()
+		select {
+		case <-started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("data poller did not start")
+		}
+		// Give the waiters a moment to reach their epoll_wait.
+		time.Sleep(time.Millisecond)
+		if err := events.Close(nil); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("iteration %d: Serve did not stop after Close", i)
+		}
+	}
+}

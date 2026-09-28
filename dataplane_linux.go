@@ -148,8 +148,9 @@ func (data *dataPoller) submit(waiter *dataWaiter) bool {
 }
 
 // close stops the waiters once every loop has deregistered its connections.
-// The wake descriptor is level-triggered and nobody drains it after Close, so
-// each waiter in turn returns from epoll_wait and sees the closed poller.
+// Close raises each waiter on its own wake descriptor, so every waiter returns
+// from epoll_wait and sees the closed poller regardless of what the others
+// drained.
 func (data *dataPoller) close(err error) {
 	_ = data.poller.Close(err)
 	data.wg.Wait()
