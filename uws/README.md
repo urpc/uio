@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws"
 )
 
@@ -31,7 +32,8 @@ func (handler) OnClose(*uws.Conn, uws.CloseEvent) {}
 server := uws.NewServer(handler{})
 server.CheckOrigin = func(*http.Request) bool { return true }
 server.EnableCompression = true
-server.Events.MaxOutboundBuffered = int(uws.DefaultMaxFramePayload) + 14
+server.MaxMessageSize = uws.DefaultMaxFramePayload
+server.Events.MaxOutboundBuffered = int(server.MaxMessageSize) + 14
 log.Fatal(server.Serve(":8080"))
 ```
 
@@ -40,7 +42,15 @@ without a listener before accepting HTTP requests:
 
 ```go
 server := uws.NewServer(handler{})
-go func() { _ = server.Serve() }()
+ready := make(chan struct{})
+serveDone := make(chan error, 1)
+server.Events.OnStart = func(*uio.Events) { close(ready) }
+go func() { serveDone <- server.Serve() }()
+select {
+case <-ready:
+case err := <-serveDone:
+	log.Fatal(err)
+}
 
 httpServer := &http.Server{
 	Addr:    ":8080",
@@ -80,19 +90,24 @@ Callbacks run in the owning UIO connection task and messages are ordered per
 connection. `Message.Payload` is borrowed until `OnMessage` returns; call
 `Message.Clone` before retaining it or passing it to another goroutine.
 
-`SendText`, `SendBinary`, and `Ping` never wait for the socket and are safe to
-call from any goroutine. A send fails only when the connection is not open or
-is closing (`uws.ErrNotReady`, `uws.ErrClosed`), when the message itself is
-invalid, or when it does not fit `Events.MaxOutboundBuffered`
-(`uws.ErrBackpressure`). A send that returns nil is queued in order and
-flushed automatically at the current or next connection-task boundary.
-Concurrent senders wait for each other only while one message is encoded and
-handed to the transport. A message larger than `MaxFramePayload` is sent as
-fragments, which are admitted to the outbound limit together or not at all.
+`SendText`, `SendBinary`, and `Ping` do not wait for socket writability and are
+safe to call from any goroutine. They can return `uws.ErrNotReady`,
+`uws.ErrClosed`, validation errors, or `uws.ErrBackpressure` when the message
+does not fit `Events.MaxOutboundBuffered`. Transport write errors can also be
+returned; `Ping` can report a flush error. A nil return means the message was
+accepted in order, not that the peer received it. Accepted data is flushed by
+the current or next connection task. Concurrent senders wait for each other
+while a message is encoded and handed to the transport. A message larger than
+`MaxFramePayload` is split into fragments. Before the first fragment, UWS
+checks that the whole wire message fits the outbound limit; a later transport
+failure can leave a partial message on the wire and closes the connection.
 
 Configure connection-level outbound backpressure with
 `Events.MaxOutboundBuffered`; zero disables the transport limit. Size it to
-hold the largest message that a callback may need to buffer.
+hold the largest message that a callback may need to buffer, including all
+fragment headers. The server example limits incoming messages to one default
+frame payload so a full-sized echo fits its outbound budget when the queue is
+otherwise empty.
 
 UWS defaults a zero `Events.WriteBufferedThreshold` to 4 KiB so consecutive
 small frames can share transport storage and a flush. Ping and Close still
@@ -101,14 +116,14 @@ preserved; use a negative value to disable this small-frame coalescing policy.
 
 When one read carries several frames, the replies their callbacks send below
 that threshold are encoded into a single batch and handed to UIO together when
-the frames of that read have been delivered, so a pipelining client costs one
-transport hand-off and one write per read rather than per message. A send from
-another goroutine during that time, and a Pong the read answers, join the
-batch in order. Every batched frame is admitted against
-`Events.MaxOutboundBuffered` when it is sent, so the hand-off itself is never
-refused. On native transports a lone frame's reply is encoded straight into
-the connection's outbound queue. Either way `Events.MaxOutboundBuffered` still
-applies per message.
+the frames of that read have been delivered. A full batch block can be handed
+over earlier, so the number of hand-offs and socket writes depends on the
+frames and transport state. A send from another goroutine during that time, or
+a Pong the read answers, can join the batch in order. Each batched frame is
+checked against `Events.MaxOutboundBuffered` when accepted; an unexpected
+transport refusal during hand-off aborts the connection. On native transports,
+a lone small frame can be encoded directly into the outbound queue. The
+outbound limit still applies per message.
 
 On native Unix transports, UIO runs the complete per-connection path as one
 serialized connection task: socket I/O, WebSocket parsing and decompression,
@@ -145,8 +160,9 @@ production profile rather than connection count alone. The stdio/Windows
 backend keeps its dedicated per-connection blocking read/write goroutines and
 delivers callbacks synchronously from the read path.
 
-`Close` starts a graceful close handshake: its frame follows every message
-accepted before it, and no message is accepted after it. When
+On an open connection, `Close` starts a graceful close handshake: its frame
+follows every message accepted before it, and no message is accepted after it.
+Before the handshake completes, `Close` closes the transport directly. When
 `Events.MaxOutboundBuffered` has no room for the frame, the frame waits for the
 transport to drain instead of failing. The transport then waits for the peer
 response; `CloseTimeout` bounds the whole handshake.
@@ -202,10 +218,11 @@ if err != nil {
 }
 ```
 
-`Dial` reports errors that prevent the connection attempt from starting.
-WebSocket handshake completion is asynchronous: `OnOpen` means the connection
-is ready for application messages, while a handshake failure calls `OnClose`
-without a preceding `OnOpen` and places the cause in `CloseEvent.Err`.
+`Dial` can return errors from setup, the network dial, or writing and flushing
+the HTTP upgrade request. WebSocket handshake completion is asynchronous:
+`OnOpen` means the connection is ready for application messages, while a
+handshake response failure calls `OnClose` without a preceding `OnOpen` and
+places the cause in `CloseEvent.Err`.
 
 The context passed to `Dial` is checked before UIO starts its network dial and
 then bounds the WebSocket handshake. The network connection itself follows

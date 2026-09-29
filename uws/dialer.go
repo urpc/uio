@@ -63,8 +63,8 @@ func NewDialer() *Dialer {
 // connection and WebSocket handshake; it no longer affects the connection
 // after OnOpen. The returned connection remains pending until Handler.OnOpen
 // reports handshake success or Handler.OnClose reports a handshake failure.
-// The returned error only covers failures that prevent the connection attempt
-// from starting.
+// The returned error covers setup, network dial, and upgrade-request write or
+// flush failures. A handshake response failure is reported through OnClose.
 func (d *Dialer) Dial(ctx context.Context, addr string, handler Handler) (*Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()

@@ -177,13 +177,17 @@ if err != nil {
 }
 buffer.CommitWrite(n)
 _, err = conn.WriteOwned(buffer)
+if err == uio.ErrOutboundOverflow {
+	uio.ReleaseBuffer(buffer)
+}
+return err
 ```
 
 Inside a native stream connection's own callback, `Conn.ReserveOutbound`
 goes one step further: it appends the requested bytes to the connection's
 outbound queue and returns them for the encoder to fill in place, so a round
-of small replies shares a few pooled blocks and is sent with one write when the
-callback returns. Fill every reserved byte before the callback returns or
+of small replies can share a few pooled blocks and be flushed together after
+the callback returns. Fill every reserved byte before the callback returns or
 flushes. Elsewhere, including on the `stdio` backend, it returns
 `ErrReserveUnsupported` and the caller falls back to another write:
 
