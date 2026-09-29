@@ -135,41 +135,26 @@ func TestDialerNegotiatesAndUsesSmallDeflateWindow(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("client did not decode small-window message")
 	}
-	writer, err := client.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	split := len(clientPayload) / 2
-	if _, err = writer.Write(clientPayload[:split]); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = writer.Write(clientPayload[split:]); err != nil {
-		t.Fatal(err)
-	}
-	if err = writer.Close(); err != nil {
+	if err = client.SendBinary(clientPayload); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.After(testIOTimeout())
 	select {
 	case first := <-serverMessage:
-		if !first.RSV1 || first.Opcode != frame.Binary || !first.Masked || first.Fin {
+		if !first.RSV1 || first.Opcode != frame.Binary || !first.Masked {
 			t.Fatalf("client first frame = %+v", first)
 		}
 		encoded := append([]byte(nil), first.Payload...)
-		for {
-			var message frame.Frame
+		for last := first; !last.Fin; {
 			select {
-			case message = <-serverMessage:
+			case last = <-serverMessage:
 			case <-deadline:
 				t.Fatal("server did not receive final client continuation")
 			}
-			if message.RSV1 || message.Opcode != frame.Continuation || !message.Masked {
-				t.Fatalf("client continuation frame = %+v", message)
+			if last.RSV1 || last.Opcode != frame.Continuation || !last.Masked {
+				t.Fatalf("client continuation frame = %+v", last)
 			}
-			encoded = append(encoded, message.Payload...)
-			if message.Fin {
-				break
-			}
+			encoded = append(encoded, last.Payload...)
 		}
 		decoder := compress.NewDecoderWithWindow(false, 8)
 		decoded, decodeErr := decoder.Decode(encoded, len(clientPayload))

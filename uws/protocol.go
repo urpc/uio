@@ -494,16 +494,13 @@ func (c *Conn) rejectHandshake() {
 	_, _ = c.raw.Write([]byte(response))
 }
 
-// closeTransport requests graceful transport shutdown without waiting on a
-// streaming Writer. The current Writer inherits pending Close-frame work; the
-// raw connection closes only after that drain and all tracked bytes retire.
+// closeTransport requests graceful transport shutdown. The raw connection
+// closes once a deferred Close frame went out and every accepted byte retired,
+// bounded by the close timer.
 func (c *Conn) closeTransport() error {
 	c.closing.Store(true)
 	if !c.writes.close.requestTransportClose() {
 		return nil
-	}
-	if err := c.tryCompleteWriteDrain(); err != nil && !errors.Is(err, net.ErrClosed) {
-		return err
 	}
 	if err := c.flush(); err != nil && !errors.Is(err, net.ErrClosed) {
 		return err
@@ -560,9 +557,10 @@ func (c *Conn) ensureCloseTimer() {
 	state.mu.Unlock()
 }
 
-// tryCloseTransport claims shutdown once the Writer handoff and all accepted
-// wire bytes have completed. The claim is terminal even before UIO reports
-// OnClose, so another close request cannot close the transport again.
+// tryCloseTransport claims shutdown once a deferred Close frame went out and
+// all accepted wire bytes have completed. The claim is terminal even before
+// UIO reports OnClose, so another close request cannot close the transport
+// again.
 func (c *Conn) tryCloseTransport() (bool, error) {
 	if !c.writes.close.claimTransportClose() {
 		return false, nil
@@ -572,7 +570,8 @@ func (c *Conn) tryCloseTransport() (bool, error) {
 }
 
 // abortTransport claims the same terminal responsibility as a graceful drain.
-// A timer, failed Writer, and protocol error may race; only one reaches UIO.
+// A timer, a broken stream, and a protocol error may race; only one reaches
+// UIO.
 func (c *Conn) abortTransport(err error) {
 	if !c.writes.close.claimAbort() {
 		return
@@ -672,7 +671,7 @@ func (c *Conn) acceptMessage(message frame.Message) error {
 func (c *Conn) acceptControl(f frame.Frame) error {
 	switch f.Opcode {
 	case frame.Ping:
-		err := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
+		err := c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
 		if errors.Is(err, ErrBackpressure) {
 			// The outbound limit is full: the Pong cannot be sent now and must
 			// not close the connection over it. Dropping it loses only this
@@ -692,10 +691,9 @@ func (c *Conn) acceptControl(f frame.Frame) error {
 			reason = string(f.Payload[2:])
 		}
 		c.setCloseReason(code, reason)
-		if err := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: f.Payload}); err != nil && !errors.Is(err, ErrClosed) {
+		if err := c.sendCloseFrame(f.Payload); err != nil && !errors.Is(err, ErrClosed) {
 			return err
 		}
-		c.closing.Store(true)
 		return c.closeTransport()
 	default:
 		return frame.ErrProtocol
@@ -732,7 +730,7 @@ func (c *Conn) protocolClose(err error) error {
 		code = 1009
 	}
 	payload := []byte{byte(code >> 8), byte(code)}
-	writeErr := c.sendProtocolControlFrame(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
+	writeErr := c.sendCloseFrame(payload)
 	c.closing.Store(true)
 	if writeErr != nil {
 		c.abortTransport(errors.Join(err, writeErr))

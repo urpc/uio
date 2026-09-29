@@ -88,71 +88,24 @@ func TestHeartbeatCanBeRestarted(t *testing.T) {
 	time.Sleep(2 * time.Millisecond)
 }
 
-func TestHeartbeatScanSkipsBusyWriterAndProcessesOthers(t *testing.T) {
-	server := NewServer(nil)
-	server.HeartbeatInterval = time.Millisecond
-	server.HeartbeatTimeout = 20 * time.Millisecond
-	config := testServerConfig(server)
-	newConn := func(raw uio.Conn) *Conn {
-		conn := &Conn{raw: raw, config: config, heartbeat: &heartbeatState{}}
-		conn.opened.Store(true)
-		return conn
-	}
-	busy := newConn(newScriptedConn())
-	responsiveRaw := newHeartbeatWriteProbe()
-	responsive := newConn(responsiveRaw)
-	writer, err := busy.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = writer.fail(ErrClosed) })
-	server.connections.Store(busy, busy)
-	server.connections.Store(responsive, responsive)
-	done := make(chan bool, 1)
-	go func() {
-		done <- scanHeartbeat(&server.connections, time.Now(), server.HeartbeatTimeout, make(chan struct{}))
-	}()
-	select {
-	case completed := <-done:
-		if !completed {
-			t.Fatal("heartbeat scan stopped unexpectedly")
-		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat scan waited for a busy Writer")
-	}
-	select {
-	case <-responsiveRaw.written:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("responsive connection did not receive heartbeat")
-	}
-	if busy.heartbeat.pingOutstanding.Load() {
-		t.Fatal("busy connection recorded a ping that was not sent")
-	}
-}
-
-func TestHeartbeatTimeoutDoesNotWaitForBusyWriter(t *testing.T) {
+func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
 	server := NewServer(nil)
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 5 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
 	config := testServerConfig(server)
-	busyRaw := &writeProbeConn{closed: make(chan struct{})}
-	busy := &Conn{raw: busyRaw, config: config, heartbeat: &heartbeatState{}}
-	busy.opened.Store(true)
+	expiredRaw := &writeProbeConn{closed: make(chan struct{})}
+	expired := &Conn{raw: expiredRaw, config: config, heartbeat: &heartbeatState{}}
+	expired.opened.Store(true)
 	timedOutAt := time.Now().Add(-time.Second)
-	busy.heartbeat.beginPing(timedOutAt, 1)
-	busy.heartbeat.mu.Lock()
-	busy.heartbeat.pingSentAt = timedOutAt.UnixNano()
-	busy.heartbeat.mu.Unlock()
+	expired.heartbeat.beginPing(timedOutAt, 1)
+	expired.heartbeat.mu.Lock()
+	expired.heartbeat.pingSentAt = timedOutAt.UnixNano()
+	expired.heartbeat.mu.Unlock()
 	responsiveRaw := newHeartbeatWriteProbe()
 	responsive := &Conn{raw: responsiveRaw, config: config, heartbeat: &heartbeatState{}}
 	responsive.opened.Store(true)
-	writer, err := busy.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = writer.fail(ErrClosed) })
-	server.connections.Store(busy, busy)
+	server.connections.Store(expired, expired)
 	server.connections.Store(responsive, responsive)
 	done := make(chan bool, 1)
 	go func() {
@@ -161,7 +114,7 @@ func TestHeartbeatTimeoutDoesNotWaitForBusyWriter(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat timeout waited for a busy Writer")
+		t.Fatal("heartbeat timeout scan did not finish")
 	}
 	select {
 	case <-responsiveRaw.written:
@@ -169,11 +122,11 @@ func TestHeartbeatTimeoutDoesNotWaitForBusyWriter(t *testing.T) {
 		t.Fatal("heartbeat timeout prevented later connections from being processed")
 	}
 	select {
-	case <-busyRaw.closed:
+	case <-expiredRaw.closed:
 	case <-time.After(testIOTimeout()):
-		t.Fatal("busy timed-out connection did not close within CloseTimeout")
+		t.Fatal("timed-out connection did not close within CloseTimeout")
 	}
-	if info := busy.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
+	if info := expired.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
 		t.Fatalf("heartbeat close info = %+v", info)
 	}
 }
@@ -189,9 +142,8 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 	conn := &Conn{raw: raw, config: config, heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
 	queuedAt := time.Now()
-	attempted, err := conn.tryHeartbeatPing(queuedAt)
-	if err != nil || !attempted {
-		t.Fatalf("queue heartbeat ping: attempted=%v err=%v", attempted, err)
+	if err := conn.sendHeartbeatPing(queuedAt); err != nil || !conn.heartbeat.pingOutstanding.Load() {
+		t.Fatalf("queue heartbeat ping: outstanding=%v err=%v", conn.heartbeat.pingOutstanding.Load(), err)
 	}
 	conn.heartbeat.mu.Lock()
 	pingTarget := conn.heartbeat.pingTarget
@@ -300,36 +252,6 @@ func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
 	}
 }
 
-func TestHeartbeatBusyWriterHasFiniteSendDeadline(t *testing.T) {
-	server := NewServer(nil)
-	server.HeartbeatTimeout = 20 * time.Millisecond
-	server.CloseTimeout = time.Millisecond
-	raw := newScriptedConn()
-	raw.closed = make(chan struct{})
-	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writer.fail(ErrClosed)
-	server.connections.Store(conn, conn)
-	first := time.Now()
-	scanHeartbeat(&server.connections, first, server.HeartbeatTimeout, make(chan struct{}))
-	if conn.closing.Load() || conn.heartbeat.pingOutstanding.Load() {
-		t.Fatal("busy Writer caused an immediate heartbeat close or Ping")
-	}
-	scanHeartbeat(&server.connections, first.Add(2*server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{}))
-	select {
-	case <-raw.closed:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("busy Writer postponed heartbeat timeout indefinitely")
-	}
-	if raw.closes != 1 {
-		t.Fatalf("transport closes = %d, want 1", raw.closes)
-	}
-}
-
 func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
 	server := NewServer(nil)
 	server.HeartbeatInterval = time.Millisecond
@@ -341,9 +263,8 @@ func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
 	conn := &Conn{raw: raw, config: config, heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
 	queuedAt := time.Now()
-	attempted, err := conn.tryHeartbeatPing(queuedAt)
-	if err != nil || !attempted {
-		t.Fatalf("queue heartbeat ping: attempted=%v err=%v", attempted, err)
+	if err := conn.sendHeartbeatPing(queuedAt); err != nil || !conn.heartbeat.pingOutstanding.Load() {
+		t.Fatalf("queue heartbeat ping: outstanding=%v err=%v", conn.heartbeat.pingOutstanding.Load(), err)
 	}
 	pending := conn.writes.close.pendingBytes.Load()
 	conn.releaseOutbound(int(pending))
@@ -395,13 +316,14 @@ func TestHeartbeatCancelRequiresMatchingNonce(t *testing.T) {
 	}
 }
 
-func TestHeartbeatTryPaths(t *testing.T) {
-	if attempted, err := (&Conn{}).tryHeartbeatPing(time.Now()); attempted || !errors.Is(err, ErrClosed) {
-		t.Fatalf("unavailable heartbeat ping = attempted:%v err:%v", attempted, err)
+func TestHeartbeatSendPaths(t *testing.T) {
+	if err := (&Conn{}).sendHeartbeatPing(time.Now()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("unavailable heartbeat ping = %v", err)
 	}
 
+	raw := newScriptedConn()
 	conn := &Conn{
-		raw:       newScriptedConn(),
+		raw:       raw,
 		config:    testServerConfig(NewServer(nil)),
 		heartbeat: &heartbeatState{},
 	}
@@ -409,50 +331,21 @@ func TestHeartbeatTryPaths(t *testing.T) {
 	if !conn.heartbeat.beginPing(time.Now(), 1) {
 		t.Fatal("heartbeat ping did not start")
 	}
-	if attempted, err := conn.tryHeartbeatPing(time.Now()); attempted || err != nil {
-		t.Fatalf("outstanding heartbeat ping = attempted:%v err:%v", attempted, err)
+	if err := conn.sendHeartbeatPing(time.Now()); err != nil || raw.writes != 0 {
+		t.Fatalf("outstanding heartbeat ping = %v, writes = %d", err, raw.writes)
 	}
 
 	writeErr := errors.New("heartbeat close write failed")
-	raw := newScriptedConn()
-	raw.writeErr = writeErr
-	failed := &Conn{raw: raw, config: testServerConfig(NewServer(nil))}
+	failedRaw := newScriptedConn()
+	failedRaw.writeErr = writeErr
+	failed := &Conn{raw: failedRaw, config: testServerConfig(NewServer(nil))}
 	failed.opened.Store(true)
-	if !failed.tryHeartbeatClose(1001, "timeout") {
-		t.Fatal("heartbeat close did not acquire write ownership")
-	}
-	if !failed.closing.Load() || raw.closes != 1 {
-		t.Fatalf("failed heartbeat close state = closing:%v closes:%d", failed.closing.Load(), raw.closes)
+	failed.sendHeartbeatClose(1001, "timeout")
+	if !failed.closing.Load() || failedRaw.closes != 1 {
+		t.Fatalf("failed heartbeat close state = closing:%v closes:%d", failed.closing.Load(), failedRaw.closes)
 	}
 	if info := failed.closeInfo(); !errors.Is(info.Err, writeErr) {
 		t.Fatalf("heartbeat close error = %v, want %v", info.Err, writeErr)
-	}
-}
-
-func TestHeartbeatWorkerStopsWithBusyWriter(t *testing.T) {
-	server := NewServer(nil)
-	server.HeartbeatInterval = time.Millisecond
-	server.HeartbeatTimeout = time.Second
-	config := testServerConfig(server)
-	busy := &Conn{raw: newScriptedConn(), config: config, heartbeat: &heartbeatState{}}
-	busy.opened.Store(true)
-	writer, err := busy.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = writer.fail(ErrClosed) })
-	server.connections.Store(busy, busy)
-	server.startHeartbeat(config)
-	time.Sleep(2 * server.HeartbeatInterval)
-	done := make(chan struct{})
-	go func() {
-		server.stopHeartbeat()
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat worker did not stop while Writer held the write lock")
 	}
 }
 
@@ -657,18 +550,7 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 		t.Fatal("responsive heartbeat client was closed")
 	default:
 	}
-	// A send racing the connection's own task may report its documented
-	// transient busies; the message must still go out.
-	for deadline := time.Now().Add(testIOTimeout()); ; {
-		if err = client.SendText([]byte("alive")); err == nil || !errors.Is(err, ErrWriteBusy) {
-			break
-		}
-		if time.Now().After(deadline) {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	if err != nil {
+	if err = client.SendText([]byte("alive")); err != nil {
 		t.Fatal(err)
 	}
 	select {

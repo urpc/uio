@@ -207,8 +207,9 @@ func (s *Server) runHeartbeat(connections *sync.Map, interval, timeout time.Dura
 	}
 }
 
-// scanHeartbeat performs only non-blocking per-connection operations. A busy
-// streaming Writer starts a send-stall deadline without delaying other peers.
+// scanHeartbeat waits at most for one frame submission per connection: the
+// write lock is never held across application code. A Ping the outbound limit
+// refuses starts a send-stall deadline without delaying other peers.
 func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, stop <-chan struct{}) bool {
 	completed := true
 	connections.Range(func(_, value any) bool {
@@ -230,18 +231,14 @@ func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, 
 		if heartbeat.pingOutstanding.Load() {
 			return true
 		}
-		attempted, err := conn.tryHeartbeatPing(now)
-		switch {
-		case err == nil && !attempted:
-			heartbeat.noteSendStall(now)
+		switch err := conn.sendHeartbeatPing(now); {
+		case err == nil:
 		case errors.Is(err, ErrBackpressure):
 			heartbeat.noteSendStall(now)
-		case err != nil:
-			if !conn.closed.Load() && !conn.closing.Load() {
-				conn.setCloseError(err)
-				conn.closing.Store(true)
-				conn.abortTransport(err)
-			}
+		case !conn.closed.Load() && !conn.closing.Load():
+			conn.setCloseError(err)
+			conn.closing.Store(true)
+			conn.abortTransport(err)
 		}
 		return true
 	})
@@ -249,15 +246,10 @@ func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, 
 }
 
 func (c *Conn) expireHeartbeat() {
-	const (
-		code   = uint16(1001)
-		reason = "heartbeat timeout"
-	)
-	if c.closed.Load() || c.closing.Load() || c.tryHeartbeatClose(code, reason) {
+	if c.closed.Load() || c.closing.Load() {
 		return
 	}
-	c.setCloseReason(code, reason)
-	_ = c.closeTransport()
+	c.sendHeartbeatClose(1001, "heartbeat timeout")
 }
 
 // onOpen distinguishes an adopted, pre-validated net/http upgrade from a native

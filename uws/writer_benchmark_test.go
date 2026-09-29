@@ -7,19 +7,6 @@ import (
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
-func BenchmarkWriterValidateText64KiB(b *testing.B) {
-	payload := make([]byte, 64<<10)
-	writer := &Writer{opcode: frame.Text}
-	b.ReportAllocs()
-	b.SetBytes(int64(len(payload)))
-	b.ResetTimer()
-	for range b.N {
-		if !writer.validateText(payload) {
-			b.Fatal("valid UTF-8 rejected")
-		}
-	}
-}
-
 func BenchmarkClientMaskedFrameWrite(b *testing.B) {
 	for _, size := range []int{1024, 1 << 20} {
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {

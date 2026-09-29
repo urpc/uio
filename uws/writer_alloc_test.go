@@ -90,33 +90,3 @@ func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 		t.Fatalf("large client owned frame allocations = %v, want 0", allocations)
 	}
 }
-
-func TestTextWriterValidationDoesNotAllocatePerPayload(t *testing.T) {
-	payload := make([]byte, 64<<10)
-	conn := &Conn{
-		raw: &writeProbeConn{},
-		config: testServerConfig(&Server{
-			MaxFramePayload: uint64(len(payload)),
-			MaxMessageSize:  1 << 30,
-		}),
-	}
-	conn.opened.Store(true)
-	writer, err := conn.BeginMessage(TextMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = writer.Write(payload); err != nil {
-		t.Fatal(err)
-	}
-	allocations := testing.AllocsPerRun(100, func() {
-		if _, writeErr := writer.Write(payload); writeErr != nil {
-			panic(writeErr)
-		}
-	})
-	if allocations != 0 {
-		t.Fatalf("text Writer.Write allocations = %v, want 0", allocations)
-	}
-	if err = writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-}

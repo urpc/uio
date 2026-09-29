@@ -31,7 +31,6 @@ type Conn struct {
 
 	readFrames int32       // frames delivered in the current read round
 	batching   atomic.Bool // a read round is batching the small frames it sends
-	streaming  bool        // a Writer owns writes.mu; guarded by writes.mu
 
 	batch     *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
 	heartbeat *heartbeatState
@@ -41,59 +40,31 @@ type Conn struct {
 	metadata   atomic.Pointer[connMetadata]
 	handshake  atomic.Pointer[handshakeState]
 	closeTimer atomic.Pointer[closeTimerState]
-
-	// batchOrder carries the batching-ordering state that only the write
-	// batch and lock-bypassing control frames touch. It is allocated when a
-	// connection first batches a read round, so connections that never batch
-	// keep the struct in its hot 192-byte shape.
-	batchOrder atomic.Pointer[batchOrderState]
 }
 
-// batchOrderState orders lock-bypassing control frames after an accepted write
-// batch: held marks a batch that frames must not overtake, retry marks a batch
-// the outbound limit refused, and mu guards the parked frames themselves.
-type batchOrderState struct {
-	held   atomic.Bool
-	retry  atomic.Bool
-	mu     sync.Mutex
-	parked []*uio.Buffer
-}
-
-var batchOrderPool sync.Pool
-
-func (c *Conn) batchOrderState() *batchOrderState {
-	if state := c.batchOrder.Load(); state != nil {
-		return state
-	}
-	state, _ := batchOrderPool.Get().(*batchOrderState)
-	if state == nil {
-		state = &batchOrderState{}
-	}
-	if c.batchOrder.CompareAndSwap(nil, state) {
-		return state
-	}
-	batchOrderPool.Put(state)
-	return c.batchOrder.Load()
-}
-
-// connWriteState serializes frame construction and streaming Writer ownership.
-// close tracks progress that may be updated by a Writer, a protocol callback,
-// or UIO's outbound callback without making any of them wait for mu.
+// connWriteState serializes frame construction and submission. mu is held only
+// while one message or control frame is encoded and handed to UIO, never
+// across application code, so every sender may wait for it. close tracks
+// progress that UIO's outbound callback updates without taking mu.
 type connWriteState struct {
 	mu    sync.Mutex
 	close connCloseProgress
 }
 
 // These fields represent independent obligations rather than one phase: a
-// queued Close frame can be in flight while bytes are still retiring, and a
-// streaming Writer may own mu throughout both. transitionMu only protects
-// short state transitions; it never covers socket I/O or application work.
+// Close frame can wait for outbound room while earlier bytes are still
+// retiring. transitionMu only protects short state transitions; it never
+// covers socket I/O or application work.
 type connCloseProgress struct {
-	pendingBytes atomic.Int64
-	flags        atomic.Uint32
-	transitionMu sync.Mutex
-	pendingClose *pendingCloseFrame
+	pendingBytes  atomic.Int64
+	flags         atomic.Uint32
+	transitionMu  sync.Mutex
+	deferredClose *deferredCloseFrame // guarded by transitionMu
 }
+
+// deferredCloseFrame owns the payload of a Close frame the outbound limit had
+// no room for, until the transport drains enough to take it.
+type deferredCloseFrame struct{ payload []byte }
 
 const (
 	transportCloseIdle uint32 = iota
@@ -102,18 +73,16 @@ const (
 )
 
 const (
-	closeDrainRequested uint32 = 1 << iota
-	closeFrameSent
-	closeWriterAborted
+	closeFrameSent uint32 = 1 << iota
+	// closeFrameDeferred marks a Close frame that waits for outbound room,
+	// from the refusal until the frame is accepted or the transport aborts.
+	closeFrameDeferred
 )
 
 const (
-	transportPhaseShift = 3
+	transportPhaseShift = 2
 	transportPhaseMask  = uint32(3 << transportPhaseShift)
 )
-
-// pendingCloseFrame owns a copied close payload until the current Writer exits.
-type pendingCloseFrame struct{ payload []byte }
 
 // compressionState holds negotiated direction-specific RFC 7692 contexts.
 type compressionState struct {
@@ -124,10 +93,11 @@ type compressionState struct {
 // heartbeatState distinguishes a Ping waiting to be accepted, queued for
 // transport, and actually sent. The first failed enqueue keeps its deadline
 // across retries; byte positions mark when the Ping leaves the transport queue.
+// Every submission holds the connection's write lock, so accepted positions
+// follow the transport's order.
 type heartbeatState struct {
-	submitMu sync.Mutex
-	mu       sync.Mutex
-	// sendStalledAt remains set across busy Writer and backpressure retries.
+	mu sync.Mutex
+	// sendStalledAt remains set across backpressure retries.
 	sendStalledAt int64
 	pingQueuedAt  int64
 	pingSentAt    int64

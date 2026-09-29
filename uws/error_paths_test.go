@@ -473,7 +473,7 @@ func TestSendAndTransportErrorPaths(t *testing.T) {
 	}
 }
 
-func TestCloseAndWriterStateErrors(t *testing.T) {
+func TestCloseValidatesCodeAndReason(t *testing.T) {
 	conn := testServerConn(newScriptedConn())
 	if err := conn.Close(1005, ""); !errors.Is(err, frame.ErrProtocol) {
 		t.Fatalf("reserved close code error = %v", err)
@@ -483,59 +483,6 @@ func TestCloseAndWriterStateErrors(t *testing.T) {
 	}
 	if err := conn.Close(1000, strings.Repeat("x", 124)); !errors.Is(err, frame.ErrInvalidUTF8) {
 		t.Fatalf("long close reason error = %v", err)
-	}
-
-	if _, err := conn.BeginMessage(MessageType(99)); !errors.Is(err, frame.ErrProtocol) {
-		t.Fatalf("invalid writer type error = %v", err)
-	}
-	closedConn := testServerConn(newScriptedConn())
-	closedConn.closing.Store(true)
-	if _, err := closedConn.BeginMessage(BinaryMessage); !errors.Is(err, ErrClosed) {
-		t.Fatalf("closing writer error = %v", err)
-	}
-	if _, err := (&Conn{}).BeginMessage(BinaryMessage); !errors.Is(err, ErrNotReady) {
-		t.Fatalf("not-ready writer error = %v", err)
-	}
-
-	var nilWriter *Writer
-	if _, err := nilWriter.Write(nil); !errors.Is(err, ErrWriterClosed) {
-		t.Fatalf("nil Writer.Write error = %v", err)
-	}
-	if err := nilWriter.Close(); !errors.Is(err, ErrWriterClosed) {
-		t.Fatalf("nil Writer.Close error = %v", err)
-	}
-
-	limitedRaw := newScriptedConn()
-	limitedConn := testServerConn(limitedRaw)
-	limitedConn.config = testServerConfig(&Server{MaxMessageSize: 1})
-	writer, err := limitedConn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, err := writer.Write([]byte("xx")); n != 0 || !errors.Is(err, frame.ErrMessageTooBig) {
-		t.Fatalf("oversized Writer.Write = %d, %v", n, err)
-	}
-	if n, err := writer.Write(nil); n != 0 || !errors.Is(err, frame.ErrMessageTooBig) {
-		t.Fatalf("failed Writer.Write = %d, %v", n, err)
-	}
-	if err := writer.Close(); !errors.Is(err, frame.ErrMessageTooBig) {
-		t.Fatalf("failed Writer.Close = %v", err)
-	}
-	if limitedRaw.closes != 1 || !limitedConn.closing.Load() {
-		t.Fatalf("oversized writer closes/closing = %d/%v", limitedRaw.closes, limitedConn.closing.Load())
-	}
-
-	writer = &Writer{conn: limitedConn, closed: true}
-	if _, err := writer.Write(nil); !errors.Is(err, ErrWriterClosed) {
-		t.Fatalf("closed Writer.Write error = %v", err)
-	}
-	firstFailure := errors.New("first writer failure")
-	failedWriter := &Writer{conn: limitedConn, closed: true, failure: firstFailure}
-	if err := failedWriter.fail(errors.New("later writer failure")); !errors.Is(err, firstFailure) {
-		t.Fatalf("repeated Writer failure = %v, want %v", err, firstFailure)
-	}
-	if err := (&Writer{conn: limitedConn}).emitCompressed(nil); err != nil {
-		t.Fatalf("empty compressed emission = %v", err)
 	}
 }
 
@@ -604,26 +551,6 @@ func TestHandshakeAndCloseLifecycleErrors(t *testing.T) {
 	if err := testServerConn(failedRaw).closeTransport(); !errors.Is(err, flushErr) {
 		t.Fatalf("closeTransport flush error = %v", err)
 	}
-}
-
-func TestCloseTransportDoesNotWaitForWriter(t *testing.T) {
-	raw := newScriptedConn()
-	conn := testServerConn(raw)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	done := make(chan error, 1)
-	go func() { done <- conn.closeTransport() }()
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("closeTransport waited for Writer.Close")
-	}
-	_ = writer.fail(ErrClosed)
 }
 
 func TestSendCloseAndLimitStateBranches(t *testing.T) {
@@ -710,22 +637,26 @@ func TestTransportOwnedWriteErrors(t *testing.T) {
 	}
 }
 
-func TestCloseRetriesAfterBackpressure(t *testing.T) {
+func TestCloseUnderBackpressureIsDeferred(t *testing.T) {
 	raw := newScriptedConn()
 	raw.writeErr = uio.ErrOutboundOverflow
 	conn := testServerConn(raw)
-	if err := conn.Close(1000, ""); !errors.Is(err, ErrBackpressure) {
-		t.Fatalf("backpressured Close() = %v", err)
+	defer conn.stopCloseTimer()
+	if err := conn.Close(1000, ""); err != nil {
+		t.Fatalf("backpressured Close() = %v, want the frame deferred", err)
 	}
-	if conn.writes.close.closeFrameWasSent() || conn.closing.Load() {
-		t.Fatal("failed close poisoned connection state")
+	if conn.writes.close.closeFrameWasSent() || !conn.writes.close.closeIsDeferred() || !conn.closing.Load() {
+		t.Fatalf("close state: sent=%v deferred=%v closing=%v", conn.writes.close.closeFrameWasSent(),
+			conn.writes.close.closeIsDeferred(), conn.closing.Load())
+	}
+	if err := conn.Close(1000, ""); err != nil {
+		t.Fatalf("repeated Close() = %v", err)
 	}
 	raw.writeErr = nil
-	if err := conn.Close(1000, ""); err != nil {
-		t.Fatalf("retried Close() = %v", err)
-	}
-	if !conn.writes.close.closeFrameWasSent() || !conn.closing.Load() || raw.writes != 2 {
-		t.Fatalf("retried close state: sent=%v closing=%v writes=%d", conn.writes.close.closeFrameWasSent(), conn.closing.Load(), raw.writes)
+	conn.releaseOutbound(0)
+	if !conn.writes.close.closeFrameWasSent() || conn.writes.close.closeIsDeferred() || len(raw.written) != 1 {
+		t.Fatalf("drained close state: sent=%v deferred=%v written=%d", conn.writes.close.closeFrameWasSent(),
+			conn.writes.close.closeIsDeferred(), len(raw.written))
 	}
 }
 

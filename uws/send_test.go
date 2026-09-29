@@ -127,104 +127,9 @@ func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 	}
 }
 
-func TestStreamingWriterMakesOtherSendsFailFast(t *testing.T) {
-	conn := testServerConn(newScriptedConn())
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	checks := []struct {
-		name string
-		call func() error
-	}{
-		{name: "send", call: func() error { return conn.SendBinary([]byte("x")) }},
-		{name: "ping", call: func() error { return conn.Ping(nil) }},
-		{name: "close", call: func() error { return conn.Close(1000, "") }},
-		{name: "writer", call: func() error {
-			_, err := conn.BeginMessage(BinaryMessage)
-			return err
-		}},
-	}
-	for _, check := range checks {
-		t.Run(check.name, func(t *testing.T) {
-			started := time.Now()
-			if err := check.call(); !errors.Is(err, ErrWriteBusy) {
-				t.Fatalf("error = %v, want %v", err, ErrWriteBusy)
-			}
-			if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
-				t.Fatalf("operation blocked for %v", elapsed)
-			}
-		})
-	}
-	_ = writer.fail(ErrClosed)
-}
-
-func TestStreamingWriterAllowsInboundPing(t *testing.T) {
-	raw := newScriptedConn()
-	conn := testServerConn(raw)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte("ping")}); err != nil {
-		t.Fatal(err)
-	}
-	if conn.closing.Load() {
-		t.Fatal("ping closed connection while streaming writer was active")
-	}
-	if len(raw.written) != 1 || raw.written[0][0]&0x0f != byte(frame.Pong) {
-		t.Fatalf("written frames = %x, want pong", raw.written)
-	}
-	_ = writer.fail(ErrClosed)
-}
-
-func TestStreamingWriterHandsInboundCloseToWriterRelease(t *testing.T) {
-	raw := newScriptedConn()
-	conn := testServerConn(raw)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	payload := []byte{0x03, 0xe8}
-	if err = conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload}); err != nil {
-		t.Fatal(err)
-	}
-	if len(raw.written) != 0 {
-		t.Fatalf("close frame bypassed active writer: %x", raw.written)
-	}
-	if err = writer.Close(); !errors.Is(err, ErrClosed) {
-		t.Fatalf("Writer.Close error = %v, want %v", err, ErrClosed)
-	}
-	if len(raw.written) != 1 || raw.written[0][0]&0x0f != byte(frame.Close) {
-		t.Fatalf("written frames = %x, want close", raw.written)
-	}
-}
-
-func TestUncompressedWriterValidatesText(t *testing.T) {
-	raw := &writeProbeConn{closed: make(chan struct{})}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
-	conn := &Conn{raw: raw, config: testServerConfig(server)}
-	conn.opened.Store(true)
-
-	writer, err := conn.BeginMessage(TextMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, err := writer.Write([]byte{0xff}); n != 0 || err != frame.ErrInvalidUTF8 {
-		t.Fatalf("invalid text Write() = (%d, %v)", n, err)
-	}
-	if err = writer.Close(); err != frame.ErrInvalidUTF8 {
-		t.Fatalf("invalid text Close() = %v, want %v", err, frame.ErrInvalidUTF8)
-	}
-	completeTestOutbound(conn)
-	select {
-	case <-raw.closed:
-	case <-time.After(time.Second):
-		t.Fatal("invalid text did not close transport")
-	}
-}
-
-func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
+// A fragmented message whose room was checked cannot be refused part-way by a
+// real transport; if one does, the partial message on the wire is fatal.
+func TestFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 	raw := &failNthWriteConn{scriptedConn: newScriptedConn(), failAt: 2, err: uio.ErrOutboundOverflow}
 	conn := &Conn{
 		raw: raw,
@@ -234,18 +139,11 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 		}),
 	}
 	conn.opened.Store(true)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, writeErr := writer.Write([]byte("abcdefgh")); n != 4 || !errors.Is(writeErr, ErrBackpressure) {
-		t.Fatalf("Writer.Write = %d, %v; want 4, ErrBackpressure", n, writeErr)
-	}
-	if closeErr := writer.Close(); !errors.Is(closeErr, ErrBackpressure) {
-		t.Fatalf("Writer.Close error = %v, want ErrBackpressure", closeErr)
+	if err := conn.SendBinary([]byte("abcdefgh")); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("SendBinary = %v, want ErrBackpressure", err)
 	}
 	if len(raw.written) != 1 {
-		t.Fatalf("transport writes = %d, want only the successful first fragment", len(raw.written))
+		t.Fatalf("transport writes = %d, want only the accepted first fragment", len(raw.written))
 	}
 	if raw.written[0][0]&0x80 != 0 {
 		t.Fatalf("first fragment unexpectedly has FIN set: %#x", raw.written[0][0])
@@ -262,11 +160,48 @@ func TestWriterBackpressureDoesNotFinalizePartialMessage(t *testing.T) {
 	select {
 	case <-lockAvailable:
 	case <-time.After(time.Second):
-		t.Fatal("Writer.Write failure retained connection write ownership")
+		t.Fatal("failed fragment retained the write lock")
 	}
 }
 
-func TestCompressedWriterFailureDoesNotEmitMoreFrames(t *testing.T) {
+// A message larger than MaxFramePayload is sent in fragments, and only when all
+// of them fit the outbound limit: nothing is queued otherwise.
+func TestFragmentedMessageAdmittedWholeOrNotAtAll(t *testing.T) {
+	raw := &limitedWire{limit: 20}
+	server := NewServer(nil)
+	server.Events.MaxOutboundBuffered = raw.limit
+	server.MaxFramePayload = 4
+	conn := &Conn{raw: raw, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	if err := conn.SendBinary([]byte("12345678")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SendBinary([]byte("abcdefgh")); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("SendBinary beyond the limit = %v, want ErrBackpressure", err)
+	}
+	if frames := raw.frames(t); len(frames) != 2 || conn.closing.Load() {
+		t.Fatalf("frames = %d closing = %v, want the first message only and an open connection", len(frames), conn.closing.Load())
+	}
+	raw.retire(conn, raw.queuedBytes())
+	if err := conn.SendBinary([]byte("abcdefgh")); err != nil {
+		t.Fatalf("SendBinary after the queue drained = %v", err)
+	}
+	frames := raw.frames(t)
+	if len(frames) != 4 {
+		t.Fatalf("frames = %v, want two messages of two fragments", frames)
+	}
+	for i, want := range []struct {
+		opcode  frame.OpCode
+		fin     bool
+		payload string
+	}{{frame.Binary, false, "1234"}, {frame.Continuation, true, "5678"}, {frame.Binary, false, "abcd"}, {frame.Continuation, true, "efgh"}} {
+		if frames[i].Opcode != want.opcode || frames[i].Fin != want.fin || string(frames[i].Payload) != want.payload {
+			t.Fatalf("frame %d = %+v, want %+v", i, frames[i], want)
+		}
+	}
+}
+
+func TestCompressedFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 	writeErr := errors.New("compressed write failed")
 	raw := &failNthWriteConn{scriptedConn: newScriptedConn(), failAt: 2, err: writeErr}
 	conn := &Conn{
@@ -278,27 +213,19 @@ func TestCompressedWriterFailureDoesNotEmitMoreFrames(t *testing.T) {
 		compression: &compressionState{encoder: compress.NewEncoder(-1, true)},
 	}
 	conn.opened.Store(true)
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err != nil {
-		t.Fatal(err)
+	payload := bytes.Repeat([]byte("abcdefgh"), 64)
+	if err := conn.SendBinary(payload); !errors.Is(err, writeErr) {
+		t.Fatalf("SendBinary = %v, want %v", err, writeErr)
 	}
-	if _, err = writer.Write([]byte("abcdefghijklmnopqrstuvwxyz")); !errors.Is(err, writeErr) {
-		t.Fatalf("Writer.Write error = %v, want %v", err, writeErr)
-	}
-	writesAfterFailure := len(raw.written)
-	if closeErr := writer.Close(); !errors.Is(closeErr, writeErr) {
-		t.Fatalf("Writer.Close error = %v, want %v", closeErr, writeErr)
-	}
-	if len(raw.written) != writesAfterFailure {
-		t.Fatalf("Writer.Close emitted %d frames after failure", len(raw.written)-writesAfterFailure)
-	}
-	for _, wire := range raw.written {
-		if len(wire) > 0 && wire[0]&0x80 != 0 {
-			t.Fatalf("failed compressed writer emitted FIN frame: %#x", wire[0])
-		}
+	// The script records the failed second fragment too; nothing follows it.
+	if len(raw.written) != 2 || raw.written[0][0] != 0x40|byte(frame.Binary) || raw.written[1][0] != byte(frame.Continuation) {
+		t.Fatalf("written = %x, want the first compressed fragment and the failed continuation, neither final", raw.written)
 	}
 	if raw.closes != 1 || !conn.closing.Load() {
 		t.Fatalf("transport closes/closing = %d/%v, want 1/true", raw.closes, conn.closing.Load())
+	}
+	if err := conn.SendBinary(payload); !errors.Is(err, ErrClosed) {
+		t.Fatalf("send after the broken stream = %v, want %v", err, ErrClosed)
 	}
 }
 
@@ -330,44 +257,6 @@ func (conn *failNthWriteConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return n, err
 }
 
-func TestWriterValidatesSplitUTF8(t *testing.T) {
-	validChunks := [][][]byte{
-		{[]byte{0xc2}, []byte{0xa2}},
-		{[]byte{0xe2}, []byte{0x82}, []byte{0xac}},
-		{[]byte{0xf0}, []byte{0x9f, 0x98}, []byte{0x80}},
-		{[]byte("prefix\xe2"), []byte{0x82, 0xac}, []byte("suffix")},
-	}
-	for _, chunks := range validChunks {
-		writer := &Writer{opcode: frame.Text}
-		for _, chunk := range chunks {
-			if !writer.validateText(chunk) {
-				t.Fatalf("valid split UTF-8 rejected: %x", chunks)
-			}
-		}
-		if writer.textTailLen != 0 {
-			t.Fatalf("valid split retained %d tail bytes", writer.textTailLen)
-		}
-	}
-	invalidChunks := [][][]byte{
-		{[]byte{0xff}},
-		{[]byte{0xe2}, []byte{0x28}},
-		{[]byte{0xf0, 0x9f}, []byte{0xff}},
-	}
-	for _, chunks := range invalidChunks {
-		writer := &Writer{opcode: frame.Text}
-		valid := true
-		for _, chunk := range chunks {
-			if !writer.validateText(chunk) {
-				valid = false
-				break
-			}
-		}
-		if valid {
-			t.Fatalf("invalid split UTF-8 accepted: %x", chunks)
-		}
-	}
-}
-
 func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 	raw := &writeProbeConn{}
 	server := &Server{
@@ -380,49 +269,12 @@ func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 	if err := conn.SendText([]byte{0xff}); err != nil {
 		t.Fatalf("SendText with validation disabled = %v", err)
 	}
-	writer, err := conn.BeginMessage(TextMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n, err := writer.Write([]byte{0xe2}); err != nil || n != 1 {
-		t.Fatalf("Writer.Write with validation disabled = %d, %v", n, err)
-	}
-	if err = writer.Close(); err != nil {
-		t.Fatalf("Writer.Close with validation disabled = %v", err)
-	}
-	if err = conn.Close(1000, string([]byte{0xff})); !errors.Is(err, frame.ErrInvalidUTF8) {
+	if err := conn.Close(1000, string([]byte{0xff})); !errors.Is(err, frame.ErrInvalidUTF8) {
 		t.Fatalf("invalid close reason = %v, want %v", err, frame.ErrInvalidUTF8)
 	}
 }
 
-func TestCompressedWriterAbortsIncompleteText(t *testing.T) {
-	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
-	conn := &Conn{
-		raw:    raw,
-		config: testServerConfig(server),
-		compression: &compressionState{
-			encoder: compress.NewEncoder(-1, true),
-		},
-	}
-	conn.opened.Store(true)
-	writer, err := conn.BeginMessage(TextMessage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = writer.Write([]byte{0xe2}); err != nil {
-		t.Fatalf("incomplete text Write() = %v", err)
-	}
-	if err = writer.Close(); err != frame.ErrInvalidUTF8 {
-		t.Fatalf("Close() error = %v, want %v", err, frame.ErrInvalidUTF8)
-	}
-	completeTestOutbound(conn)
-	if raw.closes != 1 {
-		t.Fatalf("transport closes = %d, want 1", raw.closes)
-	}
-}
-
-func TestCompressedMessageWriterFragmentsAfterEncoding(t *testing.T) {
+func TestCompressedMessageFragmentsAfterEncoding(t *testing.T) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -430,7 +282,7 @@ func TestCompressedMessageWriterFragmentsAfterEncoding(t *testing.T) {
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	handler := &compressedStreamHandler{ready: make(chan error, 1)}
+	handler := &compressedMessageHandler{ready: make(chan error, 1)}
 	server := NewServer(handler)
 	server.EnableCompression = true
 	server.MaxFramePayload = 8
@@ -490,7 +342,7 @@ func TestCompressedMessageWriterFragmentsAfterEncoding(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(testIOTimeout()):
-		t.Fatal("compressed stream writer did not finish")
+		t.Fatal("compressed message was not sent")
 	}
 
 	var compressed []byte
@@ -520,13 +372,13 @@ func TestCompressedMessageWriterFragmentsAfterEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := bytes.Repeat([]byte("compressed-stream-"), 32)
+	want := bytes.Repeat([]byte("compressed-message-"), 32)
 	if !bytes.Equal(decoded, want) {
 		t.Fatalf("decoded payload length = %d, want %d", len(decoded), len(want))
 	}
 }
 
-func TestMessageWriterFragmentsByFrameLimit(t *testing.T) {
+func TestMessageFragmentsByFrameLimit(t *testing.T) {
 	probe, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -534,7 +386,7 @@ func TestMessageWriterFragmentsByFrameLimit(t *testing.T) {
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	handler := &streamHandler{ready: make(chan error, 1)}
+	handler := &fragmentedMessageHandler{ready: make(chan error, 1)}
 	server := NewServer(handler)
 	server.MaxFramePayload = 3
 	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
@@ -585,10 +437,10 @@ func TestMessageWriterFragmentsByFrameLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 	case <-time.After(testIOTimeout()):
-		t.Fatal("stream writer did not finish")
+		t.Fatal("fragmented message was not sent")
 	}
 	var got []byte
-	for {
+	for frames := 0; ; frames++ {
 		var header [2]byte
 		if _, err = io.ReadFull(reader, header[:]); err != nil {
 			t.Fatal(err)
@@ -598,10 +450,14 @@ func TestMessageWriterFragmentsByFrameLimit(t *testing.T) {
 			t.Fatal(err)
 		}
 		got = append(got, payload...)
+		wantOpcode := byte(frame.Continuation)
+		if frames == 0 {
+			wantOpcode = byte(frame.Binary)
+		}
+		if header[0]&0x0f != wantOpcode || len(payload) > 3 {
+			t.Fatalf("frame %d header = %x, want opcode %d and at most 3 bytes", frames, header, wantOpcode)
+		}
 		if header[0]&0x80 != 0 {
-			if header[0] != 0x80 || header[1] != 0 {
-				t.Fatalf("final frame = %x, want 8000", header)
-			}
 			break
 		}
 	}

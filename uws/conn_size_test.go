@@ -10,8 +10,8 @@ func TestConnFitsCompact64BitSizeClass(t *testing.T) {
 		return
 	}
 	// 192 is a size class whose objects start on a cache line, and the fields
-	// every message touches fit in the first two lines. The batching-ordering
-	// state lives behind the batchOrder pointer, outside the hot shape.
+	// every message touches fit in the first two lines. Rarely used state,
+	// such as a deferred Close frame, lives behind pointers.
 	const maximum = uintptr(192)
 	if size := unsafe.Sizeof(Conn{}); size > maximum {
 		t.Fatalf("Conn size = %d bytes, want at most %d", size, maximum)

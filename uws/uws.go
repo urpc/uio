@@ -53,11 +53,6 @@ var (
 	ErrNotReady = errors.New("uws: handshake not complete")
 	// ErrBackpressure reports that the UIO connection outbound queue is full.
 	ErrBackpressure = errors.New("uws: outbound queue is full")
-	// ErrWriteBusy reports that a streaming Writer currently owns the
-	// connection's write path.
-	ErrWriteBusy = errors.New("uws: connection writer is busy")
-	// ErrWriterClosed reports an operation on a closed message writer.
-	ErrWriterClosed = errors.New("uws: message writer is closed")
 	// ErrServerStarted reports a second attempt to run a Server listener after
 	// its transport has already started.
 	ErrServerStarted = errors.New("uws: server already started")

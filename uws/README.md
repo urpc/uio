@@ -80,38 +80,35 @@ Callbacks run in the owning UIO connection task and messages are ordered per
 connection. `Message.Payload` is borrowed until `OnMessage` returns; call
 `Message.Clone` before retaining it or passing it to another goroutine.
 
-`SendText`, `SendBinary`, and `Ping` are non-blocking. They return
-`uws.ErrBackpressure` when `Events.MaxOutboundBuffered` is full and
-`uws.ErrWriteBusy` while a streaming Writer owns the connection. Ordinary
-message sends are accepted into the transport and flushed automatically at the
-current or next connection-task boundary. Use `BeginMessage` for large or
-fragmented messages and call `Writer.Close` after successful writes. A
-`Writer.Write` error aborts the connection and releases write ownership
-immediately; a later `Close` only returns the first error. Configure
-connection-level outbound backpressure with `Events.MaxOutboundBuffered`; zero
-disables the transport limit. Size it to hold the largest frame that a callback
-may need to buffer.
+`SendText`, `SendBinary`, and `Ping` never wait for the socket and are safe to
+call from any goroutine. A send fails only when the connection is not open or
+is closing (`uws.ErrNotReady`, `uws.ErrClosed`), when the message itself is
+invalid, or when it does not fit `Events.MaxOutboundBuffered`
+(`uws.ErrBackpressure`). A send that returns nil is queued in order and
+flushed automatically at the current or next connection-task boundary.
+Concurrent senders wait for each other only while one message is encoded and
+handed to the transport. A message larger than `MaxFramePayload` is sent as
+fragments, which are admitted to the outbound limit together or not at all.
+
+Configure connection-level outbound backpressure with
+`Events.MaxOutboundBuffered`; zero disables the transport limit. Size it to
+hold the largest message that a callback may need to buffer.
 
 UWS defaults a zero `Events.WriteBufferedThreshold` to 4 KiB so consecutive
-small frames can share transport storage and a flush. Ping, Close, and
-`Writer.Close` still establish explicit flush boundaries. An explicit nonzero
-threshold is preserved; use a negative value to disable this small-frame
-coalescing policy.
+small frames can share transport storage and a flush. Ping and Close still
+establish explicit flush boundaries. An explicit nonzero threshold is
+preserved; use a negative value to disable this small-frame coalescing policy.
 
 When one read carries several frames, the replies their callbacks send below
 that threshold are encoded into a single batch and handed to UIO together when
 the frames of that read have been delivered, so a pipelining client costs one
 transport hand-off and one write per read rather than per message. A send from
-another goroutine during that time joins the batch in order. A control frame
-that must bypass the write lock (a Pong under an open streaming Writer) is
-submitted directly only while no batch is pending; otherwise it is parked and
-handed over right after the batch, so it can neither overtake accepted frames
-nor spend their outbound room. If the transport's outbound limit refuses the
-batch hand-off, the accepted frames stay queued and the hand-off is retried as
-the limit drains. On native
-transports a lone frame's reply is encoded straight into the connection's
-outbound queue. Either way `Events.MaxOutboundBuffered` still applies per
-message.
+another goroutine during that time, and a Pong the read answers, join the
+batch in order. Every batched frame is admitted against
+`Events.MaxOutboundBuffered` when it is sent, so the hand-off itself is never
+refused. On native transports a lone frame's reply is encoded straight into
+the connection's outbound queue. Either way `Events.MaxOutboundBuffered` still
+applies per message.
 
 On native Unix transports, UIO runs the complete per-connection path as one
 serialized connection task: socket I/O, WebSocket parsing and decompression,
@@ -148,8 +145,11 @@ production profile rather than connection count alone. The stdio/Windows
 backend keeps its dedicated per-connection blocking read/write goroutines and
 delivers callbacks synchronously from the read path.
 
-`Close` starts a graceful close handshake and returns after queueing its frame.
-The transport then waits for the peer response, bounded by `CloseTimeout`.
+`Close` starts a graceful close handshake: its frame follows every message
+accepted before it, and no message is accepted after it. When
+`Events.MaxOutboundBuffered` has no room for the frame, the frame waits for the
+transport to drain instead of failing. The transport then waits for the peer
+response; `CloseTimeout` bounds the whole handshake.
 Protocol errors are reported as close code 1002; invalid UTF-8 uses 1007;
 oversized messages use 1009.
 

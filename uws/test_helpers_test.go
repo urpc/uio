@@ -48,11 +48,11 @@ type clientHandler struct {
 	message chan Message
 }
 
-type streamHandler struct {
+type fragmentedMessageHandler struct {
 	ready chan error
 }
 
-type compressedStreamHandler struct {
+type compressedMessageHandler struct {
 	ready chan error
 }
 
@@ -319,41 +319,19 @@ func (h *reentrantCloseHandler) setCloseFunc(closeFn func()) {
 	h.closeMu.Unlock()
 }
 
-func (h *streamHandler) OnOpen(conn *Conn) {
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err == nil {
-		_, err = writer.Write([]byte("abc"))
-	}
-	if err == nil {
-		_, err = writer.Write([]byte("def"))
-	}
-	if err == nil {
-		err = writer.Close()
-	}
-	h.ready <- err
+func (h *fragmentedMessageHandler) OnOpen(conn *Conn) {
+	h.ready <- conn.SendBinary([]byte("abcdef"))
 }
 
-func (*streamHandler) OnMessage(*Conn, Message)  {}
-func (*streamHandler) OnClose(*Conn, CloseEvent) {}
+func (*fragmentedMessageHandler) OnMessage(*Conn, Message)  {}
+func (*fragmentedMessageHandler) OnClose(*Conn, CloseEvent) {}
 
-func (h *compressedStreamHandler) OnOpen(conn *Conn) {
-	writer, err := conn.BeginMessage(BinaryMessage)
-	if err == nil {
-		payload := bytes.Repeat([]byte("compressed-stream-"), 32)
-		split := len(payload) / 2
-		_, err = writer.Write(payload[:split])
-		if err == nil {
-			_, err = writer.Write(payload[split:])
-		}
-	}
-	if err == nil {
-		err = writer.Close()
-	}
-	h.ready <- err
+func (h *compressedMessageHandler) OnOpen(conn *Conn) {
+	h.ready <- conn.SendBinary(bytes.Repeat([]byte("compressed-message-"), 32))
 }
 
-func (*compressedStreamHandler) OnMessage(*Conn, Message)  {}
-func (*compressedStreamHandler) OnClose(*Conn, CloseEvent) {}
+func (*compressedMessageHandler) OnMessage(*Conn, Message)  {}
+func (*compressedMessageHandler) OnClose(*Conn, CloseEvent) {}
 
 func (h *clientHandler) OnOpen(*Conn) { close(h.open) }
 
