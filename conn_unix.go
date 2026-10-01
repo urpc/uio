@@ -230,8 +230,8 @@ func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 
 func (conn *fdConn) writeClaimed() bool { return conn.writeState.Load()&writeOwnerFlag != 0 }
 
-// turnHoldsWrite reports a claim the connection's turn keeps for a reservation
-// and may use for its own writes: not from inside its own flush.
+// turnHoldsWrite reports a claim the connection's turn keeps for a reservation,
+// outside its own flush.
 func (conn *fdConn) turnHoldsWrite() bool {
 	return conn.writeState.Load()&(writeTurnHeldFlag|writeTurnFlushFlag) == writeTurnHeldFlag
 }
@@ -383,11 +383,16 @@ func (conn *fdConn) runWriteTurn() {
 		}
 	}
 	done = true
+	conn.finishWriteTurn()
+}
+
+// finishWriteTurn releases a write turn's claim. Bytes appended after its last
+// flush found the claim taken and were left to it, so it looks again and hands
+// them, with its ioState count, to a new write turn.
+func (conn *fdConn) finishWriteTurn() {
 	conn.releaseWrite()
-	// Bytes appended after the last flush found the claim taken.
 	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
 		!conn.loop.ioStopped() && conn.tryClaimWrite(0) {
-		// This turn's count moves to the next one.
 		if !conn.loop.ioPool.submitWrite(conn) {
 			conn.handleWriteSubmitFailure()
 		}
@@ -395,6 +400,15 @@ func (conn *fdConn) runWriteTurn() {
 	}
 	// Released last: shutdown joins write turns through this count.
 	conn.loop.releaseIO()
+}
+
+// openOutputAfterOnOpen runs OnOpen, then lets output from other goroutines
+// start write turns; what they queued before leaves with this turn's flush.
+// It does so even when OnOpen panics and an Executor recovers the panic,
+// or that output would wait for an unrelated turn.
+func (conn *fdConn) openOutputAfterOnOpen() {
+	defer conn.writeState.Or(writeOpenedFlag)
+	conn.fireOnOpen()
 }
 
 func (conn *fdConn) Fd() int                              { return conn.fd }
@@ -637,6 +651,10 @@ func (conn *fdConn) runIOTask() {
 			// A callback panic may have left the claim taken for a
 			// reservation or a flush.
 			conn.releaseWriteAndKick()
+		} else {
+			// After a panic in OnOpen, output queued by other goroutines in
+			// the meantime has no sender until someone kicks it.
+			conn.kickWriter()
 		}
 		conn.ioOwner.Store(0)
 		conn.finishIOTask()
@@ -653,10 +671,7 @@ func (conn *fdConn) runIOTask() {
 		if events&ioEventAccepted != 0 {
 			conn.applyAcceptedOptions()
 		}
-		conn.fireOnOpen()
-		// Output from other goroutines may start write turns from now on; what
-		// they queued before this point leaves with this turn's flush below.
-		conn.writeState.Or(writeOpenedFlag)
+		conn.openOutputAfterOnOpen()
 	}
 	if !conn.isClosing() && events&ioEventWrite != 0 {
 		conn.noteWritable()

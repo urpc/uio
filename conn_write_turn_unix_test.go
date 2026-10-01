@@ -709,6 +709,173 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 	}
 }
 
+// A Write made while the connection's turn keeps the claim for a reservation
+// it already flushed is queued for the turn's flush, never sent directly: sent
+// directly, OnOutbound would run inside that send and a Write it makes would
+// call it again.
+func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
+	var armed atomic.Bool
+	var depth, maxDepth, count atomic.Int32
+	opened := make(chan struct{})
+	events := &Events{Pollers: 1}
+	events.OnOpen = func(c Conn) {
+		defer close(opened)
+		dst, err := c.ReserveOutbound(1)
+		if err != nil {
+			t.Errorf("ReserveOutbound: %v", err)
+			return
+		}
+		dst[0] = 'r'
+		if err = c.Flush(); err != nil {
+			t.Error(err)
+		}
+		armed.Store(true)
+		if _, err = c.Write([]byte("o")); err != nil {
+			t.Error(err)
+		}
+	}
+	events.OnOutbound = func(c Conn, n int) {
+		if !armed.Load() {
+			return
+		}
+		d := depth.Add(1)
+		defer depth.Add(-1)
+		if d > maxDepth.Load() {
+			maxDepth.Store(d)
+		}
+		if count.Add(1) < 6 {
+			_, _ = c.Write([]byte("b"))
+		}
+	}
+	testConn := newTestConnection(t, events)
+	select {
+	case <-opened:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnOpen did not run")
+	}
+	if got := string(readPeerUntil(t, testConn.peer, 7, 2*time.Second)); got != "robbbbb" {
+		t.Fatalf("peer received %q", got)
+	}
+	if d := maxDepth.Load(); d > 1 {
+		t.Fatalf("OnOutbound nested %d deep", d)
+	}
+}
+
+// OnOpen that panics under an Executor that recovers it still lets output from
+// other goroutines go out: what they queued while OnOpen ran leaves without
+// waiting for another write, and later output starts write turns.
+func TestOutputAfterRecoveredOnOpenPanic(t *testing.T) {
+	executor := &recoveringExecutor{}
+	opened := make(chan Conn, 1)
+	started := make(chan string, 1)
+	events := &Events{Pollers: 1, Executor: executor}
+	events.OnStart = func(ev *Events) {
+		for _, listener := range ev.acceptor.listeners {
+			started <- listener.laddr.String()
+			return
+		}
+	}
+	events.OnOpen = func(conn Conn) {
+		written := make(chan error, 1)
+		go func() {
+			_, err := conn.Write([]byte("early"))
+			written <- err
+		}()
+		if err := <-written; err != nil {
+			t.Error(err)
+		}
+		opened <- conn
+		panic("OnOpen panics")
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-serveDone
+	})
+	client, err := net.Dial("tcp", <-started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-opened
+	for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("OnOpen did not panic")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 5)
+	if _, err = io.ReadFull(client, buf); err != nil || string(buf) != "early" {
+		t.Fatalf("client read %q, %v: output queued during OnOpen stayed queued", buf, err)
+	}
+	if _, err = server.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = io.ReadFull(client, buf); err != nil || string(buf) != "hello" {
+		t.Fatalf("client read %q, %v after a recovered OnOpen panic", buf, err)
+	}
+}
+
+// A write turn that finds nothing left releases its claim while another
+// goroutine may be queuing output: that producer found the claim taken and
+// left its bytes to the turn, so the release looks again and sends them.
+func TestWriteTurnReleaseSendsOutputQueuedBehindIt(t *testing.T) {
+	testConn := newTestConnection(t, &Events{Pollers: 1})
+	conn := testConn.conn
+	for deadline := time.Now().Add(2 * time.Second); conn.writeState.Load()&writeOpenedFlag == 0 ||
+		conn.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A write turn holds the claim and its ioState count...
+	if !conn.loop.acquireIO() || !conn.tryClaimWrite(0) {
+		t.Fatal("could not stand in for a write turn")
+	}
+	// ...when another goroutine queues output, whose kick finds it taken.
+	written := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("late"))
+		written <- err
+	}()
+	if err := <-written; err != nil {
+		t.Fatal(err)
+	}
+	conn.finishWriteTurn()
+	if got := string(readPeerUntil(t, testConn.peer, 4, 2*time.Second)); got != "late" {
+		t.Fatalf("peer received %q", got)
+	}
+}
+
+// A kick that takes the claim after shutdown began gives it straight back:
+// closing a connection waits for the claim, so keeping it would hang Serve.
+func TestKickAfterShutdownBeganReleasesTheClaim(t *testing.T) {
+	events := &Events{Pollers: 1}
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		loop.ioPool.stop()
+		_ = loop.poller.Close(nil)
+	}()
+	conn := &fdConn{fd: -1}
+	conn.events, conn.loop = events, loop
+	conn.writeState.Store(writeOpenedFlag)
+	conn.pending.Store(1)
+	loop.stopIO()
+	conn.kickWriter()
+	if conn.writeClaimed() {
+		t.Fatal("a kick after shutdown began kept the write claim")
+	}
+}
+
 // A direct send that the socket takes in part keeps its suffix ahead of bytes
 // another goroutine queued during the send: OnOpen's large Write is not split.
 func TestDirectSendSuffixStaysWhole(t *testing.T) {
