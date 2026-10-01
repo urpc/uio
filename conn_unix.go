@@ -100,9 +100,14 @@ const (
 	writeOpenedFlag
 	// writeTurnHeldFlag marks a claim the connection's turn keeps until it
 	// ends, because ReserveOutbound handed out outbound bytes that its
-	// callback fills after the reservation returns. A turn's own flush also
-	// takes the claim this way, so the turn's cleanup releases it on a panic.
+	// callback fills after the reservation returns.
 	writeTurnHeldFlag
+	// writeTurnFlushFlag marks the connection's turn flushing with the claim,
+	// whether it took the claim for the flush or keeps it for a reservation.
+	// OnOutbound runs inside that flush, so the turn's own writes from it are
+	// queued rather than sent, and the turn's cleanup releases the claim if
+	// the callback panics.
+	writeTurnFlushFlag
 	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
 	// the loop when it releases the claim.
 	writeCloseWaitFlag
@@ -113,12 +118,22 @@ const (
 	// waiting for it. Taking the claim clears it: an earlier edge says nothing
 	// about sends the new holder has yet to make.
 	writeEdgeFlag
-	// writeContendedFlag records that another goroutine queued output while
-	// the claim was held: several producers write to this connection now, so
-	// a write turn lets them add to its batch before sending. Taking the claim
-	// clears it, so a lone producer is never kept waiting by old contention.
+	// writeContendedFlag records that a goroutine other than the one the
+	// claim was taken for queued output while it was held: several producers
+	// write to this connection now, so a write turn lets them add to its
+	// batch before sending. Taking the claim clears it, so a lone producer,
+	// however many writes it makes, is never kept waiting.
 	writeContendedFlag
 )
+
+// writeClaimerMask holds the low bits of the goroutine id a write turn's claim
+// was taken for, which tells its own further writes from other producers'.
+const (
+	writeClaimerShift        = 16
+	writeClaimerMask  uint32 = 0xffff << writeClaimerShift
+)
+
+func claimerTag() uint32 { return uint32(currentGoroutineID()) << writeClaimerShift }
 
 const (
 	// Close is split so descriptor teardown remains loop-owned while OnClose is
@@ -213,18 +228,29 @@ func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 	}
 }
 
-func (conn *fdConn) writeClaimed() bool   { return conn.writeState.Load()&writeOwnerFlag != 0 }
-func (conn *fdConn) turnHoldsWrite() bool { return conn.writeState.Load()&writeTurnHeldFlag != 0 }
+func (conn *fdConn) writeClaimed() bool { return conn.writeState.Load()&writeOwnerFlag != 0 }
 
-// tryClaimWrite takes the write claim, adding extra (writeTurnHeldFlag) in the
-// same step. It never waits: a taken claim means its holder sends.
+// turnHoldsWrite reports a claim the connection's turn keeps for a reservation
+// and may use for its own writes: not from inside its own flush.
+func (conn *fdConn) turnHoldsWrite() bool {
+	return conn.writeState.Load()&(writeTurnHeldFlag|writeTurnFlushFlag) == writeTurnHeldFlag
+}
+
+// turnOwnsClaim reports any claim the connection's turn must release.
+func (conn *fdConn) turnOwnsClaim() bool {
+	return conn.writeState.Load()&(writeTurnHeldFlag|writeTurnFlushFlag) != 0
+}
+
+// tryClaimWrite takes the write claim, adding extra (turn flags or a claimer
+// tag) in the same step. It never waits: a taken claim means its holder sends.
 func (conn *fdConn) tryClaimWrite(extra uint32) bool {
 	for {
 		old := conn.writeState.Load()
 		if old&writeOwnerFlag != 0 {
 			return false
 		}
-		if conn.writeState.CompareAndSwap(old, (old|writeOwnerFlag|extra)&^(writeEdgeFlag|writeContendedFlag)) {
+		next := old&^(writeEdgeFlag|writeContendedFlag|writeClaimerMask) | writeOwnerFlag | extra
+		if conn.writeState.CompareAndSwap(old, next) {
 			return true
 		}
 	}
@@ -233,7 +259,7 @@ func (conn *fdConn) tryClaimWrite(extra uint32) bool {
 // releaseWrite gives the claim up. A close that found it taken asked, through
 // writeCloseWaitFlag, to be handed back to the loop now.
 func (conn *fdConn) releaseWrite() {
-	old := conn.writeState.And(^(writeOwnerFlag | writeTurnHeldFlag))
+	old := conn.writeState.And(^(writeOwnerFlag | writeTurnHeldFlag | writeTurnFlushFlag))
 	if old&writeCloseWaitFlag != 0 {
 		conn.writeState.And(^writeCloseWaitFlag)
 		t := acquireTask(closeTask, conn)
@@ -262,8 +288,9 @@ func (conn *fdConn) kickWriter() {
 	}
 	state := conn.writeState.Load()
 	if state&writeOwnerFlag != 0 {
-		// The holder sends these bytes; tell it others are writing too.
-		if state&writeContendedFlag == 0 {
+		// The holder sends these bytes. Output from a goroutine other than
+		// the one its claim was taken for means several producers write now.
+		if state&writeContendedFlag == 0 && state&writeClaimerMask != claimerTag() {
 			conn.writeState.Or(writeContendedFlag)
 		}
 		return
@@ -271,7 +298,7 @@ func (conn *fdConn) kickWriter() {
 	if state&writeBlockedFlag != 0 || state&writeOpenedFlag == 0 {
 		return
 	}
-	if !conn.tryClaimWrite(0) {
+	if !conn.tryClaimWrite(claimerTag()) {
 		return
 	}
 	if !conn.loop.acquireIO() {
@@ -606,8 +633,9 @@ func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
 	defer func() {
 		conn.corked = false // a callback panic may have left a round corked
-		if conn.turnHoldsWrite() {
-			// A callback panic may have left the claim kept for a reservation.
+		if conn.turnOwnsClaim() {
+			// A callback panic may have left the claim taken for a
+			// reservation or a flush.
 			conn.releaseWriteAndKick()
 		}
 		conn.ioOwner.Store(0)
@@ -659,7 +687,7 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 	}
-	if conn.turnHoldsWrite() {
+	if conn.turnOwnsClaim() {
 		// The round's reservations are filled and flushed: other senders may
 		// take the socket again, starting with output that waited for them.
 		conn.releaseWriteAndKick()

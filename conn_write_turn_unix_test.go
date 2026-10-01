@@ -651,6 +651,135 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 	}
 }
 
+// OnOutbound runs inside the flush that reports the bytes. A Write it makes is
+// queued and sent by a later flush, never sent at once by the same call
+// stack, which would call OnOutbound again inside itself: a callback that
+// writes more whenever output drains must not nest without bound or deadlock
+// on its own lock. This holds whether the connection's turn took the claim
+// for the flush or keeps it for a reservation.
+func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
+	for _, reserve := range []bool{false, true} {
+		name := "Write"
+		if reserve {
+			name = "ReserveOutbound"
+		}
+		t.Run(name, func(t *testing.T) {
+			const total = 20000
+			var depth, maxDepth, count atomic.Int32
+			var mu sync.Mutex
+			events := &Events{Pollers: 1}
+			events.OnData = func(c Conn) error {
+				_, _ = c.Discard(-1)
+				if reserve {
+					dst, err := c.ReserveOutbound(1)
+					if err == nil {
+						dst[0] = 'a'
+						return nil
+					}
+				}
+				_, err := c.Write([]byte("a"))
+				return err
+			}
+			events.OnOutbound = func(c Conn, n int) {
+				mu.Lock() // deadlocks if the callback re-enters itself
+				defer mu.Unlock()
+				if d := depth.Add(1); d > maxDepth.Load() {
+					maxDepth.Store(d)
+				}
+				defer depth.Add(-1)
+				if count.Add(1) < total {
+					_, _ = c.Write([]byte("b"))
+				}
+			}
+			testConn := newTestConnection(t, events)
+			if _, err := unix.Write(testConn.peer, []byte("q")); err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(10 * time.Second); count.Load() < total; {
+				if time.Now().After(deadline) {
+					t.Fatalf("OnOutbound ran %d of %d times", count.Load(), total)
+				}
+				buf := make([]byte, 64<<10)
+				_, _ = unix.Read(testConn.peer, buf)
+			}
+			if d := maxDepth.Load(); d != 1 {
+				t.Fatalf("OnOutbound nested %d deep", d)
+			}
+		})
+	}
+}
+
+// A direct send that the socket takes in part keeps its suffix ahead of bytes
+// another goroutine queued during the send: OnOpen's large Write is not split.
+func TestDirectSendSuffixStaysWhole(t *testing.T) {
+	for attempt := 0; attempt < 10; attempt++ {
+		direct := bytes.Repeat([]byte{'D'}, 4<<20)
+		producer := bytes.Repeat([]byte{'P'}, 64)
+		opened := make(chan struct{}, 1)
+		producerDone := make(chan error, 1)
+		events := &Events{Pollers: 1}
+		events.OnOpen = func(c Conn) {
+			fc := c.(*fdConn)
+			go func() {
+				// The direct sender takes the claim just before its send.
+				for deadline := time.Now().Add(time.Second); fc.writeState.Load()&writeOwnerFlag == 0 &&
+					time.Now().Before(deadline); {
+				}
+				_, err := fc.Write(producer)
+				producerDone <- err
+			}()
+			if _, err := c.Write(direct); err != nil {
+				t.Error(err)
+			}
+			opened <- struct{}{}
+		}
+		testConn := newTestConnection(t, events)
+		<-opened
+		if err := <-producerDone; err != nil {
+			t.Fatal(err)
+		}
+		got := readPeerUntil(t, testConn.peer, len(direct)+len(producer), 10*time.Second)
+		if first := bytes.IndexByte(got, 'P'); first != 0 && first != len(direct) {
+			t.Fatalf("attempt %d: OnOpen payload split by producer bytes at offset %d", attempt, first)
+		}
+		testConn.stop()
+	}
+}
+
+// Contention means a goroutine other than the one a write turn's claim was
+// taken for queued output: a lone producer that writes several times per
+// request does not make its own write turn yield.
+func TestOnlyOtherProducersMarkContention(t *testing.T) {
+	testConn := newTestConnection(t, &Events{Pollers: 1})
+	conn := testConn.conn
+	for deadline := time.Now().Add(2 * time.Second); conn.writeState.Load()&writeOpenedFlag == 0 ||
+		conn.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	conn.pending.Add(1)
+	defer conn.pending.Add(-1)
+	if !conn.tryClaimWrite(claimerTag()) {
+		t.Fatal("could not take the claim")
+	}
+	defer conn.releaseWrite()
+	conn.kickWriter()
+	if conn.writeState.Load()&writeContendedFlag != 0 {
+		t.Fatal("the claim's own producer marked contention")
+	}
+	done := make(chan struct{})
+	go func() {
+		conn.kickWriter()
+		close(done)
+	}()
+	<-done
+	if conn.writeState.Load()&writeContendedFlag == 0 {
+		t.Fatal("another goroutine's output did not mark contention")
+	}
+}
+
 // writeTurnRejectingExecutor runs connection turns and refuses write turns.
 type writeTurnRejectingExecutor struct{ refused atomic.Int64 }
 

@@ -303,6 +303,28 @@ func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
 	return conn.reservePending(size), nil
 }
 
+// claimDirectSend reports whether the turn may send directly, and whether it
+// took the claim for that. The turn may use a claim it keeps for a
+// reservation; otherwise it takes the claim and must find nothing queued:
+// another sender may have left part of its output there and released the
+// claim between the turn's check and its taking it, and those bytes go first.
+// A direct send therefore starts with nothing queued or in flight, which is
+// what lets it put an unsent suffix at the head of outbound.
+func (conn *fdConn) claimDirectSend() (direct, took bool) {
+	if conn.turnHoldsWrite() {
+		return true, false
+	}
+	if !conn.tryClaimWrite(0) {
+		// Another sender owns the socket; its release sends these bytes.
+		return false, false
+	}
+	if !conn.outboundEmpty() {
+		conn.releaseWriteAndKick()
+		return false, false
+	}
+	return true, true
+}
+
 // writeOnLoop is the task-owner fast path. It lends caller memory directly to
 // the non-blocking syscall when no batching is active and copies only an unsent
 // suffix that must outlive the call.
@@ -312,10 +334,11 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	}
 	threshold := conn.events.WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && len(data) < threshold)
-	held := conn.turnHoldsWrite()
-	if !queued && !held && !conn.tryClaimWrite(0) {
-		// Another sender owns the socket; its release sends these bytes.
-		queued = true
+	took := false
+	if !queued {
+		var direct bool
+		direct, took = conn.claimDirectSend()
+		queued = !direct
 	}
 	if queued {
 		// Batching or an existing tail requires one copy into connection-owned storage.
@@ -331,7 +354,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		conn.submitMu.Unlock()
 		return len(data), nil
 	}
-	if !held {
+	if took {
 		defer conn.releaseWriteAndKick()
 	}
 
@@ -382,10 +405,11 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	}
 	threshold := conn.events.WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && total < threshold)
-	held := conn.turnHoldsWrite()
-	if !queued && !held && !conn.tryClaimWrite(0) {
-		// Another sender owns the socket; its release sends these bytes.
-		queued = true
+	took := false
+	if !queued {
+		var direct bool
+		direct, took = conn.claimDirectSend()
+		queued = !direct
 	}
 	if queued {
 		reserved, err := conn.reservePendingAfterFlush(int64(total))
@@ -400,7 +424,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		conn.submitMu.Unlock()
 		return total, nil
 	}
-	if !held {
+	if took {
 		defer conn.releaseWriteAndKick()
 	}
 	written, err := socket.Writev(conn.fd, vec)
@@ -450,10 +474,11 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold)
-	held := conn.turnHoldsWrite()
-	if !queued && !held && !conn.tryClaimWrite(0) {
-		// Another sender owns the socket; its release sends these bytes.
-		queued = true
+	took := false
+	if !queued {
+		var direct bool
+		direct, took = conn.claimDirectSend()
+		queued = !direct
 	}
 	if queued {
 		reserved, err := conn.reservePendingAfterFlush(int64(size))
@@ -473,7 +498,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		conn.submitMu.Unlock()
 		return size, nil
 	}
-	if !held {
+	if took {
 		defer conn.releaseWriteAndKick()
 	}
 
@@ -618,14 +643,25 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 	if conn.isDatagram() || conn.pending.Load() == 0 {
 		return 0, nil
 	}
-	held := conn.turnHoldsWrite()
-	// Taken as the turn's own claim, so the turn's deferred cleanup gives it
-	// back if OnOutbound panics during the flush.
-	if !held && !conn.tryClaimWrite(writeTurnHeldFlag) {
+	// The flush marks the claim as the turn's, whether taken now or kept for
+	// a reservation. OnOutbound runs inside it, so the turn's own writes from
+	// that callback are queued rather than sent, which would call it again,
+	// and the turn's cleanup releases the claim if the callback panics.
+	state := conn.writeState.Load()
+	held := state&writeTurnHeldFlag != 0
+	switch {
+	case state&writeTurnFlushFlag != 0:
+		// Called from OnOutbound inside this turn's own flush.
+		return 0, nil
+	case held:
+		conn.writeState.Or(writeTurnFlushFlag)
+	case !conn.tryClaimWrite(writeTurnFlushFlag):
 		return 0, nil
 	}
 	n, err := conn.flushWrite()
-	if !held {
+	if held {
+		conn.writeState.And(^writeTurnFlushFlag)
+	} else {
 		conn.releaseWriteAndKick()
 	}
 	return n, err
