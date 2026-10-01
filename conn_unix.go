@@ -42,11 +42,17 @@ type fdConn struct {
 	outbound bytebuf.CompositeBuffer // protected by submitMu
 	udp      *unixUDPState           // nil for stream connections
 
+	// inflight holds the batch a flush detached from outbound while it is
+	// written to the socket without submitMu, so producers never wait for a
+	// send. Every byte in it was accepted before anything still in outbound.
+	// Like inbound it belongs to the connection's turn; it is borrowed from a
+	// pool only while bytes remain unsent.
+	inflight *bytebuf.CompositeBuffer
+
 	pollTag   uint32          // registration generation echoed by the data poller
 	interest  poller.Interest // event-loop-owned registered interest
 	throttled bool            // loop-owned read-interest hysteresis
 	corked    bool            // task-owned read-round batching flag
-	accepted  bool            // accepted TCP; its open task applies the default options
 	internal  bool            // framework-owned endpoint, not a user connection
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
@@ -175,6 +181,9 @@ const (
 	ioEventOpen  uint32 = 1 << 16
 	ioEventWake  uint32 = 1 << 17
 	ioEventClose uint32 = 1 << 18
+	// ioEventAccepted rides with ioEventOpen for an accepted TCP connection,
+	// whose open turn applies the default socket options.
+	ioEventAccepted uint32 = 1 << 19
 )
 
 // scheduleIO records readiness or a synthetic event and submits the connection
@@ -196,7 +205,7 @@ func (conn *fdConn) markOpenPending() { conn.pendingEvents.Or(ioEventOpen) }
 
 // clearOpenPending withdraws the open event of a stream that failed to
 // register.
-func (conn *fdConn) clearOpenPending() { conn.pendingEvents.And(^ioEventOpen) }
+func (conn *fdConn) clearOpenPending() { conn.pendingEvents.And(^(ioEventOpen | ioEventAccepted)) }
 
 // scheduleOpen submits the task for a pending open event unless the data
 // poller already has. Noting ioEventOpen again would run OnOpen twice if that
@@ -256,11 +265,11 @@ func (conn *fdConn) assignWatchTag() uint32 {
 // prepareAccepted marks an accepted TCP connection whose default socket
 // options are still to be applied. The open task applies them, off the event
 // loop and before OnOpen, so a loop registering a connection storm spends one
-// epoll_ctl per connection instead of four syscalls.
-func (conn *fdConn) prepareAccepted() { conn.accepted = true }
+// epoll_ctl per connection instead of four syscalls. The mark is set before
+// registration publishes the open event, so one turn takes both together.
+func (conn *fdConn) prepareAccepted() { conn.pendingEvents.Or(ioEventAccepted) }
 
 func (conn *fdConn) applyAcceptedOptions() {
-	conn.accepted = false
 	_ = conn.applySocketOption(optionNoDelay, 1)
 	_ = conn.applySocketOption(optionKeepAlive, 1)
 	_ = conn.applySocketOption(optionKeepAlivePeriod, defaultTCPKeepAliveSecs)
@@ -376,7 +385,7 @@ func (conn *fdConn) runIOTask() {
 		return
 	}
 	if events&ioEventOpen != 0 {
-		if conn.accepted {
+		if events&ioEventAccepted != 0 {
 			conn.applyAcceptedOptions()
 		}
 		conn.fireOnOpen()
@@ -603,8 +612,9 @@ func (conn *fdConn) fireWriteEvent() error {
 func (conn *fdConn) onRead() error {
 	holder := conn.events.readPool.Get().(*readBuffer)
 	// A read round is corked: replies the callbacks enqueue accumulate in
-	// outbound and are flushed once when the event ends, so a burst of reads
-	// costs one writev instead of one syscall per reply.
+	// outbound and are flushed once when the event ends, or each time they
+	// fill a coalescing block, so a burst of reads costs one writev instead
+	// of one syscall per reply.
 	conn.corked = true
 	err := conn.readRound(holder.bytes)
 	conn.corked = false
@@ -673,6 +683,16 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		}
 		if n < len(buffer) {
 			return nil
+		}
+		// The round reads on. Once its replies fill a coalescing block, send
+		// them before reading further: a peer that keeps a window of requests
+		// in flight is otherwise left waiting for the whole round, which can
+		// run to 256 reads, and its pipeline empties. Smaller bursts still
+		// leave in one write when the round ends.
+		if conn.pending.Load() >= int64(conn.coalesceBlockSize()) {
+			if _, err := conn.flushOnLoop(); err != nil {
+				return err
+			}
 		}
 	}
 	if totalRead > 0 {
@@ -900,6 +920,7 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	conn.submitMu.Lock()
 	conn.outbound.Reset()
 	conn.submitMu.Unlock()
+	conn.releaseInflight()
 	conn.inbound.Reset()
 	conn.inboundTail = nil
 	conn.pending.Store(0)
