@@ -3,6 +3,9 @@
 package uio
 
 import (
+	"errors"
+	"io"
+	"net"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -87,5 +90,48 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 		if got := task.(*fdConn).close.phase.Load(); got != closeCallbackDelivered {
 			t.Fatalf("close phase = %d, want %d", got, closeCallbackDelivered)
 		}
+	}
+}
+
+// closeOnLoop defers closure to a reserved turn, and that reservation can be a
+// task the executor rejects. The rejection then ends the turn and must hand the
+// closure back to the loop, or the connection never closes.
+func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
+	closed := make(chan error, 1)
+	events := &Events{Pollers: 1, OnClose: func(_ Conn, err error) { closed <- err }}
+	testConn := newTestConnection(t, events)
+	conn := testConn.conn
+	for deadline := time.Now().Add(2 * time.Second); conn.scheduled.Load() || conn.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A task the executor is about to reject holds the scheduling claim.
+	if !conn.noteIO(ioEventRead) {
+		t.Fatal("could not reserve a turn")
+	}
+	conn.requestClose(io.EOF)
+	for deadline := time.Now().Add(2 * time.Second); ; {
+		conn.submitMu.Lock()
+		deferred := conn.close.deferred != nil
+		conn.submitMu.Unlock()
+		if deferred {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("closeOnLoop did not defer closure to the reserved turn")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The rejection is handled after closeOnLoop deferred to it.
+	conn.handleIOSubmitFailure(net.ErrClosed)
+	select {
+	case err := <-closed:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("OnClose(%v), want the deferred cause", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the connection never closed: the rejected turn kept its deferred closure")
 	}
 }

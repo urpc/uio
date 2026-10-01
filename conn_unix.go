@@ -550,10 +550,15 @@ func (conn *fdConn) finishIOTask() {
 }
 
 func (conn *fdConn) handleIOSubmitFailure(err error) {
-	// A rejected task will never run finishIOTask. Relinquish its scheduling
-	// claim before the loop can process the close request, or closeOnLoop may
-	// defer teardown forever waiting for a task that does not exist.
+	// A rejected task will never run finishIOTask, so this ends its turn the
+	// way finishIOTask does. Its scheduling claim is given up under submitMu:
+	// closeOnLoop may already have seen the claim and deferred closure to this
+	// turn, and then the closure goes back to the loop here, or the connection
+	// would never close.
+	conn.submitMu.Lock()
 	conn.scheduled.Store(false)
+	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
+	conn.submitMu.Unlock()
 	phase := conn.close.phase.Load()
 	if phase < closeResourcesReleased {
 		conn.requestClose(err)
@@ -561,6 +566,13 @@ func (conn *fdConn) handleIOSubmitFailure(err error) {
 		// closeOnLoop publishes the final cause before setting ioEventClose.
 		// A rejected earlier task must not deliver OnClose during that gap.
 		conn.fireCloseCallback()
+	}
+	if hasDeferredClose && conn.loop != nil {
+		t := acquireTask(closeTask, conn)
+		if !conn.loop.submitTask(t) {
+			releaseTask(t)
+			// The stopped loop's shutdown pass owns final fd teardown.
+		}
 	}
 	if conn.loop != nil {
 		conn.loop.releaseIO()
