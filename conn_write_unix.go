@@ -129,8 +129,10 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 }
 
 // ReserveOutbound is the task-owner encoding path: the reserved bytes are part
-// of outbound as soon as it returns, and only the owner flushes outbound while
-// its task runs, so the caller can fill them after submitMu is released.
+// of outbound as soon as it returns, and the caller fills them after submitMu
+// is released. No other sender may take outbound meanwhile, so the turn keeps
+// the write claim until its next flush; when a write turn is sending at that
+// moment the reservation is refused and the caller writes another way.
 func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	if n <= 0 {
 		return nil, nil
@@ -139,6 +141,9 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 		return nil, net.ErrClosed
 	}
 	if conn.isDatagram() || !conn.directOwner() {
+		return nil, ErrReserveUnsupported
+	}
+	if !conn.turnHoldsWrite() && !conn.tryClaimWrite(writeTurnHeldFlag) {
 		return nil, ErrReserveUnsupported
 	}
 	reserved, err := conn.reservePendingAfterFlush(int64(n))
@@ -237,8 +242,9 @@ func (conn *fdConn) precheckOutbound(size int) error {
 
 // queueOwnedWrite is the cross-goroutine write path. Ownership has already
 // moved into owned, so submitMu only covers admission, accounting, and pointer
-// insertion; payload allocation and copying never happen under the lock.
-// ErrOutboundOverflow accepts nothing and returns owned to the caller.
+// insertion; payload allocation and copying never happen under the lock. The
+// bytes are sent by a write turn, beside whatever the connection's turn is
+// reading. ErrOutboundOverflow accepts nothing and returns owned to the caller.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
 	if limit := conn.events.MaxOutboundBuffered; limit > 0 && size > limit {
 		return 0, ErrOutboundOverflow
@@ -256,7 +262,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 	}
 	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
-	conn.scheduleIO(ioEventWrite)
+	conn.kickWriter()
 	return size, nil
 }
 
@@ -299,7 +305,13 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		return conn.sendUDPOnLoop(data)
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && len(data) < threshold) {
+	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && len(data) < threshold)
+	held := conn.turnHoldsWrite()
+	if !queued && !held && !conn.tryClaimWrite(0) {
+		// Another sender owns the socket; its release sends these bytes.
+		queued = true
+	}
+	if queued {
 		// Batching or an existing tail requires one copy into connection-owned storage.
 		reserved, err := conn.reservePendingAfterFlush(int64(len(data)))
 		if err != nil {
@@ -312,6 +324,9 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		_, _ = conn.outbound.Write(data)
 		conn.submitMu.Unlock()
 		return len(data), nil
+	}
+	if !held {
+		defer conn.releaseWriteAndKick()
 	}
 
 	// The common callback path lends caller memory directly to the kernel.
@@ -362,7 +377,13 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return 0, errUnsupported
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && total < threshold) {
+	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && total < threshold)
+	held := conn.turnHoldsWrite()
+	if !queued && !held && !conn.tryClaimWrite(0) {
+		// Another sender owns the socket; its release sends these bytes.
+		queued = true
+	}
+	if queued {
 		reserved, err := conn.reservePendingAfterFlush(int64(total))
 		if err != nil {
 			return 0, err
@@ -374,6 +395,9 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		conn.outbound.WritevCoalesced(vec, conn.coalesceBlockSize())
 		conn.submitMu.Unlock()
 		return total, nil
+	}
+	if !held {
+		defer conn.releaseWriteAndKick()
 	}
 	written, err := socket.Writev(conn.fd, vec)
 	if written < 0 {
@@ -423,7 +447,13 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // already carries many frames and keeps its own writev segment.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
-	if !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold) {
+	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold)
+	held := conn.turnHoldsWrite()
+	if !queued && !held && !conn.tryClaimWrite(0) {
+		// Another sender owns the socket; its release sends these bytes.
+		queued = true
+	}
+	if queued {
 		reserved, err := conn.reservePendingAfterFlush(int64(size))
 		if err != nil {
 			bytebuf.ReleaseBuffer(owned)
@@ -440,6 +470,9 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		}
 		conn.submitMu.Unlock()
 		return size, nil
+	}
+	if !held {
+		defer conn.releaseWriteAndKick()
 	}
 
 	written, err := socket.Send(conn.fd, owned.Bytes())
@@ -543,9 +576,9 @@ func (conn *fdConn) Flush() error {
 		_, err := conn.flushOnLoop()
 		return err
 	}
-	// Outside the task, Flush is a FIFO barrier and returns after scheduling
-	// the connection's next I/O round.
-	conn.scheduleIO(ioEventWrite)
+	// Outside the task, Flush is a FIFO barrier and returns after giving the
+	// queued bytes a sender.
+	conn.kickWriter()
 	return nil
 }
 
@@ -553,8 +586,8 @@ func (conn *fdConn) Flush() error {
 // connection keeps no second queue.
 var inflightPool = sync.Pool{New: func() any { return new(bytebuf.CompositeBuffer) }}
 
-// releaseInflight returns the borrowed batch. Only the connection's turn, or
-// the loop once no turn can run, calls it.
+// releaseInflight returns the borrowed batch. Only the holder of the write
+// claim calls it; close keeps the claim it takes, so nothing sends afterwards.
 func (conn *fdConn) releaseInflight() {
 	if batch := conn.inflight; batch != nil {
 		conn.inflight = nil
@@ -563,104 +596,165 @@ func (conn *fdConn) releaseInflight() {
 	}
 }
 
-// flushOnLoop drains a bounded number of bytes and writev calls. Under
-// submitMu it only moves outbound into inflight; the socket is written without
-// it, so a producer appending to outbound never waits for a send. Inflight
-// keeps whatever the socket did not take, ahead of everything accepted since.
-// EAGAIN leaves the bytes queued and sets writeBlocked until a writable edge.
+// flushOnLoop is the connection turn's flush. The turn sends inline when it
+// holds or can take the write claim, so replies produced by its callbacks
+// leave without a scheduler hop; when another sender holds the claim, that
+// sender's release rechecks and these bytes go with it.
 func (conn *fdConn) flushOnLoop() (int, error) {
 	// pending is incremented before a producer publishes its buffer and
-	// decremented only after the corresponding bytes leave inflight. A zero
+	// decremented only after the corresponding bytes are sent. A zero
 	// value therefore proves that there is no stream payload to flush, while
-	// avoiding the submitMu round trip on the common empty path.
+	// avoiding any atomic read-modify-write on the common empty path.
 	if conn.isDatagram() || conn.pending.Load() == 0 {
+		return 0, nil
+	}
+	held := conn.turnHoldsWrite()
+	if !held && !conn.tryClaimWrite(0) {
+		return 0, nil
+	}
+	n, err := conn.flushWrite()
+	if !held {
+		conn.releaseWriteAndKick()
+	}
+	return n, err
+}
+
+// flushWrite drains a bounded number of bytes and writev calls. It requires
+// the write claim, and submitMu never covers a send, so a producer appending
+// to outbound never waits for the socket. A queue of one block, the usual
+// shape after a round of replies, is sent in place: producers only append,
+// into the tail block's spare room or as new blocks, and only the claim holder
+// discards, so the bytes a send reads stay put while the lock is released.
+// A longer queue is detached into inflight in one step instead, so its sends
+// and the release of its sent blocks also run without the lock while producers
+// start the next batch; inflight goes out ahead of everything accepted since.
+// EAGAIN leaves the bytes queued and sets writeBlocked until a writable edge.
+func (conn *fdConn) flushWrite() (int, error) {
+	if conn.pending.Load() == 0 {
 		return 0, nil
 	}
 	if conn.writeBlocked() {
 		// Once EAGAIN is observed, only a Writable event should retry the fd.
 		return 0, nil
 	}
+	var totalWritten int
+	var writeErr error
 	if conn.inflight == nil {
-		batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
 		conn.submitMu.Lock()
+		if conn.outbound.Blocks() == 1 {
+			totalWritten, writeErr = conn.sendOutboundBlock()
+		}
+		if writeErr != nil || conn.writeBlocked() || conn.outbound.Empty() {
+			conn.submitMu.Unlock()
+			return conn.retireFlush(totalWritten, writeErr)
+		}
+		batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
 		// batch is empty, so the swap leaves outbound empty for producers.
 		conn.outbound, *batch = *batch, conn.outbound
 		conn.submitMu.Unlock()
-		if batch.Empty() {
-			inflightPool.Put(batch)
-			return 0, nil
-		}
 		conn.inflight = batch
 	}
-	var totalWritten int
-	var writeErr error
+	var written int
 	if conn.inflight.Blocks() == 1 {
-		totalWritten, writeErr = conn.writeOutboundBlockLocked()
+		written, writeErr = conn.sendInflightBlock()
 	} else {
-		totalWritten, writeErr = conn.writevOutboundLocked()
+		written, writeErr = conn.sendInflightVec()
 	}
+	totalWritten += written
 	if conn.inflight.Empty() {
 		conn.releaseInflight()
-		conn.setWriteBlocked(false)
 	}
-	if totalWritten > 0 {
-		conn.events.onSocketBytesWrite(conn, totalWritten)
-	}
-	if writeErr != nil {
-		return totalWritten, writeErr
-	}
-	return totalWritten, nil
+	return conn.retireFlush(totalWritten, writeErr)
 }
 
-// writeOutboundBlockLocked flushes an inflight batch of one block, the usual
-// shape after a round of small replies, with plain write and no vector.
-func (conn *fdConn) writeOutboundBlockLocked() (int, error) {
+// retireFlush accounts what a flush sent and reports it.
+func (conn *fdConn) retireFlush(written int, err error) (int, error) {
+	if written > 0 {
+		conn.retireSent(written)
+		conn.events.onSocketBytesWrite(conn, written)
+	}
+	return written, err
+}
+
+// retireSent retires bytes the socket took. The decrement that takes the
+// backlog down to the resume mark lets reads the outbound limit paused
+// continue. Producers only add to pending and every add and retire is atomic,
+// so each downward crossing is seen here exactly once, whoever is sending and
+// whatever producers append meanwhile.
+func (conn *fdConn) retireSent(n int) {
+	after := conn.pending.Add(-int64(n))
+	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 &&
+		after <= limit/2 && after+int64(n) > limit/2 {
+		conn.scheduleRefresh()
+	}
+}
+
+// sendOutboundBlock sends a queue of one block in place, with plain write and
+// no vector. It is called and returns with submitMu held, releases it around
+// each send, and stops once producers have queued a second block.
+func (conn *fdConn) sendOutboundBlock() (int, error) {
 	totalWritten := 0
-	for calls := 0; calls < 16 && !conn.inflight.Empty(); calls++ {
-		written, err := socket.Send(conn.fd, conn.inflight.PeekChunk())
-		if err != nil {
-			if isWouldBlock(err) {
-				conn.setWriteBlocked(true)
-				return totalWritten, nil
-			}
+	for calls := 0; calls < 16 && conn.outbound.Blocks() == 1; calls++ {
+		chunk := conn.outbound.PeekChunk()
+		conn.submitMu.Unlock()
+		written, err := socket.Send(conn.fd, chunk)
+		conn.submitMu.Lock()
+		if err != nil && !isWouldBlock(err) {
 			return totalWritten, err
 		}
-		if written <= 0 {
-			conn.setWriteBlocked(true)
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
 			return totalWritten, nil
 		}
-		conn.inflight.Discard(written)
-		conn.pending.Add(-int64(written))
+		conn.outbound.Discard(written)
 		totalWritten += written
 	}
 	return totalWritten, nil
 }
 
-// writevOutboundLocked drains a multi-block inflight batch in bounded writev
-// batches.
-// Its vector is kept out of flushOnLoop's frame, which would otherwise clear
-// it on every flush.
+// sendInflightBlock sends a detached batch of one block with plain write.
+func (conn *fdConn) sendInflightBlock() (int, error) {
+	totalWritten := 0
+	for calls := 0; calls < 16 && !conn.inflight.Empty(); calls++ {
+		written, err := socket.Send(conn.fd, conn.inflight.PeekChunk())
+		if err != nil && !isWouldBlock(err) {
+			return totalWritten, err
+		}
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			return totalWritten, nil
+		}
+		conn.inflight.Discard(written)
+		totalWritten += written
+	}
+	return totalWritten, nil
+}
+
+// sendInflightVec drains a detached multi-block batch in bounded writev
+// batches. Its vector is kept out of flushWrite's frame, which would otherwise
+// clear it on every flush.
 //
 //go:noinline
-func (conn *fdConn) writevOutboundLocked() (int, error) {
+func (conn *fdConn) sendInflightVec() (int, error) {
 	var vecStorage [nativeWriteVecLimit][]byte
 	totalWritten := 0
 	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.inflight.Empty(); calls++ {
 		vec, _ := conn.inflight.PeekVecN(vecStorage[:0], len(vecStorage))
 		written, err := socket.Writev(conn.fd, vec)
-		if err != nil {
-			if isWouldBlock(err) {
-				conn.setWriteBlocked(true)
-				break
-			}
+		if err != nil && !isWouldBlock(err) {
 			return totalWritten, err
 		}
-		if written == 0 {
-			conn.setWriteBlocked(true)
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
 			break
 		}
 		conn.inflight.Discard(written)
-		conn.pending.Add(-int64(written))
 		totalWritten += written
 	}
 	return totalWritten, nil

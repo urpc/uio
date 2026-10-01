@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -20,8 +21,11 @@ import (
 
 // fdConn separates control-plane and data-plane ownership. The event loop owns
 // descriptor registration, deadlines, and interest. At most one connection
-// task owns stream socket I/O and callbacks, while submitMu admits concurrent
-// producers into the connection-owned outbound queue.
+// task reads the stream socket and runs callbacks, while submitMu admits
+// concurrent producers into the connection-owned outbound queue. Sending is
+// owned separately by the write claim in writeState: the turn sends its own
+// replies inline when the claim is free, and output from other goroutines is
+// sent by a write turn that runs beside the reading one.
 //
 // The layout keeps what a connection turn touches in the first lines and the
 // whole value within the 256-byte size class, whose objects are line aligned.
@@ -31,7 +35,7 @@ type fdConn struct {
 	pendingEvents atomic.Uint32 // coalesced readiness and synthetic events
 	scheduled     atomic.Bool   // exactly one task is queued or running
 	ioOwner       atomic.Int64  // current task goroutine, zero while idle
-	writeState    atomic.Uint32 // blocked/failed flags shared with loop
+	writeState    atomic.Uint32 // send state and the write claim; see writeOwnerFlag
 	readStalled   atomic.Bool   // ET read work owed after yield/backpressure
 	pending       atomic.Int64  // accepted payload not yet written
 
@@ -42,11 +46,11 @@ type fdConn struct {
 	outbound bytebuf.CompositeBuffer // protected by submitMu
 	udp      *unixUDPState           // nil for stream connections
 
-	// inflight holds the batch a flush detached from outbound while it is
-	// written to the socket without submitMu, so producers never wait for a
-	// send. Every byte in it was accepted before anything still in outbound.
-	// Like inbound it belongs to the connection's turn; it is borrowed from a
-	// pool only while bytes remain unsent.
+	// inflight holds a multi-block batch a flush detached from outbound, so
+	// its sends and the release of its sent blocks run without submitMu.
+	// Every byte in it was accepted before anything still in outbound. It
+	// belongs to the holder of the write claim; it is borrowed from a pool
+	// only while bytes remain unsent.
 	inflight *bytebuf.CompositeBuffer
 
 	pollTag   uint32          // registration generation echoed by the data poller
@@ -85,6 +89,27 @@ const (
 	writeBlockedFlag uint32 = 1 << iota
 	// writeFailedFlag suppresses the close-time flush after a fatal syscall.
 	writeFailedFlag
+	// writeOwnerFlag is the write claim: its holder alone writes the stream
+	// socket, discards sent bytes and touches inflight. It is taken with
+	// compare-and-swap and never waited for. Whoever releases it checks for
+	// output that arrived meanwhile, so a producer that found it taken can
+	// leave its bytes to the holder.
+	writeOwnerFlag
+	// writeOpenedFlag is set once OnOpen has returned. Before that, output
+	// waits for the open turn, which sends it after the callback.
+	writeOpenedFlag
+	// writeTurnHeldFlag marks a claim the connection's turn keeps until its
+	// next flush, because ReserveOutbound handed out outbound bytes that its
+	// callback fills after the reservation returns.
+	writeTurnHeldFlag
+	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
+	// the loop when it releases the claim.
+	writeCloseWaitFlag
+	// writeEdgeFlag records a writable edge the connection's turn handled. A
+	// sender that got EAGAIN may not have recorded writeBlockedFlag yet when
+	// the edge arrives, and that edge will not come again, so the sender
+	// consumes this flag and retries instead of waiting for it.
+	writeEdgeFlag
 )
 
 const (
@@ -138,6 +163,34 @@ func (conn *fdConn) writeFailed() bool  { return conn.writeState.Load()&writeFai
 func (conn *fdConn) setWriteBlocked(blocked bool) {
 	conn.updateWriteState(writeBlockedFlag, blocked)
 }
+
+// noteWritable handles a writable edge: the socket has room again.
+func (conn *fdConn) noteWritable() {
+	for {
+		old := conn.writeState.Load()
+		next := old&^writeBlockedFlag | writeEdgeFlag
+		if next == old || conn.writeState.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// markWriteBlocked records the EAGAIN its caller just got. If a writable edge
+// was handled since the last one, the room it reported may have come after
+// that send, so the edge is consumed and the caller retries. A stale edge
+// costs one more EAGAIN.
+func (conn *fdConn) markWriteBlocked() (retry bool) {
+	for {
+		old := conn.writeState.Load()
+		next := old | writeBlockedFlag
+		if old&writeEdgeFlag != 0 {
+			next = old &^ writeEdgeFlag
+		}
+		if conn.writeState.CompareAndSwap(old, next) {
+			return next&writeBlockedFlag == 0
+		}
+	}
+}
 func (conn *fdConn) markWriteFailed() { conn.updateWriteState(writeFailedFlag, true) }
 func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 	for {
@@ -153,6 +206,134 @@ func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 	}
 }
 
+func (conn *fdConn) writeClaimed() bool   { return conn.writeState.Load()&writeOwnerFlag != 0 }
+func (conn *fdConn) turnHoldsWrite() bool { return conn.writeState.Load()&writeTurnHeldFlag != 0 }
+
+// tryClaimWrite takes the write claim, adding extra (writeTurnHeldFlag) in the
+// same step. It never waits: a taken claim means its holder sends.
+func (conn *fdConn) tryClaimWrite(extra uint32) bool {
+	for {
+		old := conn.writeState.Load()
+		if old&writeOwnerFlag != 0 {
+			return false
+		}
+		if conn.writeState.CompareAndSwap(old, old|writeOwnerFlag|extra) {
+			return true
+		}
+	}
+}
+
+// releaseWrite gives the claim up. A close that found it taken asked, through
+// writeCloseWaitFlag, to be handed back to the loop now.
+func (conn *fdConn) releaseWrite() {
+	old := conn.writeState.And(^(writeOwnerFlag | writeTurnHeldFlag))
+	if old&writeCloseWaitFlag != 0 {
+		conn.writeState.And(^writeCloseWaitFlag)
+		t := acquireTask(closeTask, conn)
+		if !conn.loop.submitTask(t) {
+			releaseTask(t)
+			// The stopped loop's shutdown pass owns final fd teardown.
+		}
+	}
+}
+
+// releaseWriteAndKick releases the claim and then sends whatever producers
+// appended while it was held: they found the claim taken and left their
+// bytes to this holder.
+func (conn *fdConn) releaseWriteAndKick() {
+	conn.releaseWrite()
+	conn.kickWriter()
+}
+
+// kickWriter gives accepted output a sender. If the claim is free it takes it
+// and hands it to a write turn; if it is taken, the holder's release rechecks.
+// Output waits for the open turn before OnOpen returns, for a writable edge
+// while the socket is full, and for the close flush once closing started.
+func (conn *fdConn) kickWriter() {
+	if conn.isDatagram() || conn.pending.Load() == 0 || conn.isClosing() {
+		return
+	}
+	state := conn.writeState.Load()
+	if state&(writeOwnerFlag|writeBlockedFlag) != 0 || state&writeOpenedFlag == 0 {
+		return
+	}
+	if !conn.tryClaimWrite(0) {
+		return
+	}
+	if !conn.loop.acquireIO() {
+		// Shutting down: its close pass sends the bounded final flush.
+		conn.releaseWrite()
+		return
+	}
+	if !conn.loop.ioPool.submitWrite(conn) {
+		conn.handleWriteSubmitFailure()
+	}
+}
+
+// handleWriteSubmitFailure ends a write turn the scheduler refused. Its bytes
+// have no sender left, so the connection closes, as with a refused turn.
+func (conn *fdConn) handleWriteSubmitFailure() {
+	conn.releaseWrite()
+	conn.requestClose(net.ErrClosed)
+	conn.loop.releaseIO()
+}
+
+// writeTurn is a connection seen as its write task. It is the same value, so
+// submitting a write turn allocates nothing.
+type writeTurn fdConn
+
+// RunTask implements IOTask for the write turn.
+func (turn *writeTurn) RunTask() {
+	conn := (*fdConn)(turn)
+	if conn.loop == nil || conn.loop.ioPool == nil {
+		return
+	}
+	conn.runWriteTurn()
+}
+
+// maxWriteFlushes bounds one write turn, like the read budget bounds a read
+// round, so a connection that keeps producing returns its worker to the queue.
+const maxWriteFlushes = 8
+
+// runWriteTurn sends output from other goroutines while the connection's turn
+// reads. It holds the write claim and one count of its loop's ioState, which
+// shutdown joins. It never runs callbacks other than OnOutbound.
+func (conn *fdConn) runWriteTurn() {
+	for flushes := 0; ; flushes++ {
+		if conn.isClosing() || conn.pending.Load() == 0 || conn.writeBlocked() {
+			break
+		}
+		if flushes == maxWriteFlushes {
+			// The claim and the count move to the next turn in the queue.
+			if !conn.loop.ioPool.submitWrite(conn) {
+				conn.handleWriteSubmitFailure()
+			}
+			return
+		}
+		if _, err := conn.flushWrite(); err != nil {
+			conn.requestClose(err)
+			break
+		}
+		if conn.writeBlocked() {
+			// Arm writable interest; the edge restarts sending.
+			conn.scheduleRefresh()
+			break
+		}
+	}
+	conn.releaseWrite()
+	// Bytes appended after the last flush found the claim taken.
+	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
+		!conn.loop.ioStopped() && conn.tryClaimWrite(0) {
+		// This turn's count moves to the next one.
+		if !conn.loop.ioPool.submitWrite(conn) {
+			conn.handleWriteSubmitFailure()
+		}
+		return
+	}
+	// Released last: shutdown joins write turns through this count.
+	conn.loop.releaseIO()
+}
+
 func (conn *fdConn) Fd() int                              { return conn.fd }
 func (conn *fdConn) initialInterest() poller.Interest     { return poller.Readable }
 func (conn *fdConn) setInterest(interest poller.Interest) { conn.interest = interest }
@@ -163,7 +344,11 @@ func (conn *fdConn) beginShutdown()                       { conn.close.request()
 func (conn *fdConn) isDatagram() bool                     { return conn.udp != nil }
 func (conn *fdConn) afterRegister()                       {}
 
-func (conn *fdConn) readNeedsRedelivery() bool { return conn.readStalled.Load() }
+// readNeedsRedelivery runs on the loop after updateInterest. Reads the outbound
+// limit throttled stay paused until a send retires the backlog to the resume
+// mark and refreshes again: redelivered now, a read would only feed callbacks
+// whose replies cannot be accepted.
+func (conn *fdConn) readNeedsRedelivery() bool { return conn.readStalled.Load() && !conn.throttled }
 func (conn *fdConn) clearReadRedelivery() bool { return conn.readStalled.CompareAndSwap(true, false) }
 func (conn *fdConn) writeIsBlocked() bool      { return conn.writeBlocked() }
 
@@ -373,6 +558,10 @@ func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
 	defer func() {
 		conn.corked = false // a callback panic may have left a round corked
+		if conn.turnHoldsWrite() {
+			// A callback panic may have left the claim kept for a reservation.
+			conn.releaseWriteAndKick()
+		}
 		conn.ioOwner.Store(0)
 		conn.finishIOTask()
 	}()
@@ -389,9 +578,12 @@ func (conn *fdConn) runIOTask() {
 			conn.applyAcceptedOptions()
 		}
 		conn.fireOnOpen()
+		// Output from other goroutines may start write turns from now on; what
+		// they queued before this point leaves with this turn's flush below.
+		conn.writeState.Or(writeOpenedFlag)
 	}
 	if !conn.isClosing() && events&ioEventWrite != 0 {
-		conn.setWriteBlocked(false)
+		conn.noteWritable()
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
@@ -418,6 +610,11 @@ func (conn *fdConn) runIOTask() {
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
+	}
+	if conn.turnHoldsWrite() {
+		// The round's reservations are filled and flushed: other senders may
+		// take the socket again, starting with output that waited for them.
+		conn.releaseWriteAndKick()
 	}
 	if conn.needsInterestRefresh(events) {
 		if conn.canRedeliverRead(events) {
@@ -451,7 +648,13 @@ func (conn *fdConn) RunTask() {
 }
 
 func (conn *fdConn) needsInterestRefresh(events uint32) bool {
-	if conn.readStalled.Load() || events&ioEventWrite != 0 || !conn.outboundEmpty() {
+	if conn.readStalled.Load() || events&ioEventWrite != 0 {
+		return true
+	}
+	// Remaining output needs writable interest only while the socket is full
+	// or nobody holds the claim to send it; a write turn arms it itself when
+	// its send blocks.
+	if !conn.outboundEmpty() && (conn.writeBlocked() || !conn.writeClaimed()) {
 		return true
 	}
 	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
@@ -599,7 +802,7 @@ func (conn *fdConn) fireWriteEvent() error {
 	if conn.isDatagram() {
 		return nil
 	}
-	conn.setWriteBlocked(false)
+	conn.noteWritable()
 	if _, err := conn.flushOnLoop(); err != nil {
 		return err
 	}
@@ -868,8 +1071,12 @@ func (conn *fdConn) requestClose(err error) {
 
 // closeOnLoop releases transport resources exactly once. A running connection
 // task keeps ownership of its buffers, so the loop records the cause and lets
-// finishIOTask hand closure back after the task exits. OnClose is then emitted
-// as a final connection task, preserving callback serialization.
+// finishIOTask hand closure back after the task exits. A sender holding the
+// write claim may be writing the socket, so a stream also needs the claim
+// before its descriptor closes: otherwise the cause is recorded the same way
+// and the holder hands closure back when it releases the claim. The claim is
+// then kept for good. OnClose is emitted as a final connection task,
+// preserving callback serialization.
 func (conn *fdConn) closeOnLoop(cause error) {
 	if conn.close.isReleased() {
 		return
@@ -883,6 +1090,9 @@ func (conn *fdConn) closeOnLoop(cause error) {
 		}
 		conn.submitMu.Unlock()
 	}
+	if !conn.isDatagram() && !conn.claimWriteForClose(&cause) {
+		return
+	}
 	if !conn.close.release() {
 		return
 	}
@@ -890,7 +1100,7 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	var flushErr error
 	if !conn.isDatagram() && !conn.writeFailed() {
 		conn.setWriteBlocked(false)
-		_, flushErr = conn.flushOnLoop()
+		_, flushErr = conn.flushWrite()
 	}
 	remaining := conn.pending.Load()
 	deferredCloseErr := conn.takeDeferredCloseCause()
@@ -925,6 +1135,38 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	conn.inboundTail = nil
 	conn.pending.Store(0)
 	conn.scheduleCloseCallback(finalErr)
+}
+
+// claimWriteForClose takes the write claim for good before teardown, since a
+// holder may be in the middle of a send. While it is taken, the cause is
+// recorded, the holder is asked through writeCloseWaitFlag to hand closure
+// back, and the claim is tried once more: a holder that released in between
+// either saw the request or left the claim free. Recording the cause moves it
+// into the deferred slot, so *cause is cleared when the retry wins. During
+// shutdown every write turn has already been joined, and a holder can only be
+// a producer that is giving the claim straight back, so the loop waits for it.
+func (conn *fdConn) claimWriteForClose(cause *error) bool {
+	if conn.tryClaimWrite(0) {
+		return true
+	}
+	if conn.loop.ioStopped() {
+		for !conn.tryClaimWrite(0) {
+			runtime.Gosched()
+		}
+		return true
+	}
+	// A closing connection starts no further write turns, so the handoff ends.
+	conn.close.request()
+	conn.submitMu.Lock()
+	conn.setDeferredCloseLocked(*cause)
+	conn.submitMu.Unlock()
+	conn.writeState.Or(writeCloseWaitFlag)
+	if !conn.tryClaimWrite(0) {
+		return false
+	}
+	conn.writeState.And(^writeCloseWaitFlag)
+	*cause = nil
+	return true
 }
 
 // scheduleCloseCallback publishes OnClose as the terminal synthetic event.

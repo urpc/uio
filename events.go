@@ -31,7 +31,10 @@ import (
 // second public buffer type.
 type CompositeBuffer = bytebuf.CompositeBuffer
 
-// IOTask is one serialized native connection I/O round.
+// IOTask is one native connection I/O round: either a connection turn, which
+// reads and runs the connection's callbacks and is serialized per connection,
+// or a write turn, which only sends output queued from outside those callbacks
+// and may run beside the connection turn.
 type IOTask interface {
 	RunTask()
 }
@@ -135,7 +138,8 @@ type Events struct {
 	OnInbound func(c Conn, readBytes int)
 
 	// OnOutbound reports bytes successfully written to the socket. It may run on
-	// a backend writer goroutine and does not grant inbound-buffer access.
+	// a backend writer goroutine or a native write turn, concurrently with the
+	// connection's other callbacks, and does not grant inbound-buffer access.
 	OnOutbound func(c Conn, writeBytes int)
 
 	// OnStart runs synchronously after initialization and before the master

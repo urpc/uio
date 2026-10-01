@@ -23,6 +23,7 @@ const ioRejectWorkers = 4
 type ioTaskPool struct {
 	executor Executor
 	owned    *taskgo.Task[*fdConn]
+	writes   *taskgo.Task[*writeTurn] // write turns on UIO's own scheduler
 	rejected *taskgo.Task[IOTask]
 	mu       sync.Mutex // publishes stopped and creates the failure queue
 	stopped  atomic.Bool
@@ -40,8 +41,26 @@ func newIOTaskPool(executor Executor) *ioTaskPool {
 			taskgo.WithConcurrency(512*runtime.GOMAXPROCS(0)),
 			taskgo.WithMaxIdle(30*time.Second),
 		)
+		// Write turns only move bytes, so they keep a queue of their own and
+		// never wait behind callbacks that block.
+		pool.writes = taskgo.NewTask(func(turn *writeTurn) { (*fdConn)(turn).runWriteTurn() },
+			taskgo.WithConcurrency(512*runtime.GOMAXPROCS(0)),
+			taskgo.WithMaxIdle(30*time.Second),
+		)
 	}
 	return pool
+}
+
+// submitWrite schedules one write turn. Unlike connection turns, a refused
+// write turn is reported to its caller, which still holds the write claim.
+func (pool *ioTaskPool) submitWrite(conn *fdConn) bool {
+	if pool == nil || conn == nil || pool.stopped.Load() {
+		return false
+	}
+	if pool.writes != nil {
+		return pool.writes.Submit((*writeTurn)(conn))
+	}
+	return pool.executor.Submit((*writeTurn)(conn))
 }
 
 // submit schedules one already-serialized connection through the typed task
@@ -166,6 +185,9 @@ func (pool *ioTaskPool) stop() {
 		pool.mu.Unlock()
 		if pool.owned != nil {
 			_ = pool.owned.Stop(context.Background())
+		}
+		if pool.writes != nil {
+			_ = pool.writes.Stop(context.Background())
 		}
 		if rejected != nil {
 			_ = rejected.Stop(context.Background())

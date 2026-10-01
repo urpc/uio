@@ -132,6 +132,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	defer udpServer.Close()
 
 	var target atomic.Pointer[fdConn]
+	var tcpSender, udpCallbackGoid atomic.Int64
 	var releaseOnce sync.Once
 	releaseTCP := make(chan struct{})
 	release := func() { releaseOnce.Do(func() { close(releaseTCP) }) }
@@ -159,6 +160,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	}
 	events.OnData = func(conn Conn) error {
 		if conn.(*fdConn).isDatagram() {
+			udpCallbackGoid.Store(currentGoroutineID())
 			_, err := target.Load().Write([]byte("cross"))
 			udpWrite <- err
 			_, _ = conn.Discard(-1)
@@ -168,6 +170,11 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 		<-releaseTCP
 		_, _ = conn.Discard(-1)
 		return nil
+	}
+	events.OnOutbound = func(conn Conn, written int) {
+		if fdc := conn.(*fdConn); fdc == target.Load() && written > 0 {
+			tcpSender.Store(currentGoroutineID())
+		}
 	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
@@ -232,9 +239,6 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("UDP callback did not complete its cross-connection write")
 	}
-	if tcpConn.pendingEvents.Load()&ioEventWrite == 0 {
-		t.Fatal("UDP callback wrote directly to a stream owned by another task")
-	}
 	release()
 	if err = tcpClient.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
 		t.Fatal(err)
@@ -242,5 +246,15 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	var response [5]byte
 	if _, err = io.ReadFull(tcpClient, response[:]); err != nil || string(response[:]) != "cross" {
 		t.Fatalf("TCP response = %q, %v", response, err)
+	}
+	// The stream's bytes must leave through its own sender, never through a
+	// syscall made on the loop that ran the UDP callback. OnOutbound follows
+	// the send, so it may still be on its way after the client has the bytes.
+	deadline := time.Now().Add(5 * time.Second)
+	for tcpSender.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if sender, loop := tcpSender.Load(), udpCallbackGoid.Load(); sender == 0 || sender == loop {
+		t.Fatalf("stream bytes sent by goroutine %d; UDP callback loop is %d", sender, loop)
 	}
 }

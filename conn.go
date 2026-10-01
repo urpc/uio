@@ -160,8 +160,9 @@ type Conn interface {
 	// returns them for the caller to fill in place, so an encoder writes
 	// straight into the queue instead of into a buffer that is copied again.
 	// It works only in a native stream connection's own callback, where the
-	// queue is sent after the callback returns; elsewhere it reserves nothing
-	// and returns ErrReserveUnsupported, and the caller writes another way.
+	// queue is sent after the callback returns; elsewhere, or while output
+	// written from another goroutine is being sent, it reserves nothing and
+	// returns ErrReserveUnsupported, and the caller writes another way.
 	// Every reserved byte must be written before the callback returns and
 	// before the next Flush.
 	ReserveOutbound(n int) ([]byte, error)
