@@ -113,6 +113,11 @@ const (
 	// waiting for it. Taking the claim clears it: an earlier edge says nothing
 	// about sends the new holder has yet to make.
 	writeEdgeFlag
+	// writeContendedFlag records that another goroutine queued output while
+	// the claim was held: several producers write to this connection now, so
+	// a write turn lets them add to its batch before sending. Taking the claim
+	// clears it, so a lone producer is never kept waiting by old contention.
+	writeContendedFlag
 )
 
 const (
@@ -219,7 +224,7 @@ func (conn *fdConn) tryClaimWrite(extra uint32) bool {
 		if old&writeOwnerFlag != 0 {
 			return false
 		}
-		if conn.writeState.CompareAndSwap(old, (old|writeOwnerFlag|extra)&^writeEdgeFlag) {
+		if conn.writeState.CompareAndSwap(old, (old|writeOwnerFlag|extra)&^(writeEdgeFlag|writeContendedFlag)) {
 			return true
 		}
 	}
@@ -256,7 +261,14 @@ func (conn *fdConn) kickWriter() {
 		return
 	}
 	state := conn.writeState.Load()
-	if state&(writeOwnerFlag|writeBlockedFlag) != 0 || state&writeOpenedFlag == 0 {
+	if state&writeOwnerFlag != 0 {
+		// The holder sends these bytes; tell it others are writing too.
+		if state&writeContendedFlag == 0 {
+			conn.writeState.Or(writeContendedFlag)
+		}
+		return
+	}
+	if state&writeBlockedFlag != 0 || state&writeOpenedFlag == 0 {
 		return
 	}
 	if !conn.tryClaimWrite(0) {
@@ -323,13 +335,14 @@ func (conn *fdConn) runWriteTurn() {
 			}
 			return
 		}
-		if conn.pending.Load() < int64(conn.coalesceBlockSize()) {
-			// A write turn starts about a microsecond after the first queued
-			// byte. When many goroutines write to one connection, sending
-			// only what is queued by then costs a syscall per few messages,
-			// so producers that are ready to run go first and add to this
-			// batch. With nothing else runnable the yield returns at once; a
-			// queue that already fills a coalescing block is sent as it is.
+		if conn.writeState.Load()&writeContendedFlag != 0 &&
+			conn.pending.Load() < int64(conn.coalesceBlockSize()) {
+			// Other goroutines queued output while this turn held the claim,
+			// so more are likely about to: those ready to run go first and add
+			// to this batch, instead of costing a syscall each few messages.
+			// A lone producer never sets the flag and is sent at once; a queue
+			// that already fills a coalescing block is sent as it is.
+			conn.writeState.And(^writeContendedFlag)
 			runtime.Gosched()
 		}
 		if _, err := conn.flushWrite(); err != nil {
