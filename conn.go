@@ -44,7 +44,8 @@ type Conn interface {
 	RemoteAddr() net.Addr
 
 	// Userdata returns user-defined connection data. It may be called outside a
-	// callback, but callers must serialize it with SetUserdata.
+	// callback, but callers must serialize it with SetUserdata. Native
+	// OnOutbound may run beside the connection's other callbacks.
 	Userdata() any
 
 	// SetUserdata replaces user-defined connection data. It may be called outside
@@ -161,14 +162,18 @@ type Conn interface {
 	// straight into the queue instead of into a buffer that is copied again.
 	// It works only in a native stream connection's own callback, where the
 	// queue is sent after the callback returns; elsewhere, or while output
-	// written from another goroutine is being sent, it reserves nothing and
-	// returns ErrReserveUnsupported, and the caller writes another way.
+	// written from another goroutine is queued for or being sent by a write
+	// turn, it reserves nothing and returns ErrReserveUnsupported, and the
+	// caller writes another way. Once a reservation succeeds, output from other
+	// goroutines waits for the end of the connection's turn.
 	// Every reserved byte must be written before the callback returns and
 	// before the next Flush.
 	ReserveOutbound(n int) ([]byte, error)
 
 	// Flush schedules buffered data for writing without waiting for socket I/O.
-	// Writes accepted before Flush remain ordered before later writes.
+	// Writes accepted before Flush remain ordered before later writes. When
+	// another sender is sending the connection's output, Flush leaves the
+	// bytes to it and returns.
 	Flush() error
 
 	// Wake schedules one OnData callback after previously submitted tasks.
@@ -227,9 +232,10 @@ func (fc *commonConn) LocalAddr() net.Addr  { return fc.localAddr }
 func (fc *commonConn) RemoteAddr() net.Addr { return fc.remoteAddr }
 
 // Userdata is read on every data callback. Callers already serialize it with
-// SetUserdata, and connection turns are ordered by the scheduler, so it is a
-// plain field: boxing it for atomic publication cost a pointer chase, and a
-// cache miss, per callback.
+// SetUserdata, so it is a plain field: boxing it for atomic publication cost a
+// pointer chase, and a cache miss, per callback. Lifecycle and data callbacks
+// are ordered by the connection's turn, but native OnOutbound may run beside
+// them, so a value read there must not be replaced in those callbacks.
 func (fc *commonConn) Userdata() any         { return fc.userdata }
 func (fc *commonConn) SetUserdata(value any) { fc.userdata = value }
 

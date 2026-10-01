@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -159,14 +160,22 @@ func TestWriteTurnReleaseLosesNoWrite(t *testing.T) {
 	}
 }
 
-// A callback's direct send outside a read round takes the write claim like
-// every other sender, so it neither overlaps a write turn's send nor gives
-// away a claim it does not hold: both producers' records arrive whole, once,
-// and in order.
+// A direct send takes the write claim like every other sender, so it neither
+// overlaps a write turn's send nor gives away a claim it does not hold: both
+// producers' records arrive whole, once, and in order. A goroutine stands in
+// for the connection's own uncorked callback. The socket buffers hold every
+// record, so no send blocks and no writable edge runs the real turn beside it:
+// two turns of one connection never run at once.
 func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 	const records, recordSize = 4000, 8
 	testConn := newTestConnection(t, &Events{Pollers: 1})
 	conn := testConn.conn
+	if err := unix.SetsockoptInt(conn.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.SetsockoptInt(testConn.peer, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20); err != nil {
+		t.Fatal(err)
+	}
 	for deadline := time.Now().Add(2 * time.Second); conn.writeState.Load()&writeOpenedFlag == 0 ||
 		conn.ioOwner.Load() != 0; {
 		if time.Now().After(deadline) {
@@ -362,9 +371,9 @@ func TestWriteTurnResumesReadsAfterBlockedSend(t *testing.T) {
 	}
 }
 
-// Over loopback TCP the socket rarely refuses a send, so the paused reads have
-// no writable edge to restart them: the write turn that retires the backlog to
-// the resume mark must restart them itself.
+// An echo through the outbound limit over loopback TCP, where the socket rarely
+// refuses a send, completes end to end. The restart of paused reads without a
+// writable edge is pinned by TestOutboundLimitPausesReadsUntilWriteTurnDrains.
 func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	const total = 8 << 20
 	replies := make(chan []byte, 4096)
@@ -515,6 +524,7 @@ func TestOutboundLimitPausesReadsUntilWriteTurnDrains(t *testing.T) {
 // clears it, so the holder's release sends again.
 func TestWritableEdgeReachesABusySender(t *testing.T) {
 	var conn fdConn
+	conn.tryClaimWrite(0)
 	conn.noteWritable()
 	if !conn.markWriteBlocked() || conn.writeBlocked() {
 		t.Fatal("an EAGAIN after a handled edge blocked instead of retrying")
@@ -526,12 +536,226 @@ func TestWritableEdgeReachesABusySender(t *testing.T) {
 	if conn.writeBlocked() {
 		t.Fatal("a writable edge left the socket blocked")
 	}
+	// An edge handled before the claim was taken says nothing about the new
+	// holder's sends: its EAGAIN blocks at once instead of retrying.
+	conn.releaseWrite()
+	conn.tryClaimWrite(0)
+	if conn.markWriteBlocked() || !conn.writeBlocked() {
+		t.Fatal("an edge from before the claim made its holder retry")
+	}
+}
+
+// recoveringExecutor runs every task on a goroutine of its own and recovers
+// panics, as an application executor that keeps its server alive does.
+type recoveringExecutor struct{ recovered atomic.Int64 }
+
+func (e *recoveringExecutor) Submit(task IOTask) bool {
+	go func() {
+		defer func() {
+			if recover() != nil {
+				e.recovered.Add(1)
+			}
+		}()
+		task.RunTask()
+	}()
+	return true
+}
+
+func (e *recoveringExecutor) SubmitBatch(tasks []IOTask) int {
+	for _, task := range tasks {
+		e.Submit(task)
+	}
+	return len(tasks)
+}
+
+// An OnOutbound that panics during a flush, on a write turn or on the
+// connection's own turn, gives the write claim back: later output is still
+// sent, and Close and Serve return.
+func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
+	for _, fromWriteTurn := range []bool{true, false} {
+		name := "connection turn"
+		if fromWriteTurn {
+			name = "write turn"
+		}
+		t.Run(name, func(t *testing.T) {
+			executor := &recoveringExecutor{}
+			opened := make(chan *fdConn, 1)
+			started := make(chan string, 1)
+			var armed atomic.Bool
+			events := &Events{Pollers: 1, Executor: executor}
+			events.OnStart = func(ev *Events) {
+				for _, listener := range ev.acceptor.listeners {
+					started <- listener.laddr.String()
+					return
+				}
+			}
+			events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
+			events.OnData = func(conn Conn) error {
+				_, _ = conn.Discard(-1)
+				_, err := conn.Write([]byte("r"))
+				return err
+			}
+			events.OnOutbound = func(Conn, int) {
+				if armed.CompareAndSwap(true, false) {
+					panic("OnOutbound panics once")
+				}
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+			client, err := net.Dial("tcp", <-started)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			server := <-opened
+			for deadline := time.Now().Add(2 * time.Second); server.writeState.Load()&writeOpenedFlag == 0 ||
+				server.ioOwner.Load() != 0; {
+				if time.Now().After(deadline) {
+					t.Fatal("connection did not finish opening")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			armed.Store(true)
+			first := "x"
+			if fromWriteTurn {
+				_, err = server.Write([]byte(first))
+			} else {
+				first = "r"
+				_, err = client.Write([]byte("q"))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
+				if time.Now().After(deadline) {
+					t.Fatal("OnOutbound did not panic")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if _, err = server.Write([]byte("later")); err != nil {
+				t.Fatal(err)
+			}
+			_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+			want := first + "later"
+			got := make([]byte, len(want))
+			if _, err = io.ReadFull(client, got); err != nil || string(got) != want {
+				t.Fatalf("client read %q, %v; want %q", got, err, want)
+			}
+			_ = events.Close(nil)
+			select {
+			case <-serveDone:
+			case <-time.After(3 * time.Second):
+				t.Fatalf("Serve did not return after Close: writeState=%#x", server.writeState.Load())
+			}
+		})
+	}
+}
+
+// writeTurnRejectingExecutor runs connection turns and refuses write turns.
+type writeTurnRejectingExecutor struct{ refused atomic.Int64 }
+
+func (e *writeTurnRejectingExecutor) Submit(task IOTask) bool {
+	if _, ok := task.(*writeTurn); ok {
+		e.refused.Add(1)
+		return false
+	}
+	go task.RunTask()
+	return true
+}
+
+func (e *writeTurnRejectingExecutor) SubmitBatch(tasks []IOTask) int {
+	for index, task := range tasks {
+		if !e.Submit(task) {
+			return index
+		}
+	}
+	return len(tasks)
+}
+
+// A write turn the Executor refuses closes its connection, as a refused
+// connection turn does: the queued bytes have no other sender.
+func TestRefusedWriteTurnClosesTheConnection(t *testing.T) {
+	executor := &writeTurnRejectingExecutor{}
+	opened := make(chan *fdConn, 1)
+	closed := make(chan error, 1)
+	started := make(chan string, 1)
+	events := &Events{Pollers: 1, Executor: executor}
+	events.OnStart = func(ev *Events) {
+		for _, listener := range ev.acceptor.listeners {
+			started <- listener.laddr.String()
+			return
+		}
+	}
+	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
+	events.OnClose = func(_ Conn, err error) { closed <- err }
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-serveDone
+	})
+	client, err := net.Dial("tcp", <-started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-opened
+	for deadline := time.Now().Add(2 * time.Second); server.writeState.Load()&writeOpenedFlag == 0 ||
+		server.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err = server.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err = <-closed:
+		if !errors.Is(err, net.ErrClosed) || executor.refused.Load() == 0 {
+			t.Fatalf("OnClose(%v) after %d refused write turns", err, executor.refused.Load())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("the refused write turn did not close the connection")
+	}
+}
+
+// A reservation the outbound limit refuses leaves the claim free, so output
+// from other goroutines is not held back until the turn ends.
+func TestRefusedReservationReleasesTheWriteClaim(t *testing.T) {
+	result := make(chan error, 1)
+	events := &Events{Pollers: 1, MaxOutboundBuffered: 1024}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(-1)
+		_, err := conn.ReserveOutbound(4096)
+		if fdc := conn.(*fdConn); err == nil || fdc.writeClaimed() {
+			err = fmt.Errorf("ReserveOutbound = %v with the claim taken: %v", err, fdc.writeClaimed())
+		} else {
+			err = nil
+		}
+		result <- err
+		return nil
+	}
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback did not run")
+	}
 }
 
 // Closing while write turns are sending must never write a closed descriptor:
 // its number is reused at once by the next socket of this process, which may
 // be either end of the next connection. Neither client ever sends, so any byte
 // the server receives, or connection B's client reads, came from A's senders.
+// The window is a few instructions wide, so this is a smoke test; close taking
+// the write claim before the descriptor goes is what rules it out.
 func TestCloseNeverWritesReusedDescriptor(t *testing.T) {
 	opened := make(chan *fdConn, 4)
 	closed := make(chan *fdConn, 4)

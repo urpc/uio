@@ -98,17 +98,20 @@ const (
 	// writeOpenedFlag is set once OnOpen has returned. Before that, output
 	// waits for the open turn, which sends it after the callback.
 	writeOpenedFlag
-	// writeTurnHeldFlag marks a claim the connection's turn keeps until its
-	// next flush, because ReserveOutbound handed out outbound bytes that its
-	// callback fills after the reservation returns.
+	// writeTurnHeldFlag marks a claim the connection's turn keeps until it
+	// ends, because ReserveOutbound handed out outbound bytes that its
+	// callback fills after the reservation returns. A turn's own flush also
+	// takes the claim this way, so the turn's cleanup releases it on a panic.
 	writeTurnHeldFlag
 	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
 	// the loop when it releases the claim.
 	writeCloseWaitFlag
-	// writeEdgeFlag records a writable edge the connection's turn handled. A
-	// sender that got EAGAIN may not have recorded writeBlockedFlag yet when
-	// the edge arrives, and that edge will not come again, so the sender
-	// consumes this flag and retries instead of waiting for it.
+	// writeEdgeFlag records a writable edge the connection's turn handled
+	// while the current claim was held. Its holder may have got EAGAIN but not
+	// yet recorded writeBlockedFlag when the edge arrived, and that edge will
+	// not come again, so the holder consumes this flag and retries instead of
+	// waiting for it. Taking the claim clears it: an earlier edge says nothing
+	// about sends the new holder has yet to make.
 	writeEdgeFlag
 )
 
@@ -176,9 +179,8 @@ func (conn *fdConn) noteWritable() {
 }
 
 // markWriteBlocked records the EAGAIN its caller just got. If a writable edge
-// was handled since the last one, the room it reported may have come after
-// that send, so the edge is consumed and the caller retries. A stale edge
-// costs one more EAGAIN.
+// was handled since the claim was taken, the room it reported may have come
+// after that send, so the edge is consumed and the caller retries.
 func (conn *fdConn) markWriteBlocked() (retry bool) {
 	for {
 		old := conn.writeState.Load()
@@ -217,7 +219,7 @@ func (conn *fdConn) tryClaimWrite(extra uint32) bool {
 		if old&writeOwnerFlag != 0 {
 			return false
 		}
-		if conn.writeState.CompareAndSwap(old, old|writeOwnerFlag|extra) {
+		if conn.writeState.CompareAndSwap(old, (old|writeOwnerFlag|extra)&^writeEdgeFlag) {
 			return true
 		}
 	}
@@ -299,11 +301,22 @@ const maxWriteFlushes = 8
 // reads. It holds the write claim and one count of its loop's ioState, which
 // shutdown joins. It never runs callbacks other than OnOutbound.
 func (conn *fdConn) runWriteTurn() {
+	done := false
+	defer func() {
+		if !done {
+			// OnOutbound panicked during a flush. The claim and the count go
+			// back, so the connection can still send and close, and shutdown
+			// does not wait for this turn.
+			conn.releaseWriteAndKick()
+			conn.loop.releaseIO()
+		}
+	}()
 	for flushes := 0; ; flushes++ {
 		if conn.isClosing() || conn.pending.Load() == 0 || conn.writeBlocked() {
 			break
 		}
 		if flushes == maxWriteFlushes {
+			done = true
 			// The claim and the count move to the next turn in the queue.
 			if !conn.loop.ioPool.submitWrite(conn) {
 				conn.handleWriteSubmitFailure()
@@ -329,6 +342,7 @@ func (conn *fdConn) runWriteTurn() {
 			break
 		}
 	}
+	done = true
 	conn.releaseWrite()
 	// Bytes appended after the last flush found the claim taken.
 	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&

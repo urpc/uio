@@ -46,7 +46,8 @@ type IOTask interface {
 // is unsupported. The batch slice is callback-scoped, so an executor must copy
 // references it retains after SubmitBatch returns. Submit false means the task
 // was not run; a short SubmitBatch result means the rejected suffix was not run.
-// Rejection closes the affected connection.
+// Rejection closes the affected connection. A native connection may have its
+// connection turn and a write turn in flight at once; both arrive here.
 type Executor interface {
 	Submit(task IOTask) bool
 	SubmitBatch(tasks []IOTask) int
@@ -140,6 +141,7 @@ type Events struct {
 	// OnOutbound reports bytes successfully written to the socket. It may run on
 	// a backend writer goroutine or a native write turn, concurrently with the
 	// connection's other callbacks, and does not grant inbound-buffer access.
+	// Calls for one connection never overlap each other.
 	OnOutbound func(c Conn, writeBytes int)
 
 	// OnStart runs synchronously after initialization and before the master

@@ -131,8 +131,8 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 // ReserveOutbound is the task-owner encoding path: the reserved bytes are part
 // of outbound as soon as it returns, and the caller fills them after submitMu
 // is released. No other sender may take outbound meanwhile, so the turn keeps
-// the write claim until its next flush; when a write turn is sending at that
-// moment the reservation is refused and the caller writes another way.
+// the write claim until it ends; while another sender holds the claim the
+// reservation is refused and the caller writes another way.
 func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	if n <= 0 {
 		return nil, nil
@@ -143,15 +143,21 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	if conn.isDatagram() || !conn.directOwner() {
 		return nil, ErrReserveUnsupported
 	}
-	if !conn.turnHoldsWrite() && !conn.tryClaimWrite(writeTurnHeldFlag) {
+	took := !conn.turnHoldsWrite()
+	if took && !conn.tryClaimWrite(writeTurnHeldFlag) {
 		return nil, ErrReserveUnsupported
 	}
 	reserved, err := conn.reservePendingAfterFlush(int64(n))
-	if err != nil {
-		return nil, err
+	if err == nil && !reserved {
+		err = ErrOutboundOverflow
 	}
-	if !reserved {
-		return nil, ErrOutboundOverflow
+	if err != nil {
+		if took {
+			// Nothing was reserved, so other senders need not wait for this
+			// turn's next flush.
+			conn.releaseWriteAndKick()
+		}
+		return nil, err
 	}
 	conn.submitMu.Lock()
 	buffer := conn.outbound.Reserve(n, conn.coalesceBlockSize())
@@ -359,9 +365,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		return written, io.ErrShortWrite
 	}
 	// Only the unsent suffix must survive after Write returns.
-	conn.submitMu.Lock()
-	_, _ = conn.outbound.Write(remaining)
-	conn.submitMu.Unlock()
+	conn.queueDirectSuffix(bytebuf.CloneBuffer(remaining))
 	conn.setWriteBlocked(written == 0)
 	// Reported once the suffix is accounted, so OnOutbound never observes a
 	// transient empty queue in the middle of this write.
@@ -428,9 +432,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return written, io.ErrShortWrite
 	}
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
-	conn.submitMu.Lock()
-	conn.outbound.AppendOwned(owned)
-	conn.submitMu.Unlock()
+	conn.queueDirectSuffix(owned)
 	conn.setWriteBlocked(written == 0)
 	conn.events.onSocketBytesWrite(conn, written)
 	return total, nil
@@ -511,12 +513,20 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	if written > 0 {
 		owned.Discard(written)
 	}
-	conn.submitMu.Lock()
-	conn.outbound.AppendOwned(owned)
-	conn.submitMu.Unlock()
+	conn.queueDirectSuffix(owned)
 	conn.setWriteBlocked(written == 0)
 	conn.events.onSocketBytesWrite(conn, written)
 	return size, nil
+}
+
+// queueDirectSuffix queues what a direct send left unsent at the head of
+// outbound. The sender holds the write claim and started with nothing queued
+// or in flight, so bytes in outbound now came from producers that wrote during
+// the send; behind them, they would land inside this payload on the wire.
+func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
+	conn.submitMu.Lock()
+	conn.outbound.PrependOwned(owned)
+	conn.submitMu.Unlock()
 }
 
 // sendUDPOnLoop preserves datagram atomicity. A blocked datagram is reported to
@@ -609,7 +619,9 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 		return 0, nil
 	}
 	held := conn.turnHoldsWrite()
-	if !held && !conn.tryClaimWrite(0) {
+	// Taken as the turn's own claim, so the turn's deferred cleanup gives it
+	// back if OnOutbound panics during the flush.
+	if !held && !conn.tryClaimWrite(writeTurnHeldFlag) {
 		return 0, nil
 	}
 	n, err := conn.flushWrite()

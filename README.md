@@ -98,15 +98,19 @@ type Events struct {
 Basic Echo Server
 
 On native Unix, event loops accept connections, manage descriptors, and apply
-interest changes. Stream socket I/O and callbacks run in serialized connection
+interest changes. Stream reads and callbacks run in serialized connection
 tasks on the configured `Executor` or UIO's typed taskgo queue. One blocked
 stream connection therefore does not block its poller or another connection.
-Output a connection's own callbacks write leaves when the callback round ends.
-Output written from other goroutines, such as replies an RPC handler finishes
-after its request's callback returned, is sent by a write turn: a short task
-that only moves queued bytes to the socket, so it is not held behind a read
-round or a slow callback of the same connection. One claim per connection
-orders all senders, so bytes leave in the order they were accepted.
+Output a connection's own callbacks write leaves when the read round ends, or
+once it fills a coalescing block. Output written from other goroutines, such as
+replies an RPC handler finishes after its request's callback returned, is sent
+by a write turn: a short task that only moves queued bytes to the socket, so
+it is not held behind a read round or a slow callback of the same connection.
+The exception is a turn whose callback reserved outbound bytes with
+`ReserveOutbound`, as the uws server does for its replies: it keeps the socket
+until it ends, as every turn did before write turns. One claim per connection
+orders all senders, so bytes leave in the order they were accepted; with an
+`Executor`, write turns are submitted to it as well.
 On Linux, stream readiness is not collected by the event loops but by one
 shared data poller: every stream is registered with a single epoll instance
 whose waiters hand runnable connections to the task pool in arrival order.
@@ -196,8 +200,8 @@ outbound queue and returns them for the encoder to fill in place, so a round
 of small replies can share a few pooled blocks and be flushed together after
 the callback returns. Fill every reserved byte before the callback returns or
 flushes. Elsewhere, including on the `stdio` backend, or while output written
-from another goroutine is being sent, it returns `ErrReserveUnsupported` and
-the caller falls back to another write:
+from another goroutine is queued for or being sent by a write turn, it returns
+`ErrReserveUnsupported` and the caller falls back to another write:
 
 ```go
 dst, err := conn.ReserveOutbound(size)

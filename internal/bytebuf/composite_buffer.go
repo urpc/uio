@@ -129,6 +129,22 @@ func (b *CompositeBuffer) AppendOwned(buffer *Buffer) {
 	b.length += buffer.Len()
 }
 
+// PrependOwned is AppendOwned at the head of the buffer: its bytes are read
+// before everything already queued.
+func (b *CompositeBuffer) PrependOwned(buffer *Buffer) {
+	if buffer == nil {
+		return
+	}
+	if buffer.Len() == 0 {
+		putBuffer(buffer)
+		return
+	}
+	b.bufList = append(b.bufList, nil)
+	copy(b.bufList[1:], b.bufList)
+	b.bufList[0] = buffer
+	b.length += buffer.Len()
+}
+
 // AppendOwnedCoalesced consumes buffer and packs small adjacent payloads into
 // pooled blocks with at least targetCapacity. It is intended for a corked I/O
 // round where reducing writev segments is worth one payload copy.

@@ -757,6 +757,18 @@ func TestCompositeBufferAppendOwnedAndPeekVecN(t *testing.T) {
 	buffer.Reset()
 }
 
+func TestCompositeBufferPrependOwned(t *testing.T) {
+	var buffer CompositeBuffer
+	_, _ = buffer.Write([]byte("queued"))
+	buffer.Discard(2)
+	buffer.PrependOwned(CloneBuffer([]byte("head-")))
+	buffer.PrependOwned(CloneBuffer(nil))
+	if got := string(buffer.Peek(make([]byte, buffer.Len()))); got != "head-eued" || buffer.Blocks() != 2 {
+		t.Fatalf("buffer = %q in %d blocks", got, buffer.Blocks())
+	}
+	buffer.Reset()
+}
+
 func TestCompositeBufferAppendOwnedCoalesced(t *testing.T) {
 	var buffer CompositeBuffer
 	buffer.AppendOwnedCoalesced(CloneBuffer([]byte("first")), 4096)
