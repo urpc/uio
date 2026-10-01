@@ -141,7 +141,8 @@ type Events struct {
 	// OnOutbound reports bytes successfully written to the socket. It may run on
 	// a backend writer goroutine or a native write turn, concurrently with the
 	// connection's other callbacks, and does not grant inbound-buffer access.
-	// Calls for one connection never overlap each other.
+	// Calls for one connection never overlap each other: on the native backend
+	// a Write made inside OnOutbound is queued and sent after it returns.
 	OnOutbound func(c Conn, writeBytes int)
 
 	// OnStart runs synchronously after initialization and before the master
