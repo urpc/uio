@@ -310,6 +310,15 @@ func (conn *fdConn) runWriteTurn() {
 			}
 			return
 		}
+		if conn.pending.Load() < int64(conn.coalesceBlockSize()) {
+			// A write turn starts about a microsecond after the first queued
+			// byte. When many goroutines write to one connection, sending
+			// only what is queued by then costs a syscall per few messages,
+			// so producers that are ready to run go first and add to this
+			// batch. With nothing else runnable the yield returns at once; a
+			// queue that already fills a coalescing block is sent as it is.
+			runtime.Gosched()
+		}
 		if _, err := conn.flushWrite(); err != nil {
 			conn.requestClose(err)
 			break
