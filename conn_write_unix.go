@@ -333,7 +333,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		return conn.sendUDPOnLoop(data)
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && len(data) < threshold)
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && len(data) < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
 	}
@@ -399,7 +399,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return 0, errUnsupported
 	}
 	threshold := conn.events.WriteBufferedThreshold
-	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && total < threshold)
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && total < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
 	}
@@ -463,7 +463,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // already carries many frames and keeps its own writev segment.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
-	queued := !conn.outboundEmpty() || conn.corked || (threshold > 0 && size < threshold)
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
 	}
@@ -477,7 +477,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			return 0, ErrOutboundOverflow
 		}
 		conn.submitMu.Lock()
-		if conn.corked && !conn.outbound.Empty() && size <= conn.coalesceBlockSize()/2 {
+		if conn.turn&turnCorked != 0 && !conn.outbound.Empty() && size <= conn.coalesceBlockSize()/2 {
 			conn.outbound.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
 		} else {
 			conn.outbound.AppendOwned(owned)
@@ -628,25 +628,21 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 	if conn.isDatagram() || conn.pending.Load() == 0 {
 		return 0, nil
 	}
-	// The flush marks the claim as the turn's, whether taken now or kept for
-	// a reservation. OnOutbound runs inside it, so the turn's own writes from
-	// that callback are queued rather than sent, which would call it again,
-	// and the turn's cleanup releases the claim if the callback panics.
-	state := conn.writeState.Load()
-	held := state&writeTurnHeldFlag != 0
-	switch {
-	case state&writeTurnFlushFlag != 0:
-		// Called from OnOutbound inside this turn's own flush.
-		return 0, nil
-	case held:
-		conn.writeState.Or(writeTurnFlushFlag)
-	case !conn.tryClaimWrite(writeTurnFlushFlag):
+	// OnOutbound runs inside the flush, so the turn marks it: a Write that
+	// callback makes is queued rather than sent, and a flush it starts returns
+	// at once, so the callback never runs inside itself. A claim taken here
+	// is marked too, so the turn's cleanup releases it if the callback panics.
+	if conn.turn&turnFlushing != 0 {
 		return 0, nil
 	}
+	held := conn.writeState.Load()&writeTurnHeldFlag != 0
+	if !held && !conn.tryClaimWrite(writeTurnFlushFlag) {
+		return 0, nil
+	}
+	conn.turn |= turnFlushing
 	n, err := conn.flushWrite()
-	if held {
-		conn.writeState.And(^writeTurnFlushFlag)
-	} else {
+	conn.turn &^= turnFlushing
+	if !held {
 		conn.releaseWriteAndKick()
 	}
 	return n, err

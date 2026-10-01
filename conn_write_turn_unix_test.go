@@ -652,8 +652,8 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 }
 
 // OnOutbound runs inside the flush that reports the bytes. A Write it makes is
-// queued and sent by a later flush, never sent at once by the same call
-// stack, which would call OnOutbound again inside itself: a callback that
+// queued and sent by a later flush, and a Flush it calls returns at once,
+// never sending from the same call stack, which would call OnOutbound again inside itself: a callback that
 // writes more whenever output drains must not nest without bound or deadlock
 // on its own lock. This holds whether the connection's turn took the claim
 // for the flush or keeps it for a reservation.
@@ -689,6 +689,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 				defer depth.Add(-1)
 				if count.Add(1) < total {
 					_, _ = c.Write([]byte("b"))
+					_ = c.Flush()
 				}
 			}
 			testConn := newTestConnection(t, events)

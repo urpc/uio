@@ -479,7 +479,7 @@ func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 	loop := &eventLoop{}
 	loop.loopGoid.Store(currentGoroutineID())
 	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
-	conn := &fdConn{fd: -1, corked: true}
+	conn := &fdConn{fd: -1, turn: turnCorked}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = events
 	conn.loop = loop

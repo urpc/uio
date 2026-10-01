@@ -56,7 +56,7 @@ type fdConn struct {
 	pollTag   uint32          // registration generation echoed by the data poller
 	interest  poller.Interest // event-loop-owned registered interest
 	throttled bool            // loop-owned read-interest hysteresis
-	corked    bool            // task-owned read-round batching flag
+	turn      uint8           // turn-owned bits: turnCorked, turnFlushing
 	internal  bool            // framework-owned endpoint, not a user connection
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
@@ -102,11 +102,8 @@ const (
 	// ends, because ReserveOutbound handed out outbound bytes that its
 	// callback fills after the reservation returns.
 	writeTurnHeldFlag
-	// writeTurnFlushFlag marks the connection's turn flushing with the claim,
-	// whether it took the claim for the flush or keeps it for a reservation.
-	// OnOutbound runs inside that flush, so the turn's own writes from it are
-	// queued rather than sent, and the turn's cleanup releases the claim if
-	// the callback panics.
+	// writeTurnFlushFlag marks a claim the connection's turn took for one
+	// flush, so the turn's cleanup releases it if OnOutbound panics there.
 	writeTurnFlushFlag
 	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
 	// the loop when it releases the claim.
@@ -124,6 +121,16 @@ const (
 	// batch before sending. Taking the claim clears it, so a lone producer,
 	// however many writes it makes, is never kept waiting.
 	writeContendedFlag
+)
+
+// Turn-owned bits in fdConn.turn, read and written only by the running turn.
+const (
+	// turnCorked batches a read round's replies until the round ends.
+	turnCorked uint8 = 1 << iota
+	// turnFlushing marks the turn inside its own flush, where OnOutbound
+	// runs: a Write the callback makes is queued rather than sent, and a
+	// flush it starts returns at once, so OnOutbound never runs inside itself.
+	turnFlushing
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -231,9 +238,9 @@ func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
 func (conn *fdConn) writeClaimed() bool { return conn.writeState.Load()&writeOwnerFlag != 0 }
 
 // turnHoldsWrite reports a claim the connection's turn keeps for a reservation,
-// outside its own flush.
+// outside its own flush. Only the turn calls it.
 func (conn *fdConn) turnHoldsWrite() bool {
-	return conn.writeState.Load()&(writeTurnHeldFlag|writeTurnFlushFlag) == writeTurnHeldFlag
+	return conn.writeState.Load()&writeTurnHeldFlag != 0 && conn.turn&turnFlushing == 0
 }
 
 // turnOwnsClaim reports any claim the connection's turn must release.
@@ -645,13 +652,14 @@ func (conn *fdConn) setDeferredCloseLocked(err error) {
 // complete round before the loop updates interest.
 func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
+	ended := false
 	defer func() {
-		conn.corked = false // a callback panic may have left a round corked
+		conn.turn = 0 // a callback panic may have left a round corked or a flush marked
 		if conn.turnOwnsClaim() {
 			// A callback panic may have left the claim taken for a
 			// reservation or a flush.
 			conn.releaseWriteAndKick()
-		} else {
+		} else if !ended {
 			// After a panic in OnOpen, output queued by other goroutines in
 			// the meantime has no sender until someone kicks it.
 			conn.kickWriter()
@@ -691,11 +699,11 @@ func (conn *fdConn) runIOTask() {
 		}
 	}
 	if !conn.isClosing() && !conn.readStalled.Load() && events&ioEventWake != 0 {
-		conn.corked = true
+		conn.turn |= turnCorked
 		if err := conn.fireOnData(); err != nil {
 			conn.requestClose(err)
 		}
-		conn.corked = false
+		conn.turn &^= turnCorked
 	}
 	if !conn.isClosing() {
 		if _, err := conn.flushOnLoop(); err != nil {
@@ -707,6 +715,7 @@ func (conn *fdConn) runIOTask() {
 		// take the socket again, starting with output that waited for them.
 		conn.releaseWriteAndKick()
 	}
+	ended = true
 	if conn.needsInterestRefresh(events) {
 		if conn.canRedeliverRead(events) {
 			// A read round that only yielded leaves nothing for the loop to
@@ -909,9 +918,9 @@ func (conn *fdConn) onRead() error {
 	// outbound and are flushed once when the event ends, or each time they
 	// fill a coalescing block, so a burst of reads costs one writev instead
 	// of one syscall per reply.
-	conn.corked = true
+	conn.turn |= turnCorked
 	err := conn.readRound(holder.bytes)
-	conn.corked = false
+	conn.turn &^= turnCorked
 	conn.events.readPool.Put(holder)
 	return err
 }
