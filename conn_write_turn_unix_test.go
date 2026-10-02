@@ -11,6 +11,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -648,6 +649,181 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 				t.Fatalf("Serve did not return after Close: writeState=%#x", server.writeState.Load())
 			}
 		})
+	}
+}
+
+// A flush the socket refused part of, on a write turn or on the connection's
+// own turn, still arms writable interest when the OnOutbound it then runs
+// panics: the rest of the output is sent once the peer reads.
+func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
+	for _, fromWriteTurn := range []bool{true, false} {
+		name := "connection turn"
+		if fromWriteTurn {
+			name = "write turn"
+		}
+		t.Run(name, func(t *testing.T) {
+			const total = 2 << 20
+			payload := make([]byte, total)
+			for i := range payload {
+				payload[i] = byte(i * 11)
+			}
+			executor := &recoveringExecutor{}
+			opened := make(chan *fdConn, 1)
+			started := make(chan string, 1)
+			var armed atomic.Bool
+			var blockedAtPanic, ownerAtPanic atomic.Bool
+			events := &Events{Pollers: 1, Executor: executor}
+			events.OnStart = func(ev *Events) {
+				for _, listener := range ev.acceptor.listeners {
+					started <- listener.laddr.String()
+					return
+				}
+			}
+			events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
+			events.OnData = func(conn Conn) error {
+				_, _ = conn.Discard(-1)
+				_, err := conn.Write(payload)
+				return err
+			}
+			events.OnOutbound = func(c Conn, _ int) {
+				if armed.CompareAndSwap(true, false) {
+					conn := c.(*fdConn)
+					blockedAtPanic.Store(conn.writeBlocked())
+					ownerAtPanic.Store(conn.directOwner())
+					panic("OnOutbound panics once")
+				}
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+			t.Cleanup(func() {
+				_ = events.Close(nil)
+				<-serveDone
+			})
+			// Small buffers on both ends, and a peer that does not read yet, so
+			// the first flush is refused before it reports what it sent. The
+			// peer's buffer is set before it connects: shrinking it below a
+			// window it already advertised makes Linux drop segments, and the
+			// retransmission backoff would stall this test on its own.
+			dialer := net.Dialer{Control: func(_, _ string, raw syscall.RawConn) error {
+				var sockErr error
+				if err := raw.Control(func(fd uintptr) {
+					sockErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_RCVBUF, 4096)
+				}); err != nil {
+					return err
+				}
+				return sockErr
+			}}
+			client, err := dialer.Dial("tcp", <-started)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			server := <-opened
+			for deadline := time.Now().Add(2 * time.Second); server.writeState.Load()&writeOpenedFlag == 0 ||
+				server.ioOwner.Load() != 0; {
+				if time.Now().After(deadline) {
+					t.Fatal("connection did not finish opening")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if err := unix.SetsockoptInt(server.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+				t.Fatal(err)
+			}
+			armed.Store(true)
+			if fromWriteTurn {
+				_, err = server.Write(payload)
+			} else {
+				_, err = client.Write([]byte("q"))
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
+				if time.Now().After(deadline) {
+					t.Fatal("OnOutbound did not panic")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if !blockedAtPanic.Load() {
+				t.Fatal("the flush that ran OnOutbound was not refused by the socket")
+			}
+			if ownerAtPanic.Load() == fromWriteTurn {
+				t.Fatalf("OnOutbound ran on the wrong turn: connection turn = %v", ownerAtPanic.Load())
+			}
+			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
+			got := make([]byte, total)
+			if n, err := io.ReadFull(client, got); err != nil {
+				t.Fatalf("peer read %d of %d bytes: %v (pending=%d writeState=%#x)",
+					n, total, err, server.pending.Load(), server.writeState.Load())
+			}
+			if !bytes.Equal(got, payload) {
+				t.Fatal("peer received a different stream")
+			}
+		})
+	}
+}
+
+// A read round that yielded is redelivered even when OnOutbound panics in the
+// turn's final flush: bytes already in the socket bring no new edge.
+func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
+	executor := &recoveringExecutor{}
+	opened := make(chan *fdConn, 1)
+	started := make(chan string, 1)
+	var armed, stalledAtPanic atomic.Bool
+	events := &Events{Pollers: 1, Executor: executor, MaxBufferSize: 1}
+	events.OnStart = func(ev *Events) {
+		for _, listener := range ev.acceptor.listeners {
+			started <- listener.laddr.String()
+			return
+		}
+	}
+	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
+	events.OnData = func(conn Conn) error {
+		buf := make([]byte, conn.InboundBuffered())
+		_, _ = io.ReadFull(conn, buf)
+		if _, err := conn.Write(buf); err != nil {
+			return err
+		}
+		return conn.YieldRead()
+	}
+	events.OnOutbound = func(c Conn, _ int) {
+		if armed.CompareAndSwap(true, false) {
+			stalledAtPanic.Store(c.(*fdConn).readStalled.Load())
+			panic("OnOutbound panics once")
+		}
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-serveDone
+	})
+	client, err := net.Dial("tcp", <-started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-opened
+	for deadline := time.Now().Add(2 * time.Second); server.writeState.Load()&writeOpenedFlag == 0 ||
+		server.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	armed.Store(true)
+	// One read takes one byte; the round yields after it, leaving the second
+	// byte in the socket.
+	if _, err := client.Write([]byte("qw")); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got := make([]byte, 2)
+	if n, err := io.ReadFull(client, got); err != nil || string(got) != "qw" {
+		t.Fatalf("client read %q (%d bytes), %v; want %q (readStalled=%v)", got[:n], n, err, "qw", server.readStalled.Load())
+	}
+	if executor.recovered.Load() == 0 || !stalledAtPanic.Load() {
+		t.Fatalf("OnOutbound did not panic after a yielded read: recovered=%d", executor.recovered.Load())
 	}
 }
 

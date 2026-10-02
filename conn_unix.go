@@ -347,22 +347,22 @@ const maxWriteFlushes = 8
 // reads. It holds the write claim and one count of its loop's ioState, which
 // shutdown joins. It never runs callbacks other than OnOutbound.
 func (conn *fdConn) runWriteTurn() {
-	done := false
+	handedOn := false
 	defer func() {
-		if !done {
-			// OnOutbound panicked during a flush. The claim and the count go
-			// back, so the connection can still send and close, and shutdown
-			// does not wait for this turn.
-			conn.releaseWriteAndKick()
-			conn.loop.releaseIO()
+		// Every exit but the hand-on ends the turn here, including a panic in
+		// OnOutbound, which runs after a flush may have left the socket
+		// blocked: the claim and the count go back and writable interest is
+		// armed whether or not the flush returned.
+		if !handedOn {
+			conn.finishWriteTurn()
 		}
 	}()
 	for flushes := 0; ; flushes++ {
 		if conn.isClosing() || conn.pending.Load() == 0 || conn.writeBlocked() {
-			break
+			return
 		}
 		if flushes == maxWriteFlushes {
-			done = true
+			handedOn = true
 			// The claim and the count move to the next turn in the queue.
 			if !conn.loop.ioPool.submitWrite(conn) {
 				conn.handleWriteSubmitFailure()
@@ -381,22 +381,19 @@ func (conn *fdConn) runWriteTurn() {
 		}
 		if _, err := conn.flushWrite(); err != nil {
 			conn.requestClose(err)
-			break
-		}
-		if conn.writeBlocked() {
-			// Arm writable interest; the edge restarts sending.
-			conn.scheduleRefresh()
-			break
+			return
 		}
 	}
-	done = true
-	conn.finishWriteTurn()
 }
 
-// finishWriteTurn releases a write turn's claim. Bytes appended after its last
-// flush found the claim taken and were left to it, so it looks again and hands
-// them, with its ioState count, to a new write turn.
+// finishWriteTurn ends a write turn. A socket that refused its bytes gets
+// writable interest, whose edge restarts sending. Bytes appended after its
+// last flush found the claim taken and were left to it, so it looks again and
+// hands them, with its ioState count, to a new write turn.
 func (conn *fdConn) finishWriteTurn() {
+	if conn.writeBlocked() {
+		conn.scheduleRefresh()
+	}
 	conn.releaseWrite()
 	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
 		!conn.loop.ioStopped() && conn.tryClaimWrite(0) {
@@ -649,25 +646,34 @@ func (conn *fdConn) setDeferredCloseLocked(err error) {
 // runIOTask performs one serialized connection turn. Ordering matters: close
 // is terminal, writable readiness drains old output before new input is read,
 // read callbacks may enqueue corked replies, and one final flush publishes the
-// complete round before the loop updates interest.
+// complete round before the loop updates interest. The deferred epilogue is
+// the only way out, so a callback panic that an Executor recovers ends the
+// turn like a return does: the claim goes back and the loop learns what the
+// turn left behind.
 func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
-	ended := false
+	var events uint32
+	settle, ended := false, false
 	defer func() {
 		conn.turn = 0 // a callback panic may have left a round corked or a flush marked
 		if conn.turnOwnsClaim() {
-			// A callback panic may have left the claim taken for a
-			// reservation or a flush.
+			// The round's reservations are filled and flushed, or a callback
+			// panic left the claim taken for a reservation or a flush: other
+			// senders may take the socket again, starting with output that
+			// waited for them.
 			conn.releaseWriteAndKick()
 		} else if !ended {
 			// After a panic in OnOpen, output queued by other goroutines in
 			// the meantime has no sender until someone kicks it.
 			conn.kickWriter()
 		}
+		if settle {
+			conn.settleInterest(events)
+		}
 		conn.ioOwner.Store(0)
 		conn.finishIOTask()
 	}()
-	events := conn.takeIOEvents()
+	events = conn.takeIOEvents()
 	if events&ioEventClose != 0 {
 		conn.fireCloseCallback()
 		return
@@ -675,6 +681,7 @@ func (conn *fdConn) runIOTask() {
 	if conn.close.isReleased() {
 		return
 	}
+	settle = true
 	if events&ioEventOpen != 0 {
 		if events&ioEventAccepted != 0 {
 			conn.applyAcceptedOptions()
@@ -710,22 +717,24 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 	}
-	if conn.turnOwnsClaim() {
-		// The round's reservations are filled and flushed: other senders may
-		// take the socket again, starting with output that waited for them.
-		conn.releaseWriteAndKick()
-	}
 	ended = true
-	if conn.needsInterestRefresh(events) {
-		if conn.canRedeliverRead(events) {
-			// A read round that only yielded leaves nothing for the loop to
-			// change: the next turn is queued here instead of through it.
-			conn.readStalled.Store(false)
-			conn.pendingEvents.Or(ioEventRead | ioEventWake)
-		} else {
-			conn.scheduleRefresh()
-		}
+}
+
+// settleInterest tells the loop what a connection turn left behind: output
+// the socket refused needs writable interest, a read that yielded or paused
+// needs another turn, and an edge already handled may leave interest to drop.
+func (conn *fdConn) settleInterest(events uint32) {
+	if !conn.needsInterestRefresh(events) {
+		return
 	}
+	if conn.canRedeliverRead(events) {
+		// A read round that only yielded leaves nothing for the loop to
+		// change: the next turn is queued here instead of through it.
+		conn.readStalled.Store(false)
+		conn.pendingEvents.Or(ioEventRead | ioEventWake)
+		return
+	}
+	conn.scheduleRefresh()
 }
 
 // canRedeliverRead reports whether a stalled read may be handed straight to
