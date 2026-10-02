@@ -129,6 +129,65 @@ func newTestConnection(t *testing.T, events *Events) testConnection {
 
 func startTestConnection(t *testing.T, events *Events) (testConnection, <-chan error) {
 	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return startTestConnectionOn(t, events, fds)
+}
+
+// newTCPTestConnection is newTestConnection over loopback TCP. A Unix stream
+// socket charges a whole buffer for every send, so on Linux its default limit
+// holds only a few hundred small writes; TCP coalesces them.
+func newTCPTestConnection(t *testing.T, events *Events) testConnection {
+	t.Helper()
+	testConn, registered := startTestConnectionOn(t, events, tcpLoopbackPair(t))
+	if err := <-registered; err != nil {
+		t.Fatal(err)
+	}
+	return testConn
+}
+
+func tcpLoopbackPair(t *testing.T) [2]int {
+	t.Helper()
+	listener, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(listener)
+	if err = unix.Bind(listener, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.Listen(listener, 1); err != nil {
+		t.Fatal(err)
+	}
+	addr, err := unix.Getsockname(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.Connect(peer, addr); err != nil {
+		t.Fatal(err)
+	}
+	local, _, err := unix.Accept(listener)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fd := range []int{local, peer} {
+		if err = unix.SetsockoptInt(fd, unix.IPPROTO_TCP, unix.TCP_NODELAY, 1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return [2]int{local, peer}
+}
+
+// startTestConnectionOn registers fds[0] as a connection on a fresh loop and
+// leaves fds[1] to the test as its peer.
+func startTestConnectionOn(t *testing.T, events *Events, fds [2]int) (testConnection, <-chan error) {
+	t.Helper()
 	if err := events.initConfig(); err != nil {
 		t.Fatal(err)
 	}
@@ -137,10 +196,6 @@ func startTestConnection(t *testing.T, events *Events) (testConnection, <-chan e
 		t.Fatal(err)
 	}
 	events.workers = []*eventLoop{loop}
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
 	if err = unix.SetNonblock(fds[0], true); err != nil {
 		t.Fatal(err)
 	}

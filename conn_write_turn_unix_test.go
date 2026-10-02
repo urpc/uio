@@ -166,10 +166,11 @@ func TestWriteTurnReleaseLosesNoWrite(t *testing.T) {
 // producers' records arrive whole, once, and in order. A goroutine stands in
 // for the connection's own uncorked callback. The socket buffers hold every
 // record, so no send blocks and no writable edge runs the real turn beside it:
-// two turns of one connection never run at once.
+// two turns of one connection never run at once. That needs TCP: a Unix
+// socket's per-send charge fills Linux's default limit after 555 such records.
 func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 	const records, recordSize = 4000, 8
-	testConn := newTestConnection(t, &Events{Pollers: 1})
+	testConn := newTCPTestConnection(t, &Events{Pollers: 1})
 	conn := testConn.conn
 	if err := unix.SetsockoptInt(conn.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
 		t.Fatal(err)
