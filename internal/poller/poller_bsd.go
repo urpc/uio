@@ -175,7 +175,11 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 	// Register before kevent so Close cannot release descriptors still in use.
 	poller.mu.Lock()
 	if poller.closed.Load() {
-		poller.release()
+		// A waiter still registered releases when it leaves; descriptors
+		// must outlive every kevent call that can still read them.
+		if poller.waiters == 0 {
+			poller.release()
+		}
 		err := poller.closeError()
 		poller.mu.Unlock()
 		return 0, err

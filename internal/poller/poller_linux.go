@@ -176,7 +176,13 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 	// so a waiter is either seen by Close or observes the closed poller.
 	poller.mu.Lock()
 	if poller.closed.Load() {
-		poller.release()
+		// Another waiter may still be registered: Close woke it on its private
+		// descriptor, and closing that descriptor before it collects the
+		// event takes the event out of epoll, leaving it asleep for good.
+		// The last registered waiter releases instead.
+		if poller.waiters == 0 {
+			poller.release()
+		}
 		err := poller.closeError()
 		poller.mu.Unlock()
 		return 0, err

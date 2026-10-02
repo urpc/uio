@@ -51,3 +51,39 @@ func TestCloseReleasesEveryWaiter(t *testing.T) {
 		p.release()
 	}
 }
+
+// A waiter that reaches WaitBatch after Close must leave the descriptors to
+// the waiters still registered. Close wakes each of those on its private
+// eventfd; closing that eventfd before the waiter collects the event takes
+// the event out of epoll, and the waiter sleeps for good. The shared data
+// poller meets this when one waiter starts late and Events closes at once.
+func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
+	for attempt := 0; attempt < 20; attempt++ {
+		p, err := NewNetPoller()
+		if err != nil {
+			t.Fatal(err)
+		}
+		returned := make(chan struct{})
+		go func() {
+			_, _ = p.WaitBatch(&Batch{}, make([]Event, 8), -1)
+			close(returned)
+		}()
+		for registered := 0; registered == 0; {
+			p.mu.Lock()
+			registered = p.waiters
+			p.mu.Unlock()
+			time.Sleep(10 * time.Microsecond)
+		}
+		// Let the registered waiter block in epoll_wait.
+		time.Sleep(100 * time.Microsecond)
+		_ = p.Close(nil)
+		if _, err := p.WaitBatch(&Batch{}, make([]Event, 8), -1); err != nil {
+			t.Fatalf("attempt %d: late WaitBatch: %v", attempt, err)
+		}
+		select {
+		case <-returned:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("attempt %d: the waiter registered before Close never returned", attempt)
+		}
+	}
+}
