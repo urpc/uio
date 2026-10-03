@@ -14,6 +14,10 @@ import (
 // through the VFS first, which takes the file position lock and runs the file
 // permission hooks on every call before reaching the same socket code.
 // A descriptor that is not a socket falls back to the VFS calls.
+//
+// Sends pass MSG_NOSIGNAL. A peer that has gone makes them fail with EPIPE
+// either way; without the flag the kernel also raises SIGPIPE, which a
+// program that subscribes to the signal receives for every such send.
 
 var zeroByte byte
 
@@ -38,7 +42,7 @@ func Recv(fd int, p []byte) (int, error) {
 
 // Send writes to a connected stream socket.
 func Send(fd int, p []byte) (int, error) {
-	n, _, errno := syscall.Syscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), 0, 0, 0)
+	n, _, errno := syscall.Syscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
 	if errno != 0 {
 		if errno == syscall.ENOTSOCK {
 			return syscall.Write(fd, p)
@@ -53,7 +57,7 @@ func sendmsgIovecs(fd int, iovecs []unix.Iovec) (int, error) {
 	var msg unix.Msghdr
 	msg.Iov = &iovecs[0]
 	msg.SetIovlen(len(iovecs))
-	n, _, errno := unix.Syscall(unix.SYS_SENDMSG, uintptr(fd), uintptr(unsafe.Pointer(&msg)), 0)
+	n, _, errno := unix.Syscall(unix.SYS_SENDMSG, uintptr(fd), uintptr(unsafe.Pointer(&msg)), unix.MSG_NOSIGNAL)
 	if errno != 0 {
 		if errno == unix.ENOTSOCK {
 			n, _, errno = unix.Syscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs)))

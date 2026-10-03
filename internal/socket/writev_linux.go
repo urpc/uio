@@ -10,9 +10,13 @@ import (
 
 const stackWritevLimit = 64
 
+// writevBatchLimit keeps every batch in stackWritevLimit stack-backed iovecs.
+const writevBatchLimit = stackWritevLimit
+
 // Writev writes a stream socket's buffers with one sendmsg and stack-backed
 // iovecs for UIO's common batches. x/sys reserves only eight iovecs and
-// allocates when a corked read round produces a larger batch.
+// allocates when a corked read round produces a larger batch. Longer vectors
+// go out in batches of that size.
 func Writev(fd int, buffers [][]byte) (int, error) {
 	switch len(buffers) {
 	case 0:
@@ -21,7 +25,7 @@ func Writev(fd int, buffers [][]byte) (int, error) {
 		return Send(fd, buffers[0])
 	}
 	if len(buffers) > stackWritevLimit {
-		return unix.Writev(fd, buffers)
+		return writevBatches(fd, buffers)
 	}
 	var storage [stackWritevLimit]unix.Iovec
 	iovecs := storage[:len(buffers)]

@@ -4,8 +4,11 @@ package socket
 
 import (
 	"bytes"
+	"os"
+	"os/signal"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -56,5 +59,32 @@ func TestStreamCallsFallBackForNonSockets(t *testing.T) {
 	n, err := Recv(pipe[0], buffer)
 	if err != nil || string(buffer[:n]) != "abcd" {
 		t.Fatalf("Recv from pipe = %q, %v", buffer[:n], err)
+	}
+}
+
+// A send to a peer that has gone fails with EPIPE and raises no SIGPIPE,
+// which a program subscribed to the signal would receive for every such send.
+func TestStreamSendsDoNotRaiseSIGPIPE(t *testing.T) {
+	signals := make(chan os.Signal, 8)
+	signal.Notify(signals, syscall.SIGPIPE)
+	defer signal.Stop(signals)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	if err = unix.Close(fds[1]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Send(fds[0], []byte("x")); err != syscall.EPIPE {
+		t.Fatalf("Send to a closed peer = %v, want EPIPE", err)
+	}
+	if _, err = Writev(fds[0], [][]byte{[]byte("x"), []byte("y")}); err != syscall.EPIPE {
+		t.Fatalf("Writev to a closed peer = %v, want EPIPE", err)
+	}
+	select {
+	case <-signals:
+		t.Fatal("a send to a closed peer raised SIGPIPE")
+	case <-time.After(200 * time.Millisecond):
 	}
 }

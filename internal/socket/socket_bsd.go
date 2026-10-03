@@ -25,7 +25,10 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Writev invokes the writev system call directly.
+const writevBatchLimit = maxWritevBuffers
+
+// Writev invokes the writev system call directly. Longer vectors than one
+// writev takes go out in batches.
 //
 // Note that SYS_WRITEV is about to be deprecated on Darwin
 // and the Go team suggested to use libSystem wrappers instead of direct system-calls,
@@ -36,15 +39,17 @@ func Writev(fd int, vec [][]byte) (int, error) {
 		return 0, nil
 	case 1:
 		return syscall.Write(fd, vec[0])
-	default:
-		iovecs := make([]unix.Iovec, 0, minIovec)
-		iovecs = appendBytes(iovecs, vec)
-		n, _, err := unix.RawSyscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs))) //nolint:staticcheck
-		if err != 0 {
-			return int(n), err
-		}
-		return int(n), nil
 	}
+	if len(vec) > writevBatchLimit {
+		return writevBatches(fd, vec)
+	}
+	iovecs := make([]unix.Iovec, 0, minIovec)
+	iovecs = appendBytes(iovecs, vec)
+	n, _, err := unix.RawSyscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs))) //nolint:staticcheck
+	if err != 0 {
+		return int(n), err
+	}
+	return int(n), nil
 }
 
 // minIovec is the size of the small initial allocation used by
