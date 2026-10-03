@@ -428,10 +428,11 @@ func (conn *fdConn) afterRegister()                       {}
 // readNeedsRedelivery runs on the loop after updateInterest. Reads the outbound
 // limit throttled stay paused until a send retires the backlog to the resume
 // mark and refreshes again: redelivered now, a read would only feed callbacks
-// whose replies cannot be accepted.
+// whose replies cannot be accepted. A socket that refuses output pauses
+// nothing: the peer may be waiting for this read before it reads, as another
+// uio connection does, and then neither end gets another edge.
 func (conn *fdConn) readNeedsRedelivery() bool { return conn.readStalled.Load() && !conn.throttled }
 func (conn *fdConn) clearReadRedelivery() bool { return conn.readStalled.CompareAndSwap(true, false) }
-func (conn *fdConn) writeIsBlocked() bool      { return conn.writeBlocked() }
 
 // Direct I/O belongs to this connection's active task. Datagrams additionally
 // belong to their loop during delivery; a loop never owns a stream's I/O task,

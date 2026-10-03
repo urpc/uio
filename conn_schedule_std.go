@@ -32,4 +32,3 @@ func (conn *fdConn) RunTask()                    {}
 func (conn *fdConn) handleIOSubmitFailure(error) {}
 func (conn *fdConn) readNeedsRedelivery() bool   { return false }
 func (conn *fdConn) clearReadRedelivery() bool   { return false }
-func (conn *fdConn) writeIsBlocked() bool        { return false }
