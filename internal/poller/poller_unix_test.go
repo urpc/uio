@@ -265,3 +265,53 @@ func TestNetPollerWaitModesAndEventMasks(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// Edge-triggered readers stop at a short read unless a hangup is reported, so
+// the bit must come with the peer's end of stream, also when it is queued
+// behind bytes, and never with bytes alone, which would cost every read round
+// a syscall.
+func TestNetPollerReportsHangupApartFromData(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	poller, err := NewNetPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poller.Close(nil)
+	poller.SetEdgeTriggered(fds[0], true)
+	if err = poller.Add(fds[0], Readable); err != nil {
+		t.Fatal(err)
+	}
+	wait := func() Events {
+		t.Helper()
+		var events [4]Event
+		n, waitErr := poller.Wait(events[:], 1000)
+		if n != 1 || waitErr != nil || events[0].FD != fds[0] {
+			t.Fatalf("Wait = %#v, %v; want one event for fd %d", events[:n], waitErr, fds[0])
+		}
+		return events[0].Events
+	}
+	if _, err = unix.Write(fds[1], []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(); got&ReadEvents == 0 || got&HangupEvents != 0 {
+		t.Fatalf("bytes alone reported %b, want ReadEvents without HangupEvents", got)
+	}
+	var buffer [8]byte
+	if _, err = unix.Read(fds[0], buffer[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = unix.Write(fds[1], []byte("y")); err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.Shutdown(fds[1], unix.SHUT_WR); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(); got&(ReadEvents|HangupEvents) != ReadEvents|HangupEvents {
+		t.Fatalf("bytes followed by end of stream reported %b, want ReadEvents|HangupEvents", got)
+	}
+}

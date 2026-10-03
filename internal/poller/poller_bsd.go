@@ -218,6 +218,9 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 		if event.Filter == readEvents || event.Flags&errorEvents != 0 {
 			events |= ReadEvents
 		}
+		if event.Flags&errorEvents != 0 {
+			events |= HangupEvents
+		}
 		if event.Filter == writeEvents {
 			events |= WriteEvents
 		}

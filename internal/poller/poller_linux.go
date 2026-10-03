@@ -16,6 +16,8 @@ const (
 	readEvents  = unix.EPOLLIN
 	writeEvents = unix.EPOLLOUT
 	errorEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP | unix.EPOLLPRI
+	// hangupEvents leaves out EPOLLPRI: urgent data ends nothing.
+	hangupEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
 )
 
 // NetPoller wraps epoll plus an eventfd used to wake the owner for queued
@@ -238,6 +240,9 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 		var events Events
 		if event.Events&(readEvents|errorEvents) != 0 {
 			events |= ReadEvents
+		}
+		if event.Events&hangupEvents != 0 {
+			events |= HangupEvents
 		}
 		if event.Events&writeEvents != 0 {
 			events |= WriteEvents

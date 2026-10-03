@@ -27,6 +27,12 @@ type Events uint32
 const (
 	ReadEvents Events = 1 << iota
 	WriteEvents
+	// HangupEvents rides with ReadEvents when the peer has closed or reset
+	// its side, or the socket has an error. Unlike new bytes, an end of
+	// stream or error queued behind bytes already announced raises no edge of
+	// its own, so an edge-triggered reader that sees it must read until the
+	// socket reports it rather than stop at a short read.
+	HangupEvents
 )
 
 // Interest is the desired readiness state for a watched descriptor.

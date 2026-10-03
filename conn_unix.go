@@ -56,7 +56,7 @@ type fdConn struct {
 	pollTag   uint32          // registration generation echoed by the data poller
 	interest  poller.Interest // event-loop-owned registered interest
 	throttled bool            // loop-owned read-interest hysteresis
-	turn      uint8           // turn-owned bits: turnCorked, turnFlushing
+	turn      uint8           // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
 	internal  bool            // framework-owned endpoint, not a user connection
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
@@ -123,7 +123,9 @@ const (
 	writeContendedFlag
 )
 
-// Turn-owned bits in fdConn.turn, read and written only by the running turn.
+// Bits in fdConn.turn, read and written only by the running turn. The cork
+// and flush bits live for one turn; the hangup bit, once set, is kept for
+// the connection's life.
 const (
 	// turnCorked batches a read round's replies until the round ends.
 	turnCorked uint8 = 1 << iota
@@ -131,6 +133,11 @@ const (
 	// runs: a Write the callback makes is queued rather than sent, and a
 	// flush it starts returns at once, so OnOutbound never runs inside itself.
 	turnFlushing
+	// turnHangup records a hangup the poller reported, for the rest of the
+	// connection's life: the end of stream or error behind the bytes still
+	// unread raises no further edge, and the rounds that read those bytes,
+	// redelivered ones included, must read on until the socket reports it.
+	turnHangup
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -442,9 +449,14 @@ func (conn *fdConn) directOwner() bool {
 	return conn.ioOwner.Load() == owner || (conn.isDatagram() && conn.loop != nil && conn.loop.loopGoid.Load() == owner)
 }
 
+// Readiness bits are the poller's own: noteIO folds them in unchanged.
 const (
-	ioEventRead  uint32 = 1
-	ioEventWrite uint32 = 2
+	ioEventRead   = uint32(poller.ReadEvents)
+	ioEventWrite  = uint32(poller.WriteEvents)
+	ioEventHangup = uint32(poller.HangupEvents)
+)
+
+const (
 	ioEventOpen  uint32 = 1 << 16
 	ioEventWake  uint32 = 1 << 17
 	ioEventClose uint32 = 1 << 18
@@ -656,7 +668,9 @@ func (conn *fdConn) runIOTask() {
 	var events uint32
 	settle, ended := false, false
 	defer func() {
-		conn.turn = 0 // a callback panic may have left a round corked or a flush marked
+		// A callback panic may have left a round corked or a flush marked;
+		// only a reported hangup outlives the turn.
+		conn.turn &= turnHangup
 		if conn.turnOwnsClaim() {
 			// The round's reservations are filled and flushed, or a callback
 			// panic left the claim taken for a reservation or a flush: other
@@ -696,6 +710,9 @@ func (conn *fdConn) runIOTask() {
 		}
 	}
 	if !conn.isClosing() && events&ioEventRead != 0 {
+		if events&ioEventHangup != 0 {
+			conn.turn |= turnHangup
+		}
 		var err error
 		if conn.isDatagram() {
 			err = conn.onRecvUDP()
@@ -994,7 +1011,10 @@ func (conn *fdConn) readRound(buffer []byte) error {
 				return nil
 			}
 		}
-		if n < len(buffer) {
+		if n < len(buffer) && conn.turn&turnHangup == 0 {
+			// The socket is drained, and bytes that arrive later raise a new
+			// edge. A hangup already queued behind these bytes raises none,
+			// which is why the round reads on once the poller reported one.
 			return nil
 		}
 		// The round reads on. Once its replies fill a coalescing block, send
