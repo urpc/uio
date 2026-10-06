@@ -8,9 +8,18 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+// rawProbeMinProcs is the smallest GOMAXPROCS at which the raw readiness
+// probe pays; see WaitBatch.
+const rawProbeMinProcs = 8
+
+// rawProbeEnabled caches that comparison. runtime.GOMAXPROCS takes the
+// runtime's scheduler lock, which has no place on a waiter's path.
+var rawProbeEnabled = runtime.GOMAXPROCS(0) >= rawProbeMinProcs
 
 const (
 	readEvents  = unix.EPOLLIN
@@ -209,7 +218,26 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 	poller.waiters++
 	poller.mu.Unlock()
 	defer poller.finishWait()
-	n, err := unix.EpollWait(poller.epfd, batch.rawEvents[:], timeout)
+	var n int
+	var err error
+	// A raw zero-timeout probe first: while readiness is pending, which under
+	// load it almost always is, this takes the batch without entering the
+	// runtime's syscall accounting, so the waiter keeps its P and the events
+	// are handed to the executor a hand-off earlier. The probe costs one
+	// syscall on an idle wait, and the blocking call still sees any readiness
+	// that arrives after an empty probe. It stays off small hosts, where
+	// holding a P through a syscall costs more than the hand-off it saves.
+	if timeout != 0 && rawProbeEnabled {
+		r, _, errno := unix.RawSyscall6(unix.SYS_EPOLL_PWAIT, uintptr(poller.epfd),
+			uintptr(unsafe.Pointer(&batch.rawEvents[0])), uintptr(len(batch.rawEvents)), 0, 0, 0)
+		if errno == 0 && r > 0 {
+			n = int(r)
+		} else {
+			n, err = unix.EpollWait(poller.epfd, batch.rawEvents[:], timeout)
+		}
+	} else {
+		n, err = unix.EpollWait(poller.epfd, batch.rawEvents[:], timeout)
+	}
 	if poller.closed.Load() {
 		return 0, poller.closeError()
 	}
