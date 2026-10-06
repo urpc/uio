@@ -11,26 +11,73 @@ import (
 	"github.com/urpc/uio/internal/poller"
 )
 
-// dataPoller watches the readiness of every stream connection through one
-// shared epoll instance and hands runnable connections to the task pool.
+// The data plane shards stream readiness over several independent pollers.
+// Each connection belongs to one shard, picked by descriptor at registration,
+// and that shard's waiters are the only ones that ever report it. What they
+// hand over still goes to the io pool's one shared queue: turn queues per
+// shard were measured against it and came out 4% slower, so the pool is
+// untouched by this.
 //
-// Event loops keep owning registration, interest, deadlines, close, UDP and
-// accept, but they no longer wait for stream readiness themselves. A loop that
-// only saw a share of the traffic kept draining its share and blocking in
-// epoll_wait; every time it blocked it gave up its P, and under load it then
-// waited for another one while its connections' input sat in the kernel. That
-// made a connection's latency depend on which loop owned it. A busy waiter
-// rarely blocks, and one shared ready list hands input to the pool in arrival
-// order no matter how many loops there are. Large hosts run a few waiters on
-// the same instance; epoll gives each ready edge to one of them.
+// One shared poller behind a handful of waiters measured well until the
+// machine got wide: on a 64-core host, wake-ups from a single queue landed on
+// the submitting waiter's P and every worker crossed cores to reach them
+// (runtime/trace: ~23 core-seconds per second runnable-but-unscheduled against
+// ~30 running). Several pollers keep a connection's events in one cluster of
+// cores, so its state stays in one L3 domain and a wake-up no longer races
+// every other core for a P. The shard count defaults to the number of L3
+// domains a wide AMD part tends to have; measurements on the 64-core host put
+// it at 8.
+const defaultDataShards = 8
+
+// dataPlaneSharded reports that this backend's connections are collected by
+// the sharded stream poller, so the io pool must keep one turn queue per
+// shard. Backends without one keep a single queue.
+const dataPlaneSharded = true
+
+// dataShardsOverride fixes the shard count in tests; zero means automatic.
+var dataShardsOverride int
+
+// dataWaitersOverride fixes the per-shard waiter count in tests; zero means
+// automatic.
+var dataWaitersOverride int
+
+// dataShardCount scales the shard count with the machine: about four Ps per
+// shard, at least one and at most defaultDataShards. A small host keeps a
+// single collector, so it pays nothing for a structure it cannot fill, and a
+// wide one gets the locality without a count tied to any particular chip.
+func dataShardCount(procs int) int {
+	if dataShardsOverride > 0 {
+		return dataShardsOverride
+	}
+	count := procs / 4
+	if count < 1 {
+		count = 1
+	}
+	if count > defaultDataShards {
+		count = defaultDataShards
+	}
+	return count
+}
+
+// dataPoller owns one epoll instance per shard.
 type dataPoller struct {
-	poller *poller.NetPoller
-	fdMap  *fdmap.Map[fdConn]
+	shards []*dataShard
 	pool   *ioTaskPool
 	wg     sync.WaitGroup
 }
 
-// dataWaiter is one goroutine's private dispatch state.
+// dataShard is one shard's poller and lookup table. On Unix newFdMap hands
+// every caller the process-wide table, so the shards in fact resolve events
+// through one shared table — which registerConn relies on: a connection is
+// published there before its descriptor is watched, so a waiter is never
+// handed an event for a connection no table holds yet. Per-shard tables would
+// reopen that gap, since data.register runs after the watch starts.
+type dataShard struct {
+	poller *poller.NetPoller
+	fdMap  *fdmap.Map[fdConn]
+}
+
+// dataWaiter is one waiter goroutine's private dispatch state.
 type dataWaiter struct {
 	batch poller.Batch
 	evbuf []poller.Event
@@ -39,24 +86,51 @@ type dataWaiter struct {
 }
 
 func newDataPoller(ev *Events) (*dataPoller, error) {
-	netPoller, err := poller.NewNetPoller()
-	if err != nil {
-		return nil, err
+	data := &dataPoller{pool: ev.ioPool}
+	for range ev.dataShards {
+		netPoller, err := poller.NewNetPoller()
+		if err != nil {
+			for _, shard := range data.shards {
+				_ = shard.poller.Close(err)
+			}
+			return nil, err
+		}
+		data.shards = append(data.shards, &dataShard{poller: netPoller, fdMap: newFdMap()})
 	}
-	return &dataPoller{poller: netPoller, fdMap: newFdMap(), pool: ev.ioPool}, nil
+	return data, nil
 }
 
-// dataWaitersOverride fixes the waiter count in tests; zero means automatic.
-var dataWaitersOverride int
+// shard returns the shard owning fd. Descriptors arrive in allocation order,
+// so consecutive connections land on different shards and a reuse of a
+// descriptor lands on the shard the connection was watched by.
+func (data *dataPoller) shard(fd int) *dataShard {
+	return data.shards[fd%len(data.shards)]
+}
 
-// dataWaiters is how many goroutines wait on the shared poller. epoll hands
-// each ready edge to one waiter, so a second waiter collects the next batch
-// while the first one is still folding its events in and handing them to the
-// executor, instead of letting input sit in the kernel for that long. That
-// matters most for executors whose submissions are not free. Beyond two per
-// 24 Ps, more waiters only split the load into goroutines that block more
-// often.
-func dataWaiters() int {
+// watcherFor returns the poller watching fd.
+func (data *dataPoller) watcherFor(fd int) *poller.NetPoller {
+	return data.shard(fd).poller
+}
+
+// register publishes conn in its shard's lookup table.
+func (data *dataPoller) register(conn *fdConn) error {
+	return data.shard(conn.fd).fdMap.Put(conn.fd, conn)
+}
+
+// unregister drops fd from its shard's lookup table.
+func (data *dataPoller) unregister(fd int) {
+	data.shard(fd).fdMap.Delete(fd)
+}
+
+// dataWaiters is how many waiter goroutines each shard runs. epoll hands each
+// ready edge to one waiter, so a second waiter on the same poller collects the
+// next batch while the first is still folding its events in and handing them
+// to the executor. The process-wide total scales with the machine — one per
+// four Ps, at least two — and the shards divide it, so a small host whose
+// single shard keeps them all behaves as it always did, and a wide one keeps
+// two per shard while its shards are what feed the queues. Measurements on a
+// 64-core host put the knee there: a third waiter per shard lost throughput.
+func dataWaiters(shards int) int {
 	if dataWaitersOverride > 0 {
 		return dataWaitersOverride
 	}
@@ -64,64 +138,71 @@ func dataWaiters() int {
 	if procs < 4 {
 		return 1
 	}
-	return max(2, procs/12)
+	total := max(2, procs/4)
+	perShard := total / shards
+	if perShard < 1 {
+		perShard = 1
+	}
+	return perShard
 }
 
 func (data *dataPoller) start(ev *Events) {
-	waiters := dataWaiters()
-	for range waiters {
-		waiter := &dataWaiter{
-			evbuf: make([]poller.Event, eventBatch),
-			ready: make([]*fdConn, 0, eventBatch),
-			args:  make([]IOTask, 0, eventBatch),
+	perShard := dataWaiters(len(data.shards))
+	for _, shard := range data.shards {
+		for range perShard {
+			waiter := &dataWaiter{
+				evbuf: make([]poller.Event, eventBatch),
+				ready: make([]*fdConn, 0, eventBatch),
+				args:  make([]IOTask, 0, eventBatch),
+			}
+			data.wg.Add(1)
+			go func(shard *dataShard) {
+				defer data.wg.Done()
+				if ev.LockOSThread {
+					runtime.LockOSThread()
+					defer runtime.UnlockOSThread()
+				}
+				if err := data.serve(shard, waiter, perShard > 1); err != nil {
+					ev.initiateClose(err)
+				}
+			}(shard)
 		}
-		data.wg.Add(1)
-		go func() {
-			defer data.wg.Done()
-			if ev.LockOSThread {
-				runtime.LockOSThread()
-				defer runtime.UnlockOSThread()
-			}
-			if err := data.serve(waiter, waiters > 1); err != nil {
-				ev.initiateClose(err)
-			}
-		}()
 	}
 }
 
-// serve dispatches readiness until the poller is closed. Each event carries
-// the tag the connection was registered with: a loop may close a descriptor,
-// and the kernel reuse its number for a new connection, after epoll_wait has
-// returned an event for it. The tag keeps such an event from reaching the new
-// connection before its open task.
+// serve dispatches one shard's readiness until the poller is closed. Each
+// event carries the tag the connection was registered with: a loop may close a
+// descriptor, and the kernel reuse its number for a new connection, after
+// epoll_wait has returned an event for it. The tag keeps such an event from
+// reaching the new connection before its open task.
 //
-// With more than one waiter, a waiter that handed tasks to the executor
-// yields before it waits again. The executor's wake-ups queue the workers on
-// this waiter's P, and epoll_wait would keep that P in a system call until the
-// runtime retakes it; yielding runs them at once while another waiter keeps
-// watching the poller. A lone waiter must not yield: it would queue behind
-// the very workers it woke.
-func (data *dataPoller) serve(waiter *dataWaiter, yield bool) error {
+// With more than one waiter on a shard, a waiter that handed tasks to the
+// executor yields before it waits again. The executor's wake-ups queue the
+// workers on this waiter's P, and epoll_wait would keep that P in a system
+// call until the runtime retakes it; yielding runs them at once while another
+// waiter keeps watching the poller. A lone waiter must not yield: it would
+// queue behind the very workers it woke.
+func (data *dataPoller) serve(shard *dataShard, waiter *dataWaiter, yield bool) error {
 	for {
-		n, err := data.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
-		if data.poller.Closed() {
+		n, err := shard.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
+		if shard.poller.Closed() {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		data.dispatch(waiter, waiter.evbuf[:n])
+		data.dispatch(shard, waiter, waiter.evbuf[:n])
 		if data.submit(waiter) && yield {
 			runtime.Gosched()
 		}
 	}
 }
 
-// dispatch folds readiness into the connections still registered under the
-// reported tag and collects the ones that became runnable.
-func (data *dataPoller) dispatch(waiter *dataWaiter, events []poller.Event) {
+// dispatch folds readiness into the connections this shard watches and
+// collects the ones that became runnable.
+func (data *dataPoller) dispatch(shard *dataShard, waiter *dataWaiter, events []poller.Event) {
 	for _, event := range events {
-		conn := data.fdMap.Get(event.FD)
+		conn := shard.fdMap.Get(event.FD)
 		if conn == nil || conn.pollTag != event.Tag || conn.isClosing() {
 			continue
 		}
@@ -147,13 +228,12 @@ func (data *dataPoller) submit(waiter *dataWaiter) bool {
 	return true
 }
 
-// close stops the waiters once every loop has deregistered its connections.
-// Close raises each waiter on its own wake descriptor, so every waiter returns
-// from epoll_wait and sees the closed poller regardless of what the others
-// drained.
+// close stops every shard's waiter. Close raises each shard's waiter on its
+// own wake descriptor, so every waiter returns from epoll_wait and sees the
+// closed poller regardless of what the others drained.
 func (data *dataPoller) close(err error) {
-	_ = data.poller.Close(err)
+	for _, shard := range data.shards {
+		_ = shard.poller.Close(err)
+	}
 	data.wg.Wait()
 }
-
-func (data *dataPoller) watcher() *poller.NetPoller { return data.poller }

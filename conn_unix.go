@@ -520,10 +520,10 @@ func (conn *fdConn) noteIO(events uint32) bool {
 // watchTags generates registration tags. Zero means untagged.
 var watchTags atomic.Uint32
 
-// watcher returns the poller watching this descriptor: the shared data poller
-// for streams when the backend has one, otherwise the owning loop's poller.
+// watcher returns the poller watching this descriptor: the data-plane shard
+// owning it for streams when the backend has one, otherwise the loop's poller.
 func (conn *fdConn) watcher() *poller.NetPoller {
-	if data := conn.events.dataPlane(); data != nil && !conn.isDatagram() {
+	if data := conn.events.streamPoller(conn.fd); data != nil && !conn.isDatagram() {
 		return data
 	}
 	return conn.loop.poller

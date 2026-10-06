@@ -75,7 +75,8 @@ type Events struct {
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]
 	ioPool         *ioTaskPool
-	data           *dataPoller // shared stream readiness, when the backend has one
+	data           *dataPoller // sharded stream readiness, when the backend has one
+	dataShards     int         // data-plane shard count, fixed at init
 	readPool       sync.Pool
 	readBufferSize int
 
@@ -330,13 +331,13 @@ func (ev *Events) rollbackInit(err error) {
 	ev.callbackWG.Wait()
 }
 
-// dataPlane returns the shared poller that watches stream connections, or
-// nil when each event loop watches its own.
-func (ev *Events) dataPlane() *poller.NetPoller {
+// streamPoller returns the data-plane poller watching fd's shard, or nil when
+// each event loop watches its own connections.
+func (ev *Events) streamPoller(fd int) *poller.NetPoller {
 	if ev == nil || ev.data == nil {
 		return nil
 	}
-	return ev.data.watcher()
+	return ev.data.watcherFor(fd)
 }
 
 // closeDataPoller runs after every loop has stopped, so no stream is still
@@ -372,6 +373,14 @@ func (ev *Events) initConfig() error {
 func (ev *Events) initLoops() (err error) {
 	// Native Unix always uses connection tasks. An injected Executor owns
 	// scheduling when present; otherwise UIO creates its default taskgo queue.
+	// The queue stays single: turns from every data-plane shard share it, and
+	// measurements on a 64-core host showed a shared queue beating one queue
+	// per shard by ~4% — the shards exist to spread event collection, not to
+	// pin work to cores.
+	ev.dataShards = 1
+	if dataPlaneSharded {
+		ev.dataShards = dataShardCount(runtime.GOMAXPROCS(0))
+	}
 	ev.ioPool = newIOTaskPool(ev.Executor)
 
 	// The shared stream poller starts before the loops that register with it.

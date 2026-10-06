@@ -51,18 +51,18 @@ func startEchoEvents(t *testing.T, events *Events) string {
 	}
 }
 
-// TestDataPollerEchoWithSeveralWaiters drives concurrent echo traffic through
+// TestDataPollerEchoWithSeveralShards drives concurrent echo traffic through
 // several goroutines sharing the stream poller, then checks that Serve joins
 // all of them on shutdown.
-func TestDataPollerEchoWithSeveralWaiters(t *testing.T) {
-	previous := dataWaitersOverride
-	dataWaitersOverride = 3
-	t.Cleanup(func() { dataWaitersOverride = previous })
+func TestDataPollerEchoWithSeveralShards(t *testing.T) {
+	previous := dataShardsOverride
+	dataShardsOverride = 3
+	t.Cleanup(func() { dataShardsOverride = previous })
 
 	events := &Events{Pollers: 4}
 	addr := startEchoEvents(t, events)
 	if events.data == nil {
-		t.Fatal("stream connections are not using the shared data poller")
+		t.Fatal("stream connections are not using the sharded data poller")
 	}
 
 	const clients, rounds = 16, 200
@@ -133,15 +133,16 @@ func TestDataPollerIgnoresStaleTags(t *testing.T) {
 	}
 
 	waiter := &dataWaiter{}
+	shard := events.data.shard(conn.Fd())
 	stale := poller.Event{FD: conn.Fd(), Events: poller.ReadEvents, Tag: conn.pollTag + 1}
-	events.data.dispatch(waiter, []poller.Event{stale})
+	events.data.dispatch(shard, waiter, []poller.Event{stale})
 	if len(waiter.ready) != 0 || conn.scheduled.Load() {
 		t.Fatal("stale readiness scheduled the current connection")
 	}
 
 	current := stale
 	current.Tag = conn.pollTag
-	events.data.dispatch(waiter, []poller.Event{current})
+	events.data.dispatch(shard, waiter, []poller.Event{current})
 	if len(waiter.ready) != 1 || waiter.ready[0] != conn {
 		t.Fatal("current readiness did not schedule the connection")
 	}
@@ -220,9 +221,9 @@ func readFull(conn net.Conn, buf []byte) (int, error) {
 // waiter: several goroutines share the stream poller, no stream traffic ever
 // wakes them, and Close must still join every one of them promptly.
 func TestDataPollerCloseStopsAllWaiters(t *testing.T) {
-	previous := dataWaitersOverride
-	dataWaitersOverride = 3
-	t.Cleanup(func() { dataWaitersOverride = previous })
+	previous := dataShardsOverride
+	dataShardsOverride = 3
+	t.Cleanup(func() { dataShardsOverride = previous })
 
 	for i := 0; i < 50; i++ {
 		events := &Events{Pollers: 1}

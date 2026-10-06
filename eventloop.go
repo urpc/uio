@@ -423,6 +423,9 @@ func (loop *eventLoop) getConn(fd int) *fdConn { return loop.fdMap.Get(fd) }
 func (loop *eventLoop) listen(fd int) error    { return loop.poller.Add(fd, poller.Readable) }
 func (loop *eventLoop) delConn(conn *fdConn) {
 	loop.fdMap.Delete(conn.Fd())
+	if data := loop.events.data; data != nil && !conn.isDatagram() {
+		data.unregister(conn.Fd())
+	}
 	_ = conn.watcher().Remove(conn.Fd(), conn.currentInterest())
 }
 func (loop *eventLoop) modRead(conn *fdConn) error {
@@ -472,6 +475,15 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 		_ = watcher.Remove(fd, interest)
 		conn.closeUnregistered()
 		return err
+	}
+	if data := loop.events.data; data != nil && !conn.isDatagram() {
+		if err := data.register(conn); err != nil {
+			conn.clearOpenPending()
+			loop.fdMap.Delete(fd)
+			_ = watcher.Remove(fd, interest)
+			conn.closeUnregistered()
+			return err
+		}
 	}
 	if registeredForTest != nil {
 		registeredForTest(conn)
