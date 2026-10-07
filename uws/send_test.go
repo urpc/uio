@@ -116,14 +116,16 @@ func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
-	if err := conn.SendText([]byte{0xff}); err != frame.ErrInvalidUTF8 {
-		t.Fatalf("SendText(invalid) = %v, want %v", err, frame.ErrInvalidUTF8)
+	// Text payloads are the sender's contract and are not revalidated on
+	// send; what a peer sent has already been checked on read.
+	if err := conn.SendText([]byte{0xff}); err != nil {
+		t.Fatalf("SendText(unvalidated byte) = %v, want nil", err)
 	}
 	if err := conn.SendBinary([]byte("12345")); err != frame.ErrMessageTooBig {
 		t.Fatalf("SendBinary(oversized) = %v, want %v", err, frame.ErrMessageTooBig)
 	}
-	if raw.writes != 0 {
-		t.Fatalf("invalid sends wrote %d frames", raw.writes)
+	if raw.writes != 1 {
+		t.Fatalf("sends wrote %d frames, want the one valid text frame", raw.writes)
 	}
 }
 

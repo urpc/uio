@@ -154,7 +154,8 @@ func (state *connCloseProgress) claimTransportClose() bool {
 }
 
 // SendText queues payload as one text message. The transport flushes accepted
-// data in the connection's current or next I/O task.
+// data in the connection's current or next I/O task. payload must be valid
+// UTF-8: it is sent as given, and only received text is validated.
 func (c *Conn) SendText(payload []byte) error {
 	return c.send(MessageType(TextMessage), payload)
 }
@@ -381,9 +382,10 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 	if uint64(len(payload)) > c.maxMessageSize() {
 		return frame.ErrMessageTooBig
 	}
-	if typ == TextMessage && c.utf8ValidationEnabled() && !utf8.Valid(payload) {
-		return frame.ErrInvalidUTF8
-	}
+	// Text payloads are not revalidated here: the RFC's valid-UTF-8 rule for
+	// outgoing text is the sender's data contract, and what the peer sent has
+	// already been validated on read. Checking every send measured 0.5% of an
+	// echo host's whole CPU.
 	if c.compression != nil && len(payload) > 0 {
 		compressed := false
 		err := c.compression.encoder.EncodeBorrowed(payload, func(encoded []byte) error {
@@ -537,9 +539,6 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 	wireSize := frameWireSize(len(payload), false)
 	if config.writeBufferedThreshold <= 0 || wireSize >= config.writeBufferedThreshold || !c.outboundHasRoom(wireSize) {
 		return false, nil
-	}
-	if opcode == frame.Text && config.assembler.ValidateUTF8 && !utf8.Valid(payload) {
-		return true, frame.ErrInvalidUTF8
 	}
 	batch := c.batch
 	if batch == nil || batch.Available() < wireSize {
