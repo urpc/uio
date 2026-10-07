@@ -761,15 +761,6 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.setInterest(poller.Readable)
-	if err := loop.modRead(conn); err != nil {
-		t.Fatal(err)
-	}
-	if err := loop.modWrite(conn); err != nil {
-		t.Fatal(err)
-	}
-	if err := loop.modReadWrite(conn); err != nil {
-		t.Fatal(err)
-	}
 	loop.OnEvent(nil, 12345, poller.ReadEvents)
 	loop.OnClose(nil, nil)
 

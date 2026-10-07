@@ -16,8 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urpc/uio/internal/bytebuf"
-	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 	"golang.org/x/sys/unix"
 )
@@ -444,7 +442,7 @@ func TestConnectionTaskUsesBatchExecutorFastPath(t *testing.T) {
 		t.Fatal("batch executor did not run OnOpen")
 	}
 	deadline := time.Now().Add(time.Second)
-	for testConn.conn.scheduled.Load() {
+	for testConn.conn.taskState.Load()&taskScheduledBit != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("OnOpen connection task did not finish")
 		}
@@ -474,15 +472,15 @@ func TestBatchExecutorPartialRejection(t *testing.T) {
 	pool := newIOTaskPool(executor)
 	loop := &eventLoop{ioPool: pool}
 	first := &fdConn{commonConn: commonConn{events: events, loop: loop}}
-	first.pendingEvents.Store(ioEventOpen)
-	first.scheduled.Store(true)
+	first.taskState.Store(ioEventOpen)
+	first.taskState.Or(taskScheduledBit)
 	if !loop.acquireIO() {
 		t.Fatal("failed to reserve first connection task")
 	}
 	second := &fdConn{commonConn: commonConn{events: events, loop: loop}}
 	second.close.phase.Store(closeResourcesReleased)
-	second.pendingEvents.Store(ioEventClose)
-	second.scheduled.Store(true)
+	second.taskState.Store(ioEventClose)
+	second.taskState.Or(taskScheduledBit)
 	if !loop.acquireIO() {
 		t.Fatal("failed to reserve second connection task")
 	}
@@ -557,7 +555,7 @@ func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d loopState=%d queued=%v stopped=%v",
-			testConn.conn.scheduled.Load(), testConn.conn.close.phase.Load(),
+			testConn.conn.taskState.Load()&taskScheduledBit != 0, testConn.conn.close.phase.Load(),
 			testConn.conn.loop.ioState.Load(), testConn.conn.loop.hasPendingTasks(), testConn.conn.loop.stopping.Load())
 	}
 }
@@ -577,9 +575,9 @@ func TestRejectedIOTaskReleasesScheduleBeforeClose(t *testing.T) {
 	if !loop.acquireIO() {
 		t.Fatal("loop did not reserve the rejected task")
 	}
-	conn.scheduled.Store(true)
+	conn.taskState.Or(taskScheduledBit)
 	conn.handleIOSubmitFailure(net.ErrClosed)
-	if conn.scheduled.Load() {
+	if conn.taskState.Load()&taskScheduledBit != 0 {
 		t.Fatal("rejected task still owned the connection after requesting close")
 	}
 	batch := loop.tasks.Drain()
@@ -598,8 +596,8 @@ func TestRejectedTaskWaitsForPublishedCloseCause(t *testing.T) {
 		loop:   loop,
 	}}
 	conn.close.phase.Store(closeResourcesReleased)
-	conn.pendingEvents.Store(ioEventOpen)
-	conn.scheduled.Store(true)
+	conn.taskState.Store(ioEventOpen)
+	conn.taskState.Or(taskScheduledBit)
 	if !loop.acquireIO() {
 		t.Fatal("failed to reserve earlier task")
 	}
@@ -616,8 +614,8 @@ func TestRejectedTaskWaitsForPublishedCloseCause(t *testing.T) {
 	conn.submitMu.Lock()
 	conn.setDeferredCloseLocked(wantErr)
 	conn.submitMu.Unlock()
-	conn.pendingEvents.Store(ioEventClose)
-	conn.scheduled.Store(true)
+	conn.taskState.Store(ioEventClose)
+	conn.taskState.Or(taskScheduledBit)
 	loop.acquireCloseIO()
 	conn.handleIOSubmitFailure(net.ErrClosed)
 	select {
@@ -1403,19 +1401,19 @@ func TestBackpressureHysteresis(t *testing.T) {
 	conn := &fdConn{}
 	conn.events = events
 	conn.pending.Store(75)
-	conn.outbound.AppendOwned(bytebuf.CloneBuffer([]byte("x")))
-	if got := conn.desiredInterest(); got&poller.Readable != 0 || got&poller.Writable == 0 {
-		t.Fatalf("high-water interest = %v", got)
+	_ = conn.updateInterest()
+	if !conn.throttled.Load() {
+		t.Fatal("backlog at the high-water mark did not pause reads")
 	}
 	conn.pending.Store(60)
-	if got := conn.desiredInterest(); got&poller.Readable != 0 {
-		t.Fatalf("hysteresis interest = %v", got)
+	_ = conn.updateInterest()
+	if !conn.throttled.Load() {
+		t.Fatal("hysteresis: backlog below the high-water mark resumed reads early")
 	}
 	conn.pending.Store(50)
-	conn.outbound.Reset()
-	conn.pending.Store(0)
-	if got := conn.desiredInterest(); got != poller.Readable {
-		t.Fatalf("low-water interest = %v", got)
+	_ = conn.updateInterest()
+	if conn.throttled.Load() {
+		t.Fatal("drained backlog did not resume reads")
 	}
 }
 

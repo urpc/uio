@@ -31,13 +31,17 @@ import (
 // whole value within the 256-byte size class, whose objects are line aligned.
 type fdConn struct {
 	commonConn
-	fd            int
-	pendingEvents atomic.Uint32 // coalesced readiness and synthetic events
-	scheduled     atomic.Bool   // exactly one task is queued or running
-	ioOwner       atomic.Int64  // current task goroutine, zero while idle
-	writeState    atomic.Uint32 // send state and the write claim; see writeOwnerFlag
-	readStalled   atomic.Bool   // ET read work owed after yield/backpressure
-	pending       atomic.Int64  // accepted payload not yet written
+	fd int
+	// taskState coalesces readiness and synthetic events in its low bits and
+	// carries, in its top bit, the claim that exactly one task is queued or
+	// running: a producer sets both with one atomic and only the first setter
+	// submits, and the running turn keeps the bit while it takes the events.
+	taskState   atomic.Uint32
+	throttled   atomic.Bool   // outbound-limit read pause, 75%/50% hysteresis; see pauseRead
+	ioOwner     atomic.Int64  // current task goroutine, zero while idle
+	writeState  atomic.Uint32 // send state and the write claim; see writeOwnerFlag
+	readStalled atomic.Bool   // ET read work owed after yield/backpressure
+	pending     atomic.Int64  // accepted payload not yet written
 
 	// submitMu orders cross-goroutine submissions and protects outbound while a
 	// worker round and an external producer overlap.
@@ -53,11 +57,10 @@ type fdConn struct {
 	// only while bytes remain unsent.
 	inflight *bytebuf.CompositeBuffer
 
-	pollTag   uint32          // registration generation echoed by the data poller
-	interest  poller.Interest // event-loop-owned registered interest
-	throttled bool            // loop-owned read-interest hysteresis
-	turn      uint8           // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
-	internal  bool            // framework-owned endpoint, not a user connection
+	pollTag  uint32          // registration generation echoed by the data poller
+	interest poller.Interest // registration set at Add and never changed
+	turn     uint8           // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
+	internal bool            // framework-owned endpoint, not a user connection
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
 }
@@ -393,14 +396,12 @@ func (conn *fdConn) runWriteTurn() {
 	}
 }
 
-// finishWriteTurn ends a write turn. A socket that refused its bytes gets
-// writable interest, whose edge restarts sending. Bytes appended after its
-// last flush found the claim taken and were left to it, so it looks again and
-// hands them, with its ioState count, to a new write turn.
+// finishWriteTurn ends a write turn. A socket that refused its bytes needs no
+// interest armed: write interest has been on since registration, so the edge
+// that drains the socket starts the next turn by itself. Bytes appended after
+// its last flush found the claim taken and were left to it, so it looks again
+// and hands them, with its ioState count, to a new write turn.
 func (conn *fdConn) finishWriteTurn() {
-	if conn.writeBlocked() {
-		conn.scheduleRefresh()
-	}
 	conn.releaseWrite()
 	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
 		!conn.loop.ioStopped() && conn.tryClaimWrite(0) {
@@ -422,8 +423,21 @@ func (conn *fdConn) openOutputAfterOnOpen() {
 	conn.fireOnOpen()
 }
 
-func (conn *fdConn) Fd() int                              { return conn.fd }
-func (conn *fdConn) initialInterest() poller.Interest     { return poller.Readable }
+func (conn *fdConn) Fd() int { return conn.fd }
+
+// initialInterest is what a stream registers for good: read and write
+// interest armed together, once. Under edge triggering an always-armed write
+// interest reports a socket only when it goes from full back to writable,
+// which is the only write event a refused send waits for, so no connection
+// turn ever changes the registration and nothing in the I/O path issues
+// epoll_ctl.
+func (conn *fdConn) initialInterest() poller.Interest {
+	if conn.isDatagram() {
+		return poller.Readable
+	}
+	return poller.Readable | poller.Writable
+}
+
 func (conn *fdConn) setInterest(interest poller.Interest) { conn.interest = interest }
 func (conn *fdConn) currentInterest() poller.Interest     { return conn.interest }
 func (conn *fdConn) isClosing() bool                      { return conn.close.isClosing() }
@@ -438,8 +452,32 @@ func (conn *fdConn) afterRegister()                       {}
 // whose replies cannot be accepted. A socket that refuses output pauses
 // nothing: the peer may be waiting for this read before it reads, as another
 // uio connection does, and then neither end gets another edge.
-func (conn *fdConn) readNeedsRedelivery() bool { return conn.readStalled.Load() && !conn.throttled }
+//
+// updateInterest clears throttled before this loads readStalled, and
+// pauseRead stores readStalled before it loads throttled, so a pause racing
+// the drain to the resume mark is seen by at least one of them; whichever
+// wins clearReadRedelivery redelivers the read.
+func (conn *fdConn) readNeedsRedelivery() bool {
+	return conn.readStalled.Load() && !conn.throttled.Load()
+}
 func (conn *fdConn) clearReadRedelivery() bool { return conn.readStalled.CompareAndSwap(true, false) }
+
+// skipsEdge reports a readiness event its connection's turn would have
+// nothing to do with, so the poller drops it instead of scheduling a turn.
+//   - A paused read is owed a redelivery that reads the socket on its own, so
+//     read edges until then carry nothing new. Writable and hangup edges still
+//     pass: queued output waits for the one, and a hangup must reach the turn
+//     to mark the rounds that read on to the end of the stream.
+//   - A write-only edge with nothing to send: registration arms every stream
+//     with one, and kqueue raises one each time an acknowledgement frees send
+//     space. Output is sent without an edge; only a write-blocked socket, or
+//     queued output whose sender may be waiting on an edge, needs it.
+func (conn *fdConn) skipsEdge(events poller.Events) bool {
+	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
+		return conn.readStalled.Load()
+	}
+	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
+}
 
 // Direct I/O belongs to this connection's active task. Datagrams additionally
 // belong to their loop during delivery; a loop never owns a stream's I/O task,
@@ -463,6 +501,10 @@ const (
 	// ioEventAccepted rides with ioEventOpen for an accepted TCP connection,
 	// whose open turn applies the default socket options.
 	ioEventAccepted uint32 = 1 << 19
+	// taskScheduledBit claims the connection's one queued or running task. It
+	// shares taskState with the event bits so a producer sets claim and events
+	// with one atomic.
+	taskScheduledBit uint32 = 1 << 31
 )
 
 // scheduleIO records readiness or a synthetic event and submits the connection
@@ -480,38 +522,38 @@ func (conn *fdConn) scheduleIO(events uint32) {
 // visible to its poller. The shared data poller may see the stream's first
 // bytes and submit its task before the loop schedules the open event; that
 // task then takes both events and still runs OnOpen before it reads.
-func (conn *fdConn) markOpenPending() { conn.pendingEvents.Or(ioEventOpen) }
+func (conn *fdConn) markOpenPending() { conn.taskState.Or(ioEventOpen) }
 
 // clearOpenPending withdraws the open event of a stream that failed to
 // register.
-func (conn *fdConn) clearOpenPending() { conn.pendingEvents.And(^(ioEventOpen | ioEventAccepted)) }
+func (conn *fdConn) clearOpenPending() { conn.taskState.And(^(ioEventOpen | ioEventAccepted)) }
 
 // scheduleOpen submits the task for a pending open event unless the data
 // poller already has. Noting ioEventOpen again would run OnOpen twice if that
 // task has already taken it.
 func (conn *fdConn) scheduleOpen() {
-	if conn.pendingEvents.Load()&ioEventOpen != 0 {
+	if conn.taskState.Load()&ioEventOpen != 0 {
 		conn.scheduleIO(0)
 	}
 }
 
 // noteIO folds readiness into this connection and reports whether the caller
-// acquired responsibility for submitting its single in-flight task. The
-// scheduled claim is the last step: once it is visible a task must run, since
+// acquired responsibility for submitting its single in-flight task. Events and
+// the task claim share one word, so setting both is one atomic and the first
+// setter is the submitter; once the claim is visible a task must run, since
 // closeOnLoop hands teardown to whichever task holds it.
 func (conn *fdConn) noteIO(events uint32) bool {
 	if conn.isClosing() || conn.loop == nil || conn.loop.stopping.Load() || conn.loop.ioPool == nil {
 		return false
 	}
-	conn.pendingEvents.Or(events)
-	if conn.scheduled.Load() {
+	if conn.taskState.Or(events|taskScheduledBit)&taskScheduledBit != 0 {
 		return false
 	}
 	if !conn.loop.acquireIO() {
-		return false
-	}
-	if conn.isClosing() || conn.loop.stopping.Load() || !conn.scheduled.CompareAndSwap(false, true) {
-		conn.loop.releaseIO()
+		// The loop stopped between the claim and the reservation. The events
+		// stay recorded for the stop pass, which closes every connection
+		// whatever a task would have done with them.
+		conn.taskState.And(^taskScheduledBit)
 		return false
 	}
 	return true
@@ -546,7 +588,16 @@ func (conn *fdConn) assignWatchTag() uint32 {
 // loop and before OnOpen, so a loop registering a connection storm spends one
 // epoll_ctl per connection instead of four syscalls. The mark is set before
 // registration publishes the open event, so one turn takes both together.
-func (conn *fdConn) prepareAccepted() { conn.pendingEvents.Or(ioEventAccepted) }
+//
+// Where the platform copies the listening socket's options to what it accepts
+// (Linux; see setListenerOptions), there is nothing left to apply and no mark
+// is made: accepting a connection costs no setsockopt at all.
+func (conn *fdConn) prepareAccepted() {
+	if inheritAcceptedOptions {
+		return
+	}
+	conn.taskState.Or(ioEventAccepted)
+}
 
 func (conn *fdConn) applyAcceptedOptions() {
 	_ = conn.applySocketOption(optionNoDelay, 1)
@@ -564,28 +615,33 @@ func (conn *fdConn) scheduleRefresh() {
 	}
 }
 
+// takeIOEvents hands the pending events to the turn and keeps the task claim
+// set: producers that arrive while the turn runs see the claim and leave their
+// events for finishIOTask to pick up.
 func (conn *fdConn) takeIOEvents() uint32 {
-	return conn.pendingEvents.Swap(0)
+	return conn.taskState.Swap(taskScheduledBit)
 }
 
 // finishIOTask closes the lost-work race between the task's final event check
-// and a concurrent producer. scheduled is cleared under submitMu, then events
-// are checked again; either the current task resubmits itself or the producer
-// wins the idle-to-scheduled transition. Deferred close returns to the loop
-// only after no task can still touch connection-owned buffers.
+// and a concurrent producer. The claim is given up under submitMu with the
+// same atomic that checks for events, so either the current task resubmits
+// itself or the producer that set them owns the next turn. Deferred close
+// returns to the loop only after no task can still touch connection-owned
+// buffers.
 func (conn *fdConn) finishIOTask() {
-	if conn.pendingEvents.Load() != 0 && !conn.loop.ioStopped() && conn.close.phase.Load() != closeCallbackDelivered {
+	if conn.taskState.Load()&^taskScheduledBit != 0 && !conn.loop.ioStopped() && conn.close.phase.Load() != closeCallbackDelivered {
 		if !conn.loop.ioPool.submit(conn) {
 			conn.handleIOSubmitFailure(net.ErrClosed)
 		}
 		return
 	}
 	conn.submitMu.Lock()
-	conn.scheduled.Store(false)
+	left := conn.taskState.And(^taskScheduledBit)
 	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
 	conn.submitMu.Unlock()
 	rescheduled := false
-	if conn.pendingEvents.Load() != 0 && !conn.loop.ioStopped() && conn.scheduled.CompareAndSwap(false, true) {
+	if left&^taskScheduledBit != 0 && !conn.loop.ioStopped() &&
+		conn.taskState.Or(taskScheduledBit)&taskScheduledBit == 0 {
 		rescheduled = true // the current reservation moves to the next turn
 		if !conn.loop.ioPool.submit(conn) {
 			conn.handleIOSubmitFailure(net.ErrClosed)
@@ -614,13 +670,13 @@ func (conn *fdConn) handleIOSubmitFailure(err error) {
 	// turn, and then the closure goes back to the loop here, or the connection
 	// would never close.
 	conn.submitMu.Lock()
-	conn.scheduled.Store(false)
+	conn.taskState.And(^taskScheduledBit)
 	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
 	conn.submitMu.Unlock()
 	phase := conn.close.phase.Load()
 	if phase < closeResourcesReleased {
 		conn.requestClose(err)
-	} else if phase == closeResourcesReleased && conn.pendingEvents.Load()&ioEventClose != 0 {
+	} else if phase == closeResourcesReleased && conn.taskState.Load()&ioEventClose != 0 {
 		// closeOnLoop publishes the final cause before setting ioEventClose.
 		// A rejected earlier task must not deliver OnClose during that gap.
 		conn.fireCloseCallback()
@@ -683,7 +739,7 @@ func (conn *fdConn) runIOTask() {
 			conn.kickWriter()
 		}
 		if settle {
-			conn.settleInterest(events)
+			conn.settleInterest()
 		}
 		conn.ioOwner.Store(0)
 		conn.finishIOTask()
@@ -716,7 +772,7 @@ func (conn *fdConn) runIOTask() {
 		var err error
 		if conn.isDatagram() {
 			err = conn.onRecvUDP()
-		} else {
+		} else if !conn.readPaused() {
 			err = conn.onRead()
 		}
 		if err != nil {
@@ -738,31 +794,56 @@ func (conn *fdConn) runIOTask() {
 	ended = true
 }
 
-// settleInterest tells the loop what a connection turn left behind: output
-// the socket refused needs writable interest, a read that yielded or paused
-// needs another turn, and an edge already handled may leave interest to drop.
-func (conn *fdConn) settleInterest(events uint32) {
-	if !conn.needsInterestRefresh(events) {
+// settleInterest hands read work the turn left owed to the next turn. A read
+// the outbound limit paused is left to the drain that reaches the resume mark;
+// one that only yielded or ran out of budget is queued here. pauseRead stored
+// readStalled before this loads throttled, which is what lets a pause rely on
+// the refresh that clears throttled to redeliver it.
+func (conn *fdConn) settleInterest() {
+	if !conn.readStalled.Load() || conn.throttled.Load() || conn.isClosing() {
 		return
 	}
-	if conn.canRedeliverRead(events) {
-		// A read round that only yielded leaves nothing for the loop to
-		// change: the next turn is queued here instead of through it.
-		conn.readStalled.Store(false)
-		conn.pendingEvents.Or(ioEventRead | ioEventWake)
-		return
+	if conn.readStalled.CompareAndSwap(true, false) {
+		conn.taskState.Or(ioEventRead | ioEventWake)
 	}
-	conn.scheduleRefresh()
 }
 
-// canRedeliverRead reports whether a stalled read may be handed straight to
-// the next turn. Only the refresh command may change registered interest, so
-// this holds only when the interest the loop would compute is unchanged:
-// no outbound limit to throttle reads, nothing left to write, and no writable
-// edge whose interest may need disarming.
-func (conn *fdConn) canRedeliverRead(events uint32) bool {
-	return conn.readStalled.Load() && events&ioEventWrite == 0 && conn.events.MaxOutboundBuffered <= 0 &&
-		conn.outboundEmpty() && !conn.writeBlocked() && !conn.isClosing()
+// readPaused reports whether the outbound limit holds this turn's read back,
+// recording the read as owed when it does. Reads pause once the backlog
+// reaches 75% of MaxOutboundBuffered and stay paused until it drains to 50%,
+// whichever edge started the turn: a writable edge carries read readiness as
+// well, and kqueue raises read edges for every arrival. Once a hangup has been
+// reported the turn reads on regardless, so the peer is closed after its last
+// bytes as it would be unthrottled.
+func (conn *fdConn) readPaused() bool {
+	return conn.events.MaxOutboundBuffered > 0 && conn.readPausedByLimit()
+}
+
+func (conn *fdConn) readPausedByLimit() bool {
+	limit := int64(conn.events.MaxOutboundBuffered)
+	if conn.turn&turnHangup != 0 {
+		return false
+	}
+	if !conn.throttled.Load() && conn.pending.Load() < limit-limit/4 {
+		return false
+	}
+	return conn.pauseRead(limit)
+}
+
+// pauseRead records a read the outbound limit stops and reports whether it
+// stays paused. The send that retires the backlog to the resume mark
+// schedules a refresh, and the loop redelivers the read; a backlog that got
+// there before the pause was published had nobody to redeliver it, so the
+// caller takes the read back and delivers it itself.
+func (conn *fdConn) pauseRead(limit int64) bool {
+	conn.throttled.Store(true)
+	conn.readStalled.Store(true)
+	if conn.throttled.Load() && conn.pending.Load() > limit/2 {
+		return true
+	}
+	conn.throttled.Store(false)
+	// A refresh that saw the stored readStalled has redelivered it already.
+	return !conn.readStalled.CompareAndSwap(true, false)
 }
 
 // RunTask implements IOTask for injected executors. The executor contract
@@ -772,22 +853,6 @@ func (conn *fdConn) RunTask() {
 		return
 	}
 	conn.runIOTask()
-}
-
-func (conn *fdConn) needsInterestRefresh(events uint32) bool {
-	if conn.readStalled.Load() || events&ioEventWrite != 0 {
-		return true
-	}
-	// Remaining output needs writable interest only while the socket is full
-	// or nobody holds the claim to send it; a write turn arms it itself when
-	// its send blocks.
-	if !conn.outboundEmpty() && (conn.writeBlocked() || !conn.writeClaimed()) {
-		return true
-	}
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
-		return conn.pending.Load() >= limit-limit/4
-	}
-	return false
 }
 
 func (conn *fdConn) closeUnregistered() {
@@ -874,7 +939,7 @@ func (conn *fdConn) fireOnOpen() {
 		callback(conn)
 		conn.endInboundCallback(started)
 	}
-	if !conn.scheduled.Load() {
+	if conn.taskState.Load()&taskScheduledBit == 0 {
 		if err := conn.finishCallback(); err != nil {
 			conn.requestClose(err)
 		}
@@ -1004,10 +1069,9 @@ func (conn *fdConn) readRound(buffer []byte) error {
 			if _, err := conn.flushOnLoop(); err != nil {
 				return err
 			}
-			if conn.readShouldStop() {
-				// The peer is behind. readStalled records that ET delivery is owed;
-				// the refresh command resubmits the read after output drains.
-				conn.readStalled.Store(true)
+			// The peer is behind. readStalled records that ET delivery is owed;
+			// the refresh command resubmits the read after output drains.
+			if conn.readShouldStop() && conn.pauseRead(int64(conn.events.MaxOutboundBuffered)) {
 				return nil
 			}
 		}
@@ -1211,9 +1275,9 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	if conn.close.isReleased() {
 		return
 	}
-	if conn.scheduled.Load() {
+	if conn.taskState.Load()&taskScheduledBit != 0 {
 		conn.submitMu.Lock()
-		if conn.scheduled.Load() && !conn.close.isReleased() {
+		if conn.taskState.Load()&taskScheduledBit != 0 && !conn.close.isReleased() {
 			conn.setDeferredCloseLocked(cause)
 			conn.submitMu.Unlock()
 			return
@@ -1309,15 +1373,15 @@ func (conn *fdConn) scheduleCloseCallback(err error) {
 	conn.submitMu.Lock()
 	conn.setDeferredCloseLocked(err)
 	conn.submitMu.Unlock()
-	conn.pendingEvents.Or(ioEventClose)
-	if !conn.scheduled.CompareAndSwap(false, true) {
+	conn.taskState.Or(ioEventClose)
+	if conn.taskState.Or(taskScheduledBit)&taskScheduledBit != 0 {
 		return
 	}
 	if conn.loop != nil {
 		conn.loop.acquireCloseIO()
 	}
 	if conn.loop == nil || conn.loop.ioPool == nil || !conn.loop.ioPool.submit(conn) {
-		conn.scheduled.Store(false)
+		conn.taskState.And(^taskScheduledBit)
 		conn.fireCloseCallback()
 		if conn.loop != nil {
 			conn.loop.releaseIO()

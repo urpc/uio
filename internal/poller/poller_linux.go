@@ -5,9 +5,11 @@ package poller
 import (
 	"encoding/binary"
 	"errors"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -61,6 +63,14 @@ type Batch struct {
 	rawEvents [1024]unix.EpollEvent
 	wakefd    int
 	haveWake  bool
+
+	// parkFile holds a non-blocking duplicate of the epoll descriptor,
+	// registered with the runtime's netpoller so its owner can wait parked
+	// (see WaitBatchParked); parkConn is its raw connection. Both live here,
+	// per waiter, because the runtime wakes every goroutine parked on the
+	// descriptor, and several waiters share one poller.
+	parkFile *os.File
+	parkConn syscall.RawConn
 }
 
 // NewNetPoller creates epoll and registers its internal level-triggered waker.
@@ -181,10 +191,38 @@ func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
 // WaitBatch is Wait with a caller-owned kernel buffer. epoll hands each ready
 // edge to one waiter, so several goroutines can share one poller this way.
 func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int, error) {
-	// Register before entering epoll_wait so Close wakes instead of releasing
-	// descriptors that this call can still access. The registration and the
-	// private wake descriptor are published under the same lock Close reads,
-	// so a waiter is either seen by Close or observes the closed poller.
+	if registered, err := poller.beginWait(batch); !registered {
+		return 0, err
+	}
+	defer poller.finishWait()
+	return poller.wait(batch, out, timeout, false)
+}
+
+// WaitBatchParked is WaitBatch with the blocking wait parked in the runtime's
+// netpoller rather than spent in epoll_wait. A goroutine blocked in a system
+// call keeps its P until the runtime's monitor takes it back, which can leave
+// the workers a waiter just woke queued behind it; parked, the waiter hands
+// its P back the moment it finds nothing, and the runtime wakes it as soon as
+// the epoll descriptor reports events. A non-blocking duplicate of the
+// descriptor, registered with the runtime, is what it parks on; each Read
+// callback takes whatever is ready with a zero-timeout wait, so a waiter with
+// events pending still makes exactly one syscall. Where that duplicate cannot
+// be set up, the wait falls back to blocking in epoll_wait as before.
+func (poller *NetPoller) WaitBatchParked(batch *Batch, out []Event) (int, error) {
+	if registered, err := poller.beginWait(batch); !registered {
+		return 0, err
+	}
+	defer poller.finishWait()
+	return poller.wait(batch, out, -1, true)
+}
+
+// beginWait registers a waiter before it enters the kernel, so Close wakes it
+// instead of releasing descriptors it can still access. The registration and
+// the private wake descriptor are published under the same lock Close reads,
+// so a waiter is either seen by Close or observes the closed poller. Only a
+// registered waiter may enter the kernel and run finishWait; a closed poller
+// registers nothing, and its close reason, the error returned then, may be nil.
+func (poller *NetPoller) beginWait(batch *Batch) (bool, error) {
 	poller.mu.Lock()
 	if poller.closed.Load() {
 		// Another waiter may still be registered: Close woke it on its private
@@ -196,20 +234,20 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 		}
 		err := poller.closeError()
 		poller.mu.Unlock()
-		return 0, err
+		return false, err
 	}
 	if !batch.haveWake {
 		wakefd, err := unix.Eventfd(0, unix.EFD_NONBLOCK|unix.EFD_CLOEXEC)
 		if err != nil {
 			poller.mu.Unlock()
-			return 0, err
+			return false, err
 		}
 		if err = unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 			Fd: int32(wakefd), Events: readEvents,
 		}); err != nil {
 			_ = unix.Close(wakefd)
 			poller.mu.Unlock()
-			return 0, err
+			return false, err
 		}
 		batch.wakefd = wakefd
 		batch.haveWake = true
@@ -217,17 +255,42 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 	}
 	poller.waiters++
 	poller.mu.Unlock()
-	defer poller.finishWait()
+	return true, nil
+}
+
+// wait takes one round of events and converts them. park selects the parked
+// wait of WaitBatchParked over the probe-and-block of WaitBatch.
+func (poller *NetPoller) wait(batch *Batch, out []Event, timeout int, park bool) (int, error) {
 	var n int
 	var err error
-	// A raw zero-timeout probe first: while readiness is pending, which under
-	// load it almost always is, this takes the batch without entering the
-	// runtime's syscall accounting, so the waiter keeps its P and the events
-	// are handed to the executor a hand-off earlier. The probe costs one
-	// syscall on an idle wait, and the blocking call still sees any readiness
-	// that arrives after an empty probe. It stays off small hosts, where
-	// holding a P through a syscall costs more than the hand-off it saves.
-	if timeout != 0 && rawProbeEnabled {
+	if park {
+		if batch.parkConn == nil {
+			poller.mountPark(batch)
+		}
+		if batch.parkConn != nil {
+			readErr := batch.parkConn.Read(func(uintptr) bool {
+				n, err = unix.EpollWait(poller.epfd, batch.rawEvents[:], 0)
+				return n != 0 || (err != nil && err != unix.EINTR)
+			})
+			if readErr != nil {
+				// The runtime cannot poll the duplicate after all. Drop it and
+				// block instead, as the wait always could.
+				batch.parkFile.Close()
+				batch.parkFile, batch.parkConn = nil, nil
+				n, err = 0, nil
+			}
+		}
+		if batch.parkConn == nil {
+			n, err = unix.EpollWait(poller.epfd, batch.rawEvents[:], timeout)
+		}
+	} else if timeout != 0 && rawProbeEnabled {
+		// A raw zero-timeout probe first: while readiness is pending, which under
+		// load it almost always is, this takes the batch without entering the
+		// runtime's syscall accounting, so the waiter keeps its P and the events
+		// are handed to the executor a hand-off earlier. The probe costs one
+		// syscall on an idle wait, and the blocking call still sees any readiness
+		// that arrives after an empty probe. It stays off small hosts, where
+		// holding a P through a syscall costs more than the hand-off it saves.
 		r, _, errno := unix.RawSyscall6(unix.SYS_EPOLL_PWAIT, uintptr(poller.epfd),
 			uintptr(unsafe.Pointer(&batch.rawEvents[0])), uintptr(len(batch.rawEvents)), 0, 0, 0)
 		if errno == 0 && r > 0 {
@@ -279,6 +342,33 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 		count++
 	}
 	return count, nil
+}
+
+// mountPark duplicates the epoll descriptor as non-blocking and hands the
+// duplicate to the runtime's netpoller, which only polls descriptors that are.
+// epoll_wait itself is unaffected by the flag. On any failure the batch is
+// left without a park and the caller blocks in epoll_wait instead.
+func (poller *NetPoller) mountPark(batch *Batch) {
+	if batch.parkFile != nil {
+		batch.parkFile.Close()
+		batch.parkFile = nil
+	}
+	fd, err := unix.Dup(poller.epfd)
+	if err != nil {
+		return
+	}
+	if err = unix.SetNonblock(fd, true); err != nil {
+		_ = unix.Close(fd)
+		return
+	}
+	file := os.NewFile(uintptr(fd), "uio-epoll")
+	conn, err := file.SyscallConn()
+	if err != nil {
+		file.Close()
+		return
+	}
+	batch.parkFile = file
+	batch.parkConn = conn
 }
 
 // Wake interrupts Wait. The eventfd counter is coalesced by the event loop, so
@@ -370,6 +460,11 @@ func (poller *NetPoller) release() {
 			// forget the descriptor instead of ever touching it again.
 			waiter.wakefd = 0
 			waiter.haveWake = false
+			if waiter.parkFile != nil {
+				waiter.parkFile.Close()
+				waiter.parkFile = nil
+				waiter.parkConn = nil
+			}
 		}
 		poller.wakers = nil
 		_ = unix.Close(poller.wakefd)

@@ -125,7 +125,7 @@ func TestDataPollerIgnoresStaleTags(t *testing.T) {
 		t.Fatal("connection did not open")
 	}
 	deadline := time.Now().Add(5 * time.Second)
-	for conn.scheduled.Load() {
+	for conn.taskState.Load()&taskScheduledBit != 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("open task did not finish")
 		}
@@ -136,7 +136,7 @@ func TestDataPollerIgnoresStaleTags(t *testing.T) {
 	shard := events.data.shard(conn.Fd())
 	stale := poller.Event{FD: conn.Fd(), Events: poller.ReadEvents, Tag: conn.pollTag + 1}
 	events.data.dispatch(shard, waiter, []poller.Event{stale})
-	if len(waiter.ready) != 0 || conn.scheduled.Load() {
+	if len(waiter.ready) != 0 || conn.taskState.Load()&taskScheduledBit != 0 {
 		t.Fatal("stale readiness scheduled the current connection")
 	}
 
@@ -160,7 +160,7 @@ func TestDataPollerRunsOpenBeforeRead(t *testing.T) {
 		// read by this connection's task shows it ran as well.
 		start := reads.Load()
 		deadline := time.Now().Add(2 * time.Second)
-		for !conn.scheduled.Load() && reads.Load() == start {
+		for conn.taskState.Load()&taskScheduledBit == 0 && reads.Load() == start {
 			if time.Now().After(deadline) {
 				return
 			}

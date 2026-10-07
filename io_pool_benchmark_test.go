@@ -165,8 +165,8 @@ func (runner *ioTaskBenchmarkRunner) runBatch() {
 	wait.Add(len(runner.connections))
 	runner.active.Store(&wait)
 	for _, conn := range runner.connections {
-		conn.pendingEvents.Store(ioEventOpen)
-		conn.scheduled.Store(true)
+		conn.taskState.Store(ioEventOpen)
+		conn.taskState.Or(taskScheduledBit)
 		if !conn.loop.acquireIO() {
 			panic("I/O benchmark loop stopped")
 		}
@@ -176,7 +176,7 @@ func (runner *ioTaskBenchmarkRunner) runBatch() {
 	}
 	wait.Wait()
 	for _, conn := range runner.connections {
-		for conn.scheduled.Load() {
+		for conn.taskState.Load()&taskScheduledBit != 0 {
 			runtime.Gosched()
 		}
 	}

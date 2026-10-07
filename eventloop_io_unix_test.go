@@ -17,7 +17,7 @@ func TestIOAdmissionRaceWithShutdown(t *testing.T) {
 		go func() {
 			<-start
 			if conn.noteIO(ioEventRead) {
-				conn.scheduled.Store(false)
+				conn.taskState.And(^taskScheduledBit)
 				loop.releaseIO()
 			}
 			close(producerDone)
@@ -38,7 +38,7 @@ func TestIOAdmissionRaceWithShutdown(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("shutdown lost an in-flight I/O reservation")
 		}
-		if conn.scheduled.Load() {
+		if conn.taskState.Load()&taskScheduledBit != 0 {
 			t.Fatal("shutdown left a connection scheduled without an owner")
 		}
 	}

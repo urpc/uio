@@ -38,8 +38,8 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 	for index := range tasks {
 		conn := &fdConn{commonConn: commonConn{events: events}}
 		conn.close.phase.Store(closeResourcesReleased)
-		conn.pendingEvents.Store(ioEventClose)
-		conn.scheduled.Store(true)
+		conn.taskState.Store(ioEventClose)
+		conn.taskState.Or(taskScheduledBit)
 		tasks[index] = conn
 	}
 
@@ -101,7 +101,7 @@ func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
 	events := &Events{Pollers: 1, OnClose: func(_ Conn, err error) { closed <- err }}
 	testConn := newTestConnection(t, events)
 	conn := testConn.conn
-	for deadline := time.Now().Add(2 * time.Second); conn.scheduled.Load() || conn.ioOwner.Load() != 0; {
+	for deadline := time.Now().Add(2 * time.Second); conn.taskState.Load()&taskScheduledBit != 0 || conn.ioOwner.Load() != 0; {
 		if time.Now().After(deadline) {
 			t.Fatal("connection did not finish opening")
 		}

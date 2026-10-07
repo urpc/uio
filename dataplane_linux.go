@@ -146,8 +146,21 @@ func dataWaiters(shards int) int {
 	return perShard
 }
 
+// parkedWaiters is the most waiters that still benefit from a parked wait.
+// The runtime's netpoller wakes a parked goroutine only when a P runs out of
+// work or its 10ms tick lands, so once enough waiters park at once some wait
+// minutes-long stretches in wall-clock terms and closed-loop echo pays it in
+// round trips: measured on a 64-logical-CPU host, one waiter per shard kept
+// pace while two per shard — sixteen parked waiters over eight epoll
+// descriptors — halved throughput (3.7M to 1.5M requests a second). Up to the
+// eight waiters a 48-CPU host runs, park measured level or ahead everywhere,
+// and on a small host it is what fills the cores at all. Past that the waiter
+// blocks in epoll_wait with the raw probe as before.
+const parkedWaiters = 8
+
 func (data *dataPoller) start(ev *Events) {
 	perShard := dataWaiters(len(data.shards))
+	parked := perShard*len(data.shards) <= parkedWaiters
 	for _, shard := range data.shards {
 		for range perShard {
 			waiter := &dataWaiter{
@@ -162,7 +175,7 @@ func (data *dataPoller) start(ev *Events) {
 					runtime.LockOSThread()
 					defer runtime.UnlockOSThread()
 				}
-				if err := data.serve(shard, waiter, perShard > 1); err != nil {
+				if err := data.serve(shard, waiter, perShard > 1, parked); err != nil {
 					ev.initiateClose(err)
 				}
 			}(shard)
@@ -182,9 +195,15 @@ func (data *dataPoller) start(ev *Events) {
 // call until the runtime retakes it; yielding runs them at once while another
 // waiter keeps watching the poller. A lone waiter must not yield: it would
 // queue behind the very workers it woke.
-func (data *dataPoller) serve(shard *dataShard, waiter *dataWaiter, yield bool) error {
+func (data *dataPoller) serve(shard *dataShard, waiter *dataWaiter, yield, parked bool) error {
 	for {
-		n, err := shard.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
+		var n int
+		var err error
+		if parked {
+			n, err = shard.poller.WaitBatchParked(&waiter.batch, waiter.evbuf)
+		} else {
+			n, err = shard.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
+		}
 		if shard.poller.Closed() {
 			return nil
 		}
@@ -203,7 +222,7 @@ func (data *dataPoller) serve(shard *dataShard, waiter *dataWaiter, yield bool) 
 func (data *dataPoller) dispatch(shard *dataShard, waiter *dataWaiter, events []poller.Event) {
 	for _, event := range events {
 		conn := shard.fdMap.Get(event.FD)
-		if conn == nil || conn.pollTag != event.Tag || conn.isClosing() {
+		if conn == nil || conn.pollTag != event.Tag || conn.isClosing() || conn.skipsEdge(event.Events) {
 			continue
 		}
 		if conn.noteIO(uint32(event.Events)) {

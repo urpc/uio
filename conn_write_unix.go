@@ -11,7 +11,6 @@ import (
 	"unsafe"
 
 	"github.com/urpc/uio/internal/bytebuf"
-	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 )
 
@@ -797,56 +796,32 @@ func (conn *fdConn) outboundEmpty() bool {
 	return conn.pending.Load() == 0
 }
 
+// updateInterest runs the outbound limit's read-pause hysteresis on the loop,
+// whose refresh command then redelivers a paused read once throttled is
+// clear. A stream's registration never changes — read and write interest are
+// armed together at Add, and under edge triggering the always-armed write
+// interest reports a socket only when it goes from full back to writable —
+// so this issues no epoll_ctl.
 func (conn *fdConn) updateInterest() error {
 	if conn.close.isReleased() || (conn.udp != nil && conn.udp.server != nil) {
 		return nil
 	}
-	want := conn.desiredInterest()
-	if want == conn.interest {
-		return nil
+	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
+		// Hysteresis avoids resuming around a single threshold.
+		if pending := conn.pending.Load(); pending <= limit/2 {
+			conn.throttled.Store(false)
+		} else if pending >= limit-limit/4 {
+			conn.throttled.Store(true)
+		}
+	} else {
+		conn.throttled.Store(false)
 	}
-	if err := conn.watcher().Modify(conn.fd, conn.interest, want); err != nil {
-		return err
-	}
-	conn.interest = want
 	return nil
 }
 
-// desiredInterest applies per-connection read hysteresis and arms writable
-// only while user-space output remains. It runs exclusively on the event loop.
-func (conn *fdConn) desiredInterest() poller.Interest {
-	if conn.isDatagram() {
-		return poller.Readable
-	}
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
-		// Hysteresis avoids toggling Readable around a single threshold.
-		pending := conn.pending.Load()
-		if !conn.throttled && pending >= limit-limit/4 {
-			conn.throttled = true
-		}
-		if conn.throttled && pending <= limit/2 {
-			conn.throttled = false
-		}
-	} else {
-		conn.throttled = false
-	}
-	var want poller.Interest
-	if !conn.throttled {
-		want |= poller.Readable
-	}
-	if !conn.outboundEmpty() {
-		want |= poller.Writable
-	}
-	if want == 0 {
-		// pending may still live in queued tasks; suppress reads until consumed.
-		want = poller.Writable
-	}
-	return want
-}
-
-// readShouldStop reports whether this connection filled its outbound limit.
-// The interest side applies the same limit through hysteresis, so the read
-// round and poller registration cannot disagree.
+// readShouldStop reports whether this connection filled its outbound limit,
+// which ends a read round however far it got; a turn does not start reading
+// past the 75% mark at all (see readPaused).
 func (conn *fdConn) readShouldStop() bool {
 	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
 		return conn.pending.Load() >= limit

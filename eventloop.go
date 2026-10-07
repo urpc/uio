@@ -212,7 +212,7 @@ func (loop *eventLoop) runTasks(limit int) {
 }
 
 // runTask applies one control-plane command on the loop goroutine. Data-plane
-// readiness is deliberately absent: it is folded into fdConn.pendingEvents and
+// readiness is deliberately absent: it is folded into fdConn.taskState and
 // submitted to ioPool after the entire poll batch has been collected.
 func (loop *eventLoop) runTask(t *task) {
 	done := t.done
@@ -410,6 +410,9 @@ func (loop *eventLoop) OnEvent(_ *poller.NetPoller, fd int, events poller.Events
 		}
 		return
 	}
+	if conn.skipsEdge(events) {
+		return
+	}
 	if conn.noteIO(uint32(events)) {
 		loop.ioReady = append(loop.ioReady, conn)
 	}
@@ -427,26 +430,6 @@ func (loop *eventLoop) delConn(conn *fdConn) {
 		data.unregister(conn.Fd())
 	}
 	_ = conn.watcher().Remove(conn.Fd(), conn.currentInterest())
-}
-func (loop *eventLoop) modRead(conn *fdConn) error {
-	return loop.modifyInterest(conn, poller.Readable)
-}
-func (loop *eventLoop) modWrite(conn *fdConn) error {
-	return loop.modifyInterest(conn, poller.Writable)
-}
-func (loop *eventLoop) modReadWrite(conn *fdConn) error {
-	return loop.modifyInterest(conn, poller.Readable|poller.Writable)
-}
-func (loop *eventLoop) modifyInterest(conn *fdConn, want poller.Interest) error {
-	previous := conn.currentInterest()
-	if previous == want {
-		return nil
-	}
-	if err := conn.watcher().Modify(conn.Fd(), previous, want); err != nil {
-		return err
-	}
-	conn.setInterest(want)
-	return nil
 }
 
 // registeredForTest, when a test sets it, runs on the loop after a connection

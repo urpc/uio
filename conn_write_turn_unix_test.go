@@ -165,9 +165,11 @@ func TestWriteTurnReleaseLosesNoWrite(t *testing.T) {
 // overlaps a write turn's send nor gives away a claim it does not hold: both
 // producers' records arrive whole, once, and in order. A goroutine stands in
 // for the connection's own uncorked callback. The socket buffers hold every
-// record, so no send blocks and no writable edge runs the real turn beside it:
-// two turns of one connection never run at once. That needs TCP: a Unix
-// socket's per-send charge fills Linux's default limit after 555 such records.
+// record, so a send blocks only on the kernel's page-granular accounting, and
+// the write edges it raises are flushed by real turns beside the writers: the
+// claim serializes the sends, and the records arrive whole. That needs TCP: a
+// Unix socket's per-send charge fills Linux's default limit after 555 such
+// records.
 func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 	const records, recordSize = 4000, 8
 	testConn := newTCPTestConnection(t, &Events{Pollers: 1})
@@ -215,10 +217,9 @@ func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 				return
 			}
 		}
-		// Bytes the owner queued behind a write turn leave with its release.
-		if _, err := conn.flushOnLoop(); err != nil {
-			t.Error(err)
-		}
+		// Bytes the owner queued behind a write turn leave with the kick a
+		// turn's release makes; flushOnLoop itself runs only inside a turn.
+		conn.kickWriter()
 	}()
 	data := readPeerUntil(t, testConn.peer, 2*records*recordSize, 10*time.Second)
 	wg.Wait()
@@ -443,9 +444,10 @@ func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	}
 }
 
-// A read that finds the outbound limit full while a write turn holds the claim
-// pauses: it is not redelivered while the backlog stays high, and the write
-// turn that drains the backlog restarts it without any writable edge.
+// Input that arrives while a write turn holds the claim over a backlog past
+// the throttle mark is not read: the read pauses, it is not redelivered while
+// the backlog stays high, and the write turn that drains the backlog restarts
+// it without any writable edge.
 func TestOutboundLimitPausesReadsUntilWriteTurnDrains(t *testing.T) {
 	const limit, readSize, sent = 1024, 64, 200
 	var armed atomic.Bool
@@ -501,14 +503,18 @@ func TestOutboundLimitPausesReadsUntilWriteTurnDrains(t *testing.T) {
 	if _, err := testConn.conn.Write(bytes.Repeat([]byte{'y'}, limit)); err != nil {
 		t.Fatal(err)
 	}
-	// The peer sends more than one read takes; the first read finds the
-	// limit full and pauses.
+	// The peer sends input; the turn its edge starts finds the backlog past
+	// the throttle mark and records the read as owed instead of reading.
 	if err := writePeerAll(testConn.peer, make([]byte, sent), time.Now().Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	waitConsumed(readSize, "the first read did not happen")
+	for deadline := time.Now().Add(2 * time.Second); !testConn.conn.readStalled.Load(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the input's turn did not pause the read")
+		}
+	}
 	time.Sleep(50 * time.Millisecond)
-	if n := consumed.Load(); n != readSize {
+	if n := consumed.Load(); n != 0 {
 		t.Fatalf("reads went on while the outbound limit was full: consumed %d bytes", n)
 	}
 	// Draining the backlog never fills the socket, so no writable edge comes.

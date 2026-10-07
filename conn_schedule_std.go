@@ -24,11 +24,12 @@ func (conn *fdConn) scheduleIO(events uint32) {
 
 // Blocking backends start a connection's I/O only after OnOpen, so its open
 // event cannot race with readiness.
-func (conn *fdConn) markOpenPending()            {}
-func (conn *fdConn) clearOpenPending()           {}
-func (conn *fdConn) scheduleOpen()               { conn.scheduleIO(ioEventOpen) }
-func (conn *fdConn) noteIO(uint32) bool          { return false }
-func (conn *fdConn) RunTask()                    {}
-func (conn *fdConn) handleIOSubmitFailure(error) {}
-func (conn *fdConn) readNeedsRedelivery() bool   { return false }
-func (conn *fdConn) clearReadRedelivery() bool   { return false }
+func (conn *fdConn) markOpenPending()             {}
+func (conn *fdConn) clearOpenPending()            {}
+func (conn *fdConn) scheduleOpen()                { conn.scheduleIO(ioEventOpen) }
+func (conn *fdConn) noteIO(uint32) bool           { return false }
+func (conn *fdConn) skipsEdge(poller.Events) bool { return false }
+func (conn *fdConn) RunTask()                     {}
+func (conn *fdConn) handleIOSubmitFailure(error)  {}
+func (conn *fdConn) readNeedsRedelivery() bool    { return false }
+func (conn *fdConn) clearReadRedelivery() bool    { return false }
