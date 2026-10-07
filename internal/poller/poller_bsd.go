@@ -30,7 +30,6 @@ type NetPoller struct {
 	waiters int        // includes readiness-event conversion after kevent
 
 	closed      atomic.Bool
-	edgeFD      map[int]bool
 	closeReason atomic.Pointer[error]
 	releaseOnce sync.Once
 	rawEvents   [1024]unix.Kevent_t
@@ -56,39 +55,33 @@ func NewNetPoller() (*NetPoller, error) {
 			return nil, err
 		}
 	}
-	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1], edgeFD: make(map[int]bool)}
-	if err = poller.change(waker[0], readEvents, unix.EV_ADD); err != nil {
+	poller := &NetPoller{kqfd: kqfd, wakeRead: waker[0], wakeWrite: waker[1]}
+	if err = poller.change(waker[0], readEvents, unix.EV_ADD, false); err != nil {
 		poller.release()
 		return nil, err
 	}
 	return poller, nil
 }
 
-// SetEdgeTriggered selects EV_CLEAR for future application registrations.
-func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
-	poller.mu.Lock()
-	if enabled {
-		poller.edgeFD[fd] = true
-	} else {
-		delete(poller.edgeFD, fd)
-	}
-	poller.mu.Unlock()
-}
-
-// SetTag is accepted for interface parity; kqueue events report a zero tag.
-func (poller *NetPoller) SetTag(int, uint32) {}
-
-// Add registers a descriptor.
+// Add registers a descriptor. Its readiness is level-triggered; Register
+// covers connections.
 func (poller *NetPoller) Add(fd int, want Interest) error {
-	return poller.modify(fd, 0, want)
+	return poller.modify(fd, 0, want, false)
 }
 
 // Modify changes filters using the caller-owned previous interest.
 func (poller *NetPoller) Modify(fd int, previous, want Interest) error {
-	return poller.modify(fd, previous, want)
+	return poller.modify(fd, previous, want, false)
 }
 
-func (poller *NetPoller) modify(fd int, previous, want Interest) error {
+// Register adds a connection's descriptor in one call: want is the interest
+// and edge selects EV_CLEAR, kqueue's edge-triggered readiness. The tag is
+// accepted for interface parity; kqueue events report a zero tag.
+func (poller *NetPoller) Register(fd int, want Interest, edge bool, _ uint32) error {
+	return poller.modify(fd, 0, want, edge)
+}
+
+func (poller *NetPoller) modify(fd int, previous, want Interest, edge bool) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
@@ -100,12 +93,12 @@ func (poller *NetPoller) modify(fd int, previous, want Interest) error {
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
-	return poller.modifyLocked(fd, previous, want)
+	return poller.modifyLocked(fd, previous, want, edge)
 }
 
 // modifyLocked translates one logical interest transition into the minimum set
 // of independent kqueue filter changes.
-func (poller *NetPoller) modifyLocked(fd int, previous, want Interest) error {
+func (poller *NetPoller) modifyLocked(fd int, previous, want Interest, edge bool) error {
 	if previous&Readable != 0 && want&Readable == 0 {
 		if err := poller.deleteFilter(fd, readEvents); err != nil {
 			return err
@@ -117,12 +110,12 @@ func (poller *NetPoller) modifyLocked(fd int, previous, want Interest) error {
 		}
 	}
 	if previous&Readable == 0 && want&Readable != 0 {
-		if err := poller.change(fd, readEvents, unix.EV_ADD); err != nil {
+		if err := poller.change(fd, readEvents, unix.EV_ADD, edge); err != nil {
 			return err
 		}
 	}
 	if previous&Writable == 0 && want&Writable != 0 {
-		if err := poller.change(fd, writeEvents, unix.EV_ADD); err != nil {
+		if err := poller.change(fd, writeEvents, unix.EV_ADD, edge); err != nil {
 			return err
 		}
 	}
@@ -147,12 +140,11 @@ func (poller *NetPoller) removeLocked(fd int, previous Interest) error {
 	if previous&Writable != 0 {
 		errs = append(errs, poller.deleteFilter(fd, writeEvents))
 	}
-	delete(poller.edgeFD, fd)
 	return errors.Join(errs...)
 }
 
-func (poller *NetPoller) change(fd int, filter, flags int64) error {
-	if poller.edgeFD[fd] && flags&unix.EV_ADD != 0 {
+func (poller *NetPoller) change(fd int, filter int64, flags int64, edge bool) error {
+	if edge && flags&unix.EV_ADD != 0 {
 		flags |= unix.EV_CLEAR
 	}
 	event := makeKevent(fd, filter, flags)
@@ -161,7 +153,7 @@ func (poller *NetPoller) change(fd int, filter, flags int64) error {
 }
 
 func (poller *NetPoller) deleteFilter(fd int, filter int64) error {
-	err := poller.change(fd, filter, unix.EV_DELETE)
+	err := poller.change(fd, filter, unix.EV_DELETE, false)
 	// A missing filter already represents the requested state.
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
 		return nil

@@ -109,8 +109,8 @@ func (ld *acceptor) accept(l *listener) error {
 		fdc.fd = nfd
 		fdc.events = ld.events
 		fdc.loop = ld.events.selectWorker(nfd)
-		fdc.localAddr = l.laddr
-		fdc.remoteAddr = socket.SockaddrToAddr(sa, false)
+		fdc.localAddr = &l.laddr
+		fdc.remoteAddr = socket.SockaddrToAddrPort(sa)
 
 		ld.events.submitAccepted(fdc, tcp)
 	}
@@ -149,7 +149,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
-		l.udpSvr.localAddr = l.laddr
+		l.udpSvr.localAddr = &l.laddr
 
 		if err = ld.loop.fdMap.Put(l.fd, l.udpSvr); err != nil {
 			l.udpSvr.closeUnregistered()
@@ -159,7 +159,6 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			ld.loop.fdMap.Delete(l.fd)
 			return err
 		}
-		l.udpSvr.interest = poller.Readable
 		return nil
 	}
 

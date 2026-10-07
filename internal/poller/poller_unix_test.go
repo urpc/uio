@@ -282,8 +282,7 @@ func TestNetPollerReportsHangupApartFromData(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer poller.Close(nil)
-	poller.SetEdgeTriggered(fds[0], true)
-	if err = poller.Add(fds[0], Readable); err != nil {
+	if err = poller.Register(fds[0], Readable, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	wait := func() Events {

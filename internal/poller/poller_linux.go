@@ -43,8 +43,6 @@ type NetPoller struct {
 	wakers  []*Batch   // waiters Close raises on their private descriptor
 
 	closed      atomic.Bool
-	edgeFD      map[int]bool
-	tags        map[int]uint32
 	closeReason atomic.Pointer[error]
 	releaseOnce sync.Once
 	batch       Batch
@@ -84,7 +82,7 @@ func NewNetPoller() (*NetPoller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &NetPoller{epfd: epfd, wakefd: wakefd, edgeFD: make(map[int]bool), tags: make(map[int]uint32)}
+	poller := &NetPoller{epfd: epfd, wakefd: wakefd}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
@@ -95,33 +93,32 @@ func NewNetPoller() (*NetPoller, error) {
 	return poller, nil
 }
 
-// SetEdgeTriggered selects edge-triggered readiness for future registrations.
-// It must be called before adding application descriptors.
-func (poller *NetPoller) SetEdgeTriggered(fd int, enabled bool) {
-	poller.mu.Lock()
-	if enabled {
-		poller.edgeFD[fd] = true
-	} else {
-		delete(poller.edgeFD, fd)
-	}
-	poller.mu.Unlock()
-}
-
-// SetTag attaches tag to future registrations and modifications of fd. Wait
-// reports it with every event for fd; zero clears it.
-func (poller *NetPoller) SetTag(fd int, tag uint32) {
-	poller.mu.Lock()
-	if tag != 0 {
-		poller.tags[fd] = tag
-	} else {
-		delete(poller.tags, fd)
-	}
-	poller.mu.Unlock()
-}
-
-// Add registers a descriptor that is not already watched.
+// Add registers a descriptor that is not already watched. Its readiness is
+// level-triggered and its events carry no tag; Register covers connections.
 func (poller *NetPoller) Add(fd int, want Interest) error {
 	return poller.control(fd, want, unix.EPOLL_CTL_ADD)
+}
+
+// Register adds a connection's descriptor in one call: want is the interest,
+// edge selects edge-triggered readiness, and every event the poller reports
+// for fd carries tag. Streams and datagrams both register this way, once —
+// nothing modifies their registration afterwards — so the poller keeps no
+// per-descriptor state for triggering or tags.
+func (poller *NetPoller) Register(fd int, want Interest, edge bool, tag uint32) error {
+	if want == 0 {
+		return errInvalidInterest
+	}
+	if poller.closed.Load() {
+		return poller.closedError()
+	}
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	if poller.closed.Load() {
+		return poller.closedError()
+	}
+	return unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_ADD, fd, &unix.EpollEvent{
+		Fd: int32(fd), Pad: int32(tag), Events: epollEvents(want, edge),
+	})
 }
 
 // Modify changes the interest of an already watched descriptor.
@@ -137,8 +134,6 @@ func (poller *NetPoller) Remove(fd int, _ Interest) error {
 		return nil
 	}
 	err := unix.EpollCtl(poller.epfd, unix.EPOLL_CTL_DEL, fd, nil)
-	delete(poller.edgeFD, fd)
-	delete(poller.tags, fd)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.EBADF) {
 		return nil
 	}
@@ -158,25 +153,25 @@ func (poller *NetPoller) control(fd int, want Interest, operation int) error {
 		return poller.closedError()
 	}
 	if err := unix.EpollCtl(poller.epfd, operation, fd, &unix.EpollEvent{
-		Fd: int32(fd), Pad: int32(poller.tags[fd]), Events: poller.epollEvents(fd, want),
+		Fd: int32(fd), Events: epollEvents(want, false),
 	}); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (poller *NetPoller) epollEvents(fd int, want Interest) uint32 {
+// epollEvents maps an interest to epoll bits. Stream descriptors use
+// edge-triggered readiness because connection tasks drain each round until
+// EAGAIN; the wake descriptor is registered without that bit.
+func epollEvents(want Interest, edge bool) uint32 {
 	events := uint32(errorEvents)
-	// Stream descriptors use edge-triggered readiness because connection tasks
-	// drain each round until EAGAIN; the wake descriptor remains level-triggered.
-	// The wake descriptor is intentionally registered without this bit.
 	if want&Readable != 0 {
 		events |= readEvents
 	}
 	if want&Writable != 0 {
 		events |= writeEvents
 	}
-	if poller.edgeFD[fd] {
+	if edge {
 		events |= unix.EPOLLET
 	}
 	return events

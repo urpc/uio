@@ -99,6 +99,16 @@ func (fc *fdConn) closeUnregistered() {
 	}
 }
 
+func (fc *fdConn) RemoteAddr() net.Addr {
+	if !fc.remoteAddr.IsValid() {
+		return nil
+	}
+	if fc.isDatagram() {
+		return net.UDPAddrFromAddrPort(fc.remoteAddr)
+	}
+	return net.TCPAddrFromAddrPort(fc.remoteAddr)
+}
+
 func (fc *fdConn) Fd() int {
 	var rc syscall.Conn
 
@@ -254,7 +264,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 			n, err = fc.udp.Write(p)
 		} else {
 			// udp child connection.
-			n, err = fc.udp.WriteTo(p, fc.remoteAddr)
+			n, err = fc.udp.WriteTo(p, net.UDPAddrFromAddrPort(fc.remoteAddr))
 		}
 
 		if n > 0 {
@@ -809,7 +819,7 @@ func (fc *fdConn) listenUDP() error {
 			udpConn = &fdConn{}
 			udpConn.udp = fc.udp
 			udpConn.localAddr = fc.localAddr
-			udpConn.remoteAddr = addr
+			udpConn.remoteAddr = remoteAddrFrom(addr)
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
 			udpConn.udpSvr = fc

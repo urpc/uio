@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"sync/atomic"
 	"time"
 
@@ -220,16 +221,48 @@ func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 type commonConn struct {
 	events      *Events                 // events
 	loop        *eventLoop              // event loop
-	inboundGoid atomic.Int64            // current inbound callback owner
+	inboundLive atomic.Bool             // an inbound callback is in progress
+	turn        uint8                   // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
+	internal    bool                    // framework-owned endpoint, not a user connection
 	userdata    any                     // user-defined data; see Conn.SetUserdata
 	inboundTail []byte                  // inbound tail buffer
 	inbound     bytebuf.CompositeBuffer // inbound buffer
-	localAddr   net.Addr                // local address
-	remoteAddr  net.Addr                // remote address
+	// localAddr points at the address object rather than holding it: every
+	// connection a listener accepts shares the listener's one object, and the
+	// only connections that box their own are dialed or adopted ones.
+	localAddr  *net.Addr
+	remoteAddr netip.AddrPort // remote address, kept by value
 }
 
-func (fc *commonConn) LocalAddr() net.Addr  { return fc.localAddr }
-func (fc *commonConn) RemoteAddr() net.Addr { return fc.remoteAddr }
+func (fc *commonConn) LocalAddr() net.Addr {
+	if fc.localAddr == nil {
+		return nil
+	}
+	return *fc.localAddr
+}
+
+// setLocalAddr boxes addr behind the field; listeners hand their shared
+// address object to every connection they accept instead.
+func (fc *commonConn) setLocalAddr(addr net.Addr) { fc.localAddr = boxAddr(addr) }
+
+// boxAddr boxes an address; it is only for the cold paths that have no shared
+// object to point at.
+func boxAddr(addr net.Addr) *net.Addr { return &addr }
+
+// remoteAddrFrom converts a net.Addr to the value form the connection stores.
+func remoteAddrFrom(addr net.Addr) netip.AddrPort {
+	switch a := addr.(type) {
+	case *net.TCPAddr:
+		if a != nil {
+			return a.AddrPort()
+		}
+	case *net.UDPAddr:
+		if a != nil {
+			return a.AddrPort()
+		}
+	}
+	return netip.AddrPort{}
+}
 
 // Userdata is read on every data callback. Callers already serialize it with
 // SetUserdata, so it is a plain field: boxing it for atomic publication cost a
@@ -240,20 +273,16 @@ func (fc *commonConn) Userdata() any         { return fc.userdata }
 func (fc *commonConn) SetUserdata(value any) { fc.userdata = value }
 
 // Callback ownership is a contract check for borrowed inbound slices, not a
-// lock. Native tasks and std callbackMu serialize access before entering here.
-// Nested internal callback helpers leave the outer owner's scope intact.
+// lock. Native tasks and std callbackMu serialize access before entering here,
+// so at most one goroutine is ever inside a connection's callback and a flag
+// records it; nested internal helpers leave the outer caller's scope intact.
 func (fc *commonConn) beginInboundCallback() bool {
-	id := currentGoroutineID()
-	if fc.inboundGoid.Load() == id {
-		return false
-	}
-	fc.inboundGoid.Store(id)
-	return true
+	return fc.inboundLive.CompareAndSwap(false, true)
 }
 
 func (fc *commonConn) endInboundCallback(started bool) {
-	if started && fc.inboundGoid.Load() == currentGoroutineID() {
-		fc.inboundGoid.Store(0)
+	if started {
+		fc.inboundLive.Store(false)
 	}
 }
 func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
@@ -371,7 +400,7 @@ func (fc *commonConn) assertInboundAccess() {
 	if fc.loop == nil || fc.events == nil {
 		return
 	}
-	if fc.inboundGoid.Load() == currentGoroutineID() {
+	if fc.inboundLive.Load() {
 		return
 	}
 	panic("uio: inbound access outside a connection callback")

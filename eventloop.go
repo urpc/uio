@@ -442,8 +442,7 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	// Publish before Watch so every delivered event can resolve the fd.
 	fd := conn.Fd()
 	watcher := conn.watcher()
-	watcher.SetEdgeTriggered(fd, !conn.isDatagram())
-	watcher.SetTag(fd, conn.assignWatchTag())
+	tag := conn.assignWatchTag()
 	if err := loop.fdMap.Put(fd, conn); err != nil {
 		conn.closeUnregistered()
 		return err
@@ -452,7 +451,7 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	if !conn.isDatagram() {
 		conn.markOpenPending()
 	}
-	if err := watcher.Add(fd, interest); err != nil {
+	if err := watcher.Register(fd, interest, !conn.isDatagram(), tag); err != nil {
 		conn.clearOpenPending()
 		loop.fdMap.Delete(fd)
 		_ = watcher.Remove(fd, interest)
@@ -471,7 +470,6 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	if registeredForTest != nil {
 		registeredForTest(conn)
 	}
-	conn.setInterest(interest)
 	// Datagram callbacks and shared socket state stay on the loop. Stream
 	// callbacks run in their serialized connection task. Stdio's scheduleOpen
 	// starts its dedicated blocking I/O loops after OnOpen below.

@@ -27,21 +27,25 @@ import (
 // replies inline when the claim is free, and output from other goroutines is
 // sent by a write turn that runs beside the reading one.
 //
-// The layout keeps what a connection turn touches in the first lines and the
-// whole value within the 256-byte size class, whose objects are line aligned.
+// The declaration order packs the state exactly into the 256-byte size class
+// whose objects are cache-line aligned: the turn's scalars sit together in one
+// sixteen-byte block with no padding between them, and everything wider is
+// declared before it. Do not reorder a field into that block without checking
+// TestUnixConnectionColdStateIsLazy.
+const (
+	// readStalledFlag marks ET read work owed after a yield or backpressure.
+	readStalledFlag uint32 = 1 << iota
+	// throttledFlag marks the outbound limit's read pause, 75%/50% hysteresis;
+	// see pauseRead.
+	throttledFlag
+)
+
 type fdConn struct {
 	commonConn
 	fd int
-	// taskState coalesces readiness and synthetic events in its low bits and
-	// carries, in its top bit, the claim that exactly one task is queued or
-	// running: a producer sets both with one atomic and only the first setter
-	// submits, and the running turn keeps the bit while it takes the events.
-	taskState   atomic.Uint32
-	throttled   atomic.Bool   // outbound-limit read pause, 75%/50% hysteresis; see pauseRead
-	ioOwner     atomic.Int64  // current task goroutine, zero while idle
-	writeState  atomic.Uint32 // send state and the write claim; see writeOwnerFlag
-	readStalled atomic.Bool   // ET read work owed after yield/backpressure
-	pending     atomic.Int64  // accepted payload not yet written
+
+	ioOwner atomic.Int64 // current task goroutine, zero while idle
+	pending atomic.Int64 // accepted payload not yet written
 
 	// submitMu orders cross-goroutine submissions and protects outbound while a
 	// worker round and an external producer overlap.
@@ -57,12 +61,16 @@ type fdConn struct {
 	// only while bytes remain unsent.
 	inflight *bytebuf.CompositeBuffer
 
-	pollTag  uint32          // registration generation echoed by the data poller
-	interest poller.Interest // registration set at Add and never changed
-	turn     uint8           // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
-	internal bool            // framework-owned endpoint, not a user connection
-
 	deadlines *deadlineState // allocated by the first nonzero deadline
+
+	// taskState coalesces readiness and synthetic events in its low bits and
+	// carries, in its top bit, the claim that exactly one task is queued or
+	// running: a producer sets both with one atomic and only the first setter
+	// submits, and the running turn keeps the bit while it takes the events.
+	taskState  atomic.Uint32
+	writeState atomic.Uint32 // send state and the write claim; see writeOwnerFlag
+	pollTag    uint32        // registration generation echoed by the data poller
+	flags      atomic.Uint32 // readStalledFlag and throttledFlag; see below
 }
 
 // unixUDPState contains fields that TCP connections never use.
@@ -423,7 +431,54 @@ func (conn *fdConn) openOutputAfterOnOpen() {
 	conn.fireOnOpen()
 }
 
+// readStalled and throttled share one flags word so the two one-bit states
+// cost four bytes together, not one padded atomic each.
+
+func (conn *fdConn) readStalled() bool { return conn.flags.Load()&readStalledFlag != 0 }
+func (conn *fdConn) throttled() bool   { return conn.flags.Load()&throttledFlag != 0 }
+func (conn *fdConn) setReadStalled(v bool) {
+	if v {
+		conn.flags.Or(readStalledFlag)
+		return
+	}
+	conn.flags.And(^readStalledFlag)
+}
+func (conn *fdConn) setThrottled(v bool) {
+	if v {
+		conn.flags.Or(throttledFlag)
+		return
+	}
+	conn.flags.And(^throttledFlag)
+}
+
+// clearReadStalled reports whether the owed read was still owed; exactly one
+// caller clears it.
+func (conn *fdConn) clearReadStalled() bool {
+	for {
+		old := conn.flags.Load()
+		if old&readStalledFlag == 0 {
+			return false
+		}
+		if conn.flags.CompareAndSwap(old, old&^readStalledFlag) {
+			return true
+		}
+	}
+}
+
 func (conn *fdConn) Fd() int { return conn.fd }
+
+// RemoteAddr builds the net.Addr on demand: the connection keeps only the
+// 32-byte value, so an accepted connection allocates nothing for its peer
+// address. Datagram connections report it as a UDP address, streams as TCP.
+func (conn *fdConn) RemoteAddr() net.Addr {
+	if !conn.remoteAddr.IsValid() {
+		return nil
+	}
+	if conn.isDatagram() {
+		return net.UDPAddrFromAddrPort(conn.remoteAddr)
+	}
+	return net.TCPAddrFromAddrPort(conn.remoteAddr)
+}
 
 // initialInterest is what a stream registers for good: read and write
 // interest armed together, once. Under edge triggering an always-armed write
@@ -438,13 +493,14 @@ func (conn *fdConn) initialInterest() poller.Interest {
 	return poller.Readable | poller.Writable
 }
 
-func (conn *fdConn) setInterest(interest poller.Interest) { conn.interest = interest }
-func (conn *fdConn) currentInterest() poller.Interest     { return conn.interest }
-func (conn *fdConn) isClosing() bool                      { return conn.close.isClosing() }
-func (conn *fdConn) isClosedOnLoop() bool                 { return conn.close.isReleased() }
-func (conn *fdConn) beginShutdown()                       { conn.close.request() }
-func (conn *fdConn) isDatagram() bool                     { return conn.udp != nil }
-func (conn *fdConn) afterRegister()                       {}
+// currentInterest is the interest the connection registered with; nothing
+// changes it after Add, so it is what initialInterest returns.
+func (conn *fdConn) currentInterest() poller.Interest { return conn.initialInterest() }
+func (conn *fdConn) isClosing() bool                  { return conn.close.isClosing() }
+func (conn *fdConn) isClosedOnLoop() bool             { return conn.close.isReleased() }
+func (conn *fdConn) beginShutdown()                   { conn.close.request() }
+func (conn *fdConn) isDatagram() bool                 { return conn.udp != nil }
+func (conn *fdConn) afterRegister()                   {}
 
 // readNeedsRedelivery runs on the loop after updateInterest. Reads the outbound
 // limit throttled stay paused until a send retires the backlog to the resume
@@ -458,9 +514,9 @@ func (conn *fdConn) afterRegister()                       {}
 // the drain to the resume mark is seen by at least one of them; whichever
 // wins clearReadRedelivery redelivers the read.
 func (conn *fdConn) readNeedsRedelivery() bool {
-	return conn.readStalled.Load() && !conn.throttled.Load()
+	return conn.readStalled() && !conn.throttled()
 }
-func (conn *fdConn) clearReadRedelivery() bool { return conn.readStalled.CompareAndSwap(true, false) }
+func (conn *fdConn) clearReadRedelivery() bool { return conn.clearReadStalled() }
 
 // skipsEdge reports a readiness event its connection's turn would have
 // nothing to do with, so the poller drops it instead of scheduling a turn.
@@ -474,7 +530,7 @@ func (conn *fdConn) clearReadRedelivery() bool { return conn.readStalled.Compare
 //     queued output whose sender may be waiting on an edge, needs it.
 func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
-		return conn.readStalled.Load()
+		return conn.readStalled()
 	}
 	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
 }
@@ -779,7 +835,7 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 	}
-	if !conn.isClosing() && !conn.readStalled.Load() && events&ioEventWake != 0 {
+	if !conn.isClosing() && !conn.readStalled() && events&ioEventWake != 0 {
 		conn.turn |= turnCorked
 		if err := conn.fireOnData(); err != nil {
 			conn.requestClose(err)
@@ -800,10 +856,10 @@ func (conn *fdConn) runIOTask() {
 // readStalled before this loads throttled, which is what lets a pause rely on
 // the refresh that clears throttled to redeliver it.
 func (conn *fdConn) settleInterest() {
-	if !conn.readStalled.Load() || conn.throttled.Load() || conn.isClosing() {
+	if !conn.readStalled() || conn.throttled() || conn.isClosing() {
 		return
 	}
-	if conn.readStalled.CompareAndSwap(true, false) {
+	if conn.clearReadStalled() {
 		conn.taskState.Or(ioEventRead | ioEventWake)
 	}
 }
@@ -824,7 +880,7 @@ func (conn *fdConn) readPausedByLimit() bool {
 	if conn.turn&turnHangup != 0 {
 		return false
 	}
-	if !conn.throttled.Load() && conn.pending.Load() < limit-limit/4 {
+	if !conn.throttled() && conn.pending.Load() < limit-limit/4 {
 		return false
 	}
 	return conn.pauseRead(limit)
@@ -836,14 +892,14 @@ func (conn *fdConn) readPausedByLimit() bool {
 // there before the pause was published had nobody to redeliver it, so the
 // caller takes the read back and delivers it itself.
 func (conn *fdConn) pauseRead(limit int64) bool {
-	conn.throttled.Store(true)
-	conn.readStalled.Store(true)
-	if conn.throttled.Load() && conn.pending.Load() > limit/2 {
+	conn.setThrottled(true)
+	conn.setReadStalled(true)
+	if conn.throttled() && conn.pending.Load() > limit/2 {
 		return true
 	}
-	conn.throttled.Store(false)
+	conn.setThrottled(false)
 	// A refresh that saw the stored readStalled has redelivered it already.
-	return !conn.readStalled.CompareAndSwap(true, false)
+	return !conn.clearReadStalled()
 }
 
 // RunTask implements IOTask for injected executors. The executor contract
@@ -1059,7 +1115,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 			conn.inboundTail = nil
 			conn.endInboundCallback(started)
 		}
-		if conn.readStalled.Load() {
+		if conn.readStalled() {
 			return nil
 		}
 		if conn.readShouldStop() {
@@ -1093,7 +1149,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		}
 	}
 	if totalRead > 0 {
-		conn.readStalled.Store(true)
+		conn.setReadStalled(true)
 	}
 	return nil
 }
@@ -1135,7 +1191,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 			}
 			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
 			packetConn.events, packetConn.loop = conn.events, conn.loop
-			packetConn.localAddr, packetConn.remoteAddr = conn.localAddr, source.NetAddr()
+			packetConn.localAddr, packetConn.remoteAddr = conn.localAddr, source.NetAddr().AddrPort()
 			conn.udp.peers[source] = packetConn
 			packetConn.fireOnOpen()
 		}
@@ -1196,7 +1252,7 @@ func (conn *fdConn) YieldRead() error {
 	if !conn.directOwner() {
 		return errUnsupported
 	}
-	conn.readStalled.Store(true)
+	conn.setReadStalled(true)
 	return nil
 }
 

@@ -89,7 +89,7 @@ func TestPausedReadRedeliveredWhileWriteBlocked(t *testing.T) {
 			for deadline := time.Now().Add(5 * time.Second); received.Load() < 1+input; time.Sleep(time.Millisecond) {
 				if time.Now().After(deadline) {
 					t.Fatalf("server read %d of %d bytes: readStalled=%v writeBlocked=%v pending=%d",
-						received.Load(), 1+input, server.readStalled.Load(), server.writeBlocked(), server.pending.Load())
+						received.Load(), 1+input, server.readStalled(), server.writeBlocked(), server.pending.Load())
 				}
 			}
 			if !server.writeBlocked() {

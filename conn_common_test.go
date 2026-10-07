@@ -26,10 +26,13 @@ func TestUnflushedErrorDescriptionAndCause(t *testing.T) {
 func TestCommonConnMetadataAndUnsupportedDeadlines(t *testing.T) {
 	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 	remote := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
-	conn := &commonConn{localAddr: local, remoteAddr: remote}
+	conn := &commonConn{localAddr: boxAddr(local), remoteAddr: remoteAddrFrom(remote)}
 	conn.SetUserdata("userdata")
-	if conn.LocalAddr() != local || conn.RemoteAddr() != remote || conn.Userdata() != "userdata" {
+	if conn.LocalAddr() != local || conn.Userdata() != "userdata" {
 		t.Fatal("connection metadata was not preserved")
+	}
+	if got := conn.remoteAddr; got != remoteAddrFrom(remote) {
+		t.Fatalf("remoteAddr = %v, want %v", got, remoteAddrFrom(remote))
 	}
 	for name, set := range map[string]func() error{
 		"deadline":       func() error { return conn.SetDeadline(time.Now()) },

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
@@ -1402,17 +1403,17 @@ func TestBackpressureHysteresis(t *testing.T) {
 	conn.events = events
 	conn.pending.Store(75)
 	_ = conn.updateInterest()
-	if !conn.throttled.Load() {
+	if !conn.throttled() {
 		t.Fatal("backlog at the high-water mark did not pause reads")
 	}
 	conn.pending.Store(60)
 	_ = conn.updateInterest()
-	if !conn.throttled.Load() {
+	if !conn.throttled() {
 		t.Fatal("hysteresis: backlog below the high-water mark resumed reads early")
 	}
 	conn.pending.Store(50)
 	_ = conn.updateInterest()
-	if conn.throttled.Load() {
+	if conn.throttled() {
 		t.Fatal("drained backlog did not resume reads")
 	}
 }
@@ -1424,7 +1425,7 @@ func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	server := &fdConn{udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
 	child := &fdConn{udp: &unixUDPState{server: server}}
 	child.events = events
-	child.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
+	child.remoteAddr = netip.MustParseAddrPort("127.0.0.1:1")
 	child.udp.key = socket.UDPAddress{Port: 1}
 	server.udp.peers[child.udp.key] = child
 	child.pending.Store(7)

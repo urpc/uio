@@ -809,12 +809,12 @@ func (conn *fdConn) updateInterest() error {
 	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
 		// Hysteresis avoids resuming around a single threshold.
 		if pending := conn.pending.Load(); pending <= limit/2 {
-			conn.throttled.Store(false)
+			conn.setThrottled(false)
 		} else if pending >= limit-limit/4 {
-			conn.throttled.Store(true)
+			conn.setThrottled(true)
 		}
 	} else {
-		conn.throttled.Store(false)
+		conn.setThrottled(false)
 	}
 	return nil
 }

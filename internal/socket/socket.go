@@ -20,10 +20,25 @@ package socket
 
 import (
 	"net"
+	"net/netip"
 	"syscall"
 )
 
 // SockaddrToAddr returns a go/net friendly address
+// SockaddrToAddrPort converts a sockaddr to the value form, with no
+// allocation; an unsupported or empty address returns the zero value.
+func SockaddrToAddrPort(sa syscall.Sockaddr) netip.AddrPort {
+	switch sa := sa.(type) {
+	case *syscall.SockaddrInet4:
+		return netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), uint16(sa.Port))
+	case *syscall.SockaddrInet6:
+		return netip.AddrPortFrom(netip.AddrFrom16(sa.Addr), uint16(sa.Port))
+	case *syscall.SockaddrUnix:
+		_ = sa
+	}
+	return netip.AddrPort{}
+}
+
 func SockaddrToAddr(sa syscall.Sockaddr, udpAddr bool) net.Addr {
 	var addr net.Addr
 	switch sa := sa.(type) {

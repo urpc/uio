@@ -40,8 +40,7 @@ func TestNetPollerUrgentDataIsNotHangup(t *testing.T) {
 	}
 	defer poller.Close(nil)
 	serverFD := connFD(t, server)
-	poller.SetEdgeTriggered(serverFD, true)
-	if err = poller.Add(serverFD, Readable); err != nil {
+	if err = poller.Register(serverFD, Readable, true, 0); err != nil {
 		t.Fatal(err)
 	}
 	if err = unix.Sendto(connFD(t, client), []byte{'!'}, unix.MSG_OOB, nil); err != nil {

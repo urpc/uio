@@ -138,7 +138,7 @@ func (bp *backpressureServer) drainAndExpectInput(t *testing.T, want int64) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("paused read was never resumed: got %d of %d bytes, backlog %d, readStalled=%v throttled=%v",
-			bp.got.Load(), want, bp.server.pending.Load(), bp.server.readStalled.Load(), bp.server.throttled.Load())
+			bp.got.Load(), want, bp.server.pending.Load(), bp.server.readStalled(), bp.server.throttled())
 	}
 	if got := bp.got.Load(); got != want {
 		t.Fatalf("got %d input bytes after the drain, want %d", got, want)
@@ -227,7 +227,7 @@ func fillOutboundLimitOnce() func(Conn, int) error {
 
 func waitReadStalled(t *testing.T, conn *fdConn) {
 	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); !conn.readStalled.Load(); time.Sleep(time.Millisecond) {
+	for deadline := time.Now().Add(5 * time.Second); !conn.readStalled(); time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatalf("read never paused: backlog %d of %d", conn.pending.Load(), backpressureLimit)
 		}
@@ -251,7 +251,7 @@ func TestSkipsEdge(t *testing.T) {
 	if conn.skipsEdge(poller.WriteEvents) {
 		t.Fatal("a write-only edge was dropped from a write-blocked socket")
 	}
-	conn.readStalled.Store(true)
+	conn.setReadStalled(true)
 	if !conn.skipsEdge(poller.ReadEvents) {
 		t.Fatal("a read edge reached a paused read")
 	}

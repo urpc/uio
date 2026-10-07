@@ -21,11 +21,11 @@ type NetPoller struct {
 	closeOnce   sync.Once
 }
 
-// SetEdgeTriggered is a no-op because blocking transports have no readiness mode.
-func (poller *NetPoller) SetEdgeTriggered(int, bool) {}
-
-// SetTag is accepted for interface parity; blocking backends have no events.
-func (poller *NetPoller) SetTag(int, uint32) {}
+// Register is accepted for interface parity; blocking transports have no
+// readiness mode and report no events.
+func (poller *NetPoller) Register(_ int, want Interest, _ bool, _ uint32) error {
+	return poller.validateInterest(want)
+}
 
 // NewNetPoller creates a channel-backed command waker.
 func NewNetPoller() (*NetPoller, error) {

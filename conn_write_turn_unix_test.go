@@ -508,7 +508,7 @@ func TestOutboundLimitPausesReadsUntilWriteTurnDrains(t *testing.T) {
 	if err := writePeerAll(testConn.peer, make([]byte, sent), time.Now().Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	for deadline := time.Now().Add(2 * time.Second); !testConn.conn.readStalled.Load(); time.Sleep(time.Millisecond) {
+	for deadline := time.Now().Add(2 * time.Second); !testConn.conn.readStalled(); time.Sleep(time.Millisecond) {
 		if time.Now().After(deadline) {
 			t.Fatal("the input's turn did not pause the read")
 		}
@@ -795,7 +795,7 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	}
 	events.OnOutbound = func(c Conn, _ int) {
 		if armed.CompareAndSwap(true, false) {
-			stalledAtPanic.Store(c.(*fdConn).readStalled.Load())
+			stalledAtPanic.Store(c.(*fdConn).readStalled())
 			panic("OnOutbound panics once")
 		}
 	}
@@ -827,7 +827,7 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
 	got := make([]byte, 2)
 	if n, err := io.ReadFull(client, got); err != nil || string(got) != "qw" {
-		t.Fatalf("client read %q (%d bytes), %v; want %q (readStalled=%v)", got[:n], n, err, "qw", server.readStalled.Load())
+		t.Fatalf("client read %q (%d bytes), %v; want %q (readStalled=%v)", got[:n], n, err, "qw", server.readStalled())
 	}
 	if executor.recovered.Load() == 0 || !stalledAtPanic.Load() {
 		t.Fatalf("OnOutbound did not panic after a yielded read: recovered=%d", executor.recovered.Load())

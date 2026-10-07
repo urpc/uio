@@ -162,7 +162,7 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 	loop := &eventLoop{buffer: make([]byte, 64)}
 	loop.loopGoid.Store(currentGoroutineID())
 	server := &fdConn{
-		fd: receiver, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}, interest: poller.Readable,
+		fd: receiver, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)},
 	}
 	server.events, server.loop = events, loop
 	payload := []byte{'x'}
@@ -208,7 +208,7 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	}}
 	loop := &eventLoop{buffer: make([]byte, 64)}
 	loop.loopGoid.Store(currentGoroutineID())
-	conn := &fdConn{fd: receiver, udp: &unixUDPState{}, interest: poller.Readable}
+	conn := &fdConn{fd: receiver, udp: &unixUDPState{}}
 	conn.events, conn.loop = events, loop
 	for range 272 {
 		if err := unix.Sendto(sender, []byte{'x'}, 0, target); err != nil {
@@ -409,7 +409,6 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
 	conn.loop = loop
-	conn.interest = poller.Readable
 	if n, err := conn.Writev([][]byte{[]byte("a"), []byte("b")}); err != nil || n != 2 {
 		t.Fatalf("buffered Writev = %d, %v", n, err)
 	}
@@ -479,7 +478,7 @@ func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 	loop := &eventLoop{}
 	loop.loopGoid.Store(currentGoroutineID())
 	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
-	conn := &fdConn{fd: -1, turn: turnCorked}
+	conn := &fdConn{fd: -1, commonConn: commonConn{turn: turnCorked}}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = events
 	conn.loop = loop
@@ -760,7 +759,6 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 	if err := loop.poller.Add(conn.fd, poller.Readable); err != nil {
 		t.Fatal(err)
 	}
-	conn.setInterest(poller.Readable)
 	loop.OnEvent(nil, 12345, poller.ReadEvents)
 	loop.OnClose(nil, nil)
 
