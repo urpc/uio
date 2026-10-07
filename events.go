@@ -81,9 +81,11 @@ type Events struct {
 	readBufferSize int
 
 	// Pollers is the number of event-loop goroutines.
-	// The default value is 4, capped by runtime.NumCPU(). On Linux, stream
-	// readiness is collected by one shared data poller instead, so Pollers
-	// sizes accept, registration, close, deadline and UDP work.
+	// The default is one per four CPUs, at least two, capped by
+	// runtime.NumCPU(). On Linux, stream readiness is collected by the
+	// sharded data pollers instead, so Pollers sizes accept, registration,
+	// close, deadline and UDP work; connection churn is what notices its
+	// count, echo and pipeline are indifferent to it.
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
@@ -351,7 +353,11 @@ func (ev *Events) closeDataPoller(err error) {
 func (ev *Events) initConfig() error {
 
 	if ev.Pollers <= 0 {
-		ev.Pollers = 4
+		// One event loop per four CPUs, at least two. The loops accept and
+		// then own each connection's registration and close, so a churning
+		// workload needs them spread wide, while loops past what the control
+		// plane uses only contend with the io workers for Ps.
+		ev.Pollers = max(2, runtime.NumCPU()/4)
 	}
 	ev.Pollers = min(ev.Pollers, runtime.NumCPU())
 

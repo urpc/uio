@@ -15,8 +15,8 @@ func TestPollerCountDefaultsAndLimits(t *testing.T) {
 		configured int
 		want       int
 	}{
-		{name: "zero", want: min(4, runtime.NumCPU())},
-		{name: "negative", configured: -1, want: min(4, runtime.NumCPU())},
+		{name: "zero", want: min(max(2, runtime.NumCPU()/4), runtime.NumCPU())},
+		{name: "negative", configured: -1, want: min(max(2, runtime.NumCPU()/4), runtime.NumCPU())},
 		{name: "explicit", configured: 1, want: 1},
 		{name: "above CPU count", configured: runtime.NumCPU() + 1, want: runtime.NumCPU()},
 	} {
