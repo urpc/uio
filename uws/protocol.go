@@ -407,6 +407,13 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		}
 		return err
 	}
+	// Publish the request for Conn.Request during OnOpen; notifyOpen releases
+	// the state when the callback returns.
+	state.mu.Lock()
+	if c.handshake.Load() == state {
+		state.request = &req
+	}
+	state.mu.Unlock()
 	protocol := handshake.SelectSubprotocol(req.Subprotocols, c.config.subprotocols)
 	params, extensions, err := extension.NegotiateServerWithPolicy(req.Extensions, c.config.compressionEnabled, !c.config.compressionContextTakeover)
 	if err != nil {

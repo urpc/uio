@@ -38,6 +38,28 @@ type Request struct {
 	Key          string
 	Subprotocols []string
 	Extensions   []string
+
+	// raw is the complete upgrade header block a fast-path parse consumed. It
+	// references the caller's input, so the caller must keep that input alive
+	// for as long as the request is used.
+	raw []byte
+}
+
+// BuildHTTP returns the upgrade request as a net/http request, parsing the
+// retained header block on first use. Requests that net/http parsed directly
+// return their existing request.
+func (r *Request) BuildHTTP() (*http.Request, error) {
+	if r.HTTP != nil {
+		return r.HTTP, nil
+	}
+	if len(r.raw) == 0 {
+		return nil, ErrBadRequest
+	}
+	request, err := http.ReadRequest(newHeaderReader(r.raw))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
+	}
+	return request, nil
 }
 
 // ParseServerRequest parses one complete HTTP/1.1 header from data. It returns
@@ -59,7 +81,19 @@ func ParseServerRequest(data []byte, options ServerOptions) (Request, int, error
 	if end > maxBytes {
 		return Request{}, 0, ErrBadRequest
 	}
-	reader := newHeaderReader(data[:end])
+	// The fast path recognizes a regular upgrade request without net/http.
+	// Anything outside its grammar is decided by the full parser below, so an
+	// unusual request keeps its exact previous behavior, errors included.
+	if request, ok := parseServerRequestFast(data[:end], options); ok {
+		return request, end, nil
+	}
+	return parseServerRequestNetHTTP(data[:end], options)
+}
+
+// parseServerRequestNetHTTP parses one complete upgrade header block with
+// net/http and is the reference behavior for every request.
+func parseServerRequestNetHTTP(block []byte, options ServerOptions) (Request, int, error) {
+	reader := newHeaderReader(block)
 	req, err := http.ReadRequest(reader)
 	if err != nil {
 		return Request{}, 0, fmt.Errorf("%w: %v", ErrBadRequest, err)
@@ -68,7 +102,7 @@ func ParseServerRequest(data []byte, options ServerOptions) (Request, int, error
 	if err != nil {
 		return Request{}, 0, err
 	}
-	return request, end, nil
+	return request, len(block), nil
 }
 
 // ValidateServerRequest validates an HTTP/1.1 WebSocket upgrade request that

@@ -25,8 +25,12 @@ func TestParseServerRequestAndResponse(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if consumed != len(data)-2 || req.HTTP.Method != http.MethodGet || req.Key != testKey {
-		t.Fatalf("request = consumed:%d method:%s key:%q", consumed, req.HTTP.Method, req.Key)
+	httpRequest, err := req.BuildHTTP()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if consumed != len(data)-2 || httpRequest.Method != http.MethodGet || req.Key != testKey {
+		t.Fatalf("request = consumed:%d method:%s key:%q", consumed, httpRequest.Method, req.Key)
 	}
 	if got := SelectSubprotocol(req.Subprotocols, []string{"superchat"}); got != "superchat" {
 		t.Fatalf("selected protocol = %q", got)
@@ -225,10 +229,17 @@ func FuzzParseServerRequestNeverPanics(f *testing.F) {
 func BenchmarkParseServerRequest(b *testing.B) {
 	request := []byte("GET /ws HTTP/1.1\r\n" +
 		"Host: 127.0.0.1:26001\r\n" +
+		"User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36\r\n" +
+		"Accept-Encoding: gzip, deflate, br, zstd\r\n" +
+		"Accept-Language: en-US,en;q=0.9\r\n" +
+		"Cache-Control: no-cache\r\n" +
+		"Pragma: no-cache\r\n" +
+		"Origin: http://127.0.0.1:26001\r\n" +
 		"Connection: Upgrade\r\n" +
 		"Upgrade: websocket\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
-		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
+		"Sec-WebSocket-Key: " + testKey + "\r\n" +
+		"Sec-WebSocket-Extensions: permessage-deflate; client_max_window_bits\r\n\r\n")
 	b.ReportAllocs()
 	b.SetBytes(int64(len(request)))
 	b.ResetTimer()

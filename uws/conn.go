@@ -10,6 +10,7 @@ import (
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
+	"github.com/urpc/uio/uws/internal/handshake"
 )
 
 // Conn is an established or handshaking WebSocket connection. UIO serializes
@@ -130,11 +131,13 @@ type connMetadata struct {
 
 // handshakeState contains every resource whose lifetime ends at handshake
 // completion. notifyOpen releases the entire object after OnOpen returns, which
-// also bounds the lifetime of an adopted net/http request.
+// also bounds the lifetime of an adopted net/http request and of a native
+// upgrade request a handler may ask for during OnOpen.
 type handshakeState struct {
 	mu          sync.Mutex
 	data        []byte
 	upgrade     *httpUpgrade
+	request     *handshake.Request // native upgrade request, exposed through Request()
 	clientKey   string
 	contextStop func() bool
 	cleanup     func()
@@ -186,9 +189,10 @@ func (c *Conn) SetNoDelay(noDelay bool) error {
 	return c.raw.SetNoDelay(noDelay)
 }
 
-// Request returns the HTTP upgrade request until OnOpen returns for a
-// connection adopted through Server.ServeHTTP. It returns nil afterward and
-// for connections accepted by Server.Serve. The request is read-only.
+// Request returns the HTTP upgrade request during OnOpen for server
+// connections, whether accepted by Server.Serve or adopted through
+// Server.ServeHTTP. It returns nil afterward — handlers that need it beyond
+// OnOpen must keep it — and for client connections. The request is read-only.
 func (c *Conn) Request() *http.Request {
 	if c == nil {
 		return nil
@@ -201,12 +205,21 @@ func handshakeHTTPRequest(state *handshakeState) *http.Request {
 		return nil
 	}
 	state.mu.Lock()
-	var request *http.Request
+	defer state.mu.Unlock()
 	if state.upgrade != nil {
-		request = state.upgrade.request.HTTP
+		return state.upgrade.request.HTTP
 	}
-	state.mu.Unlock()
-	return request
+	if state.request == nil {
+		return nil
+	}
+	if state.request.HTTP == nil {
+		// The native path parsed the request without net/http; build it from
+		// the retained header block only when a handler asks for it.
+		if request, err := state.request.BuildHTTP(); err == nil {
+			state.request.HTTP = request
+		}
+	}
+	return state.request.HTTP
 }
 
 func (c *Conn) isClient() bool { return c.config != nil && c.config.client }
