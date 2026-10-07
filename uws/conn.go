@@ -115,7 +115,7 @@ type heartbeatState struct {
 // graceful-close deadline from callback and timer goroutines.
 type closeTimerState struct {
 	mu    sync.Mutex
-	timer *time.Timer
+	shard uint8 // deadline shard the close timeout lives in
 }
 
 // connMetadata groups infrequently used negotiated and close information so a
@@ -136,10 +136,10 @@ type handshakeState struct {
 	data        []byte
 	upgrade     *httpUpgrade
 	clientKey   string
-	timer       *time.Timer
 	contextStop func() bool
 	cleanup     func()
 	epoch       uint64
+	shard       uint8 // deadline shard the handshake timeout lives in
 	expired     bool
 }
 

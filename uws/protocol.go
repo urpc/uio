@@ -30,14 +30,11 @@ func (c *Conn) startHandshakeTimer(timeout time.Duration) {
 	epoch := state.epoch
 	stopContext := state.contextStop
 	state.contextStop = nil
-	if state.timer != nil {
-		state.timer.Stop()
-	}
+	shard := deadlineShardIndex()
+	state.shard = shard
 	state.expired = false
-	state.timer = time.AfterFunc(timeout, func() {
-		c.expireHandshake(state, epoch, context.DeadlineExceeded)
-	})
 	state.mu.Unlock()
+	deadlineShardAt(shard).arm(c, deadlineKindHandshake, time.Now().Add(timeout).UnixNano(), epoch, true)
 	if stopContext != nil {
 		stopContext()
 	}
@@ -93,7 +90,7 @@ func (c *Conn) expireHandshake(state *handshakeState, epoch uint64, cause error)
 		return
 	}
 	state.expired = true
-	resources := state.detachResourcesLocked()
+	resources := state.detachResourcesLocked(c)
 	c.handshake.CompareAndSwap(state, nil)
 	state.mu.Unlock()
 	resources.stop()
@@ -109,7 +106,7 @@ func (c *Conn) stopHandshakeTimer() {
 	}
 	state.mu.Lock()
 	state.expired = true
-	resources := state.detachResourcesLocked()
+	resources := state.detachResourcesLocked(c)
 	c.handshake.CompareAndSwap(state, nil)
 	state.mu.Unlock()
 	resources.stop()
@@ -128,7 +125,7 @@ func (c *Conn) markOpened() bool {
 		state.mu.Unlock()
 		return false
 	}
-	resources := state.detachResourcesLocked()
+	resources := state.detachResourcesLocked(c)
 	c.opened.Store(true)
 	state.mu.Unlock()
 	resources.stop()
@@ -136,26 +133,32 @@ func (c *Conn) markOpened() bool {
 }
 
 type handshakeResources struct {
-	timer       *time.Timer
+	conn        *Conn
+	shard       uint8
+	epoch       uint64
 	contextStop func() bool
 	cleanup     func()
 }
 
 // detachResourcesLocked invalidates timer/context callbacks while ownership of
 // the handshake state is still serialized by its mutex.
-func (state *handshakeState) detachResourcesLocked() handshakeResources {
-	state.epoch++
-	resources := handshakeResources{state.timer, state.contextStop, state.cleanup}
-	state.timer = nil
+func (state *handshakeState) detachResourcesLocked(c *Conn) handshakeResources {
+	epoch := state.epoch
+	state.epoch = epoch + 1
+	resources := handshakeResources{
+		conn:        c,
+		shard:       state.shard,
+		epoch:       epoch,
+		contextStop: state.contextStop,
+		cleanup:     state.cleanup,
+	}
 	state.contextStop = nil
 	state.cleanup = nil
 	return resources
 }
 
 func (resources handshakeResources) stop() {
-	if resources.timer != nil {
-		resources.timer.Stop()
-	}
+	deadlineShardAt(resources.shard).cancel(resources.conn, deadlineKindHandshake, resources.epoch)
 	if resources.contextStop != nil {
 		resources.contextStop()
 	}
@@ -530,13 +533,10 @@ func (c *Conn) startCloseTimer() {
 		state.mu.Unlock()
 		return
 	}
-	if state.timer != nil {
-		state.timer.Stop()
-	}
-	state.timer = time.AfterFunc(c.closeTimeout(), func() {
-		c.abortTransport(io.ErrClosedPipe)
-	})
+	state.shard = deadlineShardIndex()
+	shard := state.shard
 	state.mu.Unlock()
+	deadlineShardAt(shard).arm(c, deadlineKindClose, time.Now().Add(c.closeTimeout()).UnixNano(), 0, true)
 }
 
 func (c *Conn) ensureCloseTimer() {
@@ -549,12 +549,10 @@ func (c *Conn) ensureCloseTimer() {
 		state.mu.Unlock()
 		return
 	}
-	if state.timer == nil {
-		state.timer = time.AfterFunc(c.closeTimeout(), func() {
-			c.abortTransport(io.ErrClosedPipe)
-		})
-	}
+	state.shard = deadlineShardIndex()
+	shard := state.shard
 	state.mu.Unlock()
+	deadlineShardAt(shard).arm(c, deadlineKindClose, time.Now().Add(c.closeTimeout()).UnixNano(), 0, false)
 }
 
 // tryCloseTransport claims shutdown once a deferred Close frame went out and
@@ -586,12 +584,9 @@ func (c *Conn) stopCloseTimer() {
 		return
 	}
 	state.mu.Lock()
-	timer := state.timer
-	state.timer = nil
+	shard := state.shard
 	state.mu.Unlock()
-	if timer != nil {
-		timer.Stop()
-	}
+	deadlineShardAt(shard).cancel(c, deadlineKindClose, 0)
 }
 
 func (c *Conn) ensureCloseTimerState() *closeTimerState {

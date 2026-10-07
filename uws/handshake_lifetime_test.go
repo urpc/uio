@@ -14,11 +14,12 @@ func TestHandshakeResourcesDetachExactlyOnce(t *testing.T) {
 			var contextStops, cleanups atomic.Int32
 			state := &handshakeState{
 				epoch:       1,
-				timer:       time.NewTimer(time.Hour),
 				contextStop: func() bool { contextStops.Add(1); return true },
 				cleanup:     func() { cleanups.Add(1) },
 			}
 			conn := &Conn{raw: newScriptedConn()}
+			state.shard = deadlineShardIndex()
+			deadlineShardAt(state.shard).arm(conn, deadlineKindHandshake, time.Now().Add(time.Hour).UnixNano(), 1, true)
 			conn.handshake.Store(state)
 			switch action {
 			case "open":
@@ -47,7 +48,10 @@ func TestHandshakeResourcesDetachExactlyOnce(t *testing.T) {
 			}
 			state.mu.Lock()
 			defer state.mu.Unlock()
-			if state.timer != nil || state.contextStop != nil || state.cleanup != nil {
+			if deadlineShardAt(state.shard).has(conn, deadlineKindHandshake) {
+				t.Fatal("handshake deadline retained after completion")
+			}
+			if state.contextStop != nil || state.cleanup != nil {
 				t.Fatal("handshake resources retained after completion")
 			}
 		})

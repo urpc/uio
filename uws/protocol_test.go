@@ -657,9 +657,9 @@ func TestCloseDoesNotRecreateTimerAfterTransportClose(t *testing.T) {
 	}
 	if state := conn.closeTimer.Load(); state != nil {
 		state.mu.Lock()
-		timer := state.timer
+		shard := state.shard
 		state.mu.Unlock()
-		if timer != nil {
+		if deadlineShardAt(shard).has(conn, deadlineKindClose) {
 			t.Fatal("closed connection recreated its close timer")
 		}
 	}
