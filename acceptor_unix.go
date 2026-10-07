@@ -244,6 +244,13 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 		return nil, err
 	}
 
+	// Arm the listening socket with the options every accepted stream
+	// connection wants, on platforms that copy them at accept time; see
+	// setListenerOptions. UDP and Unix listeners are left alone.
+	if l.ln != nil {
+		setListenerOptions(l.ln)
+	}
+
 	if l.udp != nil {
 		l.laddr = l.udp.LocalAddr()
 	} else {
