@@ -147,6 +147,10 @@ const (
 	// unread raises no further edge, and the rounds that read those bytes,
 	// redelivered ones included, must read on until the socket reports it.
 	turnHangup
+	// turnRoundWrote records that a corked round's first output left for the
+	// socket on its own: the round's later writes coalesce and leave in its
+	// final flush as before.
+	turnRoundWrote
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -830,7 +834,7 @@ func (conn *fdConn) runIOTask() {
 		if err := conn.fireOnData(); err != nil {
 			conn.requestClose(err)
 		}
-		conn.turn &^= turnCorked
+		conn.turn &^= turnCorked | turnRoundWrote
 	}
 	if !conn.isClosing() {
 		if _, err := conn.flushOnLoop(); err != nil {
@@ -1008,13 +1012,14 @@ func (conn *fdConn) fireWriteEvent() error {
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
 	holder := conn.events.readPool.Get().(*readBuffer)
-	// A read round is corked: replies the callbacks enqueue accumulate in
+	// A read round is corked: the round's first reply goes straight to the
+	// socket from inside its callback, and the replies after it accumulate in
 	// outbound and are flushed once when the event ends, or each time they
 	// fill a coalescing block, so a burst of reads costs one writev instead
 	// of one syscall per reply.
 	conn.turn |= turnCorked
 	err := conn.readRound(holder.bytes)
-	conn.turn &^= turnCorked
+	conn.turn &^= turnCorked | turnRoundWrote
 	conn.events.readPool.Put(holder)
 	return err
 }

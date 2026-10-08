@@ -454,15 +454,22 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // writeOwnedOnLoop consumes owned on every return path except
 // ErrOutboundOverflow, which accepts nothing and returns the buffer to the
 // caller; a partial direct write that cannot queue its suffix reports
-// io.ErrShortWrite and consumes the buffer instead. During a corked read
-// round, the first small frame keeps zero-copy ownership and later frames are
-// coalesced into pooled blocks to keep the final writev batch short. Buffers
-// up to half a coalescing block are copied, which also keeps a queue that the
-// peer is slow to drain from holding many mostly empty blocks; a larger buffer
-// already carries many frames and keeps its own writev segment.
+// io.ErrShortWrite and consumes the buffer instead. A corked read round's
+// first output goes straight to the socket when the write is one the
+// threshold sends directly anyway — a batch handed over mid-round leaves
+// without waiting for the round's end, and the threshold's promise for
+// smaller writes (join the outbound batch) holds in the first position too.
+// The frames that follow keep zero-copy ownership as outbound's first
+// segment or are coalesced into pooled blocks, to keep the final writev batch
+// short. Buffers up to half a coalescing block are copied, which also keeps a
+// queue that the peer is slow to drain from holding many mostly empty blocks;
+// a larger buffer already carries many frames and keeps its own writev
+// segment.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	threshold := conn.events.WriteBufferedThreshold
-	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold)
+	first := conn.turn&turnCorked != 0 && conn.turn&turnRoundWrote == 0 && conn.outboundEmpty() &&
+		!(threshold > 0 && size < threshold)
+	queued := !first && (!conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold))
 	if !queued && !conn.claimDirectSend() {
 		queued = true
 	}
@@ -483,6 +490,9 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		}
 		conn.submitMu.Unlock()
 		return size, nil
+	}
+	if first {
+		conn.turn |= turnRoundWrote
 	}
 	defer conn.releaseWriteAndKick()
 

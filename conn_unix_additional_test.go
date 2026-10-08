@@ -478,7 +478,10 @@ func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 	loop := &eventLoop{}
 	loop.loopGoid.Store(currentGoroutineID())
 	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
-	conn := &fdConn{fd: -1, commonConn: commonConn{turn: turnCorked}}
+	// The round's first output has left for the socket already — that write
+	// goes direct, see TestRoundFirstWriteGoesOutBeforeTheCallbackReturns —
+	// so the writes that follow are the ones that coalesce here.
+	conn := &fdConn{fd: -1, commonConn: commonConn{turn: turnCorked | turnRoundWrote}}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = events
 	conn.loop = loop
