@@ -132,7 +132,7 @@ func startStdTestEvents(t *testing.T, events *Events) <-chan error {
 
 func newStdFDConn(events *Events, raw *stdRegistrationConn) *fdConn {
 	conn := &fdConn{
-		conn: raw, writeSig: make(chan struct{}, 1), closeSig: make(chan struct{}),
+		conn: raw, writeSig: make(chan struct{}, 1),
 	}
 	conn.events = events
 	conn.loop = events.workers[0]
@@ -680,7 +680,7 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 		return len(buffer), nil
 	}
 	conn := &fdConn{
-		conn: raw, writeSig: make(chan struct{}, 1), closeSig: make(chan struct{}),
+		conn: raw, writeSig: make(chan struct{}, 1),
 	}
 	conn.events = &Events{MaxOutboundBuffered: 3}
 	conn.events.callbackWG.Add(1)
@@ -690,7 +690,12 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 		close(writeLoopDone)
 	}()
 	defer func() {
-		close(conn.closeSig)
+		// Closing wakes the write loop through its own notification channel.
+		conn.closing.Store(true)
+		select {
+		case conn.writeSig <- struct{}{}:
+		default:
+		}
 		select {
 		case <-writeLoopDone:
 		case <-time.After(time.Second):

@@ -54,8 +54,7 @@ type fdConn struct {
 	commonConn
 	conn       net.Conn
 	udp        *stdUDPState
-	writeSig   chan struct{} // coalesced notification, not one ack per Write
-	closeSig   chan struct{}
+	writeSig   chan struct{} // coalesced "output exists" wake; see writeLoop
 	closed     int32
 	err        error
 	mux        sync.Mutex
@@ -319,7 +318,6 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 
 	select {
 	case fc.writeSig <- struct{}{}:
-	//case <-fc.closeSig:
 	default:
 	}
 
@@ -408,7 +406,6 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 
 	select {
 	case fc.writeSig <- struct{}{}:
-	//case <-fc.closeSig:
 	default:
 	}
 
@@ -641,9 +638,14 @@ func (fc *fdConn) fdClose(err error) bool {
 	// save close reason
 	fc.err = err
 
-	// notify send/write loop connection will be closed.
-	if fc.closeSig != nil {
-		close(fc.closeSig)
+	// Wake the writer so it observes the close and stops. A notification that
+	// is already pending is just as good a wake as this one, so a full channel
+	// needs no second signal.
+	if fc.writeSig != nil {
+		select {
+		case fc.writeSig <- struct{}{}:
+		default:
+		}
 	}
 
 	// delete connection fd-mapping.
@@ -724,21 +726,19 @@ func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 
 // writeLoop drains every coalesced notification to completion. writeSig is a
 // level signal for "output exists", not one acknowledgement per Write.
+// writeLoop drains every coalesced notification to completion until the
+// connection closes: a close wakes it through the same notification channel,
+// and the drain then reports the closed transport.
 func (fc *fdConn) writeLoop() {
 	defer fc.events.callbackWG.Done()
-	for {
-		select {
-		case <-fc.closeSig:
+	for range fc.writeSig {
+		written, err := fc.drainOutbound()
+		if written > 0 {
+			fc.events.onSocketBytesWrite(fc, written)
+		}
+		if err != nil {
+			fc.events.closeConn(fc, err)
 			return
-		case <-fc.writeSig:
-			written, err := fc.drainOutbound()
-			if written > 0 {
-				fc.events.onSocketBytesWrite(fc, written)
-			}
-			if err != nil {
-				fc.events.closeConn(fc, err)
-				return
-			}
 		}
 	}
 }
