@@ -640,7 +640,7 @@ func TestStdUDPWriteOwnedSendsOneDatagram(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sender.Close()
-	conn := &fdConn{udp: sender}
+	conn := &fdConn{udp: &stdUDPState{sock: sender}}
 	conn.events = &Events{}
 
 	buffer := AcquireBuffer(8)

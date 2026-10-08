@@ -40,12 +40,20 @@ const stdWriteVecLimit = 16
 // protects producer admission and counters; writeMu protects the detached
 // batch while the writer performs blocking net.Conn writes; callbackMu keeps
 // OnData, Wake, and OnClose serialized for the connection.
+// stdUDPState carries the datagram fields off the stream connections, which
+// are the vast majority: sock is the shared packet socket of a server's peers
+// or a connected client's socket, svr links a logical peer back to its
+// server, and peers is the server's logical-peer map.
+type stdUDPState struct {
+	sock  *net.UDPConn
+	svr   *fdConn
+	peers map[string]*fdConn
+}
+
 type fdConn struct {
 	commonConn
 	conn       net.Conn
-	udp        *net.UDPConn
-	udpSvr     *fdConn
-	udpConns   map[string]*fdConn
+	udp        *stdUDPState
 	writeSig   chan struct{} // coalesced notification, not one ack per Write
 	closeSig   chan struct{}
 	closed     int32
@@ -95,7 +103,7 @@ func (fc *fdConn) closeUnregistered() {
 		_ = fc.conn.Close()
 	}
 	if fc.udp != nil {
-		_ = fc.udp.Close()
+		_ = fc.udp.sock.Close()
 	}
 }
 
@@ -117,7 +125,7 @@ func (fc *fdConn) Fd() int {
 	var rc syscall.Conn
 
 	if fc.udp != nil {
-		rc = net.PacketConn(fc.udp).(syscall.Conn)
+		rc = net.PacketConn(fc.udp.sock).(syscall.Conn)
 	} else {
 		rc = fc.conn.(syscall.Conn)
 	}
@@ -225,7 +233,7 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if fc.conn != nil {
 		target = fc.conn
 	} else if fc.udp != nil {
-		target = fc.udp
+		target = fc.udp.sock
 	}
 	if target == nil {
 		return errUnsupported
@@ -263,12 +271,12 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 
 	if fc.udp != nil {
 
-		if nil == fc.udpSvr && nil == fc.udpConns {
+		if nil == fc.udp.svr && nil == fc.udp.peers {
 			// connected udp client.
-			n, err = fc.udp.Write(p)
+			n, err = fc.udp.sock.Write(p)
 		} else {
 			// udp child connection.
-			n, err = fc.udp.WriteTo(p, net.UDPAddrFromAddrPort(fc.remoteAddr))
+			n, err = fc.udp.sock.WriteTo(p, net.UDPAddrFromAddrPort(fc.remoteAddr))
 		}
 
 		if n > 0 {
@@ -578,22 +586,22 @@ func (fc *fdConn) closeOnLoop(err error) {
 		return
 	}
 	fc.closing.Store(true)
-	if fc.udpSvr != nil {
-		fc.udpSvr.mux.Lock()
-		delete(fc.udpSvr.udpConns, fc.remoteAddr.String())
-		fc.udpSvr.mux.Unlock()
+	if fc.udp != nil && fc.udp.svr != nil {
+		fc.udp.svr.mux.Lock()
+		delete(fc.udp.svr.udp.peers, fc.remoteAddr.String())
+		fc.udp.svr.mux.Unlock()
 		if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
 			return
 		}
 		fc.err = err
 	} else {
-		if fc.udpConns != nil {
+		if fc.udp != nil && fc.udp.peers != nil {
 			fc.mux.Lock()
-			children := make([]*fdConn, 0, len(fc.udpConns))
-			for _, child := range fc.udpConns {
+			children := make([]*fdConn, 0, len(fc.udp.peers))
+			for _, child := range fc.udp.peers {
 				children = append(children, child)
 			}
-			fc.udpConns = nil
+			fc.udp.peers = nil
 			fc.mux.Unlock()
 			for _, child := range children {
 				child.closeOnLoop(err)
@@ -646,7 +654,7 @@ func (fc *fdConn) fdClose(err error) bool {
 	case nil != fc.conn:
 		_ = fc.conn.Close()
 	case nil != fc.udp:
-		_ = fc.udp.Close()
+		_ = fc.udp.sock.Close()
 	}
 
 	// Writers may still reference pooled outbound blocks until they return.
@@ -744,7 +752,7 @@ func (fc *fdConn) readUDPLoop() {
 	defer fc.events.readPool.Put(holder)
 	buffer := holder.bytes
 	for {
-		n, _, err := fc.udp.ReadFrom(buffer)
+		n, _, err := fc.udp.sock.ReadFrom(buffer)
 		if nil != err {
 			// close on error.
 			fc.events.closeConn(fc, err)
@@ -852,7 +860,7 @@ func (fc *fdConn) listenUDP() error {
 	buffer := holder.bytes
 
 	for {
-		n, addr, err := fc.udp.ReadFrom(buffer)
+		n, addr, err := fc.udp.sock.ReadFrom(buffer)
 		if nil != err {
 			_ = fc.CloseWith(err)
 			return err
@@ -863,18 +871,16 @@ func (fc *fdConn) listenUDP() error {
 
 		// udp server
 		fc.mux.Lock()
-		udpConn, ok := fc.udpConns[rAddr]
+		udpConn, ok := fc.udp.peers[rAddr]
 		if !ok {
 			udpConn = &fdConn{}
-			udpConn.udp = fc.udp
+			udpConn.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
 			udpConn.addr = fc.addr
 			udpConn.setRemoteAddr(addr)
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
-			udpConn.udpSvr = fc
-			udpConn.udpConns = nil // udp connection always nil
 
-			fc.udpConns[rAddr] = udpConn
+			fc.udp.peers[rAddr] = udpConn
 		}
 		fc.mux.Unlock()
 		if !ok {

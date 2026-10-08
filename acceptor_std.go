@@ -83,8 +83,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
-		l.udpSvr.udp = l.udp.(*net.UDPConn)
-		l.udpSvr.udpConns = make(map[string]*fdConn)
+		l.udpSvr.udp = &stdUDPState{sock: l.udp.(*net.UDPConn), peers: make(map[string]*fdConn)}
 
 		ld.events.callbackWG.Add(1)
 		go l.udpSvr.listenUDP()

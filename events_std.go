@@ -121,7 +121,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	fdc := &fdConn{}
 
 	if udpConn, ok := conn.(*net.UDPConn); ok {
-		fdc.udp = udpConn
+		fdc.udp = &stdUDPState{sock: udpConn}
 	} else {
 		fdc.conn = conn
 	}
