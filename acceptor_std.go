@@ -57,6 +57,11 @@ func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
 	ld.close()
 }
 
+// startMultiAcceptors exists for the shared Serve path. This backend has no
+// dedicated ReusePort acceptors: its blocking listener goroutines are created
+// together with the listeners themselves.
+func (ld *acceptor) startMultiAcceptors() {}
+
 // addListen starts one blocking accept or UDP receive goroutine for addr.
 // Accepted streams are registered before their dedicated read/write loops run.
 func (ld *acceptor) addListen(addr string) (err error) {

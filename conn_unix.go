@@ -426,8 +426,15 @@ func (conn *fdConn) finishWriteTurn() {
 // or that output would wait for an unrelated turn.
 func (conn *fdConn) openOutputAfterOnOpen() {
 	defer conn.writeState.Or(writeOpenedFlag)
+	if testHookBeforeOnOpen != nil {
+		testHookBeforeOnOpen(conn)
+	}
 	conn.fireOnOpen()
 }
+
+// testHookBeforeOnOpen runs in the open turn just before OnOpen fires; tests
+// use it to pin the goroutine the callback is delivered on. Nil outside tests.
+var testHookBeforeOnOpen func(*fdConn)
 
 // readStalled is one bit in its own flags word rather than a padded atomic
 // field, so it costs four bytes in the turn's scalar block.

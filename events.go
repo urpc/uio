@@ -176,6 +176,15 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		ev.OnStart(ev)
 	}
 
+	// The dedicated ReusePort acceptors start only now: accepting is what
+	// leads to OnOpen, and that callback must not run while the application is
+	// still initializing. The master loop, which accepts the single-listener
+	// form, begins polling just below for the same reason; bound listeners
+	// hold early connections in their backlogs until then.
+	if ev.acceptor != nil {
+		ev.acceptor.startMultiAcceptors()
+	}
+
 	defer func() {
 		if ev.OnStop != nil {
 			ev.OnStop(ev)
