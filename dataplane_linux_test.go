@@ -251,3 +251,59 @@ func TestDataPollerCloseStopsAllWaiters(t *testing.T) {
 		}
 	}
 }
+
+// flushBatchRecorder records every batch hand-off the data plane makes.
+type flushBatchRecorder struct {
+	batches atomic.Int64
+	tasks   atomic.Int64
+}
+
+func (c *flushBatchRecorder) Submit(IOTask) bool { return true }
+func (c *flushBatchRecorder) SubmitBatch(tasks []IOTask) int {
+	c.batches.Add(1)
+	c.tasks.Add(int64(len(tasks)))
+	return len(tasks)
+}
+
+// TestDataFlushCountsFilteredEvents pins the unit the flush interval counts:
+// every event the batch walk examines, not only the ones that turn into
+// connections. Under churn most of a batch can be stale descriptors, and a
+// live connection behind them must still reach the executor within the same
+// bound — with the interval applied after filtering, one live connection in a
+// batch of stale events would wait for the whole batch.
+func TestDataFlushCountsFilteredEvents(t *testing.T) {
+	exec := &flushBatchRecorder{}
+	pool := &ioTaskPool{executor: exec}
+	shard := &dataShard{fdMap: newFdMap()}
+	conn := &fdConn{}
+	conn.loop = &eventLoop{ioPool: pool}
+	conn.pollTag = 7
+	const liveFD = 42
+	if err := shard.fdMap.Put(liveFD, conn); err != nil {
+		t.Fatal(err)
+	}
+
+	waiter := &dataWaiter{args: make([]IOTask, 0, 64)}
+	var events []poller.Event
+	for i := 0; i < dataFlushEvery-1; i++ {
+		events = append(events, poller.Event{FD: 1000 + i, Tag: 1})
+	}
+	events = append(events, poller.Event{FD: liveFD, Tag: 7})
+	for i := 0; i < 10; i++ {
+		events = append(events, poller.Event{FD: 2000 + i, Tag: 1})
+	}
+
+	data := &dataPoller{pool: pool}
+	if !data.dispatch(shard, waiter, events) {
+		t.Fatal("the live connection did not reach the executor before the batch ended")
+	}
+	if got := exec.batches.Load(); got != 1 {
+		t.Fatalf("batch hand-offs = %d, want 1", got)
+	}
+	if got := exec.tasks.Load(); got != 1 {
+		t.Fatalf("tasks = %d, want 1", got)
+	}
+	if len(waiter.ready) != 0 {
+		t.Fatalf("ready list = %d, want flushed at the mark", len(waiter.ready))
+	}
+}

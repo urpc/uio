@@ -41,6 +41,12 @@ var dataShardsOverride int
 // automatic.
 var dataWaitersOverride int
 
+// dataFlushEvery bounds how many readiness events dispatch folds before the
+// connections collected so far are handed to the executor, so a connection at
+// the head of a deep batch reaches running workers without waiting out the
+// tail's checks. Steady-state batches never reach the mark.
+const dataFlushEvery = 16
+
 // dataShardCount scales the shard count with the machine: about four Ps per
 // shard, at least one and at most defaultDataShards. A small host keeps a
 // single collector, so it pays nothing for a structure it cannot fill, and a
@@ -210,25 +216,43 @@ func (data *dataPoller) serve(shard *dataShard, waiter *dataWaiter, yield, parke
 		if err != nil {
 			return err
 		}
-		data.dispatch(shard, waiter, waiter.evbuf[:n])
-		if data.submit(waiter) && yield {
+		submitted := data.dispatch(shard, waiter, waiter.evbuf[:n])
+		if data.submit(waiter) {
+			submitted = true
+		}
+		if submitted && yield {
 			runtime.Gosched()
 		}
 	}
 }
 
 // dispatch folds readiness into the connections this shard watches and
-// collects the ones that became runnable.
-func (data *dataPoller) dispatch(shard *dataShard, waiter *dataWaiter, events []poller.Event) {
+// collects the ones that became runnable, handing them over early every
+// dataFlushEvery events. It reports whether anything was submitted before
+// the leftover trailing submit, so serve keeps yielding for woken workers
+// exactly as it did with the single hand-over.
+func (data *dataPoller) dispatch(shard *dataShard, waiter *dataWaiter, events []poller.Event) bool {
+	submitted := false
+	countdown := dataFlushEvery
 	for _, event := range events {
 		conn := shard.fdMap.Get(event.FD)
-		if conn == nil || conn.pollTag != event.Tag || conn.isClosing() || conn.skipsEdge(event.Events) {
-			continue
+		if conn != nil && conn.pollTag == event.Tag && !conn.isClosing() && !conn.skipsEdge(event.Events) {
+			if conn.noteIO(uint32(event.Events)) {
+				waiter.ready = append(waiter.ready, conn)
+			}
 		}
-		if conn.noteIO(uint32(event.Events)) {
-			waiter.ready = append(waiter.ready, conn)
+		// Every checked event counts: a batch of stale or filtered events
+		// costs the same lookups as a live one, and the interval bounds how
+		// long the head of the batch waits behind the tail, not how many
+		// connections were collected.
+		if countdown--; countdown == 0 {
+			countdown = dataFlushEvery
+			if data.submit(waiter) {
+				submitted = true
+			}
 		}
 	}
+	return submitted
 }
 
 func (data *dataPoller) submit(waiter *dataWaiter) bool {
