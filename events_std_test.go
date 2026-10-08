@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -757,32 +758,40 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 	}
 }
 
+// TestStdDrainOutboundClearsVectorStorage pins that a finished drain returns
+// its write vector to the pool cleared: a stale buffer left in a slot would
+// pin the block it references for as long as the pooled vector lives.
 func TestStdDrainOutboundClearsVectorStorage(t *testing.T) {
+	// Pin the pool's per-P shard so the poisoned vector is the one the drain
+	// below fetches and returns.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	poisoned := stdWriteScratchPool.Get().(*stdWriteScratch)
+	for index := range poisoned.vec {
+		poisoned.vec[index] = []byte("stale")
+	}
+	poisoned.bufs = net.Buffers{[]byte("stale")}
+	stdWriteScratchPool.Put(poisoned)
+
 	raw := newStdRegistrationConn(30003)
 	raw.openReturned.Store(true)
 	conn := &fdConn{commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}}, conn: raw}
 	if _, err := conn.outbound.Write([]byte("payload")); err != nil {
 		t.Fatal(err)
 	}
-	storage := make([][]byte, stdWriteVecLimit)
-	if written, err := conn.drainOutbound(storage); err != nil || written != len("payload") {
+	if written, err := conn.drainOutbound(); err != nil || written != len("payload") {
 		t.Fatalf("drainOutbound = %d, %v", written, err)
 	}
-	for index, buffer := range storage {
+	returned := stdWriteScratchPool.Get().(*stdWriteScratch)
+	defer stdWriteScratchPool.Put(returned)
+	for index, buffer := range returned.vec {
 		if buffer != nil {
 			t.Fatalf("vector storage slot %d retained %d bytes", index, len(buffer))
 		}
 	}
-	for index := range storage {
-		storage[index] = []byte("stale")
-	}
-	if written, err := conn.drainOutbound(storage[:0]); err != nil || written != 0 {
-		t.Fatalf("empty drainOutbound = %d, %v", written, err)
-	}
-	for index, buffer := range storage {
-		if buffer != nil {
-			t.Fatalf("empty drain retained vector storage slot %d", index)
-		}
+	if returned.bufs != nil {
+		t.Fatal("scratch retained its Buffers wrapper")
 	}
 }
 
@@ -1001,6 +1010,9 @@ func TestStdReadLoopKeepsLifetimeUntilExit(t *testing.T) {
 	raw.openReturned.Store(true)
 	raw.secondRead = make(chan struct{})
 	events := &Events{MaxBufferSize: 64}
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
 	callbackDone := make(chan struct{}, 1)
 	events.OnData = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
@@ -1059,6 +1071,9 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 		return n, io.EOF
 	}
 	events := &Events{MaxBufferSize: 64}
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
 	received := make(chan string, 1)
 	events.OnData = func(conn Conn) error {
 		chunk := append([]byte(nil), conn.PeekChunk()...)

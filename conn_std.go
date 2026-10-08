@@ -474,13 +474,32 @@ func (fc *fdConn) Flush() error {
 	return nil
 }
 
+// stdWriteScratch is the fixed scratch one drain fills and hands over. It
+// lives in a pool rather than on the writer goroutine's stack: both the
+// vector and the net.Buffers wrapper reach net.Buffers.WriteTo as values
+// whose address the compiler must assume escapes, which would move the vector
+// to the heap once per connection, for the connection's whole life, and
+// allocate the wrapper once per drain. Pooled, an idle connection holds
+// neither.
+type stdWriteScratch struct {
+	vec  [stdWriteVecLimit][]byte
+	bufs net.Buffers
+}
+
+var stdWriteScratchPool = sync.Pool{New: func() any { return new(stdWriteScratch) }}
+
 // drainOutbound swaps the producer buffer into writeBatch before blocking on
 // the network. Producers immediately continue on a fresh CompositeBuffer;
 // writeMu prevents close cleanup from returning in-flight blocks to the pool.
-func (fc *fdConn) drainOutbound(vec [][]byte) (int, error) {
+func (fc *fdConn) drainOutbound() (int, error) {
+	scratch := stdWriteScratchPool.Get().(*stdWriteScratch)
+	defer func() {
+		clear(scratch.vec[:])
+		scratch.bufs = nil
+		stdWriteScratchPool.Put(scratch)
+	}()
 	fc.writeMu.Lock()
 	defer fc.writeMu.Unlock()
-	defer clear(vec[:cap(vec)])
 
 	fc.mux.Lock()
 	if fc.isClosing() {
@@ -499,9 +518,9 @@ func (fc *fdConn) drainOutbound(vec [][]byte) (int, error) {
 	totalWritten := 0
 	var writeErr error
 	for !fc.writeBatch.Empty() {
-		buffers, size := fc.writeBatch.PeekVecN(vec, cap(vec))
-		netBuffers := net.Buffers(buffers)
-		written, err := netBuffers.WriteTo(fc.conn)
+		buffers, size := fc.writeBatch.PeekVecN(scratch.vec[:], len(scratch.vec))
+		scratch.bufs = buffers
+		written, err := scratch.bufs.WriteTo(fc.conn)
 		clear(buffers)
 		if written > 0 {
 			n := int(written)
@@ -699,15 +718,12 @@ func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 // level signal for "output exists", not one acknowledgement per Write.
 func (fc *fdConn) writeLoop() {
 	defer fc.events.callbackWG.Done()
-	var storage [stdWriteVecLimit][]byte
 	for {
 		select {
 		case <-fc.closeSig:
 			return
 		case <-fc.writeSig:
-			var written int
-			var err error
-			written, err = fc.drainOutbound(storage[:])
+			written, err := fc.drainOutbound()
 			if written > 0 {
 				fc.events.onSocketBytesWrite(fc, written)
 			}
@@ -724,7 +740,9 @@ func (fc *fdConn) writeLoop() {
 func (fc *fdConn) readUDPLoop() {
 	defer fc.events.callbackWG.Done()
 
-	var buffer = make([]byte, fc.events.MaxBufferSize)
+	holder := fc.events.readPool.Get().(*readBuffer)
+	defer fc.events.readPool.Put(holder)
+	buffer := holder.bytes
 	for {
 		n, _, err := fc.udp.ReadFrom(buffer)
 		if nil != err {
@@ -762,7 +780,9 @@ func (fc *fdConn) readUDPLoop() {
 func (fc *fdConn) readLoop() {
 	defer fc.events.callbackWG.Done()
 
-	var buffer = make([]byte, fc.events.MaxBufferSize)
+	holder := fc.events.readPool.Get().(*readBuffer)
+	defer fc.events.readPool.Put(holder)
+	buffer := holder.bytes
 	for {
 		n, readErr := fc.conn.Read(buffer)
 		if n > 0 {
@@ -827,7 +847,9 @@ func (fc *fdConn) listenUDP() error {
 	// UDP peer callbacks all run on this listener goroutine.
 	defer fc.events.callbackWG.Done()
 
-	var buffer = make([]byte, fc.events.MaxBufferSize)
+	holder := fc.events.readPool.Get().(*readBuffer)
+	defer fc.events.readPool.Put(holder)
+	buffer := holder.bytes
 
 	for {
 		n, addr, err := fc.udp.ReadFrom(buffer)
