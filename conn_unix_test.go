@@ -744,7 +744,7 @@ func TestShutdownRetainsTaskErrorAfterNilCloseRequest(t *testing.T) {
 	}
 }
 
-func TestShutdownWaitsForTaskBehindQueuedRefresh(t *testing.T) {
+func TestShutdownWaitsForTaskBehindQueuedTask(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	closed := make(chan struct{}, 1)
@@ -765,11 +765,11 @@ func TestShutdownWaitsForTaskBehindQueuedRefresh(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection task did not start")
 	}
-	refresh := acquireTask(refreshTask, testConn.conn)
-	if !testConn.conn.loop.submitTask(refresh) {
-		releaseTask(refresh)
+	queued := acquireTask(deadlineTask, testConn.conn)
+	if !testConn.conn.loop.submitTask(queued) {
+		releaseTask(queued)
 		close(release)
-		t.Fatal("refresh task was rejected before shutdown")
+		t.Fatal("queued task was rejected before shutdown")
 	}
 	testConn.conn.loop.beginStop(nil)
 	deadline := time.Now().Add(time.Second)
@@ -1397,27 +1397,6 @@ func TestDeadlineClearAndExpire(t *testing.T) {
 	}
 }
 
-func TestBackpressureHysteresis(t *testing.T) {
-	events := &Events{MaxOutboundBuffered: 100}
-	conn := &fdConn{}
-	conn.events = events
-	conn.pending.Store(75)
-	_ = conn.updateInterest()
-	if !conn.throttled() {
-		t.Fatal("backlog at the high-water mark did not pause reads")
-	}
-	conn.pending.Store(60)
-	_ = conn.updateInterest()
-	if !conn.throttled() {
-		t.Fatal("hysteresis: backlog below the high-water mark resumed reads early")
-	}
-	conn.pending.Store(50)
-	_ = conn.updateInterest()
-	if conn.throttled() {
-		t.Fatal("drained backlog did not resume reads")
-	}
-}
-
 func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	cause := errors.New("closed")
 	closed := make(chan error, 1)
@@ -1454,7 +1433,7 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 	events.OnStart = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			break
 		}
 		events.acceptor.mux.Unlock()
@@ -1569,7 +1548,7 @@ func TestEventsCloseFromCallbackDoesNotDeadlock(t *testing.T) {
 	events.OnStart = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			break
 		}
 		events.acceptor.mux.Unlock()
@@ -1629,7 +1608,7 @@ func TestUDPChildCloseDoesNotCloseSharedServer(t *testing.T) {
 	events.OnStart = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			break
 		}
 		events.acceptor.mux.Unlock()

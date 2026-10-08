@@ -238,18 +238,6 @@ func (loop *eventLoop) runTask(t *task) {
 	case stopTask:
 		loop.stopErr = t.err
 		loop.stopping.Store(true)
-	case refreshTask:
-		result = t.conn.updateInterest()
-		if result == nil && t.conn.readNeedsRedelivery() && !t.conn.isClosing() {
-			if t.conn.clearReadRedelivery() {
-				// Wake drains bytes retained in the connection buffer; Read drains
-				// the edge-triggered socket that may not produce another edge.
-				t.conn.scheduleIO(ioEventRead | ioEventWake)
-			}
-		}
-		if result != nil {
-			t.conn.requestClose(result)
-		}
 	case udpWriteTask:
 		datagram = t.conn.runUDPWriteTask(t.udpPayload)
 	}

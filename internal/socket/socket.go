@@ -32,7 +32,15 @@ func SockaddrToAddrPort(sa syscall.Sockaddr) netip.AddrPort {
 	case *syscall.SockaddrInet4:
 		return netip.AddrPortFrom(netip.AddrFrom4(sa.Addr), uint16(sa.Port))
 	case *syscall.SockaddrInet6:
-		return netip.AddrPortFrom(netip.AddrFrom16(sa.Addr), uint16(sa.Port))
+		addr := netip.AddrFrom16(sa.Addr)
+		if sa.ZoneId != 0 {
+			// Link-local peers carry their interface; keep it the way
+			// SockaddrToAddr does, as a zone name.
+			if ifi, err := net.InterfaceByIndex(int(sa.ZoneId)); err == nil {
+				addr = addr.WithZone(ifi.Name)
+			}
+		}
+		return netip.AddrPortFrom(addr, uint16(sa.Port))
 	case *syscall.SockaddrUnix:
 		_ = sa
 	}

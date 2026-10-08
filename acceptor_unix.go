@@ -42,7 +42,7 @@ type listener struct {
 	network string         // network protocol
 	fd      int            // fd
 	addr    string         // address
-	laddr   net.Addr       // local listen address
+	pair    *addrPair      // local listen address, shared by accepted connections
 	ln      net.Listener   // tcp/unix listener
 	file    *os.File       // file
 	udp     net.PacketConn // udp endpoint
@@ -109,8 +109,14 @@ func (ld *acceptor) accept(l *listener) error {
 		fdc.fd = nfd
 		fdc.events = ld.events
 		fdc.loop = ld.events.selectWorker(nfd)
-		fdc.localAddr = &l.laddr
-		fdc.remoteAddr = socket.SockaddrToAddrPort(sa)
+		fdc.addr = l.pair
+		if tcp {
+			fdc.remoteAddr = socket.SockaddrToAddrPort(sa)
+		} else {
+			// Unix peers keep their address object; only IP peers have a
+			// value form.
+			fdc.setRemoteAddr(socket.SockaddrToAddr(sa, false))
+		}
 
 		ld.events.submitAccepted(fdc, tcp)
 	}
@@ -149,7 +155,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
-		l.udpSvr.localAddr = &l.laddr
+		l.udpSvr.addr = l.pair
 
 		if err = ld.loop.fdMap.Put(l.fd, l.udpSvr); err != nil {
 			l.udpSvr.closeUnregistered()
@@ -250,11 +256,13 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 		setListenerOptions(l.ln)
 	}
 
+	var laddr net.Addr
 	if l.udp != nil {
-		l.laddr = l.udp.LocalAddr()
+		laddr = l.udp.LocalAddr()
 	} else {
-		l.laddr = l.ln.Addr()
+		laddr = l.ln.Addr()
 	}
+	l.pair = &addrPair{local: laddr}
 
 	switch ln := l.ln.(type) {
 	case nil:

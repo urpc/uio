@@ -19,7 +19,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 	events.OnStart = func(ev *Events) {
 		ev.acceptor.mux.Lock()
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			break
 		}
 		ev.acceptor.mux.Unlock()

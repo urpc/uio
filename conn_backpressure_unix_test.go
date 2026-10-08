@@ -13,9 +13,9 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// backpressureLimit is the MaxOutboundBuffered of the read-pause tests. The
-// pinned socket buffers hold a small fraction of it, so the backlog the tests
-// build stays in user space where the limit counts it.
+// backpressureLimit is the MaxOutboundBuffered of the outbound-budget tests.
+// The pinned socket buffers hold a small fraction of it, so the backlog the
+// tests build stays in user space where the limit counts it.
 const backpressureLimit = 1 << 20
 
 // backpressureServer is one connection under MaxOutboundBuffered whose
@@ -37,7 +37,7 @@ func startBackpressureServer(t *testing.T, onData func(conn Conn, n int) error) 
 	events := &Events{Pollers: 1, MaxOutboundBuffered: backpressureLimit}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -108,96 +108,76 @@ func (bp *backpressureServer) sendInput(t *testing.T, count int) {
 	time.Sleep(100 * time.Millisecond)
 }
 
-func (bp *backpressureServer) expectPaused(t *testing.T, when string) {
+// expectDelivered waits until every armed input byte has reached OnData.
+func (bp *backpressureServer) expectDelivered(t *testing.T, want int64, when string) {
 	t.Helper()
-	if calls := bp.calls.Load(); calls != 0 {
-		t.Fatalf("%s: OnData ran %d times with backlog %d of %d", when, calls, bp.server.pending.Load(), backpressureLimit)
+	for deadline := time.Now().Add(5 * time.Second); bp.got.Load() < want; {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: OnData got %d of %d bytes (backlog %d of %d, readStalled=%v)",
+				when, bp.got.Load(), want, bp.server.pending.Load(), backpressureLimit, bp.server.readStalled())
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
 
-// drainAndExpectInput reads everything the server sends until the input the
-// test queued has reached OnData: the backlog falls to the resume mark, and
-// the paused read must be delivered then.
-func (bp *backpressureServer) drainAndExpectInput(t *testing.T, want int64) {
-	t.Helper()
+// MaxOutboundBuffered is a write budget only: input keeps being read and
+// delivered while the backlog sits past the old pause mark, so a full-duplex
+// peer can always drain the backlog that would otherwise wait on its reads.
+func TestReadsContinueWhileOutboundBackedUp(t *testing.T) {
+	bp := startBackpressureServer(t, nil)
+	bp.fillTo(t, backpressureLimit-backpressureLimit/8, backpressureLimit-backpressureLimit/4)
+	bp.armed.Store(true)
+	bp.sendInput(t, 10)
+	bp.expectDelivered(t, 10, "with the backlog past the pause mark")
+}
+
+// The same holds with the backlog at the limit itself: reads neither pause
+// there, nor does a writable edge need to restart them.
+func TestReadsContinueAtOutboundLimit(t *testing.T) {
+	bp := startBackpressureServer(t, fillOutboundLimitOnce())
+	bp.fillTo(t, backpressureLimit/2, 1)
+	bp.sendInput(t, 1)
+	// The fill writes until the budget refuses; the socket may take a little
+	// more afterwards, so the backlog settles near, not at, the limit.
+	if pending := bp.server.pending.Load(); pending < backpressureLimit-backpressureLimit/8 {
+		t.Fatalf("backlog = %d, want near the limit %d", pending, backpressureLimit)
+	}
+	bp.armed.Store(true)
+	bp.sendInput(t, 10)
+	bp.expectDelivered(t, 10, "with the backlog near the limit")
+
+	// The budget still refuses writes that would exceed it...
+	if _, err := bp.server.Write(make([]byte, backpressureLimit)); !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("write past the limit: err = %v, want ErrOutboundOverflow", err)
+	}
+	// ...and accepts them again once the peer drains.
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		buffer := make([]byte, 64<<10)
-		for bp.got.Load() < want {
-			_ = bp.client.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-			if _, err := bp.client.Read(buffer); err != nil {
-				var netErr net.Error
-				if !errors.As(err, &netErr) || !netErr.Timeout() {
-					return
-				}
+		for taken := 0; taken < backpressureLimit/2; {
+			_ = bp.client.SetReadDeadline(time.Now().Add(time.Second))
+			n, err := bp.client.Read(buffer)
+			if err != nil {
+				return
 			}
+			taken += n
 		}
 	}()
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
-		t.Fatalf("paused read was never resumed: got %d of %d bytes, backlog %d, readStalled=%v throttled=%v",
-			bp.got.Load(), want, bp.server.pending.Load(), bp.server.readStalled(), bp.server.throttled())
+		t.Fatal("peer did not drain half the budget")
 	}
-	if got := bp.got.Load(); got != want {
-		t.Fatalf("got %d input bytes after the drain, want %d", got, want)
-	}
-}
-
-// MaxOutboundBuffered pauses a connection's reads once its backlog reaches
-// 75% of the limit, not only once a read round fills it, and the read resumes
-// when the backlog drains to 50%.
-func TestReadPausesAtOutboundThrottleMark(t *testing.T) {
-	bp := startBackpressureServer(t, nil)
-	bp.fillTo(t, backpressureLimit-backpressureLimit/8, backpressureLimit-backpressureLimit/4)
-	bp.armed.Store(true)
-	bp.sendInput(t, 10)
-	bp.expectPaused(t, "between the throttle mark and the limit")
-	bp.drainAndExpectInput(t, 10)
-}
-
-// A read round that fills the limit pauses the read, and further input must
-// not restart it. kqueue raises a read edge for every arrival, which a turn
-// must not take as leave to read.
-func TestReadPausedAtOutboundLimitIgnoresNewInput(t *testing.T) {
-	bp := startBackpressureServer(t, fillOutboundLimitOnce())
-	bp.fillTo(t, backpressureLimit/2, 1)
-	bp.sendInput(t, 1)
-	waitReadStalled(t, bp.server)
-	bp.armed.Store(true)
-	bp.sendInput(t, 10)
-	bp.expectPaused(t, "with the backlog at the limit")
-	bp.drainAndExpectInput(t, 10)
-}
-
-// A writable edge on a paused read must not restart it. Under always-armed
-// write interest epoll reports that edge with read readiness too whenever
-// input is queued.
-func TestReadPausedAtOutboundLimitIgnoresWritableEdge(t *testing.T) {
-	bp := startBackpressureServer(t, fillOutboundLimitOnce())
-	bp.fillTo(t, backpressureLimit/2, 1)
-	bp.sendInput(t, 1)
-	waitReadStalled(t, bp.server)
-	bp.armed.Store(true)
-	bp.sendInput(t, 1)
-	// The peer takes a little output: the socket turns writable while the
-	// backlog stays far above the resume mark.
-	buffer := make([]byte, 64<<10)
-	for taken := 0; taken < len(buffer); {
-		_ = bp.client.SetReadDeadline(time.Now().Add(time.Second))
-		n, err := bp.client.Read(buffer[taken:])
-		if err != nil {
-			t.Fatal(err)
+	for deadline := time.Now().Add(5 * time.Second); bp.server.pending.Load() > backpressureLimit-backpressureLimit/4; {
+		if time.Now().After(deadline) {
+			t.Fatalf("backlog stayed at %d after the drain", bp.server.pending.Load())
 		}
-		taken += n
+		time.Sleep(time.Millisecond)
 	}
-	time.Sleep(200 * time.Millisecond)
-	if bp.server.pending.Load() <= backpressureLimit/2 {
-		t.Skipf("backlog drained to %d; the edge resumed reads legitimately", bp.server.pending.Load())
+	if _, err := bp.server.Write([]byte{'z'}); err != nil {
+		t.Fatalf("write after the drain: %v", err)
 	}
-	bp.expectPaused(t, "after a writable edge")
-	bp.drainAndExpectInput(t, 1)
 }
 
 // fillOutboundLimitOnce returns an OnData that, the first time it runs,
@@ -225,19 +205,10 @@ func fillOutboundLimitOnce() func(Conn, int) error {
 	}
 }
 
-func waitReadStalled(t *testing.T, conn *fdConn) {
-	t.Helper()
-	for deadline := time.Now().Add(5 * time.Second); !conn.readStalled(); time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatalf("read never paused: backlog %d of %d", conn.pending.Load(), backpressureLimit)
-		}
-	}
-}
-
 func TestSkipsEdge(t *testing.T) {
 	conn := &fdConn{}
 	if conn.skipsEdge(poller.ReadEvents) {
-		t.Fatal("a read edge was dropped while the read was not paused")
+		t.Fatal("a read edge was dropped while no read was owed")
 	}
 	if !conn.skipsEdge(poller.WriteEvents) {
 		t.Fatal("a write-only edge with nothing to send scheduled a turn")
@@ -253,13 +224,13 @@ func TestSkipsEdge(t *testing.T) {
 	}
 	conn.setReadStalled(true)
 	if !conn.skipsEdge(poller.ReadEvents) {
-		t.Fatal("a read edge reached a paused read")
+		t.Fatal("a read edge reached a read that was already owed")
 	}
 	if conn.skipsEdge(poller.ReadEvents | poller.HangupEvents) {
-		t.Fatal("a hangup was dropped while the read was paused")
+		t.Fatal("a hangup was dropped while a read was owed")
 	}
 	if conn.skipsEdge(poller.ReadEvents | poller.WriteEvents) {
-		t.Fatal("a writable edge was dropped while the read was paused")
+		t.Fatal("a writable edge was dropped while a read was owed")
 	}
 }
 

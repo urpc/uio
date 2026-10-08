@@ -34,7 +34,7 @@ func TestWritevTakesVectorsLongerThanOneSyscall(t *testing.T) {
 			}
 			events.OnStart = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
-					started <- listener.laddr.String()
+					started <- listener.pair.local.String()
 					return
 				}
 			}

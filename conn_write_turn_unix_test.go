@@ -376,7 +376,8 @@ func TestWriteTurnResumesReadsAfterBlockedSend(t *testing.T) {
 
 // An echo through the outbound limit over loopback TCP, where the socket rarely
 // refuses a send, completes end to end. The restart of paused reads without a
-// writable edge is pinned by TestOutboundLimitPausesReadsUntilWriteTurnDrains.
+// writable edge is pinned by the write-budget tests: a socket that turns
+// writable while the backlog stays above the limit only resumes sending.
 func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	const total = 8 << 20
 	replies := make(chan []byte, 4096)
@@ -385,7 +386,7 @@ func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 8 << 10}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -441,88 +442,6 @@ func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	}
 	if !bytes.Equal(echoed, input) {
 		t.Fatal("echoed stream differs from the input")
-	}
-}
-
-// Input that arrives while a write turn holds the claim over a backlog past
-// the throttle mark is not read: the read pauses, it is not redelivered while
-// the backlog stays high, and the write turn that drains the backlog restarts
-// it without any writable edge.
-func TestOutboundLimitPausesReadsUntilWriteTurnDrains(t *testing.T) {
-	const limit, readSize, sent = 1024, 64, 200
-	var armed atomic.Bool
-	var consumed atomic.Int64
-	holding := make(chan struct{})
-	unblock := make(chan struct{})
-	var unblockOnce sync.Once
-	release := func() { unblockOnce.Do(func() { close(unblock) }) }
-	defer release()
-	events := &Events{Pollers: 1, MaxOutboundBuffered: limit, MaxBufferSize: readSize}
-	events.OnOutbound = func(Conn, int) {
-		if armed.CompareAndSwap(true, false) {
-			close(holding)
-			<-unblock
-		}
-	}
-	events.OnData = func(conn Conn) error {
-		n, _ := conn.Discard(-1)
-		consumed.Add(int64(n))
-		return nil
-	}
-	testConn := newTestConnection(t, events)
-	// Start from an open, idle connection, so the open turn neither sends the
-	// first byte itself nor sees the filled limit.
-	for deadline := time.Now().Add(2 * time.Second); testConn.conn.writeState.Load()&writeOpenedFlag == 0 ||
-		testConn.conn.ioOwner.Load() != 0; {
-		if time.Now().After(deadline) {
-			t.Fatal("connection did not finish opening")
-		}
-		time.Sleep(time.Millisecond)
-	}
-	waitConsumed := func(want int64, failure string) {
-		t.Helper()
-		for deadline := time.Now().Add(2 * time.Second); consumed.Load() < want; {
-			if time.Now().After(deadline) {
-				t.Fatalf("%s: consumed %d of %d bytes", failure, consumed.Load(), want)
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}
-
-	// A write turn sends one byte, then keeps its claim inside OnOutbound.
-	armed.Store(true)
-	if _, err := testConn.conn.Write([]byte{'x'}); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case <-holding:
-	case <-time.After(2 * time.Second):
-		t.Fatal("write turn did not start")
-	}
-	// The limit fills behind the held claim.
-	if _, err := testConn.conn.Write(bytes.Repeat([]byte{'y'}, limit)); err != nil {
-		t.Fatal(err)
-	}
-	// The peer sends input; the turn its edge starts finds the backlog past
-	// the throttle mark and records the read as owed instead of reading.
-	if err := writePeerAll(testConn.peer, make([]byte, sent), time.Now().Add(2*time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	for deadline := time.Now().Add(2 * time.Second); !testConn.conn.readStalled(); time.Sleep(time.Millisecond) {
-		if time.Now().After(deadline) {
-			t.Fatal("the input's turn did not pause the read")
-		}
-	}
-	time.Sleep(50 * time.Millisecond)
-	if n := consumed.Load(); n != 0 {
-		t.Fatalf("reads went on while the outbound limit was full: consumed %d bytes", n)
-	}
-	// Draining the backlog never fills the socket, so no writable edge comes.
-	release()
-	waitConsumed(sent, "paused reads did not resume after the write turn drained the backlog")
-	if got := readPeerUntil(t, testConn.peer, 1+limit, 2*time.Second); got[0] != 'x' ||
-		!bytes.Equal(got[1:], bytes.Repeat([]byte{'y'}, limit)) {
-		t.Fatal("peer received a different stream")
 	}
 }
 
@@ -593,7 +512,7 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 			events := &Events{Pollers: 1, Executor: executor}
 			events.OnStart = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
-					started <- listener.laddr.String()
+					started <- listener.pair.local.String()
 					return
 				}
 			}
@@ -682,7 +601,7 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 			events := &Events{Pollers: 1, Executor: executor}
 			events.OnStart = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
-					started <- listener.laddr.String()
+					started <- listener.pair.local.String()
 					return
 				}
 			}
@@ -780,7 +699,7 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	events := &Events{Pollers: 1, Executor: executor, MaxBufferSize: 1}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -955,7 +874,7 @@ func TestOutputAfterRecoveredOnOpenPanic(t *testing.T) {
 	events := &Events{Pollers: 1, Executor: executor}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -1162,7 +1081,7 @@ func TestRefusedWriteTurnClosesTheConnection(t *testing.T) {
 	events := &Events{Pollers: 1, Executor: executor}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -1244,7 +1163,7 @@ func TestCloseNeverWritesReusedDescriptor(t *testing.T) {
 	events := &Events{Pollers: 1}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}
@@ -1397,7 +1316,7 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 	events := &Events{Pollers: 1}
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}

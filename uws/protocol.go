@@ -30,8 +30,13 @@ func (c *Conn) startHandshakeTimer(timeout time.Duration) {
 	epoch := state.epoch
 	stopContext := state.contextStop
 	state.contextStop = nil
-	shard := deadlineShardIndex()
-	state.shard = shard
+	// The shard is picked once per connection: arming and canceling must agree,
+	// and a second arm must land where the cancel can reach it.
+	if !state.shardSet {
+		state.shard = deadlineShardIndex()
+		state.shardSet = true
+	}
+	shard := state.shard
 	state.expired = false
 	state.mu.Unlock()
 	deadlineShardAt(shard).arm(c, deadlineKindHandshake, time.Now().Add(timeout).UnixNano(), epoch, true)
@@ -530,20 +535,28 @@ func (c *Conn) closeTimeout() time.Duration {
 	return c.config.closeTimeout
 }
 
+// armCloseTimerLocked arms the connection's close timeout in its single shard.
+// The state mutex stays held across the registry update so an arm and a cancel
+// from another goroutine cannot interleave into a lost or duplicated entry.
+func (c *Conn) armCloseTimerLocked(state *closeTimerState, replace bool) {
+	if !state.hasShard {
+		state.shard = deadlineShardIndex()
+		state.hasShard = true
+	}
+	deadlineShardAt(state.shard).arm(c, deadlineKindClose, time.Now().Add(c.closeTimeout()).UnixNano(), 0, replace)
+}
+
 func (c *Conn) startCloseTimer() {
 	if c.closed.Load() {
 		return
 	}
 	state := c.ensureCloseTimerState()
 	state.mu.Lock()
+	defer state.mu.Unlock()
 	if c.closed.Load() {
-		state.mu.Unlock()
 		return
 	}
-	state.shard = deadlineShardIndex()
-	shard := state.shard
-	state.mu.Unlock()
-	deadlineShardAt(shard).arm(c, deadlineKindClose, time.Now().Add(c.closeTimeout()).UnixNano(), 0, true)
+	c.armCloseTimerLocked(state, true)
 }
 
 func (c *Conn) ensureCloseTimer() {
@@ -552,14 +565,11 @@ func (c *Conn) ensureCloseTimer() {
 	}
 	state := c.ensureCloseTimerState()
 	state.mu.Lock()
+	defer state.mu.Unlock()
 	if c.closed.Load() {
-		state.mu.Unlock()
 		return
 	}
-	state.shard = deadlineShardIndex()
-	shard := state.shard
-	state.mu.Unlock()
-	deadlineShardAt(shard).arm(c, deadlineKindClose, time.Now().Add(c.closeTimeout()).UnixNano(), 0, false)
+	c.armCloseTimerLocked(state, false)
 }
 
 // tryCloseTransport claims shutdown once a deferred Close frame went out and
@@ -591,9 +601,11 @@ func (c *Conn) stopCloseTimer() {
 		return
 	}
 	state.mu.Lock()
-	shard := state.shard
-	state.mu.Unlock()
-	deadlineShardAt(shard).cancel(c, deadlineKindClose, 0)
+	defer state.mu.Unlock()
+	if !state.hasShard {
+		return
+	}
+	deadlineShardAt(state.shard).cancel(c, deadlineKindClose, 0)
 }
 
 func (c *Conn) ensureCloseTimerState() *closeTimerState {

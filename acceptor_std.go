@@ -91,7 +91,9 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		return nil
 	}
 
+	ld.events.callbackWG.Add(1)
 	go func() {
+		defer ld.events.callbackWG.Done()
 		var tempDelay time.Duration // how long to sleep on accept failure
 		for {
 			conn, err := l.ln.Accept()
@@ -115,8 +117,8 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			fdc.conn = conn
 			fdc.events = ld.events
 			fdc.loop = ld.events.selectWorker(fdc.Fd())
-			fdc.localAddr = boxAddr(conn.LocalAddr())
-			fdc.remoteAddr = remoteAddrFrom(conn.RemoteAddr())
+			fdc.setLocalAddr(conn.LocalAddr())
+			fdc.setRemoteAddr(conn.RemoteAddr())
 			fdc.writeSig = make(chan struct{}, 1)
 			fdc.closeSig = make(chan struct{})
 

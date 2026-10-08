@@ -146,7 +146,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	events := &Events{Pollers: 1}
 	events.OnStart = func(events *Events) {
 		for _, listener := range events.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}

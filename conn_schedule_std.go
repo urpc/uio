@@ -31,5 +31,3 @@ func (conn *fdConn) noteIO(uint32) bool           { return false }
 func (conn *fdConn) skipsEdge(poller.Events) bool { return false }
 func (conn *fdConn) RunTask()                     {}
 func (conn *fdConn) handleIOSubmitFailure(error)  {}
-func (conn *fdConn) readNeedsRedelivery() bool    { return false }
-func (conn *fdConn) clearReadRedelivery() bool    { return false }

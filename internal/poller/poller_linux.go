@@ -348,7 +348,9 @@ func (poller *NetPoller) mountPark(batch *Batch) {
 		batch.parkFile.Close()
 		batch.parkFile = nil
 	}
-	fd, err := unix.Dup(poller.epfd)
+	// F_DUPFD_CLOEXEC: the duplicate must not survive into a child process,
+	// and setting the flag after a plain dup would leave a fork/exec window.
+	fd, err := unix.FcntlInt(uintptr(poller.epfd), unix.F_DUPFD_CLOEXEC, 0)
 	if err != nil {
 		return
 	}

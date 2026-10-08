@@ -26,7 +26,7 @@ func TestUnflushedErrorDescriptionAndCause(t *testing.T) {
 func TestCommonConnMetadataAndUnsupportedDeadlines(t *testing.T) {
 	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 	remote := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
-	conn := &commonConn{localAddr: boxAddr(local), remoteAddr: remoteAddrFrom(remote)}
+	conn := &commonConn{addr: &addrPair{local: local}, remoteAddr: remoteAddrFrom(remote)}
 	conn.SetUserdata("userdata")
 	if conn.LocalAddr() != local || conn.Userdata() != "userdata" {
 		t.Fatal("connection metadata was not preserved")

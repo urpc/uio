@@ -39,7 +39,7 @@ func TestPausedReadRedeliveredWhileWriteBlocked(t *testing.T) {
 			events := &Events{Pollers: 1, MaxBufferSize: 1, MaxOutboundBuffered: test.limit}
 			events.OnStart = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
-					started <- listener.laddr.String()
+					started <- listener.pair.local.String()
 					return
 				}
 			}

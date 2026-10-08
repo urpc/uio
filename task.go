@@ -18,7 +18,6 @@ const (
 	deadlineTask
 	timeoutTask
 	stopTask
-	refreshTask
 	udpWriteTask
 )
 

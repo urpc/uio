@@ -170,7 +170,7 @@ func TestAcceptedPeersThatWriteAndCloseAreClosed(t *testing.T) {
 	var closed atomic.Int64
 	events.OnStart = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
-			started <- listener.laddr.String()
+			started <- listener.pair.local.String()
 			return
 		}
 	}

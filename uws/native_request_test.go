@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,9 +17,11 @@ type nativeRequestHandler struct {
 	open    chan struct{}
 	request chan *http.Request
 	conn    chan *Conn
+	opens   atomic.Int32
 }
 
 func (h *nativeRequestHandler) OnOpen(conn *Conn) {
+	h.opens.Add(1)
 	h.request <- conn.Request()
 	h.conn <- conn
 	close(h.open)
@@ -167,7 +170,16 @@ func TestServerNativeRequestWithCheckOrigin(t *testing.T) {
 		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
-	if line := readStatusLine(t, deniedReader); !strings.HasPrefix(line, "HTTP/1.1 400 ") {
+	// A rejected handshake closes without upgrading. The 400 and the close
+	// race on the stdio backend, whose queued rejection may lose to the
+	// blocking writer being shut down, so the client sees the response or just
+	// EOF; either is a rejection, but an upgrade is not.
+	line, readErr := deniedReader.ReadString('\n')
+	if readErr == nil && !strings.HasPrefix(line, "HTTP/1.1 400 ") {
 		t.Fatalf("denied handshake response = %q", line)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := handler.opens.Load(); got != 1 {
+		t.Fatalf("OnOpen ran %d times, want only the allowed connection", got)
 	}
 }

@@ -6,6 +6,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestCloseReleasesEveryWaiter runs a shared control wake first, so every
@@ -85,5 +87,29 @@ func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatalf("attempt %d: the waiter registered before Close never returned", attempt)
 		}
+	}
+}
+
+// TestParkDuplicateIsCloseOnExec pins that the parked wait's duplicated epoll
+// descriptor cannot leak into a child process: a plain dup clears FD_CLOEXEC,
+// and re-setting the flag afterwards would leave a fork/exec window.
+func TestParkDuplicateIsCloseOnExec(t *testing.T) {
+	p, err := NewNetPoller()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close(nil)
+	batch := &Batch{}
+	p.mountPark(batch)
+	if batch.parkFile == nil {
+		t.Fatal("park was not mounted")
+	}
+	defer batch.parkFile.Close()
+	flags, err := unix.FcntlInt(batch.parkFile.Fd(), unix.F_GETFD, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if flags&unix.FD_CLOEXEC == 0 {
+		t.Fatal("parked epoll duplicate is not close-on-exec")
 	}
 }

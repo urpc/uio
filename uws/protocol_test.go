@@ -934,3 +934,27 @@ func TestCompressedMessageLimitUsesDecodedSize(t *testing.T) {
 		})
 	}
 }
+
+func TestCloseTimerCancelCoversEveryArm(t *testing.T) {
+	raw := newScriptedConn()
+	raw.closed = make(chan struct{})
+	conn := &Conn{raw: raw, config: testServerConfig(&Server{CloseTimeout: 25 * time.Millisecond})}
+	// An arm from either entry point must land in the connection's one shard,
+	// so a single cancel reaches every pending entry.
+	conn.startCloseTimer()
+	conn.ensureCloseTimer()
+	conn.stopCloseTimer()
+	select {
+	case <-raw.closed:
+		t.Fatal("a stopped close timeout still aborted the transport")
+	case <-time.After(100 * time.Millisecond):
+	}
+	// A later arm reuses the pinned shard and is still cancellable.
+	conn.startCloseTimer()
+	conn.stopCloseTimer()
+	select {
+	case <-raw.closed:
+		t.Fatal("a re-armed close timeout was not canceled")
+	case <-time.After(100 * time.Millisecond):
+	}
+}

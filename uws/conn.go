@@ -115,8 +115,9 @@ type heartbeatState struct {
 // closeTimerState protects lazy creation, replacement, and cancellation of the
 // graceful-close deadline from callback and timer goroutines.
 type closeTimerState struct {
-	mu    sync.Mutex
-	shard uint8 // deadline shard the close timeout lives in
+	mu       sync.Mutex
+	shard    uint8
+	hasShard bool // the shard is picked once and then never changes
 }
 
 // connMetadata groups infrequently used negotiated and close information so a
@@ -143,6 +144,7 @@ type handshakeState struct {
 	cleanup     func()
 	epoch       uint64
 	shard       uint8 // deadline shard the handshake timeout lives in
+	shardSet    bool  // the shard is picked once and then never changes
 	expired     bool
 }
 

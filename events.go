@@ -114,9 +114,11 @@ type Events struct {
 	WriteBufferedThreshold int
 
 	// MaxOutboundBuffered limits accepted but unsent payload bytes per
-	// connection. Native transports pause that connection's reads at 75% of the
-	// limit and resume them at 50%. A write that would push buffered unsent data
-	// beyond the limit returns ErrOutboundOverflow. Zero disables the limit.
+	// connection. It is a pure write budget: a write that would push buffered
+	// unsent data beyond the limit returns ErrOutboundOverflow, while reads
+	// keep flowing so a full-duplex peer can always drain its side. Callers
+	// treat overflow as overload — defer, drop, or close — and bound the
+	// receive side with MaxInboundBuffered. Zero disables the limit.
 	MaxOutboundBuffered int
 
 	// MaxInboundBuffered limits payload left unread after a callback returns.

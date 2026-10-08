@@ -227,29 +227,55 @@ type commonConn struct {
 	userdata    any                     // user-defined data; see Conn.SetUserdata
 	inboundTail []byte                  // inbound tail buffer
 	inbound     bytebuf.CompositeBuffer // inbound buffer
-	// localAddr points at the address object rather than holding it: every
-	// connection a listener accepts shares the listener's one object, and the
-	// only connections that box their own are dialed or adopted ones.
-	localAddr  *net.Addr
-	remoteAddr netip.AddrPort // remote address, kept by value
+	// addr carries the address objects LocalAddr and RemoteAddr hand back.
+	// Accepted connections share the listener's single pair, and a connection
+	// whose peer is not an IP address (Unix sockets) gets its own pair through
+	// copy-on-write, so a shared pair is never mutated in place.
+	addr       *addrPair
+	remoteAddr netip.AddrPort // IP peer address, kept by value
+}
+
+// addrPair holds the address objects a connection returns for LocalAddr and
+// RemoteAddr. A listener's pair is shared by every connection it accepts; a
+// non-IP peer address forces a per-connection copy.
+type addrPair struct {
+	local  net.Addr
+	remote net.Addr
 }
 
 func (fc *commonConn) LocalAddr() net.Addr {
-	if fc.localAddr == nil {
+	if fc.addr == nil {
 		return nil
 	}
-	return *fc.localAddr
+	return fc.addr.local
 }
 
-// setLocalAddr boxes addr behind the field; listeners hand their shared
-// address object to every connection they accept instead.
-func (fc *commonConn) setLocalAddr(addr net.Addr) { fc.localAddr = boxAddr(addr) }
+// setLocalAddr stores a connection's own local address; it is only for the
+// cold paths that have no shared object to point at.
+func (fc *commonConn) setLocalAddr(addr net.Addr) { fc.addr = &addrPair{local: addr} }
 
-// boxAddr boxes an address; it is only for the cold paths that have no shared
-// object to point at.
-func boxAddr(addr net.Addr) *net.Addr { return &addr }
+// setRemoteAddr stores the peer address. IP peers keep the compact value form;
+// any other address (Unix sockets) is kept as the object itself, copied out of
+// a possibly shared pair first.
+func (fc *commonConn) setRemoteAddr(addr net.Addr) {
+	if addr == nil {
+		return
+	}
+	if addrPort := remoteAddrFrom(addr); addrPort.IsValid() {
+		fc.remoteAddr = addrPort
+		return
+	}
+	if fc.addr == nil {
+		fc.addr = &addrPair{remote: addr}
+		return
+	}
+	pair := *fc.addr // the pair may be shared with a listener or a parent connection
+	pair.remote = addr
+	fc.addr = &pair
+}
 
-// remoteAddrFrom converts a net.Addr to the value form the connection stores.
+// remoteAddrFrom converts an IP net.Addr to the value form the connection
+// stores; non-IP addresses report the zero value.
 func remoteAddrFrom(addr net.Addr) netip.AddrPort {
 	switch a := addr.(type) {
 	case *net.TCPAddr:

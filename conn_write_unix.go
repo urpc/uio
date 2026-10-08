@@ -704,17 +704,11 @@ func (conn *fdConn) retireFlush(written int, err error) (int, error) {
 	return written, err
 }
 
-// retireSent retires bytes the socket took. The decrement that takes the
-// backlog down to the resume mark lets reads the outbound limit paused
-// continue. Producers only add to pending and every add and retire is atomic,
-// so each downward crossing is seen here exactly once, whoever is sending and
-// whatever producers append meanwhile.
+// retireSent retires bytes the socket took. Producers only add to pending and
+// every add and retire is atomic, so the decrement needs no further
+// coordination.
 func (conn *fdConn) retireSent(n int) {
-	after := conn.pending.Add(-int64(n))
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 &&
-		after <= limit/2 && after+int64(n) > limit/2 {
-		conn.scheduleRefresh()
-	}
+	conn.pending.Add(-int64(n))
 }
 
 // sendOutboundBlock sends a queue of one block in place, with plain write and
@@ -794,39 +788,6 @@ func (conn *fdConn) outboundEmpty() bool {
 	// conservative, lock-free empty check for stream connections. Callers still
 	// take submitMu before inspecting or mutating the segment list itself.
 	return conn.pending.Load() == 0
-}
-
-// updateInterest runs the outbound limit's read-pause hysteresis on the loop,
-// whose refresh command then redelivers a paused read once throttled is
-// clear. A stream's registration never changes — read and write interest are
-// armed together at Add, and under edge triggering the always-armed write
-// interest reports a socket only when it goes from full back to writable —
-// so this issues no epoll_ctl.
-func (conn *fdConn) updateInterest() error {
-	if conn.close.isReleased() || (conn.udp != nil && conn.udp.server != nil) {
-		return nil
-	}
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
-		// Hysteresis avoids resuming around a single threshold.
-		if pending := conn.pending.Load(); pending <= limit/2 {
-			conn.setThrottled(false)
-		} else if pending >= limit-limit/4 {
-			conn.setThrottled(true)
-		}
-	} else {
-		conn.setThrottled(false)
-	}
-	return nil
-}
-
-// readShouldStop reports whether this connection filled its outbound limit,
-// which ends a read round however far it got; a turn does not start reading
-// past the 75% mark at all (see readPaused).
-func (conn *fdConn) readShouldStop() bool {
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
-		return conn.pending.Load() >= limit
-	}
-	return false
 }
 
 func (conn *fdConn) OutboundBuffered() int { return int(conn.pending.Load()) }

@@ -100,13 +100,17 @@ func (fc *fdConn) closeUnregistered() {
 }
 
 func (fc *fdConn) RemoteAddr() net.Addr {
-	if !fc.remoteAddr.IsValid() {
-		return nil
+	if fc.remoteAddr.IsValid() {
+		if fc.isDatagram() {
+			return net.UDPAddrFromAddrPort(fc.remoteAddr)
+		}
+		return net.TCPAddrFromAddrPort(fc.remoteAddr)
 	}
-	if fc.isDatagram() {
-		return net.UDPAddrFromAddrPort(fc.remoteAddr)
+	// Non-IP peers (Unix sockets) keep their address object in the pair.
+	if fc.addr != nil {
+		return fc.addr.remote
 	}
-	return net.TCPAddrFromAddrPort(fc.remoteAddr)
+	return nil
 }
 
 func (fc *fdConn) Fd() int {
@@ -642,6 +646,10 @@ func (fc *fdConn) Wake() error {
 	if fc.isClosing() {
 		return net.ErrClosed
 	}
+	// The wake still travels through the loop's queue, so it starts after
+	// previously submitted tasks and one callback is scheduled per call. The
+	// loop only dequeues it; see runWakeTask for why the callback itself runs
+	// elsewhere.
 	t := acquireTask(wakeTask, fc)
 	if !fc.loop.submitTask(t) {
 		releaseTask(t)
@@ -652,20 +660,39 @@ func (fc *fdConn) Wake() error {
 
 func (fc *fdConn) YieldRead() error { return fc.Wake() }
 
+// runWakeTask runs on the event loop, in submission order, and hands the
+// callback to its own goroutine instead of waiting for the connection's
+// callback mutex: a callback that dials synchronously waits for the loop to
+// register the dialed connection, so the loop waiting here would close the
+// cycle. The callback still cannot race the blocking read goroutine or
+// OnClose — callbackMu serializes them — and it counts as a lifecycle callback
+// so Wait joins it.
 func (fc *fdConn) runWakeTask() error {
+	fc.events.callbackWG.Add(1)
+	go fc.deliverWake()
+	return nil
+}
+
+func (fc *fdConn) deliverWake() {
+	defer fc.events.callbackWG.Done()
 	if fc.isClosing() {
-		return net.ErrClosed
+		return
 	}
 	// A Wake callback must not race the blocking read goroutine's inbound view.
 	fc.callbackMu.Lock()
 	defer fc.callbackMu.Unlock()
+	if fc.isClosing() {
+		// The connection closed while this callback waited its turn.
+		return
+	}
 	started := fc.beginInboundCallback()
 	defer fc.endInboundCallback(started)
-	return fc.events.onData(fc)
+	if err := fc.events.onData(fc); err != nil {
+		fc.requestClose(err)
+	}
 }
 
 func (fc *fdConn) flushOnLoop() (int, error)          { return 0, nil }
-func (fc *fdConn) updateInterest() error              { return nil }
 func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 
 // writeLoop drains every coalesced notification to completion. writeSig is a
@@ -818,8 +845,8 @@ func (fc *fdConn) listenUDP() error {
 		if !ok {
 			udpConn = &fdConn{}
 			udpConn.udp = fc.udp
-			udpConn.localAddr = fc.localAddr
-			udpConn.remoteAddr = remoteAddrFrom(addr)
+			udpConn.addr = fc.addr
+			udpConn.setRemoteAddr(addr)
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
 			udpConn.udpSvr = fc

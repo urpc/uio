@@ -23,7 +23,7 @@ func TestAcceptBurstAcrossListeners(t *testing.T) {
 	events.OnStart = func(events *Events) {
 		addrs := make([]string, 0, len(events.acceptor.listeners))
 		for _, listener := range events.acceptor.listeners {
-			addrs = append(addrs, listener.laddr.String())
+			addrs = append(addrs, listener.pair.local.String())
 		}
 		started <- addrs
 	}

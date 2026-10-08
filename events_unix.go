@@ -60,7 +60,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 		return nil, net.ErrClosed
 	}
 	localAddr := conn.LocalAddr()
-	remoteAddr := remoteAddrFrom(conn.RemoteAddr())
+	remoteAddr := conn.RemoteAddr()
 
 	// Detach the socket from net.Conn before giving its duplicate to the native
 	// poller. DupNetConn marks the new descriptor close-on-exec.
@@ -76,12 +76,12 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 
 	fdc := &fdConn{
 		commonConn: commonConn{
-			events:     ev,
-			localAddr:  &localAddr,
-			remoteAddr: remoteAddr,
+			events: ev,
+			addr:   &addrPair{local: localAddr},
 		},
 		fd: fd,
 	}
+	fdc.setRemoteAddr(remoteAddr)
 	fdc.SetUserdata(userdata)
 	fdc.loop = ev.selectLoop(fd)
 	if err = ev.addConn(fdc); err != nil {
@@ -140,8 +140,8 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	fdc := &fdConn{}
 	fdc.fd = nfd
 	fdc.SetUserdata(userdata)
-	fdc.localAddr = &lAddr
-	fdc.remoteAddr = remoteAddrFrom(rAddr)
+	fdc.setLocalAddr(lAddr)
+	fdc.setRemoteAddr(rAddr)
 	fdc.events = ev
 	fdc.loop = ev.selectLoop(nfd)
 	if strings.HasPrefix(u.Scheme, "udp") {
