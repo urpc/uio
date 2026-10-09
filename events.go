@@ -81,11 +81,14 @@ type Events struct {
 	readBufferSize int
 
 	// Pollers is the number of event-loop goroutines.
-	// The default is one per four CPUs, at least two, capped by
-	// runtime.NumCPU(). On Linux, stream readiness is collected by the
-	// sharded data pollers instead, so Pollers sizes accept, registration,
-	// close, deadline and UDP work; connection churn is what notices its
-	// count, echo and pipeline are indifferent to it.
+	// The default is one per four Ps, at least two, capped by
+	// runtime.GOMAXPROCS(0): the loops are goroutines, so a process with
+	// fewer Ps than the machine's CPUs — a cgroup-limited container, a
+	// prefork child — sizes them to the Ps it runs on. On Linux, stream
+	// readiness is collected by the sharded data pollers instead, so
+	// Pollers sizes accept, registration, close, deadline and UDP work;
+	// connection churn is what notices its count, echo and pipeline are
+	// indifferent to it.
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
@@ -364,13 +367,17 @@ func (ev *Events) closeDataPoller(err error) {
 func (ev *Events) initConfig() error {
 
 	if ev.Pollers <= 0 {
-		// One event loop per four CPUs, at least two. The loops accept and
-		// then own each connection's registration and close, so a churning
-		// workload needs them spread wide, while loops past what the control
-		// plane uses only contend with the io workers for Ps.
-		ev.Pollers = max(2, runtime.NumCPU()/4)
+		// One event loop per four Ps, at least two. The loops accept and then
+		// own each connection's registration and close, so a churning workload
+		// needs them spread wide, while loops past what the control plane uses
+		// only contend with the io workers for Ps. The count follows
+		// GOMAXPROCS rather than NumCPU — the loops are goroutines — so a
+		// process whose Ps are fewer than the machine's CPUs, a prefork child
+		// or a cgroup-limited container, sizes loops to the Ps it actually
+		// runs on.
+		ev.Pollers = max(2, runtime.GOMAXPROCS(0)/4)
 	}
-	ev.Pollers = min(ev.Pollers, runtime.NumCPU())
+	ev.Pollers = min(ev.Pollers, runtime.GOMAXPROCS(0))
 
 	if ev.MaxBufferSize <= 0 {
 		ev.MaxBufferSize = 1024 * 4

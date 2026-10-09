@@ -34,9 +34,10 @@ go get github.com/urpc/uio
 
 type Events struct {
 	// Pollers is the number of event-loop goroutines.
-	// The default value is 4, capped by runtime.NumCPU(). On Linux, stream
-	// readiness is collected by one shared data poller instead, so Pollers
-	// sizes accept, registration, close, deadline and UDP work.
+	// The default is one per four Ps, at least two, capped by
+	// runtime.GOMAXPROCS(0). On Linux, stream readiness is collected by one
+	// shared data poller instead, so Pollers sizes accept, registration,
+	// close, deadline and UDP work.
 	Pollers int
 
 	// Executor optionally supplies an asynchronous native connection-task

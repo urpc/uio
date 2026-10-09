@@ -10,15 +10,16 @@ import (
 )
 
 func TestPollerCountDefaultsAndLimits(t *testing.T) {
+	procs := runtime.GOMAXPROCS(0)
 	for _, test := range []struct {
 		name       string
 		configured int
 		want       int
 	}{
-		{name: "zero", want: min(max(2, runtime.NumCPU()/4), runtime.NumCPU())},
-		{name: "negative", configured: -1, want: min(max(2, runtime.NumCPU()/4), runtime.NumCPU())},
+		{name: "zero", want: min(max(2, procs/4), procs)},
+		{name: "negative", configured: -1, want: min(max(2, procs/4), procs)},
 		{name: "explicit", configured: 1, want: 1},
-		{name: "above CPU count", configured: runtime.NumCPU() + 1, want: runtime.NumCPU()},
+		{name: "above CPU count", configured: procs + 1, want: procs},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			events := &Events{Pollers: test.configured}
