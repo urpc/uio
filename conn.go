@@ -104,20 +104,29 @@ type Conn interface {
 	SetWriteDeadline(t time.Time) error
 
 	// Peek returns the next len(b) bytes without advancing the inbound buffer.
-	// It may only be called from a connection callback.
+	//
+	// Peek, PeekChunk, Discard, InboundBuffered, Read, WriteTo and the slices
+	// they return read the connection's inbound buffer: call them only from
+	// inside the current invocation of this connection's OnOpen, OnInbound,
+	// OnData or OnClose callback — never from OnOutbound, never from another
+	// goroutine, and never after the callback returned. The slices are
+	// borrowed from the buffer, and any call that consumes inbound data —
+	// Read, WriteTo, Discard — or the callback's return may invalidate them
+	// as the consumed blocks go back to the pool: copy anything that must
+	// outlive that.
 	Peek(b []byte) []byte
 
 	// PeekChunk returns the first contiguous inbound chunk without advancing it.
-	// The returned slice is valid only until Discard or the callback returns.
-	// It may only be called from a connection callback.
+	// The returned slice is borrowed: Read, WriteTo, Discard or the callback's
+	// return may invalidate it. See Peek for the calling scope.
 	PeekChunk() []byte
 
 	// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
-	// It may only be called from a connection callback.
+	// See Peek for the calling scope.
 	Discard(n int) (int, error)
 
 	// InboundBuffered returns a inbound buffer data length.
-	// It may only be called from a connection callback.
+	// See Peek for the calling scope.
 	InboundBuffered() int
 
 	// OutboundBuffered returns payload bytes accepted by this connection but not
@@ -125,13 +134,13 @@ type Conn interface {
 	OutboundBuffered() int
 
 	// WriterTo
-	// It may only be called from a connection callback.
+	// WriteTo drains inbound data; see Peek for the calling scope.
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.WriterTo
 
 	// ReadWriteCloser
-	// Read may only be called from a connection callback. Write and Close are
-	// safe from other goroutines.
+	// Read is inbound access; see Peek for the calling scope. Write and Close
+	// are safe from other goroutines.
 	// Stream writes are non-blocking; native UDP writes from outside the owning
 	// loop wait for that loop's non-blocking datagram send result.
 	io.ReadWriteCloser
@@ -221,7 +230,7 @@ func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 type commonConn struct {
 	events      *Events                 // events
 	loop        *eventLoop              // event loop
-	inboundLive atomic.Bool             // an inbound callback is in progress
+	inboundLive atomic.Bool             // race-build only: an inbound callback is in progress; see conn_access_debug.go
 	turn        uint8                   // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
 	internal    bool                    // framework-owned endpoint, not a user connection
 	userdata    any                     // user-defined data; see Conn.SetUserdata
@@ -298,19 +307,6 @@ func remoteAddrFrom(addr net.Addr) netip.AddrPort {
 func (fc *commonConn) Userdata() any         { return fc.userdata }
 func (fc *commonConn) SetUserdata(value any) { fc.userdata = value }
 
-// Callback ownership is a contract check for borrowed inbound slices, not a
-// lock. Native tasks and std callbackMu serialize access before entering here,
-// so at most one goroutine is ever inside a connection's callback and a flag
-// records it; nested internal helpers leave the outer caller's scope intact.
-func (fc *commonConn) beginInboundCallback() bool {
-	return fc.inboundLive.CompareAndSwap(false, true)
-}
-
-func (fc *commonConn) endInboundCallback(started bool) {
-	if started {
-		fc.inboundLive.Store(false)
-	}
-}
 func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
 func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
 func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
@@ -418,16 +414,4 @@ func (fc *commonConn) Discard(n int) (int, error) {
 func (fc *commonConn) InboundBuffered() int {
 	fc.assertInboundAccess()
 	return fc.inbound.Len() + len(fc.inboundTail)
-}
-
-func (fc *commonConn) assertInboundAccess() {
-	// Unregistered connections are used by low-level helpers and tests before an
-	// owner exists. Registered connections always have both fields.
-	if fc.loop == nil || fc.events == nil {
-		return
-	}
-	if fc.inboundLive.Load() {
-		return
-	}
-	panic("uio: inbound access outside a connection callback")
 }

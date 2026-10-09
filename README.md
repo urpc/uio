@@ -160,15 +160,25 @@ consumed on both success and failure; the caller must never use the original
 
 `MaxOutboundBuffered` is the only outbound backpressure budget. It is applied
 per connection: a write that would push buffered unsent data beyond it returns
-`ErrOutboundOverflow`. Native transports also pause reads for that connection
-at 75% of the limit and resume them after the backlog falls to 50%.
-`MaxInboundBuffered` closes a connection with `ErrInboundOverflow` when a
-callback leaves too much input unconsumed. Both limits default to zero, which
-disables them.
+`ErrOutboundOverflow`, and reads are never paused by it — a full-duplex peer
+can always drain its side. `MaxInboundBuffered` closes a connection with
+`ErrInboundOverflow` when a callback leaves too much input unconsumed. Both
+limits default to zero, which disables them.
 
-Inside a connection callback, `Conn.PeekChunk` exposes the first contiguous
-inbound chunk without copying it. Process the returned slice before calling
-`Discard`; the slice is invalid after `Discard` or after the callback returns.
+The inbound buffer is callback-scoped. `Peek`, `PeekChunk`, `Discard`,
+`InboundBuffered`, `Read`, `WriteTo` and the slices they return may only be
+used inside the current invocation of this connection's `OnOpen`, `OnInbound`,
+`OnData` or `OnClose` callback — not from `OnOutbound` and not from another
+goroutine. `PeekChunk` (and `Peek`) may return a borrowed slice, and any call
+that consumes inbound data — `Read`, `WriteTo`, `Discard` — or the callback's
+return invalidates it as the consumed blocks go back to the pool, so copy
+anything processed asynchronously. Race-enabled builds panic on a call
+outside a callback as a misuse diagnostic; builds without the race detector
+compile that diagnostic out, and there the contract rests on the documentation
+and on the connection turn's serialization alone. Cross-goroutine access is
+per method, not per type: `Write` and `Close` are documented safe from other
+goroutines, the inbound methods are not, and every other method's comment says
+where it may be called — never assume the whole `Conn` is goroutine-safe.
 
 For encoders that can write into caller-provided storage, `AcquireBuffer` and
 `Conn.WriteOwned` avoid copying the encoded result into asynchronous outbound
