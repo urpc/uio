@@ -142,6 +142,14 @@ func dataWaiters(shards int) int {
 	}
 	procs := runtime.GOMAXPROCS(0)
 	if procs < 4 {
+		// One or two Ps run a single shard, and its waiters are what feed
+		// the executor: a lone waiter's next hand-off waits for that waiter
+		// to get a P back, and on so few Ps there is no slack to absorb the
+		// turn. A second waiter covers it; a third would only take turns on
+		// the same shard.
+		if procs >= 2 {
+			return 2
+		}
 		return 1
 	}
 	total := max(2, procs/4)
