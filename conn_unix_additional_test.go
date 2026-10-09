@@ -1135,3 +1135,34 @@ func TestWriteOwnedPartialWriteDespiteLimitReportsShortWrite(t *testing.T) {
 		t.Fatal("broken partial frame did not close the stream")
 	}
 }
+
+// The []IOTask readiness scratch is only worth its allocation for an
+// injected Executor: the owned typed queue takes the connections directly.
+func TestExecutorTaskScratchIsAllocatedOnlyForAnInjectedExecutor(t *testing.T) {
+	owned := &Events{Pollers: 1}
+	if err := owned.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop, err := newEventLoop(owned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.poller.Close(nil)
+	if loop.ioReadyArgs != nil {
+		t.Fatal("owned scheduler allocated the []IOTask scratch")
+	}
+
+	injected := &Events{Pollers: 1, Executor: &recoveringExecutor{}}
+	if err := injected.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop, err = newEventLoop(injected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.poller.Close(nil)
+	if len(loop.ioReadyArgs) != 0 || cap(loop.ioReadyArgs) != eventBatch {
+		t.Fatalf("injected executor scratch = len %d cap %d, want 0/%d",
+			len(loop.ioReadyArgs), cap(loop.ioReadyArgs), eventBatch)
+	}
+}

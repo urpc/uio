@@ -180,7 +180,11 @@ func (data *dataPoller) start(ev *Events) {
 			waiter := &dataWaiter{
 				evbuf: make([]poller.Event, eventBatch),
 				ready: make([]*fdConn, 0, eventBatch),
-				args:  make([]IOTask, 0, eventBatch),
+			}
+			if ev.Executor != nil {
+				// Only the external-executor path hands the batch over as an
+				// []IOTask; the owned typed queue takes the connections directly.
+				waiter.args = make([]IOTask, 0, eventBatch)
 			}
 			data.wg.Add(1)
 			go func(shard *dataShard) {

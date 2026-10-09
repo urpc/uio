@@ -430,15 +430,8 @@ func (conn *fdConn) finishWriteTurn() {
 // or that output would wait for an unrelated turn.
 func (conn *fdConn) openOutputAfterOnOpen() {
 	defer conn.writeState.Or(writeOpenedFlag)
-	if testHookBeforeOnOpen != nil {
-		testHookBeforeOnOpen(conn)
-	}
 	conn.fireOnOpen()
 }
-
-// testHookBeforeOnOpen runs in the open turn just before OnOpen fires; tests
-// use it to pin the goroutine the callback is delivered on. Nil outside tests.
-var testHookBeforeOnOpen func(*fdConn)
 
 // readStalled is one bit in its own flags word rather than a padded atomic
 // field, so it costs four bytes in the turn's scalar block.
@@ -453,17 +446,13 @@ func (conn *fdConn) setReadStalled(v bool) {
 }
 
 // clearReadStalled reports whether the owed read was still owed; exactly one
-// caller clears it.
+// caller clears it. Every writer of the bit is the connection's owning
+// goroutine — the read round that owes the read, YieldRead inside a callback,
+// and this clear in the turn's epilogue — so one atomic read-modify-write
+// settles it: the And returns the word the clear replaced, and the bit it
+// reports was set by this same goroutine's earlier round.
 func (conn *fdConn) clearReadStalled() bool {
-	for {
-		old := conn.flags.Load()
-		if old&readStalledFlag == 0 {
-			return false
-		}
-		if conn.flags.CompareAndSwap(old, old&^readStalledFlag) {
-			return true
-		}
-	}
+	return conn.flags.And(^readStalledFlag)&readStalledFlag != 0
 }
 
 func (conn *fdConn) Fd() int { return conn.fd }
@@ -593,7 +582,11 @@ func (conn *fdConn) noteIO(events uint32) bool {
 	if conn.isClosing() || conn.loop == nil || conn.loop.stopping.Load() || conn.loop.ioPool == nil {
 		return false
 	}
-	conn.taskState.Or(events)
+	if events != 0 {
+		// A caller may only want the task (scheduleOpen folds nothing);
+		// an empty word needs no read-modify-write.
+		conn.taskState.Or(events)
+	}
 	if conn.taskState.Load()&taskScheduledBit != 0 {
 		return false
 	}
@@ -809,13 +802,16 @@ func (conn *fdConn) runIOTask() {
 		}
 		conn.openOutputAfterOnOpen()
 	}
-	if !conn.isClosing() && events&ioEventWrite != 0 {
+	// The event bits are tested before the state the branches read: most
+	// turns carry one event, and a branch whose bit is clear costs nothing
+	// further.
+	if events&ioEventWrite != 0 && !conn.isClosing() {
 		conn.noteWritable()
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
 	}
-	if !conn.isClosing() && events&ioEventRead != 0 {
+	if events&ioEventRead != 0 && !conn.isClosing() {
 		if events&ioEventHangup != 0 {
 			conn.turn |= turnHangup
 		}
@@ -829,7 +825,7 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 	}
-	if !conn.isClosing() && !conn.readStalled() && events&ioEventWake != 0 {
+	if events&ioEventWake != 0 && !conn.isClosing() && !conn.readStalled() {
 		conn.turn |= turnCorked
 		if err := conn.fireOnData(); err != nil {
 			conn.requestClose(err)

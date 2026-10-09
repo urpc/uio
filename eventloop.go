@@ -83,7 +83,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		ioPool = newIOTaskPool(events.Executor)
 		owner = true
 	}
-	return &eventLoop{
+	loop := &eventLoop{
 		events:      events,
 		poller:      netPoller,
 		ioPool:      ioPool,
@@ -94,9 +94,14 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		evbuf:       make([]poller.Event, eventBatch),
 		tasks:       taskqueue.New[*task](),
 		ioReady:     make([]*fdConn, 0, eventBatch),
-		ioReadyArgs: make([]IOTask, 0, eventBatch),
 		ioIdle:      make(chan struct{}),
-	}, nil
+	}
+	if events.Executor != nil {
+		// Only the external-executor path hands the readiness batch over as
+		// an []IOTask; the owned typed queue takes the connections directly.
+		loop.ioReadyArgs = make([]IOTask, 0, eventBatch)
+	}
+	return loop, nil
 }
 
 func (loop *eventLoop) acquireIO() bool {
