@@ -49,23 +49,24 @@ func (rejectingNativeExecutor) SubmitBatch([]IOTask) int { return 0 }
 func TestDirectOwnerIsConnectionScoped(t *testing.T) {
 	loop := &eventLoop{}
 	owner := currentGoroutineID()
-	loop.loopGoid.Store(owner)
 	stream := &fdConn{commonConn: commonConn{loop: loop}}
 	if stream.directOwner() {
-		t.Fatal("loop owner incorrectly owns a stream connection task")
-	}
-	datagram := &fdConn{commonConn: commonConn{loop: loop}, udp: &unixUDPState{}}
-	if !datagram.directOwner() {
-		t.Fatal("loop owner cannot write its datagram")
+		t.Fatal("a goroutine owns a connection whose turn it is not running")
 	}
 	stream.ioOwner.Store(owner)
 	if !stream.directOwner() {
 		t.Fatal("stream task owner cannot write its connection")
 	}
 	stream.ioOwner.Store(0)
-	loop.loopGoid.Store(0)
-	if datagram.directOwner() {
-		t.Fatal("datagram remained loop-owned after loop exit")
+	// A UDP child's turn is its server's: the server's turn runs its callbacks.
+	server := &fdConn{commonConn: commonConn{loop: loop}, udp: &unixUDPState{}}
+	child := &fdConn{commonConn: commonConn{loop: loop}, udp: &unixUDPState{server: server}}
+	if child.directOwner() {
+		t.Fatal("UDP child owned outside its server's turn")
+	}
+	server.ioOwner.Store(owner)
+	if !child.directOwner() {
+		t.Fatal("UDP child not owned by its server's turn")
 	}
 }
 
@@ -194,7 +195,7 @@ func startTestConnectionOn(t *testing.T, events *Events, fds [2]int) (testConnec
 	if err != nil {
 		t.Fatal(err)
 	}
-	events.workers = []*eventLoop{loop}
+	events.loops = []*eventLoop{loop}
 	if err = unix.SetNonblock(fds[0], true); err != nil {
 		t.Fatal(err)
 	}
@@ -205,8 +206,7 @@ func startTestConnectionOn(t *testing.T, events *Events, fds [2]int) (testConnec
 	conn.events = events
 	conn.loop = loop
 
-	done := make(chan error, 1)
-	go func() { done <- loop.Serve(false, nil) }()
+	startTestLoop(events, loop)
 	registered := make(chan error, 1)
 	go func() { registered <- events.addConn(conn) }()
 
@@ -216,9 +216,8 @@ func startTestConnectionOn(t *testing.T, events *Events, fds [2]int) (testConnec
 			if !conn.isClosing() {
 				_ = conn.CloseWith(io.EOF)
 			}
-			loop.beginStop(nil)
 			select {
-			case <-done:
+			case <-stopTestLoop(loop, nil):
 			case <-time.After(2 * time.Second):
 				t.Error("event loop did not stop")
 			}
@@ -464,16 +463,18 @@ func TestConnectionTaskUsesBatchExecutorFastPath(t *testing.T) {
 
 func TestBatchExecutorPartialRejection(t *testing.T) {
 	executor := &batchNativeExecutor{rejectAfter: 1}
-	opened := make(chan Conn, 1)
+	woken := make(chan Conn, 1)
 	closed := make(chan Conn, 1)
 	events := &Events{
-		OnOpen:  func(conn Conn) { opened <- conn },
+		OnData:  func(conn Conn) error { woken <- conn; return nil },
 		OnClose: func(conn Conn, _ error) { closed <- conn },
 	}
 	pool := newIOTaskPool(executor)
 	loop := &eventLoop{ioPool: pool}
 	first := &fdConn{commonConn: commonConn{events: events, loop: loop}}
-	first.taskState.Store(ioEventOpen)
+	// A wake turn runs a callback without touching a socket, which this
+	// connection does not have.
+	first.taskState.Store(ioEventWake)
 	first.taskState.Or(taskScheduledBit)
 	if !loop.acquireIO() {
 		t.Fatal("failed to reserve first connection task")
@@ -490,9 +491,9 @@ func TestBatchExecutorPartialRejection(t *testing.T) {
 		t.Fatal("batch submission was rejected by the I/O pool")
 	}
 	select {
-	case conn := <-opened:
+	case conn := <-woken:
 		if conn != first {
-			t.Fatalf("opened connection = %p, want %p", conn, first)
+			t.Fatalf("woken connection = %p, want %p", conn, first)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("accepted task did not run")
@@ -557,7 +558,7 @@ func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d loopState=%d queued=%v stopped=%v",
 			testConn.conn.taskState.Load()&taskScheduledBit != 0, testConn.conn.close.phase.Load(),
-			testConn.conn.loop.ioState.Load(), testConn.conn.loop.hasPendingTasks(), testConn.conn.loop.stopping.Load())
+			testConn.conn.loop.ioState.Load(), false, testConn.conn.loop.stopping.Load())
 	}
 }
 
@@ -581,11 +582,11 @@ func TestRejectedIOTaskReleasesScheduleBeforeClose(t *testing.T) {
 	if conn.taskState.Load()&taskScheduledBit != 0 {
 		t.Fatal("rejected task still owned the connection after requesting close")
 	}
-	batch := loop.tasks.Drain()
-	if batch == nil || batch.Value.kind != closeTask || batch.Value.conn != conn {
-		t.Fatal("rejected task did not enqueue the connection close")
+	// The refused turn will never run, so its handler releases the
+	// connection as that turn would have.
+	if !conn.close.isReleased() {
+		t.Fatal("rejected task did not release the connection")
 	}
-	releaseTask(batch.Value)
 }
 
 func TestRejectedTaskWaitsForPublishedCloseCause(t *testing.T) {
@@ -687,7 +688,7 @@ func TestNilShutdownCauseClosesBlockedConnectionTask(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection task did not start")
 	}
-	testConn.conn.loop.beginStop(nil)
+	stopTestLoop(testConn.conn.loop, nil)
 	close(release)
 	select {
 	case err := <-closed:
@@ -724,7 +725,7 @@ func TestShutdownRetainsTaskErrorAfterNilCloseRequest(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection task did not start")
 	}
-	testConn.conn.loop.beginStop(nil)
+	stopTestLoop(testConn.conn.loop, nil)
 	deadline := time.Now().Add(time.Second)
 	for !testConn.conn.isClosing() {
 		if time.Now().After(deadline) {
@@ -744,7 +745,7 @@ func TestShutdownRetainsTaskErrorAfterNilCloseRequest(t *testing.T) {
 	}
 }
 
-func TestShutdownWaitsForTaskBehindQueuedTask(t *testing.T) {
+func TestShutdownWaitsForRunningTask(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	closed := make(chan struct{}, 1)
@@ -765,13 +766,7 @@ func TestShutdownWaitsForTaskBehindQueuedTask(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("connection task did not start")
 	}
-	queued := acquireTask(deadlineTask, testConn.conn)
-	if !testConn.conn.loop.submitTask(queued) {
-		releaseTask(queued)
-		close(release)
-		t.Fatal("queued task was rejected before shutdown")
-	}
-	testConn.conn.loop.beginStop(nil)
+	stopTestLoop(testConn.conn.loop, nil)
 	deadline := time.Now().Add(time.Second)
 	for !testConn.conn.loop.ioStopped() {
 		if time.Now().After(deadline) {
@@ -780,7 +775,7 @@ func TestShutdownWaitsForTaskBehindQueuedTask(t *testing.T) {
 		}
 		runtime.Gosched()
 	}
-	if testConn.conn.isClosedOnLoop() {
+	if testConn.conn.isReleased() {
 		close(release)
 		t.Fatal("loop released the fd while its connection task was active")
 	}
@@ -834,7 +829,7 @@ func TestDeferredTransportCauseSurvivesShutdownHandoff(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	testConn.conn.loop.beginStop(nil)
+	stopTestLoop(testConn.conn.loop, nil)
 	close(release)
 	select {
 	case err := <-closed:
@@ -1138,7 +1133,7 @@ func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			events.workers = []*eventLoop{loop}
+			events.loops = []*eventLoop{loop}
 			sourceFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 			if err != nil {
 				t.Fatal(err)
@@ -1171,8 +1166,7 @@ func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
 				callbackErr <- err
 				return err
 			}
-			done := make(chan error, 1)
-			go func() { done <- loop.Serve(false, nil) }()
+			startTestLoop(events, loop)
 			for _, conn := range []*fdConn{source, target} {
 				registered := make(chan error, 1)
 				go func(conn *fdConn) { registered <- events.addConn(conn) }(conn)
@@ -1186,9 +1180,8 @@ func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
 						_ = conn.CloseWith(io.EOF)
 					}
 				}
-				loop.beginStop(nil)
 				select {
-				case <-done:
+				case <-stopTestLoop(loop, nil):
 				case <-time.After(2 * time.Second):
 					t.Error("event loop did not stop")
 				}
@@ -1217,7 +1210,7 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events.workers = []*eventLoop{loop}
+	events.loops = []*eventLoop{loop}
 	sourceFDs, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -1251,8 +1244,7 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 		callbackErr <- err
 		return err
 	}
-	done := make(chan error, 1)
-	go func() { done <- loop.Serve(false, nil) }()
+	startTestLoop(events, loop)
 	for _, conn := range []*fdConn{source, target} {
 		registered := make(chan error, 1)
 		go func(conn *fdConn) { registered <- events.addConn(conn) }(conn)
@@ -1266,9 +1258,8 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 				_ = conn.CloseWith(io.EOF)
 			}
 		}
-		loop.beginStop(nil)
 		select {
-		case <-done:
+		case <-stopTestLoop(loop, nil):
 		case <-time.After(2 * time.Second):
 			t.Error("event loop did not stop")
 		}
@@ -1408,7 +1399,11 @@ func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	child.udp.key = socket.UDPAddress{Port: 1}
 	server.udp.peers[child.udp.key] = child
 	child.pending.Store(7)
-	child.closeOnLoop(cause)
+	finalErr, ok := child.teardown(cause)
+	if !ok {
+		t.Fatal("UDP child was not released")
+	}
+	child.deliverClose(finalErr)
 	err := <-closed
 	if !errors.Is(err, cause) || !errors.Is(err, ErrUnflushedData) {
 		t.Fatalf("close error = %v", err)
@@ -1439,10 +1434,6 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 		events.acceptor.mux.Unlock()
 	}
 	events.OnOpen = func(conn Conn) {
-		fdConn := conn.(*fdConn)
-		if fdConn.loop == events.master {
-			t.Errorf("TCP connection registered on the listener loop")
-		}
 		if conn.Userdata() == "dial" {
 			dialOpenOnce.Do(func() { close(dialOpened) })
 		}

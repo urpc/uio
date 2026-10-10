@@ -33,11 +33,11 @@ go get github.com/urpc/uio
 ```go
 
 type Events struct {
-	// Pollers is the number of event-loop goroutines.
-	// The default is one per four Ps, at least two, capped by
-	// runtime.GOMAXPROCS(0). On Linux, stream readiness is collected by one
-	// shared data poller instead, so Pollers sizes accept, registration,
-	// close, deadline and UDP work.
+	// Pollers is the number of event loops. On Unix each loop is one
+	// epoll or kqueue instance that a few goroutines wait on; they collect
+	// readiness and hand runnable connections to the Executor. The default is
+	// one loop per four Ps, between one and eight, capped by
+	// runtime.GOMAXPROCS(0).
 	Pollers int
 
 	// Executor optionally supplies an asynchronous native connection-task
@@ -98,10 +98,31 @@ type Events struct {
 
 Basic Echo Server
 
-On native Unix, event loops accept connections, manage descriptors, and apply
-interest changes. Stream reads and callbacks run in serialized connection
-tasks on the configured `Executor` or UIO's typed taskgo queue. One blocked
-stream connection therefore does not block its poller or another connection.
+On native Unix, a connection is owned by its turn: one serialized task on the
+configured `Executor` or UIO's typed taskgo queue runs all of the
+connection's callbacks, reads its socket, and also releases the connection
+once it is closing. The event loops only collect readiness. Each loop is one
+epoll or kqueue instance; stream listeners, connections and UDP sockets are
+registered with the loop their descriptor picks, and the loop's waiters
+accept on its listeners, register what they accept, and hand runnable
+connections to the scheduler, without ever running a callback or waiting for
+a connection. One blocked connection therefore blocks neither a
+loop nor another connection. Several loops keep a connection's events within
+one cluster of cores, and with a few waiters per loop one of them collects the
+next batch while another is still handing its batch over; idle waiters park in
+the Go runtime's netpoller instead of holding a P.
+
+A stream connection's first turn runs `OnOpen`, then reads whatever the peer
+already sent and runs `OnData` for it in the same turn. Registration stays
+with the waiters, not the turns: the kernel serializes registrations per
+epoll or kqueue instance, and a few waiters per loop contend for it far less
+than every worker would. A connection that closes in a callback is released when that
+callback returns, and `OnClose` is delivered in the same turn. A close
+requested from another goroutine, a deadline, or shutdown marks the
+connection and schedules its turn, which releases it the same way. Socket
+options and deadlines set from other goroutines apply on the caller's
+goroutine.
+
 Output a connection's own callbacks write leaves when the read round ends, or
 once it fills a coalescing block. Output written from other goroutines, such as
 replies an RPC handler finishes after its request's callback returned, is sent
@@ -112,37 +133,25 @@ The exception is a turn whose callback reserved outbound bytes with
 until it ends, as every turn did before write turns. One claim per connection
 orders all senders, so bytes leave in the order they were accepted; with an
 `Executor`, write turns are submitted to it as well.
-On Linux, stream readiness is not collected by the event loops but by one
-shared data poller: every stream is registered with a single epoll instance
-whose waiters hand runnable connections to the task pool in arrival order.
-Loops that each watched a share of the streams kept blocking in `epoll_wait`,
-gave up their P each time, and under load waited for another one while their
-connections' input sat in the kernel, so latency depended on which loop owned
-a connection. With the shared poller, `Pollers` sizes the control plane
-(accept, registration, close, deadlines, UDP) and no longer changes the
-latency of stream traffic. With 4 or more Ps two waiters share the epoll
-instance, one more per 12 Ps beyond 24, so one of them collects the next batch
-while another is still handing its batch to the executor; a waiter that
-submitted work yields its P to the workers it woke before waiting again. On
-BSD and macOS each event loop still
-watches its own streams. Native UDP callbacks and datagram sends remain on their owning
-event loop because peers share the socket. An external UDP `Write` or
-`WriteOwned` waits for that loop's nonblocking send result; a call from another
-event loop returns `ErrUDPWriteOnEventLoop` to avoid a wait cycle. The
-`stdio`/Windows backend instead uses dedicated blocking read/write goroutines
-per connection; `Executor` does not apply there. Without an external executor,
-native UIO uses taskgo, which keeps about one running worker per P
-(`runtime.GOMAXPROCS(0)`) while callbacks use the CPU and adds workers, up to a
-`512 * runtime.GOMAXPROCS(0)` ceiling, while callbacks block; idle workers are
-retained for 30 seconds so their grown stacks are reused.
+
+A UDP listener is a connection of its own whose turns read every peer's
+datagrams and run the peers' callbacks, since the peers share its socket. A
+UDP `Write` or `WriteOwned` sends its datagram before returning, from any
+goroutine. The `stdio`/Windows backend instead uses dedicated blocking
+read/write goroutines per connection; `Executor` does not apply there.
+Without an external executor, native UIO uses taskgo, which keeps about one
+running worker per P (`runtime.GOMAXPROCS(0)`) while callbacks use the CPU and
+adds workers, up to a `512 * runtime.GOMAXPROCS(0)` ceiling, while callbacks
+block; idle workers are retained for 30 seconds so their grown stacks are
+reused.
 
 `Events.Dial` and `Events.DialContext` perform synchronous resolution and
-connection setup. Calls from an event-loop goroutine return
-`ErrDialOnEventLoop`. Native stream callbacks run on task workers and may dial,
-but the synchronous operation occupies that worker; move long dials to an
-application goroutine when appropriate. Native UDP callbacks run on their event
-loop and cannot dial synchronously. A synchronous dial similarly blocks a stdio
-connection's callback path. Use `DialContext` when the operation needs
+connection setup, and register the new connection on the calling goroutine.
+Native callbacks run on task workers and may dial, but the synchronous
+operation occupies that worker; move long dials to an application goroutine
+when appropriate. A synchronous dial similarly blocks a stdio connection's
+callback path. On the stdio backend, a call from an event-loop goroutine
+returns `ErrDialOnEventLoop`. Use `DialContext` when the operation needs
 cancellation or a deadline.
 `Events.Serve` listens on every supplied address. Call `Serve()` without an
 address when using an Events instance only for outbound dialing.
@@ -263,9 +272,10 @@ on a dual-socket Xeon E5-2690 v3 host with 48 logical CPUs. Server and client
 CPU resources were isolated with `taskset`: the server used all 24 logical
 CPUs in NUMA node 0 (`0-11,24-35`) and tcpkali2 used all 24 logical CPUs in
 NUMA node 1 (`12-23,36-47`). Both events and stdio ran with `GOMAXPROCS=24`;
-events additionally used 24 pollers, while tcpkali2 used `-w 24`. On Linux,
-events collects stream readiness on its shared data poller, so the pollers
-handle accept, registration and close rather than stream readiness.
+events additionally used 24 pollers, while tcpkali2 used `-w 24`. At that
+revision, Linux events collected stream readiness on a shared data poller, so
+the pollers handled accept, registration and close rather than stream
+readiness.
 
 The load used 1,000 loopback connections, a 3-second warmup, a 10-second
 measurement window, 1 KiB random messages, `--pipeline`, and the default

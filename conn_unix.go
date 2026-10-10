@@ -19,10 +19,12 @@ import (
 	"github.com/urpc/uio/internal/socket"
 )
 
-// fdConn separates control-plane and data-plane ownership. The event loop owns
-// descriptor registration, deadlines, and interest. At most one connection
-// task reads the stream socket and runs callbacks, while submitMu admits
-// concurrent producers into the connection-owned outbound queue. Sending is
+// fdConn belongs to its turn. At most one connection turn at a time reads the
+// socket and runs callbacks, and that turn also releases the connection once
+// it is closing; an event loop only collects readiness, accepts and registers
+// connections, and hands them over. submitMu admits
+// concurrent producers into the connection-owned outbound queue, and holding
+// it keeps the descriptor open for a syscall made outside the turn. Sending is
 // owned separately by the write claim in writeState: the turn sends its own
 // replies inline when the claim is free, and output from other goroutines is
 // sent by a write turn that runs beside the reading one.
@@ -67,20 +69,39 @@ type fdConn struct {
 	// submits, and the running turn keeps the bit while it takes the events.
 	taskState  atomic.Uint32
 	writeState atomic.Uint32 // send state and the write claim; see writeOwnerFlag
-	pollTag    uint32        // registration generation echoed by the data poller
+	pollTag    atomic.Uint32 // registration generation echoed by the poller
 	flags      atomic.Uint32 // readStalledFlag; see below
 }
 
-// unixUDPState contains fields that TCP connections never use.
+// unixUDPState contains fields that TCP connections never use. A UDP
+// listener is a connection of its own, the server, and each peer it hears
+// from is a child connection sharing its socket. The server's turns read
+// every child's datagrams and run every child's callbacks, so peers belongs
+// to them; a child closed or woken from elsewhere is queued for the server's
+// next turn.
 type unixUDPState struct {
 	file   *os.File // owns a duplicated UDP listener fd when non-nil
 	remote syscall.Sockaddr
 	server *fdConn
 	peers  map[socket.UDPAddress]*fdConn
 	key    socket.UDPAddress
+
+	peerMu  sync.Mutex // server only: guards closing and waking
+	closing []*fdConn  // children whose close waits for the server's turn
+	waking  []*fdConn  // children whose Wake waits for the server's turn
+
+	// readBuffer belongs to the socket's turns, which read one datagram at a
+	// time and lend it only for its callbacks. A child never reads.
+	readBuffer []byte
+
+	// Datagrams are sent on whichever goroutine writes them, and the bytes
+	// they report wait in outboundPending for whoever holds outboundClaim; see
+	// reportOutbound.
+	outboundPending atomic.Int64
+	outboundClaim   atomic.Bool
 }
 
-// deadlineState remains loop-owned except for its atomic timer generations.
+// deadlineState is guarded by submitMu except for its atomic timer generations.
 type deadlineState struct {
 	readTimer       *time.Timer
 	writeTimer      *time.Timer
@@ -115,7 +136,7 @@ const (
 	// flush, so the turn's cleanup releases it if OnOutbound panics there.
 	writeTurnFlushFlag
 	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
-	// the loop when it releases the claim.
+	// the connection's turn when it releases the claim.
 	writeCloseWaitFlag
 	// writeEdgeFlag records a writable edge the connection's turn handled
 	// while the current claim was held. Its holder may have got EAGAIN but not
@@ -151,6 +172,10 @@ const (
 	// socket on its own: the round's later writes coalesce and leave in its
 	// final flush as before.
 	turnRoundWrote
+	// turnReadToEnd makes rounds read on like turnHangup does, for a hangup
+	// that may not be this connection's, until a read finds the socket empty
+	// rather than at its end.
+	turnReadToEnd
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -163,8 +188,8 @@ const (
 func claimerTag() uint32 { return uint32(currentGoroutineID()) << writeClaimerShift }
 
 const (
-	// Close is split so descriptor teardown remains loop-owned while OnClose is
-	// delivered by the same serialized connection-task mechanism as OnData.
+	// Close is split so a close can be requested from anywhere while the
+	// connection's own turn releases it and delivers OnClose.
 	closeOpen uint32 = iota
 	closeRequested
 	closeResourcesReleased
@@ -284,16 +309,13 @@ func (conn *fdConn) tryClaimWrite(extra uint32) bool {
 }
 
 // releaseWrite gives the claim up. A close that found it taken asked, through
-// writeCloseWaitFlag, to be handed back to the loop now.
+// writeCloseWaitFlag, to be handed back to the connection's turn now.
 func (conn *fdConn) releaseWrite() {
 	old := conn.writeState.And(^(writeOwnerFlag | writeTurnHeldFlag | writeTurnFlushFlag))
 	if old&writeCloseWaitFlag != 0 {
 		conn.writeState.And(^writeCloseWaitFlag)
-		t := acquireTask(closeTask, conn)
-		if !conn.loop.submitTask(t) {
-			releaseTask(t)
-			// The stopped loop's shutdown pass owns final fd teardown.
-		}
+		// A stopped loop's shutdown pass releases the connection instead.
+		conn.scheduleTeardown()
 	}
 }
 
@@ -491,7 +513,7 @@ func (conn *fdConn) initialInterest() poller.Interest {
 // changes it after Add, so it is what initialInterest returns.
 func (conn *fdConn) currentInterest() poller.Interest { return conn.initialInterest() }
 func (conn *fdConn) isClosing() bool                  { return conn.close.isClosing() }
-func (conn *fdConn) isClosedOnLoop() bool             { return conn.close.isReleased() }
+func (conn *fdConn) isReleased() bool                 { return conn.close.isReleased() }
 func (conn *fdConn) beginShutdown()                   { conn.close.request() }
 func (conn *fdConn) isDatagram() bool                 { return conn.udp != nil }
 func (conn *fdConn) afterRegister()                   {}
@@ -513,12 +535,12 @@ func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
 }
 
-// Direct I/O belongs to this connection's active task. Datagrams additionally
-// belong to their loop during delivery; a loop never owns a stream's I/O task,
-// even when another connection's callback happens to run on that loop.
+// Direct I/O belongs to this connection's active turn. A UDP child's turn is
+// its server's: the server's turns read every child's datagrams and run their
+// callbacks.
 func (conn *fdConn) directOwner() bool {
 	owner := currentGoroutineID()
-	return conn.ioOwner.Load() == owner || (conn.isDatagram() && conn.loop != nil && conn.loop.loopGoid.Load() == owner)
+	return conn.ioOwner.Load() == owner || (conn.udp != nil && conn.udp.server != nil && conn.udp.server.ioOwner.Load() == owner)
 }
 
 // Readiness bits are the poller's own: noteIO folds them in unchanged.
@@ -535,6 +557,11 @@ const (
 	// ioEventAccepted rides with ioEventOpen for an accepted TCP connection,
 	// whose open turn applies the default socket options.
 	ioEventAccepted uint32 = 1 << 19
+	// ioEventPeers asks a UDP server's turn to take the children queued for
+	// close or wake-up.
+	ioEventPeers uint32 = 1 << 20
+	// ioEventTeardown asks the turn of a closing connection to release it.
+	ioEventTeardown uint32 = 1 << 21
 	// taskScheduledBit claims the connection's one queued or running task. It
 	// shares taskState with the event bits so a producer sets claim and events
 	// with one atomic.
@@ -552,39 +579,23 @@ func (conn *fdConn) scheduleIO(events uint32) {
 	}
 }
 
-// markOpenPending makes the open event pending before a stream becomes
-// visible to its poller. The shared data poller may see the stream's first
-// bytes and submit its task before the loop schedules the open event; that
-// task then takes both events and still runs OnOpen before it reads.
-func (conn *fdConn) markOpenPending() { conn.taskState.Or(ioEventOpen) }
-
-// clearOpenPending withdraws the open event of a stream that failed to
-// register.
-func (conn *fdConn) clearOpenPending() { conn.taskState.And(^(ioEventOpen | ioEventAccepted)) }
-
-// scheduleOpen submits the task for a pending open event unless the data
-// poller already has. Noting ioEventOpen again would run OnOpen twice if that
-// task has already taken it.
-func (conn *fdConn) scheduleOpen() {
-	if conn.taskState.Load()&ioEventOpen != 0 {
-		conn.scheduleIO(0)
-	}
-}
-
 // noteIO folds readiness into this connection and reports whether the caller
 // acquired responsibility for submitting its single in-flight task. The turn
 // reservation is taken before the scheduling claim becomes visible: shutdown
-// joins turns through this count, and closeOnLoop hands teardown to whichever
-// task holds a visible claim, so every published claim must be one the stop
-// barrier can wait out. Events are folded before ownership is decided, so a
-// finishing turn resubmits for them and a released claim stays free to take.
+// joins turns through this count, so every published claim must be one the
+// stop barrier can wait out. Events are folded before ownership is decided, so
+// a finishing turn resubmits for them and a released claim stays free to
+// take. A closing connection takes nothing but the request to release it.
 func (conn *fdConn) noteIO(events uint32) bool {
-	if conn.isClosing() || conn.loop == nil || conn.loop.stopping.Load() || conn.loop.ioPool == nil {
+	if conn.loop == nil || conn.loop.stopping.Load() || conn.loop.ioPool == nil {
+		return false
+	}
+	if conn.isClosing() && (events&ioEventTeardown == 0 || conn.close.isReleased()) {
 		return false
 	}
 	if events != 0 {
-		// A caller may only want the task (scheduleOpen folds nothing);
-		// an empty word needs no read-modify-write.
+		// A caller may only want the task (claiming a first turn folds
+		// nothing); an empty word needs no read-modify-write.
 		conn.taskState.Or(events)
 	}
 	if conn.taskState.Load()&taskScheduledBit != 0 {
@@ -615,14 +626,8 @@ var testHookTaskClaimed func(*fdConn)
 // watchTags generates registration tags. Zero means untagged.
 var watchTags atomic.Uint32
 
-// watcher returns the poller watching this descriptor: the data-plane shard
-// owning it for streams when the backend has one, otherwise the loop's poller.
-func (conn *fdConn) watcher() *poller.NetPoller {
-	if data := conn.events.streamPoller(conn.fd); data != nil && !conn.isDatagram() {
-		return data
-	}
-	return conn.loop.poller
-}
+// watcher returns the poller watching this descriptor.
+func (conn *fdConn) watcher() *poller.Poller { return conn.loop.poller }
 
 // assignWatchTag gives a new registration its own tag, so readiness reported
 // for an earlier connection on the same descriptor number is not delivered to
@@ -632,24 +637,65 @@ func (conn *fdConn) assignWatchTag() uint32 {
 	if tag == 0 {
 		tag = watchTags.Add(1)
 	}
-	conn.pollTag = tag
+	conn.pollTag.Store(tag)
 	return tag
 }
 
-// prepareAccepted marks an accepted TCP connection whose default socket
-// options are still to be applied. The open task applies them, off the event
-// loop and before OnOpen, so a loop registering a connection storm spends one
-// epoll_ctl per connection instead of four syscalls. The mark is set before
-// registration publishes the open event, so one turn takes both together.
+// watch registers the descriptor with its loop's poller, once and for good.
+func (conn *fdConn) watch() error {
+	tag := conn.assignWatchTag()
+	return conn.watcher().Register(conn.fd, conn.initialInterest(), true, tag)
+}
+
+// admitAccepted claims the first turn of a connection a waiter just accepted,
+// publishes it and watches its socket, and reports whether the caller must
+// submit the turn, which runs OnOpen and then reads what the peer already
+// sent. The claim comes first: from the fd table entry on, readiness can
+// reach the connection, and a backend without registration tags can report
+// an event its poller collected for the previous owner of the descriptor
+// number; the claim leaves any such event nothing but to fold into the turn
+// already queued. The waiter registers rather than that turn: the
+// registrations of a loop's poller then come from its few waiters, not from
+// every worker at once, and the kernel serializes them per poller.
 //
-// Where the platform copies the listening socket's options to what it accepts
-// (Linux; see setListenerOptions), there is nothing left to apply and no mark
-// is made: accepting a connection costs no setsockopt at all.
-func (conn *fdConn) prepareAccepted() {
-	if inheritAcceptedOptions {
-		return
+// An accepted TCP connection whose default socket options are still to be
+// applied also gets ioEventAccepted: its open turn applies them, off the
+// waiter. Where the platform copies the listening socket's options to what it
+// accepts (Linux; see setListenerOptions), there is nothing left to apply and
+// accepting a connection costs no setsockopt at all.
+func (conn *fdConn) admitAccepted(tcp bool) bool {
+	if conn.loop == nil || conn.events.closing.Load() {
+		conn.closeUnregistered()
+		return false
 	}
-	conn.taskState.Or(ioEventAccepted)
+	events := ioEventOpen
+	if tcp && !inheritAcceptedOptions {
+		events |= ioEventAccepted
+	}
+	conn.taskState.Store(events)
+	if !conn.noteIO(0) {
+		conn.closeUnregistered()
+		return false
+	}
+	if err := conn.loop.fdMap.Put(conn.fd, conn); err != nil {
+		conn.abandonClaim()
+		conn.closeUnregistered()
+		return false
+	}
+	if err := conn.watch(); err != nil {
+		conn.loop.fdMap.DeleteValue(conn.fd, conn)
+		conn.closeUnregistered()
+		conn.abandonClaim()
+		return false
+	}
+	return true
+}
+
+// abandonClaim gives up a first turn that was claimed but will never be
+// submitted, before anything ran.
+func (conn *fdConn) abandonClaim() {
+	conn.taskState.Store(0)
+	conn.loop.releaseIO()
 }
 
 func (conn *fdConn) applyAcceptedOptions() {
@@ -666,11 +712,9 @@ func (conn *fdConn) takeIOEvents() uint32 {
 }
 
 // finishIOTask closes the lost-work race between the task's final event check
-// and a concurrent producer. The claim is given up under submitMu with the
-// same atomic that checks for events, so either the current task resubmits
-// itself or the producer that set them owns the next turn. Deferred close
-// returns to the loop only after no task can still touch connection-owned
-// buffers.
+// and a concurrent producer. The claim is given up with the same atomic that
+// checks for events, so either the current task resubmits itself or the
+// producer that set them owns the next turn.
 func (conn *fdConn) finishIOTask() {
 	if conn.taskState.Load()&^taskScheduledBit != 0 && !conn.loop.ioStopped() && conn.close.phase.Load() != closeCallbackDelivered {
 		if !conn.loop.ioPool.submit(conn) {
@@ -678,25 +722,13 @@ func (conn *fdConn) finishIOTask() {
 		}
 		return
 	}
-	conn.submitMu.Lock()
 	left := conn.taskState.And(^taskScheduledBit)
-	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
-	conn.submitMu.Unlock()
 	rescheduled := false
-	if left&^taskScheduledBit != 0 && !conn.loop.ioStopped() &&
+	if left&^taskScheduledBit != 0 && !conn.loop.ioStopped() && conn.close.phase.Load() != closeCallbackDelivered &&
 		conn.taskState.Or(taskScheduledBit)&taskScheduledBit == 0 {
 		rescheduled = true // the current reservation moves to the next turn
 		if !conn.loop.ioPool.submit(conn) {
 			conn.handleIOSubmitFailure(net.ErrClosed)
-		}
-	}
-	if hasDeferredClose {
-		t := acquireTask(closeTask, conn)
-		// The close-phase winner takes the deferred cause. Keeping
-		// it in the slot until then prevents shutdown from overtaking the handoff.
-		if !conn.loop.submitTask(t) {
-			releaseTask(t)
-			// The stopped loop's shutdown pass owns final fd teardown.
 		}
 	}
 	// Released last: shutdown joins turns through this count, so nothing of
@@ -706,33 +738,46 @@ func (conn *fdConn) finishIOTask() {
 	}
 }
 
+// handleIOSubmitFailure ends a turn the executor refused. That turn will never
+// run, so its handler stands in for it, the close it owes included: the
+// connection closes, and is released here unless the loop is shutting down,
+// whose pass releases it then. A close handed back while the handler held the
+// claim found the claim taken and left its request in taskState, so the
+// handler hands it on once it gives the claim up.
 func (conn *fdConn) handleIOSubmitFailure(err error) {
-	// A rejected task will never run finishIOTask, so this ends its turn the
-	// way finishIOTask does. Its scheduling claim is given up under submitMu:
-	// closeOnLoop may already have seen the claim and deferred closure to this
-	// turn, and then the closure goes back to the loop here, or the connection
-	// would never close.
-	conn.submitMu.Lock()
-	conn.taskState.And(^taskScheduledBit)
-	hasDeferredClose := !conn.close.isReleased() && conn.close.deferred != nil
-	conn.submitMu.Unlock()
+	// Deferred, so a panic in OnClose that the rejection queue's executor
+	// recovers still ends the turn and returns its reservation.
+	defer func() {
+		left := conn.taskState.And(^taskScheduledBit)
+		if left&ioEventTeardown != 0 && conn.isClosing() && !conn.close.isReleased() {
+			conn.scheduleTeardown()
+		} else if left&ioEventClose != 0 && conn.close.phase.Load() == closeResourcesReleased &&
+			conn.taskState.Or(taskScheduledBit)&taskScheduledBit == 0 {
+			// The close flush left OnClose to a turn; this claim is that turn's.
+			conn.loop.acquireCloseIO()
+			if !conn.loop.ioPool.submit(conn) {
+				conn.taskState.And(^taskScheduledBit)
+				conn.fireCloseCallback()
+				conn.loop.releaseIO()
+			}
+		}
+		if conn.loop != nil {
+			conn.loop.releaseIO()
+		}
+	}()
 	phase := conn.close.phase.Load()
 	if phase < closeResourcesReleased {
-		conn.requestClose(err)
-	} else if phase == closeResourcesReleased && conn.taskState.Load()&ioEventClose != 0 {
-		// closeOnLoop publishes the final cause before setting ioEventClose.
-		// A rejected earlier task must not deliver OnClose during that gap.
-		conn.fireCloseCallback()
-	}
-	if hasDeferredClose && conn.loop != nil {
-		t := acquireTask(closeTask, conn)
-		if !conn.loop.submitTask(t) {
-			releaseTask(t)
-			// The stopped loop's shutdown pass owns final fd teardown.
+		conn.beginClose(err)
+		if conn.loop != nil && !conn.loop.stopping.Load() {
+			if finalErr, ok := conn.teardown(nil); ok {
+				conn.deliverClose(finalErr)
+			}
 		}
-	}
-	if conn.loop != nil {
-		conn.loop.releaseIO()
+	} else if phase == closeResourcesReleased && conn.taskState.Load()&ioEventClose != 0 {
+		// scheduleCloseCallback publishes the final cause before setting
+		// ioEventClose. A rejected earlier task must not deliver OnClose
+		// during that gap.
+		conn.fireCloseCallback()
 	}
 }
 
@@ -762,14 +807,25 @@ func (conn *fdConn) setDeferredCloseLocked(err error) {
 // the only way out, so a callback panic that an Executor recovers ends the
 // turn like a return does: the claim goes back and the loop learns what the
 // turn left behind.
+//
+// A stream's open turn runs OnOpen and then reads whatever the peer already
+// sent. A turn that finds its connection closing releases it as it ends and
+// delivers OnClose in the same turn.
 func (conn *fdConn) runIOTask() {
 	conn.ioOwner.Store(currentGoroutineID())
 	var events uint32
 	settle, ended := false, false
+	// Registered first, so it runs last: a callback panic that an Executor
+	// recovers, OnClose's included, still ends the turn and returns its
+	// reservation, which shutdown joins.
+	defer func() {
+		conn.ioOwner.Store(0)
+		conn.finishIOTask()
+	}()
 	defer func() {
 		// A callback panic may have left a round corked or a flush marked;
-		// only a reported hangup outlives the turn.
-		conn.turn &= turnHangup
+		// only what the rounds must read on for outlives the turn.
+		conn.turn &= turnHangup | turnReadToEnd
 		if conn.turnOwnsClaim() {
 			// The round's reservations are filled and flushed, or a callback
 			// panic left the claim taken for a reservation or a flush: other
@@ -784,8 +840,7 @@ func (conn *fdConn) runIOTask() {
 		if settle {
 			conn.settleInterest()
 		}
-		conn.ioOwner.Store(0)
-		conn.finishIOTask()
+		conn.closeInTurn()
 	}()
 	events = conn.takeIOEvents()
 	if events&ioEventClose != 0 {
@@ -796,6 +851,17 @@ func (conn *fdConn) runIOTask() {
 		return
 	}
 	settle = true
+	if events&ioEventOpen != 0 && !conn.isDatagram() {
+		// The peer's first bytes are usually here already.
+		events |= ioEventRead
+		if !poller.Tagged && events&ioEventHangup != 0 {
+			// Without registration tags the hangup may have been reported for
+			// an earlier owner of the descriptor number, so it does not stick;
+			// the round reads to the end of what the socket holds instead.
+			events &^= ioEventHangup
+			conn.turn |= turnReadToEnd
+		}
+	}
 	if events&ioEventOpen != 0 {
 		if events&ioEventAccepted != 0 {
 			conn.applyAcceptedOptions()
@@ -832,12 +898,29 @@ func (conn *fdConn) runIOTask() {
 		}
 		conn.turn &^= turnCorked | turnRoundWrote
 	}
+	if conn.udp != nil && conn.udp.peers != nil {
+		conn.settlePeers()
+	}
 	if !conn.isClosing() {
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
 	}
 	ended = true
+}
+
+// closeInTurn releases a closing connection from the end of its own turn,
+// which owns it, and delivers OnClose in the same turn. While the loop shuts
+// down its pass releases every connection instead, with the shutdown cause.
+func (conn *fdConn) closeInTurn() {
+	if !conn.isClosing() || conn.close.isReleased() || conn.loop.stopping.Load() {
+		return
+	}
+	// This turn handles any pending request to release the connection.
+	conn.taskState.And(^ioEventTeardown)
+	if finalErr, ok := conn.teardown(nil); ok {
+		conn.deliverClose(finalErr)
+	}
 }
 
 // settleInterest hands read work the turn left owed — a yield or a spent read
@@ -848,6 +931,11 @@ func (conn *fdConn) settleInterest() {
 		return
 	}
 	if conn.clearReadStalled() {
+		if conn.isDatagram() {
+			// A datagram leaves nothing unread behind its callback.
+			conn.taskState.Or(ioEventRead)
+			return
+		}
 		conn.taskState.Or(ioEventRead | ioEventWake)
 	}
 }
@@ -897,30 +985,35 @@ func boolInt(value bool) int {
 	return 0
 }
 
+// setSocketOption applies an option on the caller's goroutine. The
+// connection's own turn releases the descriptor, so it applies options
+// directly; any other caller holds the owner's submitMu across the syscall,
+// which teardown takes to mark the connection released before it closes the
+// descriptor, so the option reaches this connection's socket or nothing.
 func (conn *fdConn) setSocketOption(kind socketOptionKind, value int) error {
 	if conn.isClosing() {
 		return net.ErrClosed
 	}
-	// The loop and the connection's own task may both apply options directly:
-	// descriptor teardown waits for a running task, so the fd cannot change
-	// under the task, and neither caller would wait on the loop queue.
-	if conn.loop.inLoop() || conn.directOwner() {
+	if conn.directOwner() {
 		return conn.applySocketOption(kind, value)
 	}
-	// External callers wait for the loop result; no submission lock covers I/O.
-	t := acquireTask(optionTask, conn)
-	t.optionKind, t.optionValue = kind, value
-	t.done = make(chan error, 1)
-	done := t.done
-	if !conn.loop.submitTask(t) {
-		releaseTask(t)
-		return net.ErrClosed
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	defer owner.submitMu.Unlock()
+	return conn.applySocketOption(kind, value)
+}
+
+// descriptorOwner is the connection whose release closes this connection's
+// descriptor: a UDP child shares its server's.
+func (conn *fdConn) descriptorOwner() *fdConn {
+	if conn.udp != nil && conn.udp.server != nil {
+		return conn.udp.server
 	}
-	return <-done
+	return conn
 }
 
 func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
-	if conn.close.isReleased() {
+	if conn.close.isReleased() || conn.descriptorOwner().close.isReleased() {
 		return net.ErrClosed
 	}
 	switch kind {
@@ -1028,6 +1121,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		n, err := socket.Recv(conn.fd, buffer)
 		if err != nil {
 			if isWouldBlock(err) {
+				conn.turn &^= turnReadToEnd
 				return nil
 			}
 			return err
@@ -1065,7 +1159,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		if conn.readStalled() {
 			return nil
 		}
-		if n < len(buffer) && conn.turn&turnHangup == 0 {
+		if n < len(buffer) && conn.turn&(turnHangup|turnReadToEnd) == 0 {
 			// The socket is drained, and bytes that arrive later raise a new
 			// edge. A hangup already queued behind these bytes raises none,
 			// which is why the round reads on once the poller reported one.
@@ -1088,10 +1182,15 @@ func (conn *fdConn) readRound(buffer []byte) error {
 	return nil
 }
 
-// onRecvUDP bounds datagram work per loop turn. UDP stays loop-owned because
-// logical peers share this socket and its peer map.
+// onRecvUDP drains the socket with bounded work per turn, and a read left
+// owed when the budget runs out is redelivered to the next turn. A server's
+// children share this socket and its peer map, so their callbacks run here.
 func (conn *fdConn) onRecvUDP() error {
-	buffer := conn.loop.getBuffer()
+	buffer := conn.udp.readBuffer
+	if buffer == nil {
+		buffer = make([]byte, conn.events.readBufferSize)
+		conn.udp.readBuffer = buffer
+	}
 	totalRead := 0
 	var receive socket.UDPReceive
 	for packets := 0; packets < 256 && totalRead < 1<<20; packets++ {
@@ -1108,6 +1207,7 @@ func (conn *fdConn) onRecvUDP() error {
 			return nil
 		}
 	}
+	conn.setReadStalled(true)
 	return nil
 }
 
@@ -1149,34 +1249,87 @@ func isWouldBlock(err error) bool {
 	return err == syscall.EAGAIN || err == syscall.EWOULDBLOCK
 }
 
-func (conn *fdConn) runWakeTask() error {
-	if conn.isClosing() {
+func (conn *fdConn) Wake() error {
+	if conn.isClosing() || conn.loop == nil {
 		return net.ErrClosed
 	}
-	if conn.isDatagram() {
-		return conn.fireOnData()
+	if conn.udp != nil && conn.udp.server != nil {
+		conn.udp.server.queuePeer(conn, true)
+		return nil
 	}
 	conn.scheduleIO(ioEventWake)
 	return nil
 }
 
-func (conn *fdConn) Wake() error {
-	if conn.isClosing() {
-		return net.ErrClosed
+// queuePeer hands a child's close or Wake to the server's turn, which owns
+// the children: wake selects which.
+func (server *fdConn) queuePeer(child *fdConn, wake bool) {
+	udp := server.udp
+	udp.peerMu.Lock()
+	if wake {
+		udp.waking = append(udp.waking, child)
+	} else {
+		udp.closing = append(udp.closing, child)
 	}
-	if conn.isDatagram() {
-		if conn.loop == nil {
-			return net.ErrClosed
+	udp.peerMu.Unlock()
+	server.scheduleIO(ioEventPeers)
+}
+
+// settlePeers runs in a UDP server's turn and handles the children queued for
+// it: a closing child is released and gets OnClose, and a woken one OnData.
+// Children queued meanwhile set ioEventPeers again for the next turn.
+//
+// Children are taken one at a time, and ioEventPeers stays set while more are
+// queued: a callback panic that an Executor recovers ends this turn, and the
+// next one takes the rest.
+func (server *fdConn) settlePeers() {
+	udp := server.udp
+	// Process only the requests that were queued when this turn reached the
+	// peer hand-off. A callback may call Wake, which queues another request for
+	// the next turn; draining that request here would let a self-waking UDP
+	// callback keep this turn alive forever and prevent shutdown from joining
+	// it.
+	udp.peerMu.Lock()
+	remaining := len(udp.closing) + len(udp.waking)
+	udp.peerMu.Unlock()
+	for processed := 0; processed < remaining; processed++ {
+		udp.peerMu.Lock()
+		var child *fdConn
+		wake := false
+		if len(udp.closing) != 0 {
+			child = udp.closing[0]
+			udp.closing[0] = nil
+			udp.closing = udp.closing[1:]
+		} else if len(udp.waking) != 0 {
+			child, wake = udp.waking[0], true
+			udp.waking[0] = nil
+			udp.waking = udp.waking[1:]
 		}
-		t := acquireTask(wakeTask, conn)
-		if !conn.loop.submitTask(t) {
-			releaseTask(t)
-			return net.ErrClosed
+		if child == nil {
+			udp.peerMu.Unlock()
+			break
 		}
-		return nil
+		udp.peerMu.Unlock()
+		if !wake {
+			if finalErr, ok := child.teardown(nil); ok {
+				child.deliverClose(finalErr)
+			}
+		} else if !child.isClosing() {
+			if err := child.fireOnData(); err != nil {
+				child.requestClose(err)
+			}
+		}
 	}
-	conn.scheduleIO(ioEventWake)
-	return nil
+	// Keep the synthetic event set when a callback queued more work while this
+	// turn was running. finishIOTask will hand it to a fresh turn after the
+	// current one returns.
+	udp.peerMu.Lock()
+	if len(udp.closing)+len(udp.waking) == 0 {
+		server.taskState.And(^ioEventPeers)
+	} else {
+		server.taskState.Or(ioEventPeers)
+	}
+	udp.peerMu.Unlock()
 }
 
 func (conn *fdConn) YieldRead() error {
@@ -1192,100 +1345,118 @@ func (conn *fdConn) YieldRead() error {
 
 func (conn *fdConn) Close() error { return conn.CloseWith(io.ErrUnexpectedEOF) }
 
+// CloseWith requests the close and returns: the connection is released, and
+// OnClose delivered, by its own turn once the callback that closed it has
+// returned. Requesting it under submitMu puts Close after external writes
+// that have already reached their submission point.
 func (conn *fdConn) CloseWith(err error) error {
-	t := acquireTask(closeTask, conn)
-	t.err = err
-	// Setting closing and linking closeTask under submitMu puts Close after
-	// external writes that have already reached their submission point.
+	if conn.loop == nil {
+		return net.ErrClosed
+	}
 	conn.submitMu.Lock()
-	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.request() {
 		conn.submitMu.Unlock()
-		releaseTask(t)
 		return net.ErrClosed
 	}
-	if !conn.close.request() {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return net.ErrClosed
-	}
-	if !conn.loop.pushTask(t) {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return net.ErrClosed
-	}
+	conn.setDeferredCloseLocked(err)
 	conn.submitMu.Unlock()
-	conn.loop.notify()
+	conn.routeClose()
 	return nil
 }
 
-// requestClose is the internal idempotent close path. If the loop queue is
-// already sealed, the cause is retained for loop shutdown to consume.
+// requestClose is the internal idempotent close path. The first cause is the
+// one OnClose reports; while the loop shuts down a later one is kept too, for
+// its pass to report alongside the shutdown cause.
 func (conn *fdConn) requestClose(err error) {
-	if conn.isClosing() {
-		if conn.loop != nil && conn.loop.stopping.Load() && !conn.close.isReleased() {
-			conn.submitMu.Lock()
-			conn.setDeferredCloseLocked(err)
-			conn.submitMu.Unlock()
-		}
-		return
+	if conn.beginClose(err) {
+		conn.routeClose()
 	}
-	t := acquireTask(closeTask, conn)
-	t.err = err
-	conn.submitMu.Lock()
-	if conn.isClosing() {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return
-	}
-	if !conn.close.request() {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return
-	}
-	if !conn.loop.pushTask(t) {
-		// The queue is already stopping; preserve the I/O cause for shutdown.
-		conn.setDeferredCloseLocked(err)
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		return
-	}
-	conn.submitMu.Unlock()
-	conn.loop.notify()
 }
 
-// closeOnLoop releases transport resources exactly once. A running connection
-// task keeps ownership of its buffers, so the loop records the cause and lets
-// finishIOTask hand closure back after the task exits. A sender holding the
-// write claim may be writing the socket, so a stream also needs the claim
-// before its descriptor closes: otherwise the cause is recorded the same way
-// and the holder hands closure back when it releases the claim. The claim is
-// then kept for good. OnClose is emitted as a final connection task,
-// preserving callback serialization.
-func (conn *fdConn) closeOnLoop(cause error) {
-	if conn.close.isReleased() {
+// beginClose marks the connection closing with err as its cause and reports
+// whether this call started the close.
+func (conn *fdConn) beginClose(err error) bool {
+	conn.submitMu.Lock()
+	defer conn.submitMu.Unlock()
+	if conn.close.request() {
+		conn.setDeferredCloseLocked(err)
+		return true
+	}
+	if conn.loop != nil && conn.loop.stopping.Load() && !conn.close.isReleased() {
+		conn.setDeferredCloseLocked(err)
+	}
+	return false
+}
+
+// routeClose hands a requested close to the turn that releases the
+// connection. The running turn itself releases it as it ends; any other
+// caller schedules a turn for it. A UDP child is released by its server's
+// turn.
+func (conn *fdConn) routeClose() {
+	if conn.udp != nil && conn.udp.server != nil {
+		conn.udp.server.queuePeer(conn, false)
 		return
 	}
-	if conn.taskState.Load()&taskScheduledBit != 0 {
-		conn.submitMu.Lock()
-		if conn.taskState.Load()&taskScheduledBit != 0 && !conn.close.isReleased() {
-			conn.setDeferredCloseLocked(cause)
-			conn.submitMu.Unlock()
-			return
-		}
-		conn.submitMu.Unlock()
+	if conn.ioOwner.Load() == currentGoroutineID() {
+		return
+	}
+	conn.scheduleTeardown()
+}
+
+// scheduleTeardown submits a turn to release a closing connection. A running
+// turn takes the request when it ends; a stopped loop's shutdown pass
+// releases the connection instead.
+func (conn *fdConn) scheduleTeardown() {
+	if conn.noteIO(ioEventTeardown) && !conn.loop.ioPool.submit(conn) {
+		conn.handleIOSubmitFailure(net.ErrClosed)
+	}
+}
+
+// teardown releases transport resources exactly once and reports the final
+// cause. Only the connection's owner calls it: its turn, the handler of a
+// refused turn, its UDP server's turn, or the loop's shutdown pass once every
+// turn has stopped. A sender holding the write claim may be writing the
+// socket, so a stream also needs the claim before its descriptor closes:
+// otherwise the cause is recorded and the holder hands the release back to the
+// connection's turn when it gives the claim up. The claim is then kept for
+// good. The connection is marked released under submitMu, so a socket option
+// set from outside the turn either completes before the descriptor closes or
+// finds it released.
+func (conn *fdConn) teardown(cause error) (error, bool) {
+	if conn.close.isReleased() {
+		return nil, false
 	}
 	if !conn.isDatagram() && !conn.claimWriteForClose(&cause) {
-		return
+		return nil, false
 	}
-	if !conn.close.release() {
-		return
+	conn.submitMu.Lock()
+	released := conn.close.release()
+	conn.submitMu.Unlock()
+	if !released {
+		return nil, false
 	}
 	// Close gets one bounded flush attempt; a slow peer cannot delay shutdown.
 	var flushErr error
 	if !conn.isDatagram() && !conn.writeFailed() {
 		conn.setWriteBlocked(false)
+		flushed := false
+		defer func() {
+			if !flushed {
+				// OnOutbound panicked in the close flush. The connection is
+				// released already, so nothing else would close it: finish
+				// here, and leave OnClose to its next turn.
+				conn.scheduleCloseCallback(conn.releaseResources(cause, nil))
+			}
+		}()
 		_, flushErr = conn.flushWrite()
+		flushed = true
 	}
+	return conn.releaseResources(cause, flushErr), true
+}
+
+// releaseResources is teardown after the close flush: it closes the
+// descriptor, drops the buffers, and returns the final cause.
+func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	remaining := conn.pending.Load()
 	deferredCloseErr := conn.takeDeferredCloseCause()
 	finalErr := errors.Join(cause, deferredCloseErr, flushErr)
@@ -1301,10 +1472,12 @@ func (conn *fdConn) closeOnLoop(cause error) {
 			children := conn.udp.peers
 			conn.udp.peers = nil
 			for _, child := range children {
-				child.closeOnLoop(finalErr)
+				if childErr, ok := child.teardown(finalErr); ok {
+					child.scheduleCloseCallback(childErr)
+				}
 			}
 		}
-		conn.loop.delConn(conn)
+		conn.loop.forget(conn)
 		if conn.udp != nil && conn.udp.file != nil {
 			_ = conn.udp.file.Close()
 		} else {
@@ -1318,17 +1491,36 @@ func (conn *fdConn) closeOnLoop(cause error) {
 	conn.inbound.Reset()
 	conn.inboundTail = nil
 	conn.pending.Store(0)
-	conn.scheduleCloseCallback(finalErr)
+	return finalErr
+}
+
+// closeCallbackDue reports whether the connection gets OnClose: every user
+// connection that entered its loop does.
+func (conn *fdConn) closeCallbackDue() bool {
+	return !conn.internal && conn.events.OnClose != nil
+}
+
+// deliverClose runs OnClose for a released connection on the owner that
+// released it, which runs no other callback of the connection meanwhile.
+func (conn *fdConn) deliverClose(err error) {
+	if !conn.closeCallbackDue() {
+		conn.close.phase.CompareAndSwap(closeResourcesReleased, closeCallbackDelivered)
+		return
+	}
+	conn.submitMu.Lock()
+	conn.setDeferredCloseLocked(err)
+	conn.submitMu.Unlock()
+	conn.fireCloseCallback()
 }
 
 // claimWriteForClose takes the write claim for good before teardown, since a
 // holder may be in the middle of a send. While it is taken, the cause is
-// recorded, the holder is asked through writeCloseWaitFlag to hand closure
+// recorded, the holder is asked through writeCloseWaitFlag to hand the release
 // back, and the claim is tried once more: a holder that released in between
 // either saw the request or left the claim free. Recording the cause moves it
 // into the deferred slot, so *cause is cleared when the retry wins. During
 // shutdown every write turn has already been joined, and a holder can only be
-// a producer that is giving the claim straight back, so the loop waits for it.
+// a producer that is giving the claim straight back, so the pass waits for it.
 func (conn *fdConn) claimWriteForClose(cause *error) bool {
 	if conn.tryClaimWrite(0) {
 		return true
@@ -1353,10 +1545,11 @@ func (conn *fdConn) claimWriteForClose(cause *error) bool {
 	return true
 }
 
-// scheduleCloseCallback publishes OnClose as the terminal synthetic event.
-// Connections without a user callback advance the phase immediately.
+// scheduleCloseCallback publishes OnClose as the terminal synthetic event, for
+// a connection released outside its turn. Connections without a user callback
+// advance the phase immediately.
 func (conn *fdConn) scheduleCloseCallback(err error) {
-	if conn.internal || conn.events.OnClose == nil {
+	if !conn.closeCallbackDue() {
 		conn.close.phase.CompareAndSwap(closeResourcesReleased, closeCallbackDelivered)
 		return
 	}
@@ -1405,24 +1598,12 @@ func (conn *fdConn) setDeadline(kind deadlineKind, deadline time.Time) error {
 	if conn.isClosing() {
 		return net.ErrClosed
 	}
-	if conn.loop.inLoop() {
-		return conn.applyDeadline(kind, deadline)
-	}
-	// Deadline setters are synchronous even though application happens on-loop.
-	t := acquireTask(deadlineTask, conn)
-	t.deadlineKind, t.deadline = kind, deadline
-	t.done = make(chan error, 1)
-	done := t.done
-	if !conn.loop.submitTask(t) {
-		releaseTask(t)
-		return net.ErrClosed
-	}
-	return <-done
+	return conn.applyDeadline(kind, deadline)
 }
 
-// applyDeadline updates loop-owned deadline state and advances a generation.
-// A timer callback carries that generation so a stale callback cannot close a
-// connection after the deadline was reset or cleared.
+// applyDeadline updates the deadline state under submitMu and advances a
+// generation. A timer callback carries that generation so a stale callback
+// cannot close a connection after the deadline was reset or cleared.
 func (conn *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	conn.submitMu.Lock()
 	defer conn.submitMu.Unlock()
@@ -1465,35 +1646,31 @@ func (conn *fdConn) resetDeadlineTimer(timer *time.Timer, kind deadlineKind, dea
 		delay = 0
 	}
 	if timer == nil {
-		// The callback only submits work; it never touches loop-owned state.
-		return time.AfterFunc(delay, func() { conn.submitTimeout(kind) })
+		return time.AfterFunc(delay, func() { conn.expireDeadline(kind) })
 	}
 	timer.Reset(delay)
 	return timer
 }
 
-func (conn *fdConn) submitTimeout(kind deadlineKind) {
+// expireDeadline runs on the timer's goroutine and closes the connection if
+// the deadline the timer was armed for still stands.
+func (conn *fdConn) expireDeadline(kind deadlineKind) {
 	conn.submitMu.Lock()
 	state := conn.deadlines
 	if conn.isClosing() || state == nil {
 		conn.submitMu.Unlock()
 		return
 	}
-	t := acquireTask(timeoutTask, conn)
-	t.deadlineKind = kind
+	generation := state.writeTimerGen.Load()
 	if kind == deadlineRead {
-		t.generation = state.readTimerGen.Load()
-	} else {
-		t.generation = state.writeTimerGen.Load()
+		generation = state.readTimerGen.Load()
 	}
 	conn.submitMu.Unlock()
-	if !conn.loop.submitTask(t) {
-		releaseTask(t)
-	}
+	conn.handleTimeout(kind, generation)
 }
 
-// handleTimeout rechecks both generation and wall time on the event loop. The
-// wall-time check covers a reset racing with an already submitted timer task.
+// handleTimeout rechecks both generation and wall time. The wall-time check
+// covers a reset racing with a timer that already fired.
 func (conn *fdConn) handleTimeout(kind deadlineKind, generation uint64) {
 	conn.submitMu.Lock()
 	state := conn.deadlines

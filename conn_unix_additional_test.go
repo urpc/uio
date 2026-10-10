@@ -18,7 +18,6 @@ import (
 	"github.com/urpc/uio/internal/fdmap"
 	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
-	"github.com/urpc/uio/internal/taskqueue"
 	"golang.org/x/sys/unix"
 )
 
@@ -100,9 +99,9 @@ func TestExistingUDPPeerPacketDoesNotAllocate(t *testing.T) {
 		},
 	}
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	server := &fdConn{fd: -1, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
 	server.events, server.loop = events, loop
+	server.ioOwner.Store(currentGoroutineID())
 	source := socket.UDPAddress{Family: 4, Port: 1234}
 	copy(source.Addr[:4], []byte{127, 0, 0, 1})
 	server.handleUDPPacket([]byte("first"), source)
@@ -155,16 +154,19 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 	defer unix.Close(receiver)
 	defer unix.Close(sender)
 	packets := 0
-	events := &Events{OnData: func(Conn) error {
+	events := &Events{MaxBufferSize: 64, OnData: func(Conn) error {
 		packets++
 		return nil
 	}}
-	loop := &eventLoop{buffer: make([]byte, 64)}
-	loop.loopGoid.Store(currentGoroutineID())
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop := &eventLoop{}
 	server := &fdConn{
 		fd: receiver, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)},
 	}
 	server.events, server.loop = events, loop
+	server.ioOwner.Store(currentGoroutineID())
 	payload := []byte{'x'}
 	sendAndReceive := func() {
 		before := packets
@@ -202,14 +204,17 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	defer unix.Close(receiver)
 	defer unix.Close(sender)
 	packets := 0
-	events := &Events{OnData: func(Conn) error {
+	events := &Events{MaxBufferSize: 64, OnData: func(Conn) error {
 		packets++
 		return nil
 	}}
-	loop := &eventLoop{buffer: make([]byte, 64)}
-	loop.loopGoid.Store(currentGoroutineID())
+	if err := events.initConfig(); err != nil {
+		t.Fatal(err)
+	}
+	loop := &eventLoop{}
 	conn := &fdConn{fd: receiver, udp: &unixUDPState{}}
 	conn.events, conn.loop = events, loop
+	conn.ioOwner.Store(currentGoroutineID())
 	for range 272 {
 		if err := unix.Sendto(sender, []byte{'x'}, 0, target); err != nil {
 			t.Fatal(err)
@@ -265,7 +270,7 @@ func TestUDPWouldBlockDoesNotCloseConnection(t *testing.T) {
 	direct := &fdConn{fd: fds[0], udp: &unixUDPState{}}
 	direct.events = &Events{}
 	direct.loop = &eventLoop{}
-	direct.loop.loopGoid.Store(currentGoroutineID())
+	direct.ioOwner.Store(currentGoroutineID())
 	directBuffer := AcquireBuffer(len(payload))
 	_, _ = directBuffer.Write(payload)
 	if n, writeErr := direct.WriteOwned(directBuffer); n != 0 || !isUDPSendBlocked(writeErr) {
@@ -277,14 +282,6 @@ func TestUDPWouldBlockDoesNotCloseConnection(t *testing.T) {
 
 }
 
-func releaseTestTasks(loop *eventLoop) {
-	for node := loop.tasks.Drain(); node != nil; {
-		next := node.TakeNext()
-		releaseTask(node.Value)
-		node = next
-	}
-}
-
 func TestUnixSocketOptions(t *testing.T) {
 	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
 	if err != nil {
@@ -293,7 +290,6 @@ func TestUnixSocketOptions(t *testing.T) {
 	defer unix.Close(fd)
 
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: fd}
 	conn.events = &Events{}
 	conn.loop = loop
@@ -306,7 +302,6 @@ func TestUnixSocketOptions(t *testing.T) {
 		"keep alive period": func() error { return conn.SetKeepAlivePeriod(1) },
 	} {
 		t.Run(name, func(t *testing.T) {
-			loop.loopGoid.Store(currentGoroutineID())
 			if err := set(); err != nil {
 				t.Fatalf("socket option failed: %v", err)
 			}
@@ -404,7 +399,6 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: fds[0]}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
@@ -449,7 +443,6 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 
 func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: -1}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 16}
@@ -476,7 +469,6 @@ func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 
 func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
 	// The round's first output has left for the socket already — that write
 	// goes direct, see TestRoundFirstWriteGoesOutBeforeTheCallbackReturns —
@@ -518,9 +510,7 @@ func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 }
 
 func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.loopGoid.Store(currentGoroutineID())
-	loop.wakePending.Store(true)
+	loop := &eventLoop{}
 	conn := &fdConn{fd: -1}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{}
@@ -531,7 +521,6 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 	if !conn.isClosing() {
 		t.Fatal("write failure did not request close")
 	}
-	releaseTestTasks(loop)
 
 	conn = &fdConn{fd: -1}
 	conn.ioOwner.Store(currentGoroutineID())
@@ -543,7 +532,6 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 	if !conn.isClosing() {
 		t.Fatal("writev failure did not request close")
 	}
-	releaseTestTasks(loop)
 
 	conn = &fdConn{fd: -1}
 	conn.events = &Events{}
@@ -649,15 +637,12 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer loop.poller.Close(nil)
-	events.master = loop
-	events.workers = []*eventLoop{loop}
-	loop.loopGoid.Store(currentGoroutineID())
-	if events.selectLoop(1) != loop || !loop.inLoop() {
-		t.Fatal("current loop was not selected")
+	events.loops = []*eventLoop{loop}
+	if events.selectLoop(1) != loop {
+		t.Fatal("the only loop was not selected")
 	}
-	loop.loopGoid.Store(0)
-	if (&Events{}).selectWorker(1) != nil {
-		t.Fatal("selectWorker returned a loop from an empty set")
+	if (&Events{}).selectLoop(1) != nil {
+		t.Fatal("selectLoop returned a loop from an empty set")
 	}
 
 	conn := &fdConn{}
@@ -689,19 +674,15 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 	}
 	rejected := &fdConn{fd: -1}
 	rejected.events = events
-	if events.submitAccepted(rejected, false) {
-		t.Fatal("submitAccepted accepted a connection without a loop")
+	if rejected.admitAccepted(false) {
+		t.Fatal("admitAccepted accepted a connection without a loop")
 	}
 
-	ld := &acceptor{loop: loop, events: &Events{}, listeners: make(map[int]*listener)}
-	ld.OnEvent(nil, 12345, poller.ReadEvents|poller.WriteEvents)
-	ld.OnClose(nil, nil)
-	if err := ld.onReadUDP(&listener{fd: 12345}); err == nil {
-		t.Fatal("missing UDP server was accepted")
-	}
+	// A listener's accept error closes the Events.
 	badEvents := &Events{}
-	bad := &acceptor{events: badEvents, listeners: map[int]*listener{-1: {fd: -1}}}
-	bad.OnEvent(nil, -1, poller.ReadEvents)
+	bad := &eventLoop{events: badEvents, fdMap: newFdMap()}
+	bad.listeners.Store(&[]*listener{{fd: -1}})
+	bad.dispatch(&loopWaiter{}, []poller.Event{{FD: -1, Events: poller.ReadEvents}})
 	if !badEvents.closing.Load() {
 		t.Fatal("accept error did not close Events")
 	}
@@ -762,8 +743,8 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 	if err := loop.poller.Add(conn.fd, poller.Readable); err != nil {
 		t.Fatal(err)
 	}
-	loop.OnEvent(nil, 12345, poller.ReadEvents)
-	loop.OnClose(nil, nil)
+	// An event for a descriptor no table holds is dropped.
+	loop.dispatch(loop.newWaiter(), []poller.Event{{FD: 12345, Events: poller.ReadEvents, Tag: 1}})
 
 	failedLoop, err := newEventLoop(events)
 	if err != nil {
@@ -831,9 +812,8 @@ func TestUnixDialFailureAndResourceCleanup(t *testing.T) {
 
 func TestDialBeforeReadyDoesNotReadLoopState(t *testing.T) {
 	events := &Events{}
-	first, second := &eventLoop{}, &eventLoop{}
-	firstWorkers := []*eventLoop{first}
-	secondWorkers := []*eventLoop{second}
+	firstLoops := []*eventLoop{{}}
+	secondLoops := []*eventLoop{{}}
 	started := make(chan struct{})
 	stop := make(chan struct{})
 	done := make(chan struct{})
@@ -845,8 +825,8 @@ func TestDialBeforeReadyDoesNotReadLoopState(t *testing.T) {
 			case <-stop:
 				return
 			default:
-				events.master, events.workers = first, firstWorkers
-				events.master, events.workers = second, secondWorkers
+				events.loops = firstLoops
+				events.loops = secondLoops
 				runtime.Gosched()
 			}
 		}
@@ -865,11 +845,8 @@ func TestDialBeforeReadyDoesNotReadLoopState(t *testing.T) {
 }
 
 func TestStoppedLoopRejectsConnections(t *testing.T) {
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	stop := acquireTask(stopTask, nil)
-	if !loop.tasks.Stop(&stop.node) {
-		t.Fatal("failed to stop test loop")
-	}
+	loop := &eventLoop{fdMap: newFdMap()}
+	loop.stopping.Store(true)
 	events := &Events{}
 
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
@@ -892,10 +869,9 @@ func TestStoppedLoopRejectsConnections(t *testing.T) {
 	conn = &fdConn{fd: fds[0]}
 	conn.events = events
 	conn.loop = loop
-	if events.submitAccepted(conn, false) {
+	if conn.admitAccepted(false) {
 		t.Fatal("stopped loop accepted a connection")
 	}
-	releaseTestTasks(loop)
 }
 
 func TestRegisterConnClosesOutOfRangeFD(t *testing.T) {
@@ -927,9 +903,7 @@ func TestRegisterConnClosesOutOfRangeFD(t *testing.T) {
 }
 
 func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	loop.loopGoid.Store(currentGoroutineID())
-	loop.wakePending.Store(true)
+	loop := &eventLoop{}
 	events := &Events{}
 	conn := &fdConn{fd: -1}
 	conn.events = events
@@ -949,8 +923,8 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	if err := conn.fireOnData(); !errors.Is(err, wantErr) {
 		t.Fatalf("callback fireOnData error = %v", err)
 	}
-	if err := conn.runWakeTask(); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("closed runWakeTask error = %v", err)
+	if err := conn.Wake(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed Wake error = %v", err)
 	}
 	if n, err := conn.Write([]byte("x")); n != 0 || !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed Write = %d, %v", n, err)
@@ -961,20 +935,19 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	if n, err := conn.queueOwnedWrite(bytebuf.CloneBuffer([]byte("x")), 1); n != 0 || !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closing queueOwnedWrite = %d, %v", n, err)
 	}
-	conn.submitTimeout(deadlineRead)
-	events.closeConn(conn, wantErr)
+	conn.expireDeadline(deadlineRead)
+	conn.requestClose(wantErr)
 	conn.close.phase.Store(closeResourcesReleased)
-	conn.closeOnLoop(nil)
+	if _, ok := conn.teardown(nil); ok {
+		t.Fatal("a released connection was released again")
+	}
 
 	if err := conn.SetDeadline(time.Time{}); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed in-loop SetDeadline error = %v", err)
 	}
 
-	stopped := &eventLoop{tasks: taskqueue.New[*task]()}
-	stop := acquireTask(stopTask, nil)
-	if !stopped.tasks.Stop(&stop.node) {
-		t.Fatal("failed to stop task queue")
-	}
+	stopped := &eventLoop{}
+	stopped.stopping.Store(true)
 	rejectedClose := &fdConn{fd: -1}
 	rejectedClose.events = events
 	rejectedClose.loop = stopped
@@ -988,14 +961,13 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 	rejectedTimeout.loop = stopped
 	rejectedTimeout.deadlines = &deadlineState{}
 	rejectedTimeout.deadlines.readTimerGen.Store(3)
-	rejectedTimeout.submitTimeout(deadlineRead)
+	rejectedTimeout.expireDeadline(deadlineRead)
 	rejectedTimeout.deadlines.readGeneration = 3
 	rejectedTimeout.deadlines.readDeadline = time.Now().Add(time.Hour)
 	rejectedTimeout.handleTimeout(deadlineRead, 2)
 	if rejectedTimeout.isClosing() {
 		t.Fatal("stale timeout closed the connection")
 	}
-	releaseTestTasks(stopped)
 }
 
 func TestWriteOwnedOverflowReturnsOwnership(t *testing.T) {
@@ -1018,7 +990,6 @@ func TestWriteOwnedOverflowReturnsOwnership(t *testing.T) {
 
 	// Task-owner path with batching: the same contract.
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	owner := &fdConn{fd: -1}
 	owner.ioOwner.Store(currentGoroutineID())
 	owner.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
@@ -1068,7 +1039,6 @@ func TestWriteOwnedBlockedSocketOverflowReturnsOwnership(t *testing.T) {
 	fillStreamSendBuffer(t, fds[0])
 
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: fds[0]}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
@@ -1108,15 +1078,9 @@ func TestWriteOwnedPartialWriteDespiteLimitReportsShortWrite(t *testing.T) {
 	// partial read would not admit new bytes.
 	readPeer(t, fds[1], 4096)
 
-	// The close request must not need a running poller: a stopped queue parks
-	// the close task like it would in a shutting-down loop.
-	loop := &eventLoop{tasks: taskqueue.New[*task]()}
-	stop := acquireTask(stopTask, nil)
-	if !loop.tasks.Stop(&stop.node) {
-		t.Fatal("failed to stop test loop")
-	}
-	loop.loopGoid.Store(currentGoroutineID())
-	defer releaseTestTasks(loop)
+	// The close request must not need a running poller: the turn that made
+	// the write releases the connection as it ends.
+	loop := &eventLoop{}
 	conn := &fdConn{fd: fds[0]}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
@@ -1148,7 +1112,7 @@ func TestExecutorTaskScratchIsAllocatedOnlyForAnInjectedExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer loop.poller.Close(nil)
-	if loop.ioReadyArgs != nil {
+	if loop.newWaiter().args != nil {
 		t.Fatal("owned scheduler allocated the []IOTask scratch")
 	}
 
@@ -1161,8 +1125,8 @@ func TestExecutorTaskScratchIsAllocatedOnlyForAnInjectedExecutor(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer loop.poller.Close(nil)
-	if len(loop.ioReadyArgs) != 0 || cap(loop.ioReadyArgs) != eventBatch {
+	if args := loop.newWaiter().args; len(args) != 0 || cap(args) != eventBatch {
 		t.Fatalf("injected executor scratch = len %d cap %d, want 0/%d",
-			len(loop.ioReadyArgs), cap(loop.ioReadyArgs), eventBatch)
+			len(args), cap(args), eventBatch)
 	}
 }

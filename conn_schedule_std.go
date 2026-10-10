@@ -13,8 +13,8 @@ const ioEventWake uint32 = 1 << 17
 func (conn *fdConn) prepareAccepted() {}
 
 // Blocking backends watch every descriptor on its owning loop, untagged.
-func (conn *fdConn) watcher() *poller.NetPoller { return conn.loop.poller }
-func (conn *fdConn) assignWatchTag() uint32     { return 0 }
+func (conn *fdConn) watcher() *poller.Poller { return conn.loop.poller }
+func (conn *fdConn) assignWatchTag() uint32  { return 0 }
 
 func (conn *fdConn) scheduleIO(events uint32) {
 	if events&ioEventOpen != 0 {

@@ -93,9 +93,9 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 	}
 }
 
-// closeOnLoop defers closure to a reserved turn, and that reservation can be a
-// task the executor rejects. The rejection then ends the turn and must hand the
-// closure back to the loop, or the connection never closes.
+// A close requested from outside goes to the connection's reserved turn, and
+// that reservation can be a task the executor rejects. The rejection then
+// ends the turn and must release the connection itself, or it never closes.
 func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1, OnClose: func(_ Conn, err error) { closed <- err }}
@@ -120,11 +120,11 @@ func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("closeOnLoop did not defer closure to the reserved turn")
+			t.Fatal("the close request did not record its cause")
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// The rejection is handled after closeOnLoop deferred to it.
+	// The rejection is handled after the close was requested.
 	conn.handleIOSubmitFailure(net.ErrClosed)
 	select {
 	case err := <-closed:

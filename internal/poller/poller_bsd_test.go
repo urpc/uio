@@ -10,7 +10,7 @@ import (
 )
 
 func TestBSDWakeTreatsFullPipeAsCoalesced(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}

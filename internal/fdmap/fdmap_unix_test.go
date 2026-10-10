@@ -54,3 +54,17 @@ func TestMapRejectsOutOfRangeDescriptors(t *testing.T) {
 		mapping.Delete(fd)
 	}
 }
+
+func TestMapDeleteValueKeepsAnotherValue(t *testing.T) {
+	mapping := NewMap[string]()
+	first, second := "first", "second"
+	_ = mapping.Put(3, &first)
+	mapping.DeleteValue(3, &second)
+	if mapping.Get(3) != &first {
+		t.Fatal("DeleteValue removed a value it did not hold")
+	}
+	mapping.DeleteValue(3, &first)
+	if mapping.Get(3) != nil {
+		t.Fatal("DeleteValue kept its own value")
+	}
+}

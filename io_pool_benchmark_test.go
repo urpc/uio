@@ -149,7 +149,7 @@ type ioTaskBenchmarkRunner struct {
 func newIOTaskBenchmarkRunner(batch int, scheduler ioBenchmarkScheduler) *ioTaskBenchmarkRunner {
 	runner := &ioTaskBenchmarkRunner{scheduler: scheduler}
 	events := &Events{}
-	events.OnOpen = func(Conn) { runner.active.Load().Done() }
+	events.OnData = func(Conn) error { runner.active.Load().Done(); return nil }
 	runner.connections = make([]*fdConn, batch)
 	runner.tasks = make([]IOTask, batch)
 	for index := range runner.connections {
@@ -165,7 +165,9 @@ func (runner *ioTaskBenchmarkRunner) runBatch() {
 	wait.Add(len(runner.connections))
 	runner.active.Store(&wait)
 	for _, conn := range runner.connections {
-		conn.taskState.Store(ioEventOpen)
+		// A wake turn runs a callback without touching a socket, which these
+		// connections do not have.
+		conn.taskState.Store(ioEventWake)
 		conn.taskState.Or(taskScheduledBit)
 		if !conn.loop.acquireIO() {
 			panic("I/O benchmark loop stopped")

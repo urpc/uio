@@ -19,21 +19,21 @@
 package uio
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
 
 	"github.com/libp2p/go-reuseport"
-	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
 )
 
+// acceptBatchSize bounds how many connections one listener event accepts.
 const acceptBatchSize = 64
 
 // listener keeps both the Go listener and the duplicated non-blocking fd used
@@ -42,99 +42,47 @@ type listener struct {
 	network string         // network protocol
 	fd      int            // fd
 	addr    string         // address
+	tcp     bool           // a TCP stream listener: accepted peers are IP addresses
 	pair    *addrPair      // local listen address, shared by accepted connections
 	ln      net.Listener   // tcp/unix listener
 	file    *os.File       // file
 	udp     net.PacketConn // udp endpoint
 	udpSvr  *fdConn        // udp server
+	loop    *eventLoop     // the loop that accepts on a stream listener
 }
 
-// acceptor runs on the master event loop. It accepts stream sockets and owns
-// shared UDP listener state, then assigns stream connections to worker loops.
+// acceptor owns the listeners. Stream listeners are spread over the event
+// loops, whose waiters accept on them; a UDP listener is a connection of its
+// own, whose turns read every peer's datagrams.
 type acceptor struct {
 	mux       sync.Mutex
 	listeners map[int]*listener
-	loop      *eventLoop
 	events    *Events
-	multis    []*multiAcceptor // stream acceptors when ReusePort spreads accept, one group per address
+	next      int // the loop the next stream listener goes to
 }
 
-// OnEvent drains listener readiness and escalates a non-retryable accept error
-// to server shutdown.
-func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {
+// listenersOverride fixes the number of ReusePort listeners per address in
+// tests; zero means automatic.
+var listenersOverride int
 
-	if 0 != events&poller.ReadEvents {
-		ld.mux.Lock()
-		l, ok := ld.listeners[fd]
-		ld.mux.Unlock()
-
-		if ok {
-			if err := ld.accept(l); err != nil {
-				ld.events.initiateClose(err)
-			}
-		}
+// reusePortListeners returns how many listeners share a ReusePort address.
+// The kernel spreads connections over the listeners of a ReusePort group, and
+// each listener is accepted on by one loop, so several of them spread the
+// accepting work — a few microseconds of accept and hand-off per connection —
+// over more loops. The count grows with the machine, capped where a
+// connection's own accept cost stops being the scarce resource and each
+// listener's share would shrink its batches.
+func reusePortListeners(procs int) int {
+	if listenersOverride > 0 {
+		return listenersOverride
 	}
-
-	if 0 != events&poller.WriteEvents {
-		return
-	}
+	return min(max(2, procs/12), 4)
 }
 
-// OnClose releases every listener owned by the master loop.
-func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
-	ld.close()
-}
-
-// accept handles a bounded portion of one listener readiness notification.
-func (ld *acceptor) accept(l *listener) error {
-
-	// udp server incoming
-	if l.udp != nil {
-		return ld.onReadUDP(l)
-	}
-	return ld.acceptStream(l)
-}
-
-// acceptStream accepts a bounded batch of stream connections from l and hands
-// each to its loop. The bound preserves fairness between listeners;
-// level-triggered readiness is delivered again while the accept queue remains
-// non-empty. It runs on whichever goroutine watches l: the master loop for a
-// single listener, or a dedicated acceptor goroutine when ReusePort spreads
-// accept over several listeners.
-func (ld *acceptor) acceptStream(l *listener) error {
-	tcp := strings.HasPrefix(l.network, "tcp")
-	// Bound one readiness dispatch so a busy listener cannot monopolize its
-	// loop.
-	for accepted := 0; accepted < acceptBatchSize; accepted++ {
-		nfd, sa, err := socket.Accept(l.fd)
-		if nil != err {
-			if isWouldBlock(err) {
-				return nil
-			}
-			return err
-		}
-
-		fdc := &fdConn{}
-		fdc.fd = nfd
-		fdc.events = ld.events
-		fdc.loop = ld.events.selectWorker(nfd)
-		fdc.addr = l.pair
-		if tcp {
-			fdc.remoteAddr = socket.SockaddrToAddrPort(sa)
-		} else {
-			// Unix peers keep their address object; only IP peers have a
-			// value form.
-			fdc.setRemoteAddr(socket.SockaddrToAddr(sa, false))
-		}
-
-		ld.events.submitAccepted(fdc, tcp)
-	}
-	return nil
-}
-
-// addListen creates a listener and publishes its poller-visible endpoint while
-// holding the listener registry lock. UDP registers a logical internal
-// connection because all peers share the same socket.
+// addListen creates the listeners for addr and assigns each stream listener
+// to a loop. Nothing is accepted until startAccepting, which Serve calls once
+// OnStart has returned; until then arriving connections wait in the
+// listener backlogs.
 func (ld *acceptor) addListen(addr string) (err error) {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
@@ -152,16 +100,6 @@ func (ld *acceptor) addListen(addr string) (err error) {
 	}
 	ld.listeners[l.fd] = l
 
-	// With ReusePort, stream accepting spreads over several listeners bound
-	// to the same address, one per acceptor goroutine; a single listener
-	// keeps watching the master loop as always. The mechanism is neutral to
-	// the data plane — acceptors hand connections to their loops through the
-	// same path the master uses — so every unix backend with ReusePort takes
-	// it; only the kernel's distribution across the listeners differs.
-	if ld.events.ReusePort && strings.HasPrefix(l.network, "tcp") {
-		return ld.addMultiListen(l)
-	}
-
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.fd = l.fd
@@ -171,28 +109,69 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			peers: make(map[socket.UDPAddress]*fdConn),
 		}
 		l.file = nil
-		l.udpSvr.loop = ld.loop
+		l.udpSvr.loop = ld.events.selectLoop(l.fd)
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
 		l.udpSvr.addr = l.pair
-
-		if err = ld.loop.fdMap.Put(l.fd, l.udpSvr); err != nil {
-			l.udpSvr.closeUnregistered()
-			return err
-		}
-		if err = ld.loop.poller.Add(l.fd, poller.Readable); err != nil {
-			ld.loop.fdMap.Delete(l.fd)
-			return err
-		}
 		return nil
 	}
 
-	return ld.loop.listen(l.fd)
+	count := 1
+	if ld.events.ReusePort && l.tcp {
+		count = reusePortListeners(runtime.GOMAXPROCS(0))
+	}
+	ld.assignLoop(l)
+	// The others bind the concrete address l resolved, so a port of zero
+	// still yields one shared port.
+	resolved := l.ln.Addr().String()
+	for range count - 1 {
+		next, err := ld.listen(resolved, true)
+		if err != nil {
+			// listen can fail after creating the listener (SetNonblock); it
+			// is not in the registry yet, so release it here.
+			if next != nil {
+				ld.closeListener(next)
+			}
+			return err
+		}
+		ld.listeners[next.fd] = next
+		ld.assignLoop(next)
+	}
+	return nil
+}
+
+// assignLoop gives stream listeners to the loops in turn.
+func (ld *acceptor) assignLoop(l *listener) {
+	loops := ld.events.loops
+	l.loop = loops[ld.next%len(loops)]
+	ld.next++
+}
+
+// startAccepting registers every listener with its loop. Serve calls it once
+// OnStart has returned, so no connection is accepted — and no OnOpen can run —
+// while the application is still initializing.
+func (ld *acceptor) startAccepting() error {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	for _, l := range ld.listeners {
+		if l.udpSvr != nil {
+			if err := l.udpSvr.loop.registerListener(l.udpSvr); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := l.loop.addListener(l); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ld *acceptor) closeListener(l *listener) {
-	if l.udpSvr != nil && !l.udpSvr.isClosedOnLoop() {
-		l.udpSvr.closeOnLoop(io.ErrUnexpectedEOF)
+	if l.udpSvr != nil && !l.udpSvr.isReleased() {
+		if err, ok := l.udpSvr.teardown(io.ErrUnexpectedEOF); ok {
+			l.udpSvr.scheduleCloseCallback(err)
+		}
 	}
 	if l.file != nil && l.udpSvr == nil {
 		_ = l.file.Close()
@@ -210,31 +189,17 @@ func (ld *acceptor) closeListener(l *listener) {
 	}
 }
 
+// close releases every listener. Serve calls it after the loops' waiters have
+// returned, so nothing accepts on a listener it closes.
 func (ld *acceptor) close() {
 	ld.mux.Lock()
 	// User OnClose callbacks run while closing UDP children, so release the
 	// listener-map lock before closing resources.
 	listeners := ld.listeners
 	ld.listeners = nil
-	multis := ld.multis
-	ld.multis = nil
 	ld.mux.Unlock()
 	for _, l := range listeners {
 		ld.closeListener(l)
-	}
-	if len(multis) > 0 {
-		// Closing each poller wakes its acceptor out of Wait: closing a
-		// listener descriptor alone would not, the kernel silently drops it
-		// from the set. Join after, so Serve does not return while an
-		// acceptor could still submit.
-		for _, multi := range multis {
-			for _, np := range multi.polls {
-				_ = np.Close(nil)
-			}
-		}
-		for _, multi := range multis {
-			multi.wg.Wait()
-		}
 	}
 }
 
@@ -323,15 +288,6 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 
 	l.fd = int(l.file.Fd())
 	l.network = u.Scheme
+	l.tcp = strings.HasPrefix(u.Scheme, "tcp")
 	return &l, syscall.SetNonblock(l.fd, true)
-}
-
-func (ld *acceptor) onReadUDP(l *listener) error {
-
-	udpSvrConn := ld.loop.getConn(l.fd)
-	if nil == udpSvrConn {
-		return errors.New("no such udp server")
-	}
-
-	return udpSvrConn.fireReadEvent()
 }

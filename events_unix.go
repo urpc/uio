@@ -22,6 +22,7 @@ import (
 	"context"
 	"net"
 	"net/url"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -90,8 +91,10 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 	return fdc, nil
 }
 
-// DialContext connects synchronously from any goroutine except an event loop
-// and allows cancellation while resolving or establishing the connection.
+// DialContext connects synchronously and allows cancellation while resolving
+// or establishing the connection. The connection is registered on the calling
+// goroutine, so calling it from a connection callback waits for nothing but
+// the dial itself.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
@@ -152,4 +155,152 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		return nil, err
 	}
 	return fdc, nil
+}
+
+// loopState is this backend's share of Events: the event loops, each one
+// poller and the goroutines that wait on it, and the signal that ends Serve.
+type loopState struct {
+	loops   []*eventLoop
+	stopped chan struct{} // closed once Close has been requested
+}
+
+// initLoops creates the shared connection scheduler and Pollers loops, and
+// starts their waiters, so connections dialed during OnStart are already
+// watched. The loops accept nothing until serveLoops registers the listeners.
+// Startup rollback closes every successfully created poller before returning
+// an error.
+func (ev *Events) initLoops() (err error) {
+	// An injected Executor owns scheduling when present; otherwise UIO creates
+	// its default taskgo queue. The queue stays single: turns from every loop
+	// share it, and measurements on a 64-core host showed a shared queue
+	// beating one queue per loop by ~4% — the loops exist to spread event
+	// collection, not to pin work to cores.
+	ev.ioPool = newIOTaskPool(ev.Executor)
+	ev.stopped = make(chan struct{})
+	ev.loops = make([]*eventLoop, ev.Pollers)
+	for idx := range ev.loops {
+		if ev.loops[idx], err = newEventLoop(ev); err != nil {
+			for _, loop := range ev.loops[:idx] {
+				_ = loop.poller.Close(err)
+			}
+			ev.loops = nil
+			ev.ioPool.stop()
+			return err
+		}
+	}
+	procs := runtime.GOMAXPROCS(0)
+	waiters := loopWaiters(procs, len(ev.loops))
+	parked := waiters*len(ev.loops) <= parkedWaiters
+	for _, loop := range ev.loops {
+		loop.start(waiters, parked, ev.LockOSThread)
+	}
+	return nil
+}
+
+func (ev *Events) initListeners(addrs []string) (err error) {
+	ev.acceptor = &acceptor{events: ev}
+	for _, addr := range addrs {
+		if addr == "" {
+			continue
+		}
+		if err = ev.acceptor.addListen(addr); nil != err {
+			return err
+		}
+	}
+	return nil
+}
+
+func (ev *Events) publishLoops() {}
+
+// stopLoopsLocked ends serveLoops. It reports whether any loop exists.
+func (ev *Events) stopLoopsLocked(error) bool {
+	if ev.stopped == nil {
+		return false
+	}
+	select {
+	case <-ev.stopped:
+	default:
+		close(ev.stopped)
+	}
+	return true
+}
+
+// serveLoops starts accepting, waits for Close, and then shuts down.
+func (ev *Events) serveLoops() error {
+	if err := ev.acceptor.startAccepting(); err != nil {
+		ev.initiateClose(err)
+	}
+	<-ev.stopped
+	var err error
+	if reason := ev.closeReason.Load(); reason != nil {
+		err = *reason
+	}
+	ev.shutdownLoops(err)
+	return err
+}
+
+// shutdownLoops stops the loops in the order their users depend on: no loop
+// admits a new turn, every waiter returns, so nothing is accepted or
+// collected any more, then each loop releases its connections, the listeners
+// close, and the scheduler stops once every remaining turn, close callbacks
+// included, has returned.
+func (ev *Events) shutdownLoops(err error) {
+	for _, loop := range ev.loops {
+		loop.stopping.Store(true)
+	}
+	for _, loop := range ev.loops {
+		loop.closePoller(err)
+	}
+	for _, loop := range ev.loops {
+		loop.shutdown(err)
+	}
+	if ev.acceptor != nil {
+		ev.acceptor.close()
+	}
+	ev.stopIOPool()
+}
+
+func (ev *Events) rollbackInit(err error) {
+	ev.closing.Store(true)
+	ev.ready.Store(false)
+	ev.shutdownLoops(err)
+}
+
+// stopIOPool joins every connection turn the loops counted, including close
+// callbacks scheduled while they shut down, and then stops the scheduler.
+func (ev *Events) stopIOPool() {
+	if ev.ioPool == nil {
+		return
+	}
+	for _, loop := range ev.loops {
+		loop.waitIODrained()
+	}
+	ev.ioPool.stop()
+}
+
+func (ev *Events) selectLoop(fd int) *eventLoop {
+	if len(ev.loops) == 0 {
+		return nil
+	}
+	return ev.loops[fd%len(ev.loops)]
+}
+
+func (ev *Events) addConn(fdc *fdConn) error {
+	return ev.addConnContext(nil, fdc)
+}
+
+// addConnContext registers fdc on the calling goroutine. A context that is
+// already done refuses the connection; once registered, it is the caller's.
+func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
+	if fdc.loop == nil || ev.closing.Load() {
+		fdc.closeUnregistered()
+		return net.ErrClosed
+	}
+	if ctx != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			fdc.closeUnregistered()
+			return cause
+		}
+	}
+	return fdc.loop.registerConn(fdc)
 }

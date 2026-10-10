@@ -17,14 +17,12 @@
 package uio
 
 import (
-	"context"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
-	"github.com/urpc/uio/internal/poller"
 )
 
 // CompositeBuffer exposes UIO's pooled segmented buffer without introducing a
@@ -63,11 +61,9 @@ type readBuffer struct {
 // shared read buffers, and application callbacks for one server/dialer
 // lifecycle. Configure it before Serve; an Events value is not restartable.
 type Events struct {
-	master         *eventLoop     // serving listener
-	workers        []*eventLoop   // serving connection
-	acceptor       *acceptor      // connection acceptor
-	waitGroup      sync.WaitGroup // wait for all eventLoop exit on shutdown
-	mux            sync.Mutex     // serializes initialization and shutdown publication
+	loopState                 // the backend's event loops
+	acceptor       *acceptor  // connection acceptor
+	mux            sync.Mutex // serializes initialization and shutdown publication
 	closing        atomic.Bool
 	ready          atomic.Bool    // Dial is allowed only after full initialization
 	callbackWG     sync.WaitGroup // std I/O goroutines still able to enter callbacks
@@ -75,20 +71,19 @@ type Events struct {
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]
 	ioPool         *ioTaskPool
-	data           *dataPoller // sharded stream readiness, when the backend has one
-	dataShards     int         // data-plane shard count, fixed at init
 	readPool       sync.Pool
 	readBufferSize int
 
-	// Pollers is the number of event-loop goroutines.
-	// The default is one per four Ps, at least two, capped by
-	// runtime.GOMAXPROCS(0): the loops are goroutines, so a process with
-	// fewer Ps than the machine's CPUs — a cgroup-limited container, a
-	// prefork child — sizes them to the Ps it runs on. On Linux, stream
-	// readiness is collected by the sharded data pollers instead, so
-	// Pollers sizes accept, registration, close, deadline and UDP work;
-	// connection churn is what notices its count, echo and pipeline are
-	// indifferent to it.
+	// Pollers is the number of event loops. On Unix each loop is one
+	// epoll or kqueue instance that a few goroutines wait on: they collect
+	// readiness for the connections and listeners registered with it and hand
+	// runnable connections to the Executor, and never run a callback. The
+	// default is one loop per four Ps, between one and eight, so a
+	// connection's events stay within one cluster of cores. The count
+	// follows GOMAXPROCS rather than NumCPU, so a process whose Ps are fewer
+	// than the machine's CPUs — a prefork child or a cgroup-limited container
+	// — sizes its loops to the Ps it runs on. On the stdio and Windows
+	// backend the loops only order registration and close.
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
@@ -129,9 +124,11 @@ type Events struct {
 	// the limit.
 	MaxInboundBuffered int
 
-	// OnOpen fires after registration. Lifecycle and data callbacks are
-	// serialized per connection, while callbacks for different connections may
-	// run concurrently.
+	// OnOpen fires first for every connection, in the connection's first
+	// turn. On Unix a stream connection's first turn reads whatever its peer
+	// already sent right after OnOpen returns, in the same turn. Lifecycle and
+	// data callbacks are serialized per connection, while callbacks for
+	// different connections may run concurrently.
 	OnOpen func(c Conn)
 
 	// OnData fires when inbound data is available. Inbound access methods are
@@ -139,7 +136,9 @@ type Events struct {
 	OnData func(c Conn) error
 
 	// OnClose is the final callback for a connection and never overlaps its
-	// OnOpen or OnData callback.
+	// OnOpen or OnData callback. Close only requests the close: the
+	// connection is released, and OnClose runs, once the callback that closed
+	// it has returned.
 	OnClose func(c Conn, err error)
 
 	// OnInbound reports bytes read from the socket before OnData and shares its
@@ -150,11 +149,14 @@ type Events struct {
 	// a backend writer goroutine or a native write turn, concurrently with the
 	// connection's other callbacks, and does not grant inbound-buffer access.
 	// Calls for one connection never overlap each other: on the native backend
-	// a Write made inside OnOutbound is queued and sent after it returns.
+	// a Write made inside OnOutbound is queued and sent after it returns. A
+	// native UDP connection's datagrams leave on the goroutines that write
+	// them, and OnOutbound may report several of them, on any one of those
+	// goroutines, after its send.
 	OnOutbound func(c Conn, writeBytes int)
 
-	// OnStart runs synchronously after initialization and before the master
-	// listener loop begins polling.
+	// OnStart runs synchronously after initialization and before listeners
+	// begin accepting connections.
 	OnStart func(ev *Events)
 
 	// OnStop runs once after Serve has stopped its loops and connection tasks.
@@ -179,15 +181,6 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		ev.OnStart(ev)
 	}
 
-	// The dedicated ReusePort acceptors start only now: accepting is what
-	// leads to OnOpen, and that callback must not run while the application is
-	// still initializing. The master loop, which accepts the single-listener
-	// form, begins polling just below for the same reason; bound listeners
-	// hold early connections in their backlogs until then.
-	if ev.acceptor != nil {
-		ev.acceptor.startMultiAcceptors()
-	}
-
 	defer func() {
 		if ev.OnStop != nil {
 			ev.OnStop(ev)
@@ -195,32 +188,10 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		ev.finishLifecycle(err)
 	}()
 
-	// Serve the listener loop on the caller goroutine.
-	err = ev.master.Serve(ev.LockOSThread, ev.acceptor)
-	ev.waitGroup.Done()
-	ev.initiateClose(err)
-	ev.waitGroup.Wait()
-	ev.closeDataPoller(err)
-	ev.stopIOPool()
-	ev.callbackWG.Wait()
-	return err
-}
-
-// stopIOPool joins every connection turn the loops counted, including close
-// callbacks scheduled while they shut down, and then stops the scheduler.
-func (ev *Events) stopIOPool() {
-	if ev.ioPool == nil {
-		return
-	}
-	if ev.master != nil {
-		ev.master.waitIODrained()
-	}
-	for _, worker := range ev.workers {
-		if worker != nil {
-			worker.waitIODrained()
-		}
-	}
-	ev.ioPool.stop()
+	// Accepting starts only now: accepting is what leads to OnOpen, and that
+	// callback must not run while the application is still initializing.
+	// Bound listeners hold early connections in their backlogs until then.
+	return ev.serveLoops()
 }
 
 // Close publishes shutdown and returns without waiting. Use Wait or the return
@@ -271,35 +242,25 @@ func (ev *Events) initEvents(addrs []string) (err error) {
 		ev.rollbackInit(err)
 		return err
 	}
-	// Publish the master loop before initEvents unlocks so Close cannot observe
-	// a successfully initialized Events with an incomplete wait group.
-	ev.waitGroup.Add(1)
+	ev.publishLoops()
 	ev.ready.Store(true)
 
 	return nil
 }
 
-// initiateClose seals every loop queue after publishing closing. It never waits
+// initiateClose publishes closing and asks the loops to stop. It never waits
 // for callbacks or workers, so it is safe from every callback context.
 func (ev *Events) initiateClose(err error) {
 	ev.mux.Lock()
 	done := ev.ensureDoneLocked()
-	// Publish closing before sealing queues so producers reject new work.
+	// Publish closing before stopping the loops so producers reject new work.
 	if !ev.closing.CompareAndSwap(false, true) {
 		ev.mux.Unlock()
 		return
 	}
 	ev.recordCloseReason(err)
 	ev.ready.Store(false)
-	if ev.master != nil {
-		ev.master.beginStop(err)
-	}
-	for _, worker := range ev.workers {
-		if worker != nil {
-			worker.beginStop(err)
-		}
-	}
-	idle := ev.master == nil && len(ev.workers) == 0
+	idle := !ev.stopLoopsLocked(err)
 	ev.mux.Unlock()
 	if idle {
 		ev.doneOnce.Do(func() { close(done) })
@@ -326,56 +287,10 @@ func (ev *Events) finishLifecycle(err error) {
 	ev.doneOnce.Do(func() { close(done) })
 }
 
-func (ev *Events) rollbackInit(err error) {
-	// Workers may already be serving even though listener setup failed.
-	ev.closing.Store(true)
-	ev.ready.Store(false)
-	if ev.acceptor != nil {
-		ev.acceptor.close()
-	}
-	for _, worker := range ev.workers {
-		if worker != nil {
-			worker.beginStop(err)
-		}
-	}
-	if ev.master != nil {
-		_ = ev.master.poller.Close(err)
-	}
-	ev.waitGroup.Wait()
-	ev.closeDataPoller(err)
-	ev.stopIOPool()
-	ev.callbackWG.Wait()
-}
-
-// streamPoller returns the data-plane poller watching fd's shard, or nil when
-// each event loop watches its own connections.
-func (ev *Events) streamPoller(fd int) *poller.NetPoller {
-	if ev == nil || ev.data == nil {
-		return nil
-	}
-	return ev.data.watcherFor(fd)
-}
-
-// closeDataPoller runs after every loop has stopped, so no stream is still
-// registered with the shared poller or able to register.
-func (ev *Events) closeDataPoller(err error) {
-	if ev.data != nil {
-		ev.data.close(err)
-	}
-}
-
 func (ev *Events) initConfig() error {
 
 	if ev.Pollers <= 0 {
-		// One event loop per four Ps, at least two. The loops accept and then
-		// own each connection's registration and close, so a churning workload
-		// needs them spread wide, while loops past what the control plane uses
-		// only contend with the io workers for Ps. The count follows
-		// GOMAXPROCS rather than NumCPU — the loops are goroutines — so a
-		// process whose Ps are fewer than the machine's CPUs, a prefork child
-		// or a cgroup-limited container, sizes loops to the Ps it actually
-		// runs on.
-		ev.Pollers = max(2, runtime.GOMAXPROCS(0)/4)
+		ev.Pollers = defaultPollers(runtime.GOMAXPROCS(0))
 	}
 	ev.Pollers = min(ev.Pollers, runtime.GOMAXPROCS(0))
 
@@ -389,190 +304,6 @@ func (ev *Events) initConfig() error {
 	}
 
 	return nil
-}
-
-// initLoops creates one shared connection scheduler, a master listener loop,
-// and Pollers worker loops. Startup rollback closes every successfully created
-// poller before returning an error.
-func (ev *Events) initLoops() (err error) {
-	// Native Unix always uses connection tasks. An injected Executor owns
-	// scheduling when present; otherwise UIO creates its default taskgo queue.
-	// The queue stays single: turns from every data-plane shard share it, and
-	// measurements on a 64-core host showed a shared queue beating one queue
-	// per shard by ~4% — the shards exist to spread event collection, not to
-	// pin work to cores.
-	ev.dataShards = 1
-	if dataPlaneSharded {
-		ev.dataShards = dataShardCount(runtime.GOMAXPROCS(0))
-	}
-	ev.ioPool = newIOTaskPool(ev.Executor)
-
-	// The shared stream poller starts before the loops that register with it.
-	if ev.data, err = newDataPoller(ev); err != nil {
-		return err
-	}
-	if ev.data != nil {
-		ev.data.start(ev)
-	}
-
-	// create main loop
-	if ev.master, err = newEventLoop(ev); nil != err {
-		ev.closeDataPoller(err)
-		return err
-	}
-
-	ev.workers = make([]*eventLoop, ev.Pollers)
-	for idx := range ev.workers {
-		if ev.workers[idx], err = newEventLoop(ev); nil != err {
-			_ = ev.master.poller.Close(err)
-			for _, worker := range ev.workers[:idx] {
-				_ = worker.poller.Close(err)
-			}
-			ev.closeDataPoller(err)
-			return err
-		}
-	}
-
-	for _, worker := range ev.workers {
-		ev.waitGroup.Add(1)
-
-		go func(worker *eventLoop) {
-			serveErr := worker.Serve(ev.LockOSThread, nil)
-			// rollbackInit may hold ev.mux while waiting for this worker.
-			ev.waitGroup.Done()
-			if serveErr != nil {
-				ev.initiateClose(serveErr)
-			}
-		}(worker)
-	}
-
-	return nil
-}
-
-func (ev *Events) initListeners(addrs []string) (err error) {
-
-	ev.acceptor = &acceptor{
-		loop:   ev.master,
-		events: ev,
-	}
-
-	for _, addr := range addrs {
-		if addr == "" {
-			continue
-		}
-		if err = ev.acceptor.addListen(addr); nil != err {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func (ev *Events) selectLoop(fd int) *eventLoop {
-	return ev.selectWorker(fd)
-}
-
-func (ev *Events) selectWorker(fd int) *eventLoop {
-	if len(ev.workers) == 0 {
-		return nil
-	}
-	return ev.workers[fd%len(ev.workers)]
-}
-
-func (ev *Events) addConn(fdc *fdConn) error {
-	return ev.addConnContext(nil, fdc)
-}
-
-const (
-	registerPending uint32 = iota
-	registerCanceled
-	registerCompleted
-)
-
-// registerRequest coordinates DialContext cancellation with loop registration.
-// The CAS winner decides whether the new fd is returned or closed.
-type registerRequest struct {
-	ctx   context.Context
-	state atomic.Uint32
-}
-
-func (request *registerRequest) cause() error {
-	if cause := context.Cause(request.ctx); cause != nil {
-		return cause
-	}
-	return context.Canceled
-}
-
-// addConnContext synchronously waits for loop registration while allowing the
-// caller's context to cancel. Cancellation never returns ownership: a request
-// already executing on the loop closes the connection when it observes the
-// canceled state.
-func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
-	if fdc.loop == nil || ev.closing.Load() {
-		fdc.closeUnregistered()
-		return net.ErrClosed
-	}
-	if ctx != nil {
-		if cause := context.Cause(ctx); cause != nil {
-			fdc.closeUnregistered()
-			return cause
-		}
-	}
-	if fdc.loop.inLoop() {
-		return fdc.loop.registerConn(fdc)
-	}
-	// External Dial returns after registration. Native OnOpen runs in the
-	// connection task; stdio invokes it synchronously during registration.
-	t := acquireTask(registerTask, fdc)
-	t.done = make(chan error, 1)
-	done := t.done
-	var request *registerRequest
-	if ctx != nil {
-		request = &registerRequest{ctx: ctx}
-		t.registration = request
-	}
-	if !fdc.loop.submitTask(t) {
-		releaseTask(t)
-		fdc.closeUnregistered()
-		if ctx != nil {
-			if cause := context.Cause(ctx); cause != nil {
-				return cause
-			}
-		}
-		return net.ErrClosed
-	}
-	if request == nil {
-		return <-done
-	}
-	select {
-	case result := <-done:
-		return result
-	case <-ctx.Done():
-		if request.state.CompareAndSwap(registerPending, registerCanceled) {
-			return request.cause()
-		}
-		return <-done
-	}
-}
-
-func (ev *Events) closeConn(fdc *fdConn, err error) {
-	fdc.requestClose(err)
-}
-
-func (ev *Events) submitAccepted(fdc *fdConn, tcp bool) bool {
-	if fdc.loop == nil || ev.closing.Load() {
-		fdc.closeUnregistered()
-		return false
-	}
-	// The listener loop never waits for a worker's OnOpen callback.
-	t := acquireTask(registerTask, fdc)
-	t.acceptedTCP = tcp
-	if !fdc.loop.submitTask(t) {
-		releaseTask(t)
-		fdc.closeUnregistered()
-		return false
-	}
-	return true
 }
 
 func (ev *Events) onData(fdc *fdConn) error {

@@ -58,6 +58,6 @@ var errInvalidInterest = errors.New("poller: empty interest")
 
 // EventHandler consumes normalized readiness and terminal poller closure.
 type EventHandler interface {
-	OnEvent(ep *NetPoller, fd int, events Events)
-	OnClose(ep *NetPoller, err error)
+	OnEvent(ep *Poller, fd int, events Events)
+	OnClose(ep *Poller, err error)
 }

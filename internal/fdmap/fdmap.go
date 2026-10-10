@@ -62,6 +62,15 @@ func (m *Map[V]) Delete(k int) {
 	m.mu.Unlock()
 }
 
+// DeleteValue removes k only while it still maps to v.
+func (m *Map[V]) DeleteValue(k int, v *V) {
+	m.mu.Lock()
+	if m.store[k] == v {
+		delete(m.store, k)
+	}
+	m.mu.Unlock()
+}
+
 type entry[V any] struct {
 	key   int
 	value *V

@@ -41,13 +41,7 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 		return conn.writeOnLoop(data)
 	}
 	if conn.isDatagram() {
-		owned := bytebuf.CloneBuffer(data)
-		n, err := conn.queueUDPWrite(owned, len(data))
-		if errors.Is(err, ErrOutboundOverflow) {
-			// The clone never entered the queue, so Write still owns it.
-			bytebuf.ReleaseBuffer(owned)
-		}
-		return n, err
+		return conn.sendUDPOutside(data)
 	}
 	// This fast rejection belongs after the direct path: data sent straight to
 	// the kernel never counts against the user-space payload limit.
@@ -122,7 +116,11 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 		return conn.writeOwnedOnLoop(owned, size)
 	}
 	if conn.isDatagram() {
-		return conn.queueUDPWrite(owned, size)
+		n, err := conn.sendUDPOutside(owned.Bytes())
+		if !errors.Is(err, ErrOutboundOverflow) {
+			bytebuf.ReleaseBuffer(owned)
+		}
+		return n, err
 	}
 	return conn.queueOwnedWrite(owned, size)
 }
@@ -170,69 +168,24 @@ func (conn *fdConn) coalesceBlockSize() int {
 	return min(64<<10, conn.events.readBufferSize*2)
 }
 
-// queueUDPWrite transfers one datagram to the owning loop and waits for the
-// nonblocking send result. The admission lock also orders it before a later
-// CloseWith. A callback on another loop cannot wait without risking a cycle.
-func (conn *fdConn) queueUDPWrite(owned *Buffer, size int) (int, error) {
-	if isEventLoopGoroutine() {
-		bytebuf.ReleaseBuffer(owned)
-		return 0, ErrUDPWriteOnEventLoop
-	}
-	t := acquireTask(udpWriteTask, conn)
-	t.udpPayload = owned
-	t.udpDone = make(chan udpWriteResult, 1)
-	done := t.udpDone
-	conn.submitMu.Lock()
-	if conn.loop == nil || conn.events == nil || conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
-		conn.submitMu.Unlock()
-		bytebuf.ReleaseBuffer(owned)
-		releaseTask(t)
-		return 0, net.ErrClosed
-	}
-	if !conn.reservePending(int64(size)) {
-		conn.submitMu.Unlock()
-		releaseTask(t)
-		// The datagram was not queued and not sent: ownership returns to the
-		// caller like every other ErrOutboundOverflow.
+// sendUDPOutside sends one datagram from outside the connection's turn. A
+// datagram is never queued, so the send happens here, holding the descriptor
+// owner's submitMu, which keeps the socket from closing under the syscall;
+// OnOutbound and a failure's close run after the lock is released. The lock
+// also orders the send before a later CloseWith.
+func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
+	if limit := conn.events.MaxOutboundBuffered; limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
-	if !conn.loop.pushTask(t) {
-		conn.pending.Add(-int64(size))
-		conn.submitMu.Unlock()
-		bytebuf.ReleaseBuffer(owned)
-		releaseTask(t)
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+		owner.submitMu.Unlock()
 		return 0, net.ErrClosed
 	}
-	conn.submitMu.Unlock()
-	conn.loop.notify()
-	result := <-done
-	return result.n, result.err
-}
-
-func (conn *fdConn) settleUDPWrite(size int64) {
-	for {
-		pending := conn.pending.Load()
-		if pending == 0 {
-			return // closeOnLoop already cleared the connection's accounting.
-		}
-		remaining := pending - size
-		if remaining < 0 {
-			remaining = 0
-		}
-		if conn.pending.CompareAndSwap(pending, remaining) {
-			return
-		}
-	}
-}
-
-func (conn *fdConn) runUDPWriteTask(owned *Buffer) udpWriteResult {
-	defer bytebuf.ReleaseBuffer(owned)
-	defer conn.settleUDPWrite(int64(owned.Len()))
-	if conn.isClosedOnLoop() || (conn.udp.server != nil && conn.udp.server.isClosedOnLoop()) {
-		return udpWriteResult{err: net.ErrClosed}
-	}
-	n, err := conn.sendUDPOnLoop(owned.Bytes())
-	return udpWriteResult{n: n, err: err}
+	written, err := conn.sendDatagram(data)
+	owner.submitMu.Unlock()
+	return conn.finishDatagram(data, written, err)
 }
 
 func (conn *fdConn) precheckOutbound(size int) error {
@@ -548,10 +501,21 @@ func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
 	conn.submitMu.Unlock()
 }
 
-// sendUDPOnLoop preserves datagram atomicity. A blocked datagram is reported to
-// the caller rather than queued as a stream suffix, and a partial result is
-// fatal because retrying it would create a different packet.
+// sendUDPOnLoop sends one datagram from the connection's turn. Sends from
+// other goroutines share the socket and its destination address, so every
+// send holds the descriptor owner's submitMu.
 func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	written, err = conn.sendDatagram(data)
+	owner.submitMu.Unlock()
+	return conn.finishDatagram(data, written, err)
+}
+
+// sendDatagram is the send syscall alone. Its caller holds the descriptor
+// owner's submitMu: Sendto encodes the destination into the address value
+// it is given, which every send to this peer shares.
+func (conn *fdConn) sendDatagram(data []byte) (written int, err error) {
 	if conn.udp.remote == nil {
 		written, err = syscall.Write(conn.fd, data)
 	} else {
@@ -563,7 +527,14 @@ func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
 	if written < 0 {
 		written = 0
 	}
-	conn.events.onSocketBytesWrite(conn, written)
+	return written, err
+}
+
+// finishDatagram preserves datagram atomicity. A blocked datagram is reported
+// to the caller rather than queued as a stream suffix, and a partial result is
+// fatal because retrying it would create a different packet.
+func (conn *fdConn) finishDatagram(data []byte, written int, err error) (int, error) {
+	conn.reportOutbound(written)
 	if err != nil {
 		if isUDPSendBlocked(err) {
 			return written, err
@@ -578,6 +549,43 @@ func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
 		return written, err
 	}
 	return written, nil
+}
+
+// reportOutbound runs OnOutbound for a datagram send. Datagrams are sent on
+// whichever goroutine writes them, so the calls for one connection go through
+// a claim, as a stream's sends do: a sender adds its bytes and reports them
+// itself if it takes the claim, and otherwise leaves them to the holder, which
+// reports until nothing is pending, so the calls never overlap and a send made
+// inside OnOutbound is reported once that call returns. Nobody waits for the
+// claim, so OnOutbound callbacks that write to each other cannot deadlock.
+func (conn *fdConn) reportOutbound(n int) {
+	if n <= 0 || conn.events.OnOutbound == nil {
+		return
+	}
+	udp := conn.udp
+	udp.outboundPending.Add(int64(n))
+	for udp.outboundClaim.CompareAndSwap(false, true) {
+		conn.drainOutbound()
+		// Bytes added between the last drain and the release found the
+		// claim taken; look again.
+		if udp.outboundPending.Load() == 0 {
+			return
+		}
+	}
+}
+
+// drainOutbound reports pending bytes while holding the claim, and releases it
+// even when OnOutbound panics.
+func (conn *fdConn) drainOutbound() {
+	udp := conn.udp
+	defer udp.outboundClaim.Store(false)
+	for {
+		pending := udp.outboundPending.Swap(0)
+		if pending == 0 {
+			return
+		}
+		conn.events.OnOutbound(conn, int(pending))
+	}
 }
 
 func isUDPSendBlocked(err error) bool {

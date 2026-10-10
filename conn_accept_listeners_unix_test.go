@@ -4,47 +4,47 @@ package uio
 
 import (
 	"net"
+	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-// TestMultiAcceptorSharesOnePort pins the ReusePort accept layout: several
-// listeners bound to the same concrete port (even from a :0 request), one
-// per acceptor goroutine, all serving connections.
-func TestMultiAcceptorSharesOnePort(t *testing.T) {
-	const acceptors = 3
-	multiAcceptorsOverride = acceptors
-	t.Cleanup(func() { multiAcceptorsOverride = 0 })
+// TestReusePortListenersShareOnePort pins the ReusePort accept layout:
+// several listeners bound to the same concrete port (even from a :0 request),
+// spread over the loops, all serving connections.
+func TestReusePortListenersShareOnePort(t *testing.T) {
+	const listeners = 3
+	listenersOverride = listeners
+	t.Cleanup(func() { listenersOverride = 0 })
 
 	events := &Events{Pollers: 2, ReusePort: true}
 	addrCh := make(chan string, 1)
 	events.OnStart = func(ev *Events) {
-		if len(ev.acceptor.multis) != 1 {
-			t.Errorf("acceptor groups = %d, want 1", len(ev.acceptor.multis))
-			addrCh <- ""
-			return
+		if len(ev.acceptor.listeners) != listeners {
+			t.Errorf("listeners = %d, want %d", len(ev.acceptor.listeners), listeners)
 		}
-		multi := ev.acceptor.multis[0]
-		if len(multi.lns) != acceptors {
-			t.Errorf("acceptors = %d, want %d", len(multi.lns), acceptors)
-		}
-		if len(ev.acceptor.listeners) != acceptors {
-			t.Errorf("registered listeners = %d, want %d", len(ev.acceptor.listeners), acceptors)
-		}
-		first := multi.lns[0].ln.Addr().String()
-		for _, l := range multi.lns[1:] {
-			if got := l.ln.Addr().String(); got != first {
+		first := ""
+		perLoop := map[*eventLoop]int{}
+		for _, l := range ev.acceptor.listeners {
+			perLoop[l.loop]++
+			if first == "" {
+				first = l.ln.Addr().String()
+			} else if got := l.ln.Addr().String(); got != first {
 				t.Errorf("listener bound %s, want the shared %s", got, first)
 			}
+		}
+		if len(perLoop) != len(ev.loops) {
+			t.Errorf("listeners went to %d loops, want all %d", len(perLoop), len(ev.loops))
 		}
 		addrCh <- first
 	}
 
 	const dials = 16
-	var opened, closed atomic.Int64
+	var opened atomic.Int64
 	events.OnOpen = func(Conn) { opened.Add(1) }
-	events.OnClose = func(Conn, error) { closed.Add(1) }
 
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("tcp://127.0.0.1:0") }()
@@ -92,17 +92,19 @@ func TestMultiAcceptorSharesOnePort(t *testing.T) {
 	}
 }
 
-// TestMultiAcceptorClosesEveryAddress pins the shutdown of a ReusePort server
-// serving several addresses: every address keeps its own acceptor group, and
-// closing the server must release all of them — one group's poller left open
-// would park its acceptor goroutine and leak the descriptor, which the kernel
-// never reports by closing the listener alone.
-func TestMultiAcceptorClosesEveryAddress(t *testing.T) {
+// TestCloseReleasesEveryListener pins the shutdown of a ReusePort server
+// serving several addresses: closing the server releases every listener's
+// descriptor and stops every loop's poller.
+func TestCloseReleasesEveryListener(t *testing.T) {
 	events := &Events{Pollers: 2, ReusePort: true}
-	var groups []*multiAcceptor
+	var fds []int
+	var loops []*eventLoop
 	started := make(chan struct{})
 	events.OnStart = func(ev *Events) {
-		groups = append(groups, ev.acceptor.multis...)
+		for _, l := range ev.acceptor.listeners {
+			fds = append(fds, l.fd)
+		}
+		loops = ev.loops
 		close(started)
 	}
 	done := make(chan error, 1)
@@ -112,8 +114,8 @@ func TestMultiAcceptorClosesEveryAddress(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Serve did not start")
 	}
-	if len(groups) != 2 {
-		t.Fatalf("acceptor groups = %d, want one per address", len(groups))
+	if len(fds) < 4 {
+		t.Fatalf("listeners = %d, want at least two per address", len(fds))
 	}
 	_ = events.Close(nil)
 	select {
@@ -124,24 +126,24 @@ func TestMultiAcceptorClosesEveryAddress(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Serve did not stop")
 	}
-	for i, multi := range groups {
-		for j, np := range multi.polls {
-			if !np.Closed() {
-				t.Errorf("group %d poller %d was never closed", i, j)
-			}
+	for _, loop := range loops {
+		if !loop.poller.Closed() {
+			t.Error("a loop's poller was never closed")
+		}
+	}
+	for _, fd := range fds {
+		if _, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0); err != unix.EBADF {
+			t.Errorf("listener fd %d still open after Close: %v", fd, err)
 		}
 	}
 }
 
-// TestMultiAcceptorRequiresReusePort pins that the default single-listener
-// layout is untouched: no extra listeners, no acceptor goroutines.
-func TestMultiAcceptorRequiresReusePort(t *testing.T) {
+// TestSingleListenerWithoutReusePort pins that the default layout binds one
+// listener per address.
+func TestSingleListenerWithoutReusePort(t *testing.T) {
 	events := &Events{Pollers: 2}
 	checked := make(chan struct{})
 	events.OnStart = func(ev *Events) {
-		if len(ev.acceptor.multis) != 0 {
-			t.Error("multi-acceptors created without ReusePort")
-		}
 		if len(ev.acceptor.listeners) != 1 {
 			t.Errorf("listeners = %d, want 1", len(ev.acceptor.listeners))
 		}
@@ -166,12 +168,8 @@ func TestMultiAcceptorRequiresReusePort(t *testing.T) {
 }
 
 // TestAcceptingWaitsForOnStart pins that no connection is accepted — and so
-// no OnOpen runs — before OnStart returns, on both layouts. The dedicated
-// ReusePort acceptors used to start while the listeners were being set up,
-// before Serve reached OnStart, so a client that knew the address could open
-// a connection while the application was still initializing; the master
-// listener never had that window, because it begins accepting only when its
-// loop starts, after OnStart.
+// no OnOpen runs — before OnStart returns, on both layouts: the listeners are
+// bound before OnStart, but their loops start accepting only afterwards.
 func TestAcceptingWaitsForOnStart(t *testing.T) {
 	cases := []struct {
 		name      string
@@ -183,8 +181,8 @@ func TestAcceptingWaitsForOnStart(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.reusePort {
-				multiAcceptorsOverride = 2
-				t.Cleanup(func() { multiAcceptorsOverride = 0 })
+				listenersOverride = 2
+				t.Cleanup(func() { listenersOverride = 0 })
 			}
 
 			var opened atomic.Int64
@@ -255,13 +253,12 @@ func TestAcceptingWaitsForOnStart(t *testing.T) {
 	}
 }
 
-// TestMultiAcceptorHonorsLockOSThread pins that the dedicated acceptors take
-// the Events.LockOSThread association the master loop and the data waiters
-// already take. The hook runs in every acceptor goroutine with the
-// association that goroutine took, so a loop that stops consulting the
-// configuration fails the locked case and the goroutines themselves are
-// still accounted for in both.
-func TestMultiAcceptorHonorsLockOSThread(t *testing.T) {
+// TestWaitersHonorLockOSThread pins that every waiter takes the
+// Events.LockOSThread association. The hook runs in every waiter with the
+// association it took, so a loop that stops consulting the configuration
+// fails the locked case and the waiters themselves are still accounted for in
+// both.
+func TestWaitersHonorLockOSThread(t *testing.T) {
 	cases := []struct {
 		name string
 		lock bool
@@ -271,25 +268,28 @@ func TestMultiAcceptorHonorsLockOSThread(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			const acceptors = 2
-			multiAcceptorsOverride = acceptors
-			t.Cleanup(func() { multiAcceptorsOverride = 0 })
+			// Pollers is capped by GOMAXPROCS.
+			loops, perLoop := int32(min(2, runtime.GOMAXPROCS(0))), int32(2)
+			loopWaitersOverride = int(perLoop)
+			t.Cleanup(func() { loopWaitersOverride = 0 })
 
 			var started atomic.Int32
-			var tookLock atomic.Bool
-			testHookAcceptorThreadStarted = func(locked bool) {
+			var tookLock, skippedLock atomic.Bool
+			testHookWaiterStarted = func(locked bool) {
 				started.Add(1)
 				if locked {
 					tookLock.Store(true)
+				} else {
+					skippedLock.Store(true)
 				}
 			}
-			t.Cleanup(func() { testHookAcceptorThreadStarted = nil })
+			t.Cleanup(func() { testHookWaiterStarted = nil })
 
-			events := &Events{Pollers: 2, ReusePort: true, LockOSThread: tc.lock}
+			events := &Events{Pollers: int(loops), LockOSThread: tc.lock}
 			done := make(chan error, 1)
 			go func() { done <- events.Serve("tcp://127.0.0.1:0") }()
-			// Registered last so it runs first: no acceptor goroutine may
-			// outlive Serve, and none may read the hook after it is cleared.
+			// Registered last so it runs first: no waiter may outlive Serve,
+			// and none may read the hook after it is cleared.
 			t.Cleanup(func() {
 				_ = events.Close(nil)
 				select {
@@ -303,14 +303,14 @@ func TestMultiAcceptorHonorsLockOSThread(t *testing.T) {
 			})
 
 			deadline := time.Now().Add(3 * time.Second)
-			for started.Load() != acceptors && time.Now().Before(deadline) {
+			for started.Load() != loops*perLoop && time.Now().Before(deadline) {
 				time.Sleep(2 * time.Millisecond)
 			}
-			if got := started.Load(); got != acceptors {
-				t.Fatalf("acceptor goroutines started = %d, want %d", got, acceptors)
+			if got := started.Load(); got != loops*perLoop {
+				t.Fatalf("waiters started = %d, want %d", got, loops*perLoop)
 			}
-			if got := tookLock.Load(); got != tc.lock {
-				t.Errorf("acceptor goroutines took the thread association = %v, want %v", got, tc.lock)
+			if tookLock.Load() != tc.lock || skippedLock.Load() == tc.lock {
+				t.Errorf("waiters took the thread association = %v/%v, want all %v", tookLock.Load(), skippedLock.Load(), tc.lock)
 			}
 		})
 	}

@@ -28,15 +28,14 @@ import (
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
-// Conn is a connection managed by Events. On native Unix, socket
-// I/O and callbacks run in one serialized connection task outside the event
-// loop. The stdio/Windows backend uses dedicated blocking I/O goroutines and
-// serializes lifecycle callbacks per connection. Writes from other goroutines
-// are safe and retain no caller-owned data after returning. Close and
-// CloseWith return after the close request is accepted; OnClose is final.
-// Native UDP writes from outside the owning event loop wait for the datagram's
-// send result. Any other event-loop callback gets ErrUDPWriteOnEventLoop
-// instead of risking a cross-loop wait cycle.
+// Conn is a connection managed by Events. On native Unix, socket I/O and
+// callbacks run in the connection's turn, one serialized task outside the
+// event loops, which only collect readiness. The stdio/Windows backend uses
+// dedicated blocking I/O goroutines and serializes lifecycle callbacks per
+// connection. Writes from other goroutines are safe and retain no
+// caller-owned data after returning. Close and CloseWith return after the
+// close request is accepted; OnClose is final. Native UDP writes send the
+// datagram before returning, from any goroutine.
 type Conn interface {
 	// LocalAddr is the connection's local socket address.
 	LocalAddr() net.Addr
@@ -141,8 +140,8 @@ type Conn interface {
 	// ReadWriteCloser
 	// Read is inbound access; see Peek for the calling scope. Write and Close
 	// are safe from other goroutines.
-	// Stream writes are non-blocking; native UDP writes from outside the owning
-	// loop wait for that loop's non-blocking datagram send result.
+	// Stream writes are non-blocking; a native UDP write makes one
+	// non-blocking send and returns its result.
 	io.ReadWriteCloser
 
 	// ByteWriter
@@ -163,8 +162,7 @@ type Conn interface {
 	// that partially reached the socket and then could not queue its suffix
 	// reports io.ErrShortWrite instead: that buffer is consumed and the stream
 	// is being closed, so the partial frame is never resubmitted. For UDP, one
-	// buffer is sent as one datagram. Native UDP writes from another event loop
-	// return ErrUDPWriteOnEventLoop.
+	// buffer is sent as one datagram.
 	WriteOwned(buffer *Buffer) (int, error)
 
 	// ReserveOutbound appends n bytes to the connection's outbound queue and
@@ -194,21 +192,25 @@ type Conn interface {
 	// connection callback.
 	YieldRead() error
 
-	// CloseWith asynchronously releases the connection on its owning event loop.
-	// On Unix, unsent accepted payload is reported as UnflushedError.
+	// CloseWith requests the close and returns. On native Unix the
+	// connection's turn releases it once the callback that closed it has
+	// returned, and reports unsent accepted payload as UnflushedError.
 	CloseWith(err error) error
 }
 
 var errUnsupported = fmt.Errorf("unsupported method")
 
 var (
-	ErrOutboundOverflow    = errors.New("uio: outbound buffer limit exceeded")
-	ErrInboundOverflow     = errors.New("uio: inbound buffer limit exceeded")
-	ErrUnflushedData       = errors.New("uio: connection closed with unflushed data")
-	ErrDialOnEventLoop     = errors.New("uio: Dial cannot run on an event loop")
-	ErrUDPWriteOnEventLoop = errors.New("uio: UDP write cannot wait on another event loop")
-	ErrReserveUnsupported  = errors.New("uio: outbound reservation needs the connection's own callback")
+	ErrOutboundOverflow   = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow    = errors.New("uio: inbound buffer limit exceeded")
+	ErrUnflushedData      = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop    = errors.New("uio: Dial cannot run on an event loop")
+	ErrReserveUnsupported = errors.New("uio: outbound reservation needs the connection's own callback")
 )
+
+// Deprecated: nothing returns ErrUDPWriteOnEventLoop any more; a UDP write
+// sends its datagram from any goroutine.
+var ErrUDPWriteOnEventLoop = errors.New("uio: UDP write cannot wait on another event loop")
 
 // UnflushedError reports payload accepted by the framework but not sent before
 // the connection was closed.

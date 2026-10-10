@@ -9,10 +9,10 @@ import (
 	"time"
 )
 
-// NetPoller is a lifecycle and wake primitive for blocking-I/O builds. Socket
+// Poller is a lifecycle and wake primitive for blocking-I/O builds. Socket
 // readiness comes from per-connection goroutines, so Wait only services queued
 // event-loop commands and shutdown.
-type NetPoller struct {
+type Poller struct {
 	waker  chan struct{} // capacity one coalesces repeated wakeups
 	closed chan struct{}
 
@@ -23,26 +23,26 @@ type NetPoller struct {
 
 // Register is accepted for interface parity; blocking transports have no
 // readiness mode and report no events.
-func (poller *NetPoller) Register(_ int, want Interest, _ bool, _ uint32) error {
+func (poller *Poller) Register(_ int, want Interest, _ bool, _ uint32) error {
 	return poller.validateInterest(want)
 }
 
-// NewNetPoller creates a channel-backed command waker.
-func NewNetPoller() (*NetPoller, error) {
-	return &NetPoller{
+// New creates a channel-backed command waker.
+func New() (*Poller, error) {
+	return &Poller{
 		waker: make(chan struct{}, 1), closed: make(chan struct{}),
 	}, nil
 }
 
-func (poller *NetPoller) Add(_ int, want Interest) error {
+func (poller *Poller) Add(_ int, want Interest) error {
 	return poller.validateInterest(want)
 }
 
-func (poller *NetPoller) Modify(_ int, _ Interest, want Interest) error {
+func (poller *Poller) Modify(_ int, _ Interest, want Interest) error {
 	return poller.validateInterest(want)
 }
 
-func (poller *NetPoller) validateInterest(want Interest) error {
+func (poller *Poller) validateInterest(want Interest) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
@@ -56,11 +56,11 @@ func (poller *NetPoller) validateInterest(want Interest) error {
 	}
 }
 
-func (poller *NetPoller) Remove(int, Interest) error { return nil }
+func (poller *Poller) Remove(int, Interest) error { return nil }
 
 // Wait blocks for a command wake, timeout, or terminal close. It never returns
 // socket events on this backend.
-func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
+func (poller *Poller) Wait(_ []Event, timeout int) (int, error) {
 	if timeout == 0 {
 		select {
 		case <-poller.closed:
@@ -101,7 +101,7 @@ func (poller *NetPoller) Wait(_ []Event, timeout int) (int, error) {
 }
 
 // Wake coalesces repeated notifications in a capacity-one channel.
-func (poller *NetPoller) Wake() error {
+func (poller *Poller) Wake() error {
 	select {
 	case poller.waker <- struct{}{}:
 	default:
@@ -110,7 +110,7 @@ func (poller *NetPoller) Wake() error {
 }
 
 // Close publishes the terminal reason exactly once and releases all waiters.
-func (poller *NetPoller) Close(err error) error {
+func (poller *Poller) Close(err error) error {
 	poller.closeOnce.Do(func() {
 		poller.mu.Lock()
 		poller.closeReason = err
@@ -121,7 +121,7 @@ func (poller *NetPoller) Close(err error) error {
 }
 
 // Closed reports whether Close has run.
-func (poller *NetPoller) Closed() bool {
+func (poller *Poller) Closed() bool {
 	select {
 	case <-poller.closed:
 		return true
@@ -131,7 +131,7 @@ func (poller *NetPoller) Closed() bool {
 }
 
 // Serve is retained as a compatibility wrapper around Wait.
-func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
+func (poller *Poller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()

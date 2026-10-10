@@ -23,7 +23,7 @@ func newUnixTestHandler() *unixTestHandler {
 	return &unixTestHandler{eventCh: make(chan struct{}, 4), closeCh: make(chan error, 1)}
 }
 
-func (handler *unixTestHandler) OnEvent(_ *NetPoller, fd int, events Events) {
+func (handler *unixTestHandler) OnEvent(_ *Poller, fd int, events Events) {
 	handler.mu.Lock()
 	handler.fds = append(handler.fds, fd)
 	handler.masks = append(handler.masks, events)
@@ -33,11 +33,11 @@ func (handler *unixTestHandler) OnEvent(_ *NetPoller, fd int, events Events) {
 	handler.eventCh <- struct{}{}
 }
 
-func (handler *unixTestHandler) OnClose(_ *NetPoller, err error) {
+func (handler *unixTestHandler) OnClose(_ *Poller, err error) {
 	handler.closeCh <- err
 }
 
-func TestNetPollerRegistrationAndDispatch(t *testing.T) {
+func TestPollerRegistrationAndDispatch(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -45,7 +45,7 @@ func TestNetPollerRegistrationAndDispatch(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,8 +109,8 @@ func TestNetPollerRegistrationAndDispatch(t *testing.T) {
 	}
 }
 
-func TestNetPollerCloseBeforeServe(t *testing.T) {
-	poller, err := NewNetPoller()
+func TestPollerCloseBeforeServe(t *testing.T) {
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,14 +132,14 @@ func TestNetPollerCloseBeforeServe(t *testing.T) {
 	}
 }
 
-func TestNetPollerInterestLifecycleAndWake(t *testing.T) {
+func TestPollerInterestLifecycleAndWake(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,14 +183,14 @@ func TestNetPollerInterestLifecycleAndWake(t *testing.T) {
 	}
 }
 
-func TestNetPollerValidationAndClosedOperations(t *testing.T) {
+func TestPollerValidationAndClosedOperations(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,14 +225,14 @@ func TestNetPollerValidationAndClosedOperations(t *testing.T) {
 	}
 }
 
-func TestNetPollerWaitModesAndEventMasks(t *testing.T) {
+func TestPollerWaitModesAndEventMasks(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,14 +270,14 @@ func TestNetPollerWaitModesAndEventMasks(t *testing.T) {
 // the bit must come with the peer's end of stream, also when it is queued
 // behind bytes, and never with bytes alone, which would cost every read round
 // a syscall.
-func TestNetPollerReportsHangupApartFromData(t *testing.T) {
+func TestPollerReportsHangupApartFromData(t *testing.T) {
 	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -312,5 +312,73 @@ func TestNetPollerReportsHangupApartFromData(t *testing.T) {
 	}
 	if got := wait(); got&(ReadEvents|HangupEvents) != ReadEvents|HangupEvents {
 		t.Fatalf("bytes followed by end of stream reported %b, want ReadEvents|HangupEvents", got)
+	}
+}
+
+// Several goroutines wait on one poller, parked and blocking alike: an edge
+// reaches one of them, and Close returns every one.
+func TestPollerSharedByWaiters(t *testing.T) {
+	for _, parked := range []bool{false, true} {
+		poller, err := New()
+		if err != nil {
+			t.Fatal(err)
+		}
+		pipe := make([]int, 2)
+		if err := unix.Pipe(pipe); err != nil {
+			t.Fatal(err)
+		}
+		_ = unix.SetNonblock(pipe[0], true)
+		if err := poller.Register(pipe[0], Readable, true, 7); err != nil {
+			t.Fatal(err)
+		}
+		events := make(chan Event, 16)
+		var waiters sync.WaitGroup
+		for range 4 {
+			waiters.Add(1)
+			go func() {
+				defer waiters.Done()
+				var batch Batch
+				out := make([]Event, 8)
+				for {
+					var n int
+					var err error
+					if parked {
+						n, err = poller.WaitBatchParked(&batch, out)
+					} else {
+						n, err = poller.WaitBatch(&batch, out, -1)
+					}
+					if poller.Closed() || err != nil {
+						return
+					}
+					for _, event := range out[:n] {
+						events <- event
+					}
+				}
+			}()
+		}
+		if _, err := unix.Write(pipe[1], []byte{1}); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case event := <-events:
+			if event.FD != pipe[0] || event.Events&ReadEvents == 0 {
+				t.Fatalf("parked=%v event=%+v", parked, event)
+			}
+			if Tagged && event.Tag != 7 {
+				t.Fatalf("parked=%v tag=%d", parked, event.Tag)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("parked=%v: no waiter saw the edge", parked)
+		}
+		_ = poller.Close(nil)
+		done := make(chan struct{})
+		go func() { waiters.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("parked=%v: Close left a waiter asleep", parked)
+		}
+		_ = unix.Close(pipe[0])
+		_ = unix.Close(pipe[1])
 	}
 }

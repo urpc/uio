@@ -90,6 +90,15 @@ func (m *Map[V]) Delete(k int) {
 	atomic.SwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(nil))
 }
 
+// DeleteValue removes k only while it still maps to v, so a holder that lost
+// the slot to another value leaves that value in place.
+func (m *Map[V]) DeleteValue(k int, v *V) {
+	if uint(k) >= uint(len(m.store)) {
+		return
+	}
+	atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(v), nil)
+}
+
 // Clear atomically removes every descriptor entry.
 func (m *Map[V]) Clear() {
 	for i := 0; i < len(m.store); i++ {

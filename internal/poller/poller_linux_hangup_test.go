@@ -12,7 +12,7 @@ import (
 
 // Urgent data raises EPOLLPRI, which wakes the reader but ends nothing:
 // reporting it as a hangup would cost every later read round a syscall.
-func TestNetPollerUrgentDataIsNotHangup(t *testing.T) {
+func TestPollerUrgentDataIsNotHangup(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -34,7 +34,7 @@ func TestNetPollerUrgentDataIsNotHangup(t *testing.T) {
 	}
 	defer server.Close()
 
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}

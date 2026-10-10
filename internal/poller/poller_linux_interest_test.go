@@ -17,7 +17,7 @@ func TestLinuxAddAndModifyInterest(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}

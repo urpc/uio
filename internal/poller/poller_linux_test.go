@@ -16,7 +16,7 @@ import (
 // waiter consumed cannot be relied on to release the others.
 func TestCloseReleasesEveryWaiter(t *testing.T) {
 	for attempt := 0; attempt < 20; attempt++ {
-		p, err := NewNetPoller()
+		p, err := New()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -61,7 +61,7 @@ func TestCloseReleasesEveryWaiter(t *testing.T) {
 // poller meets this when one waiter starts late and Events closes at once.
 func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
 	for attempt := 0; attempt < 20; attempt++ {
-		p, err := NewNetPoller()
+		p, err := New()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -94,7 +94,7 @@ func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
 // descriptor cannot leak into a child process: a plain dup clears FD_CLOEXEC,
 // and re-setting the flag afterwards would leave a fork/exec window.
 func TestParkDuplicateIsCloseOnExec(t *testing.T) {
-	p, err := NewNetPoller()
+	p, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}

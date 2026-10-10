@@ -31,16 +31,26 @@ const (
 	hangupEvents = unix.EPOLLERR | unix.EPOLLHUP | unix.EPOLLRDHUP
 )
 
-// NetPoller wraps epoll plus an eventfd used to wake the owner for queued
-// control work. mu coordinates Close with an active Wait through waiters;
-// descriptors are released only after the final waiter finishes conversion.
-type NetPoller struct {
+// Tagged reports whether events carry the tag a descriptor was registered
+// with: epoll returns it in the event data.
+const Tagged = true
+
+// Poller wraps epoll plus an eventfd used to wake its waiters. mu coordinates
+// Close with active waits through waiters; descriptors are released only
+// after the final waiter finishes conversion.
+type Poller struct {
 	epfd   int
 	wakefd int
 
 	mu      sync.Mutex // protects waiters, wakers and descriptor lifetime
 	waiters int        // includes readiness-event conversion after epoll_wait
 	wakers  []*Batch   // waiters Close raises on their private descriptor
+
+	// ctl keeps the epoll descriptor open under control operations, which
+	// connections' turns issue concurrently: they share it, and only the
+	// release of the descriptors takes it exclusively. It is separate from mu
+	// so that a registration never waits behind another one's system call.
+	ctl sync.RWMutex
 
 	closed      atomic.Bool
 	closeReason atomic.Pointer[error]
@@ -67,12 +77,13 @@ type Batch struct {
 	// (see WaitBatchParked); parkConn is its raw connection. Both live here,
 	// per waiter, because the runtime wakes every goroutine parked on the
 	// descriptor, and several waiters share one poller.
-	parkFile *os.File
-	parkConn syscall.RawConn
+	parkFile  *os.File
+	parkConn  syscall.RawConn
+	parkTried bool // a failed setup is not retried on every wait
 }
 
-// NewNetPoller creates epoll and registers its internal level-triggered waker.
-func NewNetPoller() (*NetPoller, error) {
+// New creates epoll and registers its internal level-triggered waker.
+func New() (*Poller, error) {
 	epfd, err := unix.EpollCreate1(unix.EPOLL_CLOEXEC)
 	if err != nil {
 		return nil, err
@@ -82,7 +93,7 @@ func NewNetPoller() (*NetPoller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &NetPoller{epfd: epfd, wakefd: wakefd}
+	poller := &Poller{epfd: epfd, wakefd: wakefd}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
@@ -95,7 +106,7 @@ func NewNetPoller() (*NetPoller, error) {
 
 // Add registers a descriptor that is not already watched. Its readiness is
 // level-triggered and its events carry no tag; Register covers connections.
-func (poller *NetPoller) Add(fd int, want Interest) error {
+func (poller *Poller) Add(fd int, want Interest) error {
 	return poller.control(fd, want, unix.EPOLL_CTL_ADD)
 }
 
@@ -104,15 +115,15 @@ func (poller *NetPoller) Add(fd int, want Interest) error {
 // for fd carries tag. Streams and datagrams both register this way, once —
 // nothing modifies their registration afterwards — so the poller keeps no
 // per-descriptor state for triggering or tags.
-func (poller *NetPoller) Register(fd int, want Interest, edge bool, tag uint32) error {
+func (poller *Poller) Register(fd int, want Interest, edge bool, tag uint32) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
-	poller.mu.Lock()
-	defer poller.mu.Unlock()
+	poller.ctl.RLock()
+	defer poller.ctl.RUnlock()
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
@@ -122,14 +133,14 @@ func (poller *NetPoller) Register(fd int, want Interest, edge bool, tag uint32) 
 }
 
 // Modify changes the interest of an already watched descriptor.
-func (poller *NetPoller) Modify(fd int, _ Interest, want Interest) error {
+func (poller *Poller) Modify(fd int, _ Interest, want Interest) error {
 	return poller.control(fd, want, unix.EPOLL_CTL_MOD)
 }
 
 // Remove unregisters a descriptor. previous is used by kqueue backends.
-func (poller *NetPoller) Remove(fd int, _ Interest) error {
-	poller.mu.Lock()
-	defer poller.mu.Unlock()
+func (poller *Poller) Remove(fd int, _ Interest) error {
+	poller.ctl.RLock()
+	defer poller.ctl.RUnlock()
 	if poller.closed.Load() {
 		return nil
 	}
@@ -140,15 +151,15 @@ func (poller *NetPoller) Remove(fd int, _ Interest) error {
 	return err
 }
 
-func (poller *NetPoller) control(fd int, want Interest, operation int) error {
+func (poller *Poller) control(fd int, want Interest, operation int) error {
 	if want == 0 {
 		return errInvalidInterest
 	}
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
-	poller.mu.Lock()
-	defer poller.mu.Unlock()
+	poller.ctl.RLock()
+	defer poller.ctl.RUnlock()
 	if poller.closed.Load() {
 		return poller.closedError()
 	}
@@ -179,13 +190,13 @@ func epollEvents(want Interest, edge bool) uint32 {
 
 // Wait converts one epoll batch into normalized events. timeout is in
 // milliseconds; a negative value blocks indefinitely and zero polls.
-func (poller *NetPoller) Wait(out []Event, timeout int) (int, error) {
+func (poller *Poller) Wait(out []Event, timeout int) (int, error) {
 	return poller.WaitBatch(&poller.batch, out, timeout)
 }
 
 // WaitBatch is Wait with a caller-owned kernel buffer. epoll hands each ready
 // edge to one waiter, so several goroutines can share one poller this way.
-func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int, error) {
+func (poller *Poller) WaitBatch(batch *Batch, out []Event, timeout int) (int, error) {
 	if registered, err := poller.beginWait(batch); !registered {
 		return 0, err
 	}
@@ -203,7 +214,7 @@ func (poller *NetPoller) WaitBatch(batch *Batch, out []Event, timeout int) (int,
 // callback takes whatever is ready with a zero-timeout wait, so a waiter with
 // events pending still makes exactly one syscall. Where that duplicate cannot
 // be set up, the wait falls back to blocking in epoll_wait as before.
-func (poller *NetPoller) WaitBatchParked(batch *Batch, out []Event) (int, error) {
+func (poller *Poller) WaitBatchParked(batch *Batch, out []Event) (int, error) {
 	if registered, err := poller.beginWait(batch); !registered {
 		return 0, err
 	}
@@ -217,7 +228,7 @@ func (poller *NetPoller) WaitBatchParked(batch *Batch, out []Event) (int, error)
 // so a waiter is either seen by Close or observes the closed poller. Only a
 // registered waiter may enter the kernel and run finishWait; a closed poller
 // registers nothing, and its close reason, the error returned then, may be nil.
-func (poller *NetPoller) beginWait(batch *Batch) (bool, error) {
+func (poller *Poller) beginWait(batch *Batch) (bool, error) {
 	poller.mu.Lock()
 	if poller.closed.Load() {
 		// Another waiter may still be registered: Close woke it on its private
@@ -255,11 +266,11 @@ func (poller *NetPoller) beginWait(batch *Batch) (bool, error) {
 
 // wait takes one round of events and converts them. park selects the parked
 // wait of WaitBatchParked over the probe-and-block of WaitBatch.
-func (poller *NetPoller) wait(batch *Batch, out []Event, timeout int, park bool) (int, error) {
+func (poller *Poller) wait(batch *Batch, out []Event, timeout int, park bool) (int, error) {
 	var n int
 	var err error
 	if park {
-		if batch.parkConn == nil {
+		if !batch.parkTried {
 			poller.mountPark(batch)
 		}
 		if batch.parkConn != nil {
@@ -343,11 +354,8 @@ func (poller *NetPoller) wait(batch *Batch, out []Event, timeout int, park bool)
 // duplicate to the runtime's netpoller, which only polls descriptors that are.
 // epoll_wait itself is unaffected by the flag. On any failure the batch is
 // left without a park and the caller blocks in epoll_wait instead.
-func (poller *NetPoller) mountPark(batch *Batch) {
-	if batch.parkFile != nil {
-		batch.parkFile.Close()
-		batch.parkFile = nil
-	}
+func (poller *Poller) mountPark(batch *Batch) {
+	batch.parkTried = true
 	// F_DUPFD_CLOEXEC: the duplicate must not survive into a child process,
 	// and setting the flag after a plain dup would leave a fork/exec window.
 	fd, err := unix.FcntlInt(uintptr(poller.epfd), unix.F_DUPFD_CLOEXEC, 0)
@@ -370,7 +378,7 @@ func (poller *NetPoller) mountPark(batch *Batch) {
 
 // Wake interrupts Wait. The eventfd counter is coalesced by the event loop, so
 // its numeric value never represents a task count.
-func (poller *NetPoller) Wake() error {
+func (poller *Poller) Wake() error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
 	if poller.closed.Load() {
@@ -379,7 +387,7 @@ func (poller *NetPoller) Wake() error {
 	return poller.wakeLocked()
 }
 
-func (poller *NetPoller) wakeLocked() error {
+func (poller *Poller) wakeLocked() error {
 	return raiseWake(poller.wakefd)
 }
 
@@ -396,7 +404,7 @@ func raiseWake(fd int) error {
 	return err
 }
 
-func (poller *NetPoller) drainWake() {
+func (poller *Poller) drainWake() {
 	drainWakeFD(poller.wakefd)
 }
 
@@ -407,7 +415,7 @@ func drainWakeFD(fd int) {
 
 // Close publishes the terminal reason and interrupts Wait. Descriptor release
 // is deferred until no goroutine can still read or convert epoll events.
-func (poller *NetPoller) Close(err error) error {
+func (poller *Poller) Close(err error) error {
 	poller.mu.Lock()
 	defer poller.mu.Unlock()
 	if poller.closed.Load() {
@@ -433,23 +441,23 @@ func (poller *NetPoller) Close(err error) error {
 }
 
 // Closed reports whether Close has published the terminal state.
-func (poller *NetPoller) Closed() bool { return poller.closed.Load() }
+func (poller *Poller) Closed() bool { return poller.closed.Load() }
 
-func (poller *NetPoller) closeError() error {
+func (poller *Poller) closeError() error {
 	if reason := poller.closeReason.Load(); reason != nil {
 		return *reason
 	}
 	return nil
 }
 
-func (poller *NetPoller) closedError() error {
+func (poller *Poller) closedError() error {
 	if err := poller.closeError(); err != nil {
 		return err
 	}
 	return unix.EBADF
 }
 
-func (poller *NetPoller) release() {
+func (poller *Poller) release() {
 	poller.releaseOnce.Do(func() {
 		for _, waiter := range poller.wakers {
 			_ = unix.Close(waiter.wakefd)
@@ -464,12 +472,16 @@ func (poller *NetPoller) release() {
 			}
 		}
 		poller.wakers = nil
+		// Close published closed before any release, so a control operation
+		// that has not started sees it; one in progress finishes first.
+		poller.ctl.Lock()
 		_ = unix.Close(poller.wakefd)
 		_ = unix.Close(poller.epfd)
+		poller.ctl.Unlock()
 	})
 }
 
-func (poller *NetPoller) finishWait() {
+func (poller *Poller) finishWait() {
 	poller.mu.Lock()
 	poller.waiters--
 	if poller.waiters == 0 && poller.closed.Load() {
@@ -479,7 +491,7 @@ func (poller *NetPoller) finishWait() {
 }
 
 // Serve is retained as a compatibility wrapper around Wait.
-func (poller *NetPoller) Serve(lockOSThread bool, handler EventHandler) error {
+func (poller *Poller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()

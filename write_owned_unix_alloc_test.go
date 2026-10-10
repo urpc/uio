@@ -6,8 +6,8 @@ import "testing"
 
 func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 	loop := &eventLoop{}
-	loop.loopGoid.Store(currentGoroutineID())
 	conn := &fdConn{fd: -1}
+	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 2048, MaxOutboundBuffered: -1}
 	conn.loop = loop
 	payload := make([]byte, 1024)

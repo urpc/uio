@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio/internal/poller"
-	"github.com/urpc/uio/internal/taskqueue"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,7 +20,7 @@ import (
 // close to a claim that can never become a task, and Serve could return with
 // the connection still open.
 func TestStopRaceKeepsClaimReserved(t *testing.T) {
-	ep, err := poller.NewNetPoller()
+	ep, err := poller.New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -36,14 +35,13 @@ func TestStopRaceKeepsClaimReserved(t *testing.T) {
 	events := &Events{}
 	events.OnClose = func(Conn, error) { close(onClose) }
 	// The final close callback is delivered as a pooled turn, so the loop
-	// needs a real pool and task queue.
+	// needs a real pool.
 	pool := newIOTaskPool(nil)
 	defer pool.stop()
 	loop := &eventLoop{
 		events: events,
 		poller: ep,
 		fdMap:  newFdMap(),
-		tasks:  taskqueue.New[*task](),
 		ioPool: pool,
 		ioIdle: make(chan struct{}),
 	}

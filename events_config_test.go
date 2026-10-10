@@ -16,8 +16,8 @@ func TestPollerCountDefaultsAndLimits(t *testing.T) {
 		configured int
 		want       int
 	}{
-		{name: "zero", want: min(max(2, procs/4), procs)},
-		{name: "negative", configured: -1, want: min(max(2, procs/4), procs)},
+		{name: "zero", want: min(defaultPollers(procs), procs)},
+		{name: "negative", configured: -1, want: min(defaultPollers(procs), procs)},
 		{name: "explicit", configured: 1, want: 1},
 		{name: "above CPU count", configured: procs + 1, want: procs},
 	} {
@@ -105,10 +105,6 @@ func TestReadBufferPoolDoesNotAllocateOnReuse(t *testing.T) {
 
 func TestEventLifecycleHelpers(t *testing.T) {
 	events := &Events{}
-	request := &registerRequest{ctx: context.Background()}
-	if err := request.cause(); !errors.Is(err, context.Canceled) {
-		t.Fatalf("uncanceled request cause = %v, want context.Canceled", err)
-	}
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- events.Wait() }()

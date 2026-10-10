@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/urpc/uio/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
@@ -162,27 +163,39 @@ func TestExternalConnectedUDPWrites(t *testing.T) {
 	}
 }
 
-func TestUDPWriteRejectsAnotherEventsLoop(t *testing.T) {
-	events := &Events{}
-	current := &eventLoop{}
-	owner := currentGoroutineID()
-	current.loopGoid.Store(owner)
-	activeEventLoops.Store(owner, struct{}{})
-	defer activeEventLoops.Delete(owner)
-	target := &eventLoop{}
-	events.workers = []*eventLoop{target}
-	conn := &fdConn{udp: &unixUDPState{}}
-	conn.events, conn.loop = events, target
-	if n, err := conn.Write([]byte("x")); n != 0 || !errors.Is(err, ErrUDPWriteOnEventLoop) {
-		t.Fatalf("cross-loop UDP Write = %d, %v", n, err)
+// A UDP write from outside the connection's turn is sent on the caller's
+// goroutine, holding the server's submitMu: a child whose server is released
+// has no socket left to send on.
+func TestUDPChildWriteAfterServerRelease(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
-	owned := AcquireBuffer(1)
-	_, _ = owned.WriteString("x")
-	if n, err := conn.WriteOwned(owned); n != 0 || !errors.Is(err, ErrUDPWriteOnEventLoop) {
-		t.Fatalf("cross-loop UDP WriteOwned = %d, %v", n, err)
+	defer unix.Close(fds[1])
+	events := &Events{MaxBufferSize: 64}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := conn.OutboundBuffered(); got != 0 {
-		t.Fatalf("cross-loop UDP pending bytes = %d", got)
+	defer func() {
+		_ = loop.poller.Close(nil)
+		loop.ioPool.stop()
+	}()
+	server := &fdConn{fd: fds[0], udp: &unixUDPState{peers: map[socket.UDPAddress]*fdConn{}}}
+	server.events, server.loop, server.internal = events, loop, true
+	child := &fdConn{fd: fds[0], udp: &unixUDPState{server: server}}
+	child.events, child.loop = events, loop
+	if n, err := child.Write([]byte("x")); n != 1 || err != nil {
+		t.Fatalf("child write = %d, %v", n, err)
+	}
+	if got := string(readPeer(t, fds[1], 1)); got != "x" {
+		t.Fatalf("datagram = %q", got)
+	}
+	if _, ok := server.teardown(nil); !ok {
+		t.Fatal("server was not released")
+	}
+	if n, err := child.Write([]byte("y")); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after the server's release = %d, %v", n, err)
 	}
 }
 
@@ -199,16 +212,9 @@ func TestExternalUDPWouldBlockPreservesConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	events.master = loop
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- loop.Serve(false, nil) }()
 	defer func() {
-		loop.beginStop(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(3 * time.Second):
-			t.Error("UDP test loop did not stop")
-		}
+		_ = loop.poller.Close(nil)
+		loop.ioPool.stop()
 	}()
 	conn := &fdConn{fd: fds[0], udp: &unixUDPState{}}
 	conn.events, conn.loop = events, loop
@@ -220,11 +226,13 @@ func TestExternalUDPWouldBlockPreservesConnection(t *testing.T) {
 	}
 }
 
-func TestQueuedUDPWriteAndCloseOrdering(t *testing.T) {
+// An external UDP write is sent before it returns, so a Close after it never
+// overtakes it, and a write after the connection is released fails.
+func TestExternalUDPWriteAndCloseOrdering(t *testing.T) {
 	for _, closeFirst := range []bool{false, true} {
 		name := "write_before_close"
 		if closeFirst {
-			name = "released_before_write_task"
+			name = "write_after_release"
 		}
 		t.Run(name, func(t *testing.T) {
 			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
@@ -242,52 +250,33 @@ func TestQueuedUDPWriteAndCloseOrdering(t *testing.T) {
 				_ = loop.poller.Close(nil)
 				loop.ioPool.stop()
 			}()
-			events.master = loop
 			conn := &fdConn{fd: fds[0], udp: &unixUDPState{}}
 			conn.events, conn.loop = events, loop
 			defer func() {
-				if !conn.isClosedOnLoop() {
+				if !conn.isReleased() {
 					_ = unix.Close(fds[0])
 				}
 			}()
-
-			result := make(chan udpWriteResult, 1)
-			go func() {
-				n, writeErr := conn.Write([]byte("packet"))
-				result <- udpWriteResult{n: n, err: writeErr}
-			}()
-			deadline := time.Now().Add(3 * time.Second)
-			for conn.OutboundBuffered() != len("packet") {
-				if time.Now().After(deadline) {
-					t.Fatal("external UDP write was not queued")
-				}
-				time.Sleep(time.Millisecond)
-			}
 			if closeFirst {
-				conn.closeOnLoop(nil) // shutdown can release before a queued task runs.
-			} else if err := conn.CloseWith(nil); err != nil {
+				if _, ok := conn.teardown(nil); !ok {
+					t.Fatal("connection was not released")
+				}
+				if n, err := conn.Write([]byte("packet")); n != 0 || !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("write after release = %d, %v", n, err)
+				}
+				return
+			}
+			if n, err := conn.Write([]byte("packet")); n != len("packet") || err != nil {
+				t.Fatalf("write before close = %d, %v", n, err)
+			}
+			if err := conn.CloseWith(nil); err != nil {
 				t.Fatal(err)
 			}
-			loop.runTasks(2)
-			select {
-			case got := <-result:
-				if closeFirst {
-					if got.n != 0 || !errors.Is(got.err, net.ErrClosed) {
-						t.Fatalf("write after release = %d, %v", got.n, got.err)
-					}
-				} else if got.n != len("packet") || got.err != nil {
-					t.Fatalf("write before close = %d, %v", got.n, got.err)
-				}
-			case <-time.After(3 * time.Second):
-				t.Fatal("queued UDP writer did not complete")
+			if got := string(readPeer(t, fds[1], len("packet"))); got != "packet" {
+				t.Fatalf("datagram before close = %q", got)
 			}
 			if got := conn.OutboundBuffered(); got != 0 {
 				t.Fatalf("pending bytes after close = %d", got)
-			}
-			if !closeFirst {
-				if got := string(readPeer(t, fds[1], len("packet"))); got != "packet" {
-					t.Fatalf("datagram before close = %q", got)
-				}
 			}
 		})
 	}

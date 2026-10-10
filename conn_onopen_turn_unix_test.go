@@ -14,9 +14,9 @@ import (
 // under.
 func acceptorLayoutName(reusePort bool) string {
 	if reusePort {
-		return "multi-acceptor"
+		return "reuseport-listeners"
 	}
-	return "single-acceptor"
+	return "single-listener"
 }
 
 // TestOnOpenRunsInThePoolTurn pins the callback contract on the accept path:
@@ -36,12 +36,9 @@ func testOnOpenRunsInThePoolTurn(t *testing.T, reusePort bool) {
 	const dials = 8
 
 	var opens atomic.Int64
-	var onLoop, notOwner atomic.Bool
+	var notOwner atomic.Bool
 	events.OnOpen = func(conn Conn) {
 		fdc := conn.(*fdConn)
-		if fdc.loop != nil && fdc.loop.inLoop() {
-			onLoop.Store(true)
-		}
 		// runIOTask stamps the running worker; the open callback must see its
 		// own goroutine there, which is what "inside a worker" means.
 		if fdc.ioOwner.Load() != currentGoroutineID() {
@@ -98,9 +95,6 @@ func testOnOpenRunsInThePoolTurn(t *testing.T, reusePort bool) {
 	}
 	if got := opens.Load(); got != dials {
 		t.Fatalf("OnOpen ran %d times, want %d", got, dials)
-	}
-	if onLoop.Load() {
-		t.Fatal("OnOpen ran on the accepting loop goroutine")
 	}
 	if notOwner.Load() {
 		t.Fatal("OnOpen ran outside the connection's io-pool turn")

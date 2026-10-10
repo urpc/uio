@@ -24,7 +24,7 @@ func TestAddConnContextRejectsAlreadyCanceledContext(t *testing.T) {
 	if err = (&Events{}).addConnContext(ctx, conn); !errors.Is(err, cause) {
 		t.Fatalf("addConnContext() error = %v, want %v", err, cause)
 	}
-	if !conn.isClosing() || !conn.isClosedOnLoop() {
+	if !conn.isClosing() || !conn.isReleased() {
 		t.Fatalf("canceled connection state = closing:%v phase:%v", conn.isClosing(), conn.close.phase.Load())
 	}
 }

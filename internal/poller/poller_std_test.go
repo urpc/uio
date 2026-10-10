@@ -19,14 +19,14 @@ type stdEvent struct {
 	events Events
 }
 
-func (handler *stdTestHandler) OnEvent(_ *NetPoller, fd int, events Events) {
+func (handler *stdTestHandler) OnEvent(_ *Poller, fd int, events Events) {
 	handler.eventCh <- stdEvent{fd: fd, events: events}
 }
 
-func (handler *stdTestHandler) OnClose(_ *NetPoller, err error) { handler.closeCh <- err }
+func (handler *stdTestHandler) OnClose(_ *Poller, err error) { handler.closeCh <- err }
 
 func TestStdPollerInterestAndClose(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestStdPollerInterestAndClose(t *testing.T) {
 }
 
 func TestStdPollerCloseBeforeServe(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +101,7 @@ func TestStdPollerCloseBeforeServe(t *testing.T) {
 }
 
 func TestStdPollerWaitTimeout(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestStdPollerWaitTimeout(t *testing.T) {
 }
 
 func TestStdPollerWaitModesAndValidation(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +170,7 @@ func TestStdPollerWaitModesAndValidation(t *testing.T) {
 func TestStdPollerClosedWaitModes(t *testing.T) {
 	for _, timeout := range []int{0, 10, -1} {
 		t.Run(fmt.Sprintf("timeout_%d", timeout), func(t *testing.T) {
-			poller, err := NewNetPoller()
+			poller, err := New()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -187,7 +187,7 @@ func TestStdPollerClosedWaitModes(t *testing.T) {
 }
 
 func TestStdPollerBurstAddDoesNotBlock(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +214,7 @@ func TestStdPollerBurstAddDoesNotBlock(t *testing.T) {
 }
 
 func TestStdCallerOwnedInterestTransitions(t *testing.T) {
-	poller, err := NewNetPoller()
+	poller, err := New()
 	if err != nil {
 		t.Fatal(err)
 	}

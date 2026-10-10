@@ -50,10 +50,10 @@ type acceptor struct {
 }
 
 // OnEvent is unused because listener goroutines perform blocking accepts.
-func (ld *acceptor) OnEvent(ep *poller.NetPoller, fd int, events poller.Events) {}
+func (ld *acceptor) OnEvent(ep *poller.Poller, fd int, events poller.Events) {}
 
 // OnClose releases every blocking listener and stops its accept goroutine.
-func (ld *acceptor) OnClose(ep *poller.NetPoller, err error) {
+func (ld *acceptor) OnClose(ep *poller.Poller, err error) {
 	ld.close()
 }
 
