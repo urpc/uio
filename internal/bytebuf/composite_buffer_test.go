@@ -949,3 +949,63 @@ func TestCompositeBuffer_Close(t *testing.T) {
 		})
 	}
 }
+
+func compositeBytes(b *CompositeBuffer) []byte {
+	var all []byte
+	vec, _ := b.PeekVec(nil)
+	for _, segment := range vec {
+		all = append(all, segment...)
+	}
+	return all
+}
+
+func TestGatherJoinsBlocksAndTailIntoRoomForTheUnit(t *testing.T) {
+	var b CompositeBuffer
+	_, _ = b.Write(bytes.Repeat([]byte("a"), 700))
+	b.AppendOwned(CloneBuffer(bytes.Repeat([]byte("b"), 300)))
+	b.Discard(100)
+	tail := bytes.Repeat([]byte("c"), 50)
+	want := append(compositeBytes(&b), tail...)
+
+	const unit = 100 << 10
+	b.Gather(unit, tail)
+	if b.Blocks() != 1 || b.Len() != len(want) || !bytes.Equal(b.PeekChunk(), want) {
+		t.Fatalf("after Gather: %d blocks, %d bytes, first chunk %d bytes; want one block of %d", b.Blocks(), b.Len(), len(b.PeekChunk()), len(want))
+	}
+	rest := bytes.Repeat([]byte("d"), unit-len(want))
+	for len(rest) > 0 {
+		step := min(len(rest), 4096)
+		_, _ = b.Write(rest[:step])
+		rest = rest[step:]
+	}
+	if b.Blocks() != 1 || len(b.PeekChunk()) != unit {
+		t.Fatalf("the unit's later bytes went into %d blocks, first chunk %d bytes, want one block of %d", b.Blocks(), len(b.PeekChunk()), unit)
+	}
+	b.Reset()
+}
+
+func TestGatherKeepsAFirstBlockWithRoom(t *testing.T) {
+	var b CompositeBuffer
+	block := AcquireBuffer(64 << 10)
+	_, _ = block.Write([]byte("head"))
+	b.AppendOwned(block)
+	b.Gather(32<<10, []byte("tail"))
+	if b.Blocks() != 1 || b.bufList[0] != block || string(b.PeekChunk()) != "headtail" {
+		t.Fatalf("Gather replaced a block that had room: %d blocks, %q", b.Blocks(), b.PeekChunk())
+	}
+	b.Reset()
+}
+
+func TestGatherOnAnEmptyBufferHoldsTheTail(t *testing.T) {
+	var b CompositeBuffer
+	b.Gather(8<<10, []byte("only"))
+	if b.Blocks() != 1 || string(b.PeekChunk()) != "only" || b.bufList[0].Cap() < 8<<10 {
+		t.Fatalf("Gather on an empty buffer: %d blocks, %q", b.Blocks(), b.PeekChunk())
+	}
+	b.Reset()
+	b.Gather(1024, nil)
+	if b.Blocks() != 1 || b.Len() != 0 || b.bufList[0].Cap() < 1024 {
+		t.Fatalf("Gather with nothing buffered: %d blocks, %d bytes", b.Blocks(), b.Len())
+	}
+	b.Reset()
+}

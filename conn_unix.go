@@ -1127,6 +1127,14 @@ func (conn *fdConn) fireWriteEvent() error {
 	return err
 }
 
+// ReserveInbound implements Conn.ReserveInbound.
+func (conn *fdConn) ReserveInbound(n int) error {
+	if conn.isDatagram() || n <= 0 {
+		return nil
+	}
+	return conn.reserveInbound(n, conn.events.MaxInboundBuffered)
+}
+
 // onRead drains an edge-triggered stream with bounded work per task. The
 // borrowed read buffer is exposed directly during OnData; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.

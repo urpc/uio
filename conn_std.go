@@ -743,6 +743,14 @@ func (fc *fdConn) writeLoop() {
 	}
 }
 
+// ReserveInbound implements Conn.ReserveInbound.
+func (fc *fdConn) ReserveInbound(n int) error {
+	if fc.isDatagram() || n <= 0 {
+		return nil
+	}
+	return fc.reserveInbound(n, fc.events.MaxInboundBuffered)
+}
+
 // readUDPLoop owns a connected UDP socket. A datagram is borrowed for one
 // callback and always discarded before the next blocking read.
 func (fc *fdConn) readUDPLoop() {

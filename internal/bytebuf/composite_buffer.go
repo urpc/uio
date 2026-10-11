@@ -115,6 +115,36 @@ func (b *CompositeBuffer) Write(p []byte) (n int, err error) {
 	return
 }
 
+// Gather makes the unread bytes start one block with room for n of them:
+// it appends as much of tail as the first n bytes need and returns the rest,
+// so the first min(n, Len) unread bytes are one chunk and later appends up to
+// n join it. A first and only block with that room is kept; otherwise the
+// unread bytes are copied into a new block of at least n bytes and the old
+// blocks are released, which invalidates slices returned earlier by Peek,
+// PeekChunk or PeekVec.
+func (b *CompositeBuffer) Gather(n int, tail []byte) (rest []byte) {
+	take := min(len(tail), max(n-b.length, 0))
+	head, rest := tail[:take], tail[take:]
+	total := b.length + take
+	size := max(n, total)
+	if len(b.bufList) == 1 {
+		if first := b.bufList[0]; first.Len()+first.Available() >= size {
+			_, _ = first.Write(head)
+			b.length = total
+			return rest
+		}
+	}
+	block := getBlock(size)
+	for _, buffer := range b.bufList {
+		_, _ = block.Write(buffer.Bytes())
+	}
+	_, _ = block.Write(head)
+	b.removeRange(len(b.bufList))
+	b.bufList = append(b.bufList, block)
+	b.length = total
+	return rest
+}
+
 // AppendOwned transfers ownership of buffer to the composite buffer without
 // copying its payload. An empty buffer is released immediately.
 func (b *CompositeBuffer) AppendOwned(buffer *Buffer) {

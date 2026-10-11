@@ -179,19 +179,44 @@ can always drain its side. `MaxInboundBuffered` closes a connection with
 limits default to zero, which disables them.
 
 The inbound buffer is callback-scoped. `Peek`, `PeekChunk`, `Discard`,
-`InboundBuffered`, `Read`, `WriteTo` and the slices they return may only be
-used inside the current invocation of this connection's `OnOpen`, `OnInbound`,
-`OnData` or `OnClose` callback — not from `OnOutbound` and not from another
-goroutine. `PeekChunk` (and `Peek`) may return a borrowed slice, and any call
-that consumes inbound data — `Read`, `WriteTo`, `Discard` — or the callback's
-return invalidates it as the consumed blocks go back to the pool, so copy
-anything processed asynchronously. Race-enabled builds panic on a call
-outside a callback as a misuse diagnostic; builds without the race detector
-compile that diagnostic out, and there the contract rests on the documentation
-and on the connection turn's serialization alone. Cross-goroutine access is
+`InboundBuffered`, `ReserveInbound`, `Read`, `WriteTo` and the slices they
+return may only be used inside the current invocation of this connection's
+`OnOpen`, `OnInbound`, `OnData` or `OnClose` callback — not from
+`OnOutbound` and not from another goroutine. `PeekChunk` (and `Peek`) may
+return a borrowed slice, and any call that consumes inbound data — `Read`,
+`WriteTo`, `Discard` — or the callback's return invalidates it as the
+consumed blocks go back to the pool, so copy anything processed
+asynchronously. Race-enabled builds panic on a call outside a callback as a
+misuse diagnostic; builds without the race detector compile that diagnostic
+out, and there the contract rests on the documentation and on the connection
+turn's serialization alone. Cross-goroutine access is
 per method, not per type: `Write` and `Close` are documented safe from other
 goroutines, the inbound methods are not, and every other method's comment says
 where it may be called — never assume the whole `Conn` is goroutine-safe.
+
+A codec that decodes length-prefixed packets in place, from `PeekChunk`, can
+keep doing so for a packet that spans many reads with `Conn.ReserveInbound`.
+Once the header has given the packet's length, each call moves the bytes
+buffered so far into one block with room for the whole packet, so a packet
+that has arrived is one chunk and is decoded without first being copied out
+with `Peek`. Call it in every callback while the packet is incomplete and once
+more when it is complete; each call copies only the bytes read since the last.
+The block is allocated by the first call, so reserve only lengths the codec
+has already checked against its limit, and for large ones consider waiting
+until part of the packet has arrived:
+
+```go
+total := 4 + size // header plus payload
+if err := conn.ReserveInbound(total); err != nil {
+	return err
+}
+if chunk := conn.PeekChunk(); len(chunk) >= total {
+	err := decode(chunk[4:total])
+	_, _ = conn.Discard(total)
+	return err
+}
+return errIncomplete // more callbacks follow as the rest arrives
+```
 
 For encoders that can write into caller-provided storage, `AcquireBuffer` and
 `Conn.WriteOwned` avoid copying the encoded result into asynchronous outbound

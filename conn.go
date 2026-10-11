@@ -127,6 +127,22 @@ type Conn interface {
 	// See Peek for the calling scope.
 	InboundBuffered() int
 
+	// ReserveInbound makes the next n inbound bytes, such as a
+	// length-prefixed packet whose header has arrived, readable as one chunk:
+	// the bytes buffered so far, up to n, move into one block with room for
+	// n, and PeekChunk returns them. Bytes read later are borrowed again until
+	// the next call moves them in too, so a codec calls it in each callback
+	// while the unit is incomplete and once more when it is complete, and then
+	// decodes PeekChunk in place instead of copying the unit out with Peek;
+	// each call copies only what arrived since the last. It does nothing when
+	// the first chunk already holds n bytes. The block is allocated by the
+	// first call, so a caller should reserve only a length it has checked,
+	// and may wait until part of the unit has arrived; with a
+	// MaxInboundBuffered limit, an n above it returns ErrInboundOverflow. It
+	// invalidates slices returned by Peek and PeekChunk, and is a no-op for
+	// datagram connections. See Peek for the calling scope.
+	ReserveInbound(n int) error
+
 	// OutboundBuffered returns payload bytes accepted by this connection but not
 	// yet written to the socket.
 	OutboundBuffered() int
@@ -408,6 +424,28 @@ func (fc *commonConn) Discard(n int) (int, error) {
 	fc.inbound.Discard(inboundLen)
 	fc.inboundTail = fc.inboundTail[n-inboundLen:]
 	return n, nil
+}
+
+// reserveInbound gathers the first n buffered bytes, from the persistent
+// blocks and then the borrowed tail, into one block with room for n; see
+// Conn.ReserveInbound.
+func (fc *commonConn) reserveInbound(n, limit int) error {
+	fc.assertInboundAccess()
+	if limit > 0 && n > limit {
+		return ErrInboundOverflow
+	}
+	if fc.inbound.Empty() {
+		if len(fc.inboundTail) >= n {
+			return nil
+		}
+	} else if len(fc.inbound.PeekChunk()) >= n {
+		return nil
+	}
+	fc.inboundTail = fc.inbound.Gather(n, fc.inboundTail)
+	if len(fc.inboundTail) == 0 {
+		fc.inboundTail = nil
+	}
+	return nil
 }
 
 func (fc *commonConn) InboundBuffered() int {
