@@ -23,6 +23,7 @@ import (
 	"sync/atomic"
 
 	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/plocal"
 )
 
 // CompositeBuffer exposes UIO's pooled segmented buffer without introducing a
@@ -75,8 +76,7 @@ type Events struct {
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]
 	ioPool         *ioTaskPool
-	readPool       sync.Pool
-	readCache      readBufferCache
+	readPool       plocal.Cache[*readBuffer] // read buffers, one kept per P
 	readBufferSize int
 
 	// Pollers is the number of event loops. On Unix each loop is one
@@ -306,8 +306,7 @@ func (ev *Events) initConfig() error {
 	if ev.readBufferSize == 0 {
 		ev.readBufferSize = ev.MaxBufferSize
 		size := ev.readBufferSize
-		ev.readPool.New = func() any { return &readBuffer{bytes: make([]byte, size)} }
-		ev.readCache.init()
+		ev.readPool.Init(func() *readBuffer { return &readBuffer{bytes: make([]byte, size)} })
 	}
 
 	return nil

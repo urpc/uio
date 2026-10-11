@@ -1,6 +1,9 @@
 package bytebuf
 
-import "testing"
+import (
+	"fmt"
+	"testing"
+)
 
 func TestBufferPoolSizeClasses(t *testing.T) {
 	for _, test := range []struct {
@@ -21,5 +24,40 @@ func TestBufferPoolSizeClasses(t *testing.T) {
 			t.Errorf("getBuffer(%d) capacity = %d, want %d", test.requested, got, test.capacity)
 		}
 		putBuffer(buffer)
+	}
+}
+
+var poolSink int
+
+// BenchmarkAcquireRelease borrows a block the way a write batch does: acquire,
+// fill a little, release.
+func BenchmarkAcquireRelease(b *testing.B) {
+	for _, size := range []int{1024, 8 << 10, 64 << 10} {
+		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				buffer := AcquireBuffer(size)
+				buffer.AvailableBuffer()[:64][0] = 1
+				buffer.CommitWrite(64)
+				poolSink += buffer.Len()
+				ReleaseBuffer(buffer)
+			}
+		})
+	}
+}
+
+// BenchmarkCloneRelease copies a write into a pooled block and releases it
+// after the send, as a Write from outside the connection's turn does.
+func BenchmarkCloneRelease(b *testing.B) {
+	for _, size := range []int{64, 1024} {
+		payload := make([]byte, size)
+		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				buffer := CloneBuffer(payload)
+				poolSink += buffer.Len()
+				ReleaseBuffer(buffer)
+			}
+		})
 	}
 }

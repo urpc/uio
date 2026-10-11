@@ -92,10 +92,10 @@ func TestReadBufferPoolDoesNotAllocateOnReuse(t *testing.T) {
 	if err := events.initConfig(); err != nil {
 		t.Fatal(err)
 	}
-	holder := events.readPool.Get().(*readBuffer)
+	holder := events.readPool.Get()
 	events.readPool.Put(holder)
 	allocations := testing.AllocsPerRun(1000, func() {
-		holder = events.readPool.Get().(*readBuffer)
+		holder = events.readPool.Get()
 		events.readPool.Put(holder)
 	})
 	if allocations != 0 {

@@ -6,11 +6,11 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/plocal"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
@@ -27,14 +27,14 @@ type serverFrameScratch struct {
 	vec    [2][]byte
 }
 
-var serverFrameScratchPool sync.Pool
+var serverFrameScratchPool plocal.Cache[*serverFrameScratch]
+
+func init() {
+	serverFrameScratchPool.Init(func() *serverFrameScratch { return new(serverFrameScratch) })
+}
 
 func acquireServerFrameScratch() *serverFrameScratch {
-	scratch, _ := serverFrameScratchPool.Get().(*serverFrameScratch)
-	if scratch == nil {
-		scratch = &serverFrameScratch{}
-	}
-	return scratch
+	return serverFrameScratchPool.Get()
 }
 
 func releaseServerFrameScratch(scratch *serverFrameScratch) {

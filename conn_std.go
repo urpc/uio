@@ -748,7 +748,7 @@ func (fc *fdConn) writeLoop() {
 func (fc *fdConn) readUDPLoop() {
 	defer fc.events.callbackWG.Done()
 
-	holder := fc.events.readPool.Get().(*readBuffer)
+	holder := fc.events.readPool.Get()
 	defer fc.events.readPool.Put(holder)
 	buffer := holder.bytes
 	for {
@@ -788,7 +788,7 @@ func (fc *fdConn) readUDPLoop() {
 func (fc *fdConn) readLoop() {
 	defer fc.events.callbackWG.Done()
 
-	holder := fc.events.readPool.Get().(*readBuffer)
+	holder := fc.events.readPool.Get()
 	defer fc.events.readPool.Put(holder)
 	buffer := holder.bytes
 	for {
@@ -855,7 +855,7 @@ func (fc *fdConn) listenUDP() error {
 	// UDP peer callbacks all run on this listener goroutine.
 	defer fc.events.callbackWG.Done()
 
-	holder := fc.events.readPool.Get().(*readBuffer)
+	holder := fc.events.readPool.Get()
 	defer fc.events.readPool.Put(holder)
 	buffer := holder.bytes
 

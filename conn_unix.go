@@ -1131,7 +1131,7 @@ func (conn *fdConn) fireWriteEvent() error {
 // borrowed read buffer is exposed directly during OnData; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
-	holder := conn.events.borrowReadBuffer()
+	holder := conn.events.readPool.Get()
 	conn.scratch = holder
 	// A read round is corked: the round's first reply goes straight to the
 	// socket from inside its callback, and the replies after it accumulate in
@@ -1147,7 +1147,7 @@ func (conn *fdConn) onRead() error {
 			err = sendErr
 		}
 	}
-	conn.events.returnReadBuffer(holder)
+	conn.events.readPool.Put(holder)
 	return err
 }
 
