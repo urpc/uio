@@ -29,10 +29,10 @@ func TestAcceptBurstAcrossListeners(t *testing.T) {
 	}
 	events.OnOpen = func(conn Conn) {
 		fd := conn.(*fdConn).fd
-		noDelay, err := syscall.GetsockoptInt(fd, syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
+		noDelay, err := syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
 		var keepAlive int
 		if err == nil {
-			keepAlive, err = syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
+			keepAlive, err = syscall.GetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_KEEPALIVE)
 		}
 		opened <- acceptedOpen{addr: conn.LocalAddr().String(), noDelay: noDelay, keepAlive: keepAlive, err: err}
 	}

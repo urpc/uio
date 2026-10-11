@@ -331,7 +331,9 @@ func (d *Dialer) onData(raw uio.Conn) error {
 func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		conn.releaseOutbound(n)
-		conn.tryCloseTransport()
+		if conn.writes.close.closePending() {
+			conn.tryCloseTransport()
+		}
 	}
 }
 

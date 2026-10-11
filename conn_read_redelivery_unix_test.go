@@ -74,7 +74,7 @@ func TestPausedReadRedeliveredWhileWriteBlocked(t *testing.T) {
 			server := <-opened
 			// Kernels that grow buffers on their own would make room for more
 			// output later and raise a writable edge the test must not get.
-			if err = unix.SetsockoptInt(server.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer); err != nil {
+			if err = unix.SetsockoptInt(int(server.fd), unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer); err != nil {
 				t.Fatal(err)
 			}
 			if _, err = client.Write([]byte{0}); err != nil {

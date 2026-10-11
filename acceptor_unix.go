@@ -102,7 +102,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
-		l.udpSvr.fd = l.fd
+		l.udpSvr.fd = int32(l.fd)
 		// The logical UDP server takes ownership of the duplicated poller fd.
 		l.udpSvr.udp = &unixUDPState{
 			file:  l.file,

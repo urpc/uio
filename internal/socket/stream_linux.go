@@ -30,7 +30,7 @@ import (
 // go-websocket-benchmark and HttpArena with equal or better CPU efficiency.
 //
 // The trade inverts on a small host. Kernel time the runtime cannot see is
-// invisible to GOMAXPROCS sizing and to the taskgo monitor, and with few Ps a
+// invisible to GOMAXPROCS sizing and to the task scheduler, and with few Ps a
 // thread held in a syscall is a large share of the machine: echo measured −18%
 // at four Ps, +13% at eight, +2–4% from twelve up. So the calls stay raw only
 // from eight Ps on, and small hosts keep the accounted path they had.

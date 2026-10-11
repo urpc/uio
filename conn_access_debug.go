@@ -12,6 +12,13 @@ package uio
 // after its callback returned is not detected. Builds without the race
 // detector compile the whole mechanism out; see conn_access_release.go.
 
+import "sync/atomic"
+
+// inboundScope records that an inbound callback is in progress.
+type inboundScope struct {
+	inboundLive atomic.Bool
+}
+
 // beginInboundCallback marks the connection's inbound callback in progress,
 // reporting whether this call entered it, so nested internal helpers keep the
 // outer caller's scope intact.

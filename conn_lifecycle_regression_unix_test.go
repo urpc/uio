@@ -66,7 +66,7 @@ func TestStaleEventDuringAdmissionFoldsIntoTheOpenTurn(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.events, conn.loop = events, loop
 	if !conn.admitAccepted(false) {
 		t.Fatal("connection was not admitted")

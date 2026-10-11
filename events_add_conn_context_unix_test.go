@@ -20,7 +20,7 @@ func TestAddConnContextRejectsAlreadyCanceledContext(t *testing.T) {
 	cause := errors.New("registration canceled")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(cause)
-	conn := &fdConn{fd: fds[0], commonConn: commonConn{loop: &eventLoop{}}}
+	conn := &fdConn{fd: int32(fds[0]), commonConn: commonConn{loop: &eventLoop{}}}
 	if err = (&Events{}).addConnContext(ctx, conn); !errors.Is(err, cause) {
 		t.Fatalf("addConnContext() error = %v, want %v", err, cause)
 	}

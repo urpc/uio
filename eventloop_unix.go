@@ -94,11 +94,11 @@ type eventLoop struct {
 	ioPool      *ioTaskPool
 	ioPoolOwner bool
 	stopping    atomic.Bool
+	ioStop      atomic.Bool                 // set once shutdown refuses new turns
 	listeners   atomic.Pointer[[]*listener] // stream listeners this loop accepts on
 
 	_       [cacheLineSize]byte
-	ioState atomic.Uint64 // stop bit plus scheduled connection-turn count
-	_       [cacheLineSize - 8]byte
+	ioTurns [ioStripes]ioStripe // scheduled connection turns, summed over stripes
 
 	ioIdle     chan struct{}
 	ioIdleOnce sync.Once
@@ -136,10 +136,40 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 	}, nil
 }
 
+// ioStripes spreads the turn count over that many cache lines. Every turn is
+// counted when it is scheduled and uncounted when it ends, usually on two
+// different goroutines; one shared counter moved between CPUs twice a turn.
+// Each goroutine counts on the stripe its id picks, so the waiter that
+// schedules a loop's turns and the workers that end them mostly write lines
+// of their own. Only the sum means anything: a turn may be counted on one
+// stripe and uncounted on another.
+const ioStripes = 16
+
+type ioStripe struct {
+	turns atomic.Int64
+	_     [cacheLineSize - 8]byte
+}
+
+func (loop *eventLoop) ioStripe() *atomic.Int64 {
+	return &loop.ioTurns[currentGoroutineID()&(ioStripes-1)].turns
+}
+
+// ioTurnCount sums the stripes. Once ioStop is set no turn is counted any
+// more, except by an acquireIO that is about to give its count back, so a sum
+// of zero then means every turn has ended.
+func (loop *eventLoop) ioTurnCount() int64 {
+	var turns int64
+	for i := range loop.ioTurns {
+		turns += loop.ioTurns[i].turns.Load()
+	}
+	return turns
+}
+
+// acquireIO counts a turn before checking for shutdown, and stopIO sets ioStop
+// before summing, so either the turn sees the stop or the stop sees the turn.
 func (loop *eventLoop) acquireIO() bool {
-	// One add rather than a load and compare-and-swap: this line moves
-	// between CPUs on every turn, and a failed CAS would move it again.
-	if loop.ioState.Add(1)&ioStopBit != 0 {
+	loop.ioStripe().Add(1)
+	if loop.ioStop.Load() {
 		loop.releaseIO()
 		return false
 	}
@@ -148,22 +178,26 @@ func (loop *eventLoop) acquireIO() bool {
 
 // Final close callbacks may be scheduled after the shutdown barrier. Their
 // lifetime is joined by waitIODrained, rather than by the fd teardown barrier.
-func (loop *eventLoop) acquireCloseIO() { loop.ioState.Add(1) }
+func (loop *eventLoop) acquireCloseIO() { loop.ioStripe().Add(1) }
 
+// releaseIO uncounts a turn. After shutdown began, the release that brings the
+// sum to zero wakes stopIO: each release sums only after its own decrement, so
+// the last one to end sees every other's.
 func (loop *eventLoop) releaseIO() {
-	if loop.ioState.Add(^uint64(0)) == ioStopBit {
+	loop.ioStripe().Add(-1)
+	if loop.ioStop.Load() && loop.ioTurnCount() == 0 {
 		loop.ioIdleOnce.Do(func() { close(loop.ioIdle) })
 	}
 }
 
-func (loop *eventLoop) ioStopped() bool { return loop.ioState.Load()&ioStopBit != 0 }
+func (loop *eventLoop) ioStopped() bool { return loop.ioStop.Load() }
 
 // waitIODrained joins every connection turn counted by this loop, including
 // close callbacks scheduled after the shutdown barrier. It runs once per loop
 // during shutdown, so a short polling backoff costs nothing on the data path.
 func (loop *eventLoop) waitIODrained() {
 	delay := 20 * time.Microsecond
-	for loop.ioState.Load()&^ioStopBit != 0 {
+	for loop.ioTurnCount() != 0 {
 		time.Sleep(delay)
 		if delay < 2*time.Millisecond {
 			delay *= 2
@@ -176,17 +210,9 @@ func (loop *eventLoop) stopIO() {
 	if loop.ioIdle == nil {
 		loop.ioIdle = make(chan struct{})
 	}
-	for {
-		state := loop.ioState.Load()
-		if state&ioStopBit != 0 {
-			break
-		}
-		if loop.ioState.CompareAndSwap(state, state|ioStopBit) {
-			if state == 0 {
-				loop.ioIdleOnce.Do(func() { close(loop.ioIdle) })
-			}
-			break
-		}
+	loop.ioStop.Store(true)
+	if loop.ioTurnCount() == 0 {
+		loop.ioIdleOnce.Do(func() { close(loop.ioIdle) })
 	}
 	<-loop.ioIdle
 }
@@ -207,6 +233,8 @@ func (loop *eventLoop) newWaiter() *loopWaiter {
 
 // start runs count waiters on the poller.
 func (loop *eventLoop) start(count int, parked, lockOSThread bool) {
+	// A waiter yields unless it is the process's only one.
+	yield := count > 1 || len(loop.events.loops) > 1
 	for range count {
 		waiter := loop.newWaiter()
 		loop.waiters.Add(1)
@@ -219,7 +247,7 @@ func (loop *eventLoop) start(count int, parked, lockOSThread bool) {
 			if testHookWaiterStarted != nil {
 				testHookWaiterStarted(lockOSThread)
 			}
-			if err := loop.serve(waiter, count > 1, parked); err != nil {
+			if err := loop.serve(waiter, yield, parked); err != nil {
 				loop.events.initiateClose(err)
 			}
 		}()
@@ -232,12 +260,12 @@ var testHookWaiterStarted func(locked bool)
 
 // serve dispatches the loop's readiness until the poller is closed.
 //
-// With more than one waiter on the loop, a waiter that handed tasks to the
-// executor yields before it waits again. The executor's wake-ups queue the
-// workers on this waiter's P, and a wait in the kernel would keep that P in a
-// system call until the runtime retakes it; yielding runs them at once while
-// another waiter keeps watching the poller. A lone waiter must not yield: it
-// would queue behind the very workers it woke.
+// Unless it is the only waiter in the process, a waiter that handed tasks to
+// the executor yields before it waits again. The executor's wake-ups queue the
+// workers on this waiter's P, where they wait until it blocks or is preempted,
+// while other Ps may sit idle; yielding runs them at once while the other
+// waiters keep collecting. The only waiter of a process must not yield: it
+// would queue behind the very workers it woke, with nobody collecting.
 func (loop *eventLoop) serve(waiter *loopWaiter, yield, parked bool) error {
 	for {
 		var n int
@@ -364,7 +392,7 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 			return err
 		}
 		conn := &fdConn{}
-		conn.fd = nfd
+		conn.fd = int32(nfd)
 		conn.events = loop.events
 		conn.loop = loop.events.selectLoop(nfd)
 		conn.addr = l.pair
@@ -415,6 +443,7 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 		conn.abandonClaim()
 		return err
 	}
+	loop.ioPool.connOpened()
 	if registeredForTest != nil {
 		registeredForTest(conn)
 	}
@@ -431,11 +460,11 @@ var registeredForTest func(*fdConn)
 // registerListener watches a UDP listener's server connection. It has no
 // OnOpen; its turns read every peer's datagrams.
 func (loop *eventLoop) registerListener(server *fdConn) error {
-	if err := loop.fdMap.Put(server.fd, server); err != nil {
+	if err := loop.fdMap.Put(int(server.fd), server); err != nil {
 		return err
 	}
 	if err := server.watch(); err != nil {
-		loop.fdMap.DeleteValue(server.fd, server)
+		loop.fdMap.DeleteValue(int(server.fd), server)
 		return err
 	}
 	return nil
@@ -451,6 +480,8 @@ func (loop *eventLoop) forget(conn *fdConn) {
 	loop.fdMap.DeleteValue(conn.Fd(), conn)
 	if conn.isDatagram() {
 		_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
+	} else {
+		loop.ioPool.connClosed()
 	}
 }
 

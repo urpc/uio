@@ -22,7 +22,6 @@ import (
 	"io"
 	"net"
 	"net/netip"
-	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
@@ -230,11 +229,9 @@ func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 // callback touches come first so they share a cache line; the addresses are
 // read only on request.
 type commonConn struct {
-	events      *Events                 // events
-	loop        *eventLoop              // event loop
-	inboundLive atomic.Bool             // race-build only: an inbound callback is in progress; see conn_access_debug.go
-	turn        uint8                   // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
-	internal    bool                    // framework-owned endpoint, not a user connection
+	events *Events    // events
+	loop   *eventLoop // event loop
+	inboundScope
 	userdata    any                     // user-defined data; see Conn.SetUserdata
 	inboundTail []byte                  // inbound tail buffer
 	inbound     bytebuf.CompositeBuffer // inbound buffer

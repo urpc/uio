@@ -133,6 +133,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 
 	var target atomic.Pointer[fdConn]
 	var tcpSender, udpCallbackGoid atomic.Int64
+	var sentInUDPCallback atomic.Bool
 	var releaseOnce sync.Once
 	releaseTCP := make(chan struct{})
 	release := func() { releaseOnce.Do(func() { close(releaseTCP) }) }
@@ -162,8 +163,9 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 		if conn.(*fdConn).isDatagram() {
 			udpCallbackGoid.Store(currentGoroutineID())
 			_, err := target.Load().Write([]byte("cross"))
-			udpWrite <- err
 			_, _ = conn.Discard(-1)
+			udpCallbackGoid.Store(0)
+			udpWrite <- err
 			return nil
 		}
 		tcpCallback <- struct{}{}
@@ -173,7 +175,11 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	}
 	events.OnOutbound = func(conn Conn, written int) {
 		if fdc := conn.(*fdConn); fdc == target.Load() && written > 0 {
-			tcpSender.Store(currentGoroutineID())
+			sender := currentGoroutineID()
+			if sender == udpCallbackGoid.Load() {
+				sentInUDPCallback.Store(true)
+			}
+			tcpSender.Store(sender)
 		}
 	}
 	serveDone := make(chan error, 1)
@@ -248,13 +254,18 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 		t.Fatalf("TCP response = %q, %v", response, err)
 	}
 	// The stream's bytes must leave through its own sender, never through a
-	// syscall made on the loop that ran the UDP callback. OnOutbound follows
-	// the send, so it may still be on its way after the client has the bytes.
+	// syscall made inside the UDP callback. The worker that ran the callback
+	// may run the stream's write turn afterwards, which is a turn of its own.
+	// OnOutbound follows the send, so it may still be on its way after the
+	// client has the bytes.
 	deadline := time.Now().Add(5 * time.Second)
 	for tcpSender.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if sender, loop := tcpSender.Load(), udpCallbackGoid.Load(); sender == 0 || sender == loop {
-		t.Fatalf("stream bytes sent by goroutine %d; UDP callback loop is %d", sender, loop)
+	if tcpSender.Load() == 0 {
+		t.Fatal("stream bytes were not reported sent")
+	}
+	if sentInUDPCallback.Load() {
+		t.Fatal("stream bytes were sent inside the UDP callback")
 	}
 }

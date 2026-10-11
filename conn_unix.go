@@ -30,10 +30,10 @@ import (
 // sent by a write turn that runs beside the reading one.
 //
 // The declaration order packs the state exactly into the 256-byte size class
-// whose objects are cache-line aligned: the turn's scalars sit together in one
-// sixteen-byte block with no padding between them, and everything wider is
-// declared before it. Do not reorder a field into that block without checking
-// TestUnixConnectionColdStateIsLazy.
+// whose objects are cache-line aligned: the descriptor and the turn's byte
+// fields share one word, the four 32-bit words close the struct, and
+// everything wider sits between them with no padding. Do not add or reorder a
+// field without checking TestUnixConnectionColdStateIsLazy.
 const (
 	// readStalledFlag marks ET read work owed after a yield or a read round
 	// that ran out of budget.
@@ -42,7 +42,9 @@ const (
 
 type fdConn struct {
 	commonConn
-	fd int
+	fd       int32
+	turn     uint8 // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
+	internal bool  // framework-owned endpoint, not a user connection
 
 	ioOwner atomic.Int64 // current task goroutine, zero while idle
 	pending atomic.Int64 // accepted payload not yet written
@@ -62,6 +64,11 @@ type fdConn struct {
 	inflight *bytebuf.CompositeBuffer
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
+
+	// scratch is the read round's reply space while the turn reads: what the
+	// round's callbacks reserve is laid out in it and leaves in one send when
+	// the round ends; see ReserveOutbound. It belongs to the turn.
+	scratch *readBuffer
 
 	// taskState coalesces readiness and synthetic events in its low bits and
 	// carries, in its top bit, the claim that exactly one task is queued or
@@ -327,13 +334,24 @@ func (conn *fdConn) releaseWriteAndKick() {
 	conn.kickWriter()
 }
 
+// kickWriterOutside is kickWriter for a goroutine outside the connection's
+// turns, such as a Write from an RPC handler. When the write turn it starts
+// needed a worker woken, the caller yields, so the worker runs now rather
+// than once the caller next blocks (see shardpool.Pool.Submit).
+func (conn *fdConn) kickWriterOutside() {
+	if conn.kickWriter() {
+		runtime.Gosched()
+	}
+}
+
 // kickWriter gives accepted output a sender. If the claim is free it takes it
 // and hands it to a write turn; if it is taken, the holder's release rechecks.
 // Output waits for the open turn before OnOpen returns, for a writable edge
 // while the socket is full, and for the close flush once closing started.
-func (conn *fdConn) kickWriter() {
+// It reports whether the write turn it started needed a worker woken.
+func (conn *fdConn) kickWriter() bool {
 	if conn.isDatagram() || conn.pending.Load() == 0 || conn.isClosing() {
-		return
+		return false
 	}
 	state := conn.writeState.Load()
 	if state&writeOwnerFlag != 0 {
@@ -342,22 +360,24 @@ func (conn *fdConn) kickWriter() {
 		if state&writeContendedFlag == 0 && state&writeClaimerMask != claimerTag() {
 			conn.writeState.Or(writeContendedFlag)
 		}
-		return
+		return false
 	}
 	if state&writeBlockedFlag != 0 || state&writeOpenedFlag == 0 {
-		return
+		return false
 	}
 	if !conn.tryClaimWrite(claimerTag()) {
-		return
+		return false
 	}
 	if !conn.loop.acquireIO() {
 		// Shutting down: its close pass sends the bounded final flush.
 		conn.releaseWrite()
-		return
+		return false
 	}
-	if !conn.loop.ioPool.submitWrite(conn) {
+	accepted, woke := conn.loop.ioPool.submitWriteWaking(conn)
+	if !accepted {
 		conn.handleWriteSubmitFailure()
 	}
+	return woke
 }
 
 // handleWriteSubmitFailure ends a write turn the scheduler refused. Its bytes
@@ -386,7 +406,7 @@ func (turn *writeTurn) RunTask() {
 const maxWriteFlushes = 8
 
 // runWriteTurn sends output from other goroutines while the connection's turn
-// reads. It holds the write claim and one count of its loop's ioState, which
+// reads. It holds the write claim and one of its loop's turn counts, which
 // shutdown joins. It never runs callbacks other than OnOutbound.
 func (conn *fdConn) runWriteTurn() {
 	handedOn := false
@@ -432,7 +452,7 @@ func (conn *fdConn) runWriteTurn() {
 // interest armed: write interest has been on since registration, so the edge
 // that drains the socket starts the next turn by itself. Bytes appended after
 // its last flush found the claim taken and were left to it, so it looks again
-// and hands them, with its ioState count, to a new write turn.
+// and hands them, with its turn count, to a new write turn.
 func (conn *fdConn) finishWriteTurn() {
 	conn.releaseWrite()
 	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
@@ -477,7 +497,7 @@ func (conn *fdConn) clearReadStalled() bool {
 	return conn.flags.And(^readStalledFlag)&readStalledFlag != 0
 }
 
-func (conn *fdConn) Fd() int { return conn.fd }
+func (conn *fdConn) Fd() int { return int(conn.fd) }
 
 // RemoteAddr builds the net.Addr on demand: the connection keeps only the
 // 32-byte value, so an accepted connection allocates nothing for its peer
@@ -644,7 +664,7 @@ func (conn *fdConn) assignWatchTag() uint32 {
 // watch registers the descriptor with its loop's poller, once and for good.
 func (conn *fdConn) watch() error {
 	tag := conn.assignWatchTag()
-	return conn.watcher().Register(conn.fd, conn.initialInterest(), true, tag)
+	return conn.watcher().Register(int(conn.fd), conn.initialInterest(), true, tag)
 }
 
 // admitAccepted claims the first turn of a connection a waiter just accepted,
@@ -677,17 +697,18 @@ func (conn *fdConn) admitAccepted(tcp bool) bool {
 		conn.closeUnregistered()
 		return false
 	}
-	if err := conn.loop.fdMap.Put(conn.fd, conn); err != nil {
+	if err := conn.loop.fdMap.Put(int(conn.fd), conn); err != nil {
 		conn.abandonClaim()
 		conn.closeUnregistered()
 		return false
 	}
 	if err := conn.watch(); err != nil {
-		conn.loop.fdMap.DeleteValue(conn.fd, conn)
+		conn.loop.fdMap.DeleteValue(int(conn.fd), conn)
 		conn.closeUnregistered()
 		conn.abandonClaim()
 		return false
 	}
+	conn.loop.ioPool.connOpened()
 	return true
 }
 
@@ -826,21 +847,31 @@ func (conn *fdConn) runIOTask() {
 		// A callback panic may have left a round corked or a flush marked;
 		// only what the rounds must read on for outlives the turn.
 		conn.turn &= turnHangup | turnReadToEnd
+		if conn.scratch != nil {
+			// A panic left the round's reservations in its reply space.
+			conn.handOverScratch()
+			conn.scratch = nil
+		}
 		if conn.turnOwnsClaim() {
 			// The round's reservations are filled and flushed, or a callback
 			// panic left the claim taken for a reservation or a flush: other
 			// senders may take the socket again, starting with output that
 			// waited for them.
-			conn.releaseWriteAndKick()
-		} else if !ended {
+			conn.releaseWrite()
+			if conn.pending.Load() != 0 {
+				conn.kickWriter()
+			}
+		} else if !ended && conn.pending.Load() != 0 {
 			// After a panic in OnOpen, output queued by other goroutines in
 			// the meantime has no sender until someone kicks it.
 			conn.kickWriter()
 		}
-		if settle {
+		if settle && conn.readStalled() {
 			conn.settleInterest()
 		}
-		conn.closeInTurn()
+		if conn.isClosing() {
+			conn.closeInTurn()
+		}
 	}()
 	events = conn.takeIOEvents()
 	if events&ioEventClose != 0 {
@@ -901,7 +932,7 @@ func (conn *fdConn) runIOTask() {
 	if conn.udp != nil && conn.udp.peers != nil {
 		conn.settlePeers()
 	}
-	if !conn.isClosing() {
+	if conn.pending.Load() != 0 && !conn.isClosing() {
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
@@ -941,7 +972,7 @@ func (conn *fdConn) settleInterest() {
 }
 
 // RunTask implements IOTask for injected executors. The executor contract
-// guarantees asynchronous dispatch; the loop's ioState counts the turn.
+// guarantees asynchronous dispatch; the loop's turn count covers the turn.
 func (conn *fdConn) RunTask() {
 	if conn.loop == nil || conn.loop.ioPool == nil {
 		return
@@ -954,7 +985,7 @@ func (conn *fdConn) closeUnregistered() {
 		if conn.udp != nil && conn.udp.file != nil {
 			_ = conn.udp.file.Close()
 		} else {
-			_ = syscall.Close(conn.fd)
+			_ = syscall.Close(int(conn.fd))
 		}
 	}
 }
@@ -1018,17 +1049,17 @@ func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
 	}
 	switch kind {
 	case optionLinger:
-		return socket.SetLinger(conn.fd, value)
+		return socket.SetLinger(int(conn.fd), value)
 	case optionNoDelay:
-		return socket.SetNoDelay(conn.fd, value != 0)
+		return socket.SetNoDelay(int(conn.fd), value != 0)
 	case optionKeepAlive:
-		return socket.SetKeepAlive(conn.fd, value != 0)
+		return socket.SetKeepAlive(int(conn.fd), value != 0)
 	case optionKeepAlivePeriod:
-		return socket.SetKeepAlivePeriod(conn.fd, value)
+		return socket.SetKeepAlivePeriod(int(conn.fd), value)
 	case optionReadBuffer:
-		return socket.SetRecvBuffer(conn.fd, value)
+		return socket.SetRecvBuffer(int(conn.fd), value)
 	default:
-		return socket.SetSendBuffer(conn.fd, value)
+		return socket.SetSendBuffer(int(conn.fd), value)
 	}
 }
 
@@ -1100,7 +1131,8 @@ func (conn *fdConn) fireWriteEvent() error {
 // borrowed read buffer is exposed directly during OnData; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
-	holder := conn.events.readPool.Get().(*readBuffer)
+	holder := conn.events.borrowReadBuffer()
+	conn.scratch = holder
 	// A read round is corked: the round's first reply goes straight to the
 	// socket from inside its callback, and the replies after it accumulate in
 	// outbound and are flushed once when the event ends, or each time they
@@ -1109,7 +1141,13 @@ func (conn *fdConn) onRead() error {
 	conn.turn |= turnCorked
 	err := conn.readRound(holder.bytes)
 	conn.turn &^= turnCorked | turnRoundWrote
-	conn.events.readPool.Put(holder)
+	conn.scratch = nil
+	if out := holder.out; out != nil && out.Len() > 0 {
+		if sendErr := conn.sendScratch(holder); err == nil {
+			err = sendErr
+		}
+	}
+	conn.events.returnReadBuffer(holder)
 	return err
 }
 
@@ -1118,7 +1156,7 @@ func (conn *fdConn) onRead() error {
 func (conn *fdConn) readRound(buffer []byte) error {
 	totalRead := 0
 	for calls := 0; calls < 256 && totalRead < 1<<20; calls++ {
-		n, err := socket.Recv(conn.fd, buffer)
+		n, err := socket.Recv(int(conn.fd), buffer)
 		if err != nil {
 			if isWouldBlock(err) {
 				conn.turn &^= turnReadToEnd
@@ -1133,7 +1171,9 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		// inboundTail aliases the pooled read buffer. Unconsumed bytes are copied
 		// into inbound before the buffer is reused by the next syscall.
 		conn.inboundTail = buffer[:n]
-		conn.events.onSocketBytesRead(conn, n)
+		if conn.events.OnInbound != nil {
+			conn.events.onSocketBytesRead(conn, n)
+		}
 		if conn.isClosing() {
 			conn.inboundTail = nil
 			return nil
@@ -1194,7 +1234,7 @@ func (conn *fdConn) onRecvUDP() error {
 	totalRead := 0
 	var receive socket.UDPReceive
 	for packets := 0; packets < 256 && totalRead < 1<<20; packets++ {
-		n, err := socket.RecvUDP(conn.fd, buffer, &receive)
+		n, err := socket.RecvUDP(int(conn.fd), buffer, &receive)
 		if err != nil {
 			if isWouldBlock(err) {
 				return nil
@@ -1481,7 +1521,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 		if conn.udp != nil && conn.udp.file != nil {
 			_ = conn.udp.file.Close()
 		} else {
-			_ = syscall.Close(conn.fd)
+			_ = syscall.Close(int(conn.fd))
 		}
 	}
 	conn.submitMu.Lock()

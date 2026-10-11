@@ -12,7 +12,8 @@ func TestUnixConnectionColdStateIsLazy(t *testing.T) {
 	if unsafe.Sizeof(uintptr(0)) == 8 {
 		// 256 is a size class whose objects start on a cache line, so the
 		// fields a turn touches stay within the first lines of every conn.
-		const maximum = uintptr(256)
+		// Race-enabled builds add the inbound-scope diagnostics' word.
+		maximum := uintptr(256) + (unsafe.Sizeof(inboundScope{})+7)&^7
 		if size := unsafe.Sizeof(fdConn{}); size > maximum {
 			t.Fatalf("fdConn size = %d bytes, want at most %d", size, maximum)
 		}

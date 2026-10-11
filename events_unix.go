@@ -80,7 +80,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 			events: ev,
 			addr:   &addrPair{local: localAddr},
 		},
-		fd: fd,
+		fd: int32(fd),
 	}
 	fdc.setRemoteAddr(remoteAddr)
 	fdc.SetUserdata(userdata)
@@ -141,7 +141,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	}
 
 	fdc := &fdConn{}
-	fdc.fd = nfd
+	fdc.fd = int32(nfd)
 	fdc.SetUserdata(userdata)
 	fdc.setLocalAddr(lAddr)
 	fdc.setRemoteAddr(rAddr)
@@ -171,10 +171,9 @@ type loopState struct {
 // an error.
 func (ev *Events) initLoops() (err error) {
 	// An injected Executor owns scheduling when present; otherwise UIO creates
-	// its default taskgo queue. The queue stays single: turns from every loop
-	// share it, and measurements on a 64-core host showed a shared queue
-	// beating one queue per loop by ~4% — the loops exist to spread event
-	// collection, not to pin work to cores.
+	// its own scheduler, shared by every loop. It keys a connection's turns by
+	// descriptor, not by loop: the loops exist to spread event collection, and
+	// a queue per loop measured slower than a shared one on a 64-core host.
 	ev.ioPool = newIOTaskPool(ev.Executor)
 	ev.stopped = make(chan struct{})
 	ev.loops = make([]*eventLoop, ev.Pollers)

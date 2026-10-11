@@ -290,7 +290,7 @@ func (s *Server) onData(raw uio.Conn) error {
 		return ErrClosed
 	}
 	err := conn.readAvailable()
-	if protocolCloseOwnsTransport(err) {
+	if err != nil && protocolCloseOwnsTransport(err) {
 		// protocolClose owns the graceful transport shutdown after its Close
 		// frame drains; returning the protocol error would close std transports
 		// before their asynchronous writer sends it.
@@ -302,7 +302,9 @@ func (s *Server) onData(raw uio.Conn) error {
 func (s *Server) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		conn.releaseOutbound(n)
-		conn.tryCloseTransport()
+		if conn.writes.close.closePending() {
+			conn.tryCloseTransport()
+		}
 	}
 }
 

@@ -163,7 +163,7 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 	}
 	loop := &eventLoop{}
 	server := &fdConn{
-		fd: receiver, udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)},
+		fd: int32(receiver), udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)},
 	}
 	server.events, server.loop = events, loop
 	server.ioOwner.Store(currentGoroutineID())
@@ -212,7 +212,7 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	loop := &eventLoop{}
-	conn := &fdConn{fd: receiver, udp: &unixUDPState{}}
+	conn := &fdConn{fd: int32(receiver), udp: &unixUDPState{}}
 	conn.events, conn.loop = events, loop
 	conn.ioOwner.Store(currentGoroutineID())
 	for range 272 {
@@ -267,7 +267,7 @@ func TestUDPWouldBlockDoesNotCloseConnection(t *testing.T) {
 	defer unix.Close(fds[1])
 	payload := fillDatagramSendBuffer(t, fds[0])
 
-	direct := &fdConn{fd: fds[0], udp: &unixUDPState{}}
+	direct := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{}}
 	direct.events = &Events{}
 	direct.loop = &eventLoop{}
 	direct.ioOwner.Store(currentGoroutineID())
@@ -290,7 +290,7 @@ func TestUnixSocketOptions(t *testing.T) {
 	defer unix.Close(fd)
 
 	loop := &eventLoop{}
-	conn := &fdConn{fd: fd}
+	conn := &fdConn{fd: int32(fd)}
 	conn.events = &Events{}
 	conn.loop = loop
 	for name, set := range map[string]func() error{
@@ -326,7 +326,7 @@ func TestCloseUnregisteredDescriptorOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[1])
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.closeUnregistered()
 	conn.closeUnregistered()
 	if _, err := unix.Write(fds[0], []byte("x")); !errors.Is(err, unix.EBADF) {
@@ -337,7 +337,7 @@ func TestCloseUnregisteredDescriptorOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(requested[1])
-	conn = &fdConn{fd: requested[0]}
+	conn = &fdConn{fd: int32(requested[0])}
 	if !conn.close.request() {
 		t.Fatal("unregistered connection did not accept close request")
 	}
@@ -399,7 +399,7 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
 	loop := &eventLoop{}
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 16, MaxOutboundBuffered: 8}
 	conn.loop = loop
@@ -473,7 +473,7 @@ func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
 	// The round's first output has left for the socket already — that write
 	// goes direct, see TestRoundFirstWriteGoesOutBeforeTheCallbackReturns —
 	// so the writes that follow are the ones that coalesce here.
-	conn := &fdConn{fd: -1, commonConn: commonConn{turn: turnCorked | turnRoundWrote}}
+	conn := &fdConn{fd: -1, turn: turnCorked | turnRoundWrote}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = events
 	conn.loop = loop
@@ -737,10 +737,10 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 	}
 	defer unix.Close(fds[0])
 	defer unix.Close(fds[1])
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.events = events
 	conn.loop = loop
-	if err := loop.poller.Add(conn.fd, poller.Readable); err != nil {
+	if err := loop.poller.Add(int(conn.fd), poller.Readable); err != nil {
 		t.Fatal(err)
 	}
 	// An event for a descriptor no table holds is dropped.
@@ -758,7 +758,7 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 	if err := unix.Close(closedFD); err != nil {
 		t.Fatal(err)
 	}
-	failedConn := &fdConn{fd: closedFD}
+	failedConn := &fdConn{fd: int32(closedFD)}
 	failedConn.events = events
 	failedConn.loop = failedLoop
 	if err := failedLoop.registerConn(failedConn); err == nil {
@@ -854,7 +854,7 @@ func TestStoppedLoopRejectsConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[1])
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.events = events
 	conn.loop = loop
 	if err := events.addConn(conn); !errors.Is(err, net.ErrClosed) {
@@ -866,7 +866,7 @@ func TestStoppedLoopRejectsConnections(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[1])
-	conn = &fdConn{fd: fds[0]}
+	conn = &fdConn{fd: int32(fds[0])}
 	conn.events = events
 	conn.loop = loop
 	if conn.admitAccepted(false) {
@@ -892,7 +892,7 @@ func TestRegisterConnClosesOutOfRangeFD(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(fds[1])
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.events, conn.loop = events, loop
 	if err = loop.registerConn(conn); !errors.Is(err, fdmap.ErrOutOfRange) {
 		t.Fatalf("registerConn error = %v", err)
@@ -1039,7 +1039,7 @@ func TestWriteOwnedBlockedSocketOverflowReturnsOwnership(t *testing.T) {
 	fillStreamSendBuffer(t, fds[0])
 
 	loop := &eventLoop{}
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
 	conn.loop = loop
@@ -1081,7 +1081,7 @@ func TestWriteOwnedPartialWriteDespiteLimitReportsShortWrite(t *testing.T) {
 	// The close request must not need a running poller: the turn that made
 	// the write releases the connection as it ends.
 	loop := &eventLoop{}
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = &Events{WriteBufferedThreshold: 0, MaxOutboundBuffered: 4}
 	conn.loop = loop

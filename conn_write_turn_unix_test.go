@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -174,7 +175,7 @@ func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 	const records, recordSize = 4000, 8
 	testConn := newTCPTestConnection(t, &Events{Pollers: 1})
 	conn := testConn.conn
-	if err := unix.SetsockoptInt(conn.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
+	if err := unix.SetsockoptInt(int(conn.fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 1<<20); err != nil {
 		t.Fatal(err)
 	}
 	if err := unix.SetsockoptInt(testConn.peer, unix.SOL_SOCKET, unix.SO_RCVBUF, 1<<20); err != nil {
@@ -652,7 +653,7 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 				}
 				time.Sleep(time.Millisecond)
 			}
-			if err := unix.SetsockoptInt(server.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+			if err := unix.SetsockoptInt(int(server.fd), unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
 				t.Fatal(err)
 			}
 			armed.Store(true)
@@ -803,7 +804,11 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 					t.Fatalf("OnOutbound ran %d of %d times", count.Load(), total)
 				}
 				buf := make([]byte, 64<<10)
-				_, _ = unix.Read(testConn.peer, buf)
+				if _, err := unix.Read(testConn.peer, buf); err != nil {
+					// The peer is non-blocking: spinning on it would hold the
+					// only P with GOMAXPROCS=1 until the next preemption.
+					runtime.Gosched()
+				}
 			}
 			if d := maxDepth.Load(); d != 1 {
 				t.Fatalf("OnOutbound nested %d deep", d)
@@ -934,7 +939,7 @@ func TestWriteTurnReleaseSendsOutputQueuedBehindIt(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	// A write turn holds the claim and its ioState count...
+	// A write turn holds the claim and its turn count...
 	if !conn.loop.acquireIO() || !conn.tryClaimWrite(0) {
 		t.Fatal("could not stand in for a write turn")
 	}

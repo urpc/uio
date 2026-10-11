@@ -23,7 +23,7 @@ func BenchmarkCallbackWrite(b *testing.B) {
 			}
 			events := &Events{}
 			loop := &eventLoop{}
-			conn := &fdConn{fd: fds[0]}
+			conn := &fdConn{fd: int32(fds[0])}
 			conn.events, conn.loop = events, loop
 			conn.ioOwner.Store(currentGoroutineID())
 			payload := make([]byte, size)

@@ -99,7 +99,7 @@ type Events struct {
 Basic Echo Server
 
 On native Unix, a connection is owned by its turn: one serialized task on the
-configured `Executor` or UIO's typed taskgo queue runs all of the
+configured `Executor` or UIO's own connection scheduler runs all of the
 connection's callbacks, reads its socket, and also releases the connection
 once it is closing. The event loops only collect readiness. Each loop is one
 epoll or kqueue instance; stream listeners, connections and UDP sockets are
@@ -132,18 +132,22 @@ The exception is a turn whose callback reserved outbound bytes with
 `ReserveOutbound`, as the uws server does for its replies: it keeps the socket
 until it ends, as every turn did before write turns. One claim per connection
 orders all senders, so bytes leave in the order they were accepted; with an
-`Executor`, write turns are submitted to it as well.
+`Executor`, write turns are submitted to it as well; without one they run on
+a sharded scheduler of their own, beside the one for connection turns.
 
 A UDP listener is a connection of its own whose turns read every peer's
 datagrams and run the peers' callbacks, since the peers share its socket. A
 UDP `Write` or `WriteOwned` sends its datagram before returning, from any
 goroutine. The `stdio`/Windows backend instead uses dedicated blocking
 read/write goroutines per connection; `Executor` does not apply there.
-Without an external executor, native UIO uses taskgo, which keeps about one
-running worker per P (`runtime.GOMAXPROCS(0)`) while callbacks use the CPU and
-adds workers, up to a `512 * runtime.GOMAXPROCS(0)` ceiling, while callbacks
-block; idle workers are retained for 30 seconds so their grown stacks are
-reused.
+Without an external executor, native UIO runs connection turns on its own
+scheduler: one shard per P (`runtime.GOMAXPROCS(0)`), twice as many once there
+are 64 connections per P, each connection's turns queued on the shard its
+descriptor picks. A shard is served by one worker while that worker keeps up,
+so a connection's turns stay on one CPU, whose caches then hold its socket;
+a turn that finds another queued behind it brings in another worker first, so
+callbacks that block hold up neither their shard nor the others, up to 512
+workers per shard. Idle workers beyond one per shard exit after 30 seconds.
 
 `Events.Dial` and `Events.DialContext` perform synchronous resolution and
 connection setup, and register the new connection on the calling goroutine.

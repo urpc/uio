@@ -3,64 +3,96 @@
 package uio
 
 import (
-	"context"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/limpo1989/taskgo"
+	"github.com/urpc/uio/internal/shardpool"
 )
 
+// ioRejectWorkers bounds the goroutines that finish turns an injected
+// Executor refused, and so the OnClose callbacks they run at once.
 const ioRejectWorkers = 4
 
-// ioTaskPool wraps the default taskgo scheduler or a caller-supplied Executor.
-// Input and output bytes always remain owned by their connection rather than
-// the scheduler queue. The pool keeps no per-task accounting of its own: every
-// submitted turn is already counted by its loop's ioState, which Events joins
-// before stopping the pool.
+// writeShardCapacity bounds a write shard's queue. A connection has at most
+// one write turn queued or running, which holds its write claim, so a shard
+// queues no more write turns than it has connections sending from outside.
+const writeShardCapacity = 1024
+
+// ioTaskPool runs connection turns and write turns on UIO's own sharded
+// schedulers, both keyed by descriptor (see internal/shardpool), or on a
+// caller-supplied Executor. Input and output bytes always remain owned by
+// their connection rather than the scheduler queue. The pool keeps no
+// per-task accounting of its own: every submitted turn is already counted by
+// its loop's turn count, which Events joins before stopping the pool.
+//
+// Write turns have workers of their own. A write turn sends output from other
+// goroutines, so it is submitted from outside, one at a time, and waits for a
+// write worker draining its shard rather than waking another; queued behind
+// connection turns on the same workers instead, replies sent from 24
+// goroutines to 512 echoing connections measured 2-3% slower and their p99
+// 60% higher.
 type ioTaskPool struct {
 	executor Executor
-	owned    *taskgo.Task[*fdConn]
-	writes   *taskgo.Task[*writeTurn] // write turns on UIO's own scheduler
-	rejected *taskgo.Task[IOTask]
-	mu       sync.Mutex // publishes stopped and creates the failure queue
+	owned    *shardpool.Pool[*fdConn]
+	writes   *shardpool.Pool[*writeTurn]
+	rejected rejectQueue // turns the executor refused
+	mu       sync.Mutex  // publishes stopped against rejectBatch
 	stopped  atomic.Bool
 	stopOnce sync.Once
 }
 
+func turnKey(conn *fdConn) uint32         { return uint32(conn.fd) }
+func writeTurnKey(turn *writeTurn) uint32 { return uint32(turn.fd) }
+
 func newIOTaskPool(executor Executor) *ioTaskPool {
 	pool := &ioTaskPool{executor: executor}
 	if pool.executor == nil {
-		// taskgo keeps a small resident worker set for short callbacks and
-		// expands only when slow callbacks leave queued connections behind.
-		// The high ceiling protects unrelated connections without imposing a
-		// fixed goroutine cost on the normal echo path.
-		pool.owned = taskgo.NewTask(func(conn *fdConn) { conn.runIOTask() },
-			taskgo.WithConcurrency(512*runtime.GOMAXPROCS(0)),
-			taskgo.WithMaxIdle(30*time.Second),
-		)
-		// Write turns only move bytes, so they keep a queue of their own and
-		// never wait behind callbacks that block.
-		pool.writes = taskgo.NewTask(func(turn *writeTurn) { (*fdConn)(turn).runWriteTurn() },
-			taskgo.WithConcurrency(512*runtime.GOMAXPROCS(0)),
-			taskgo.WithMaxIdle(30*time.Second),
-		)
+		procs := runtime.GOMAXPROCS(0)
+		pool.owned = shardpool.New(procs, 0, turnKey, (*fdConn).runIOTask)
+		pool.writes = shardpool.New(procs, writeShardCapacity, writeTurnKey, func(turn *writeTurn) {
+			(*fdConn)(turn).runWriteTurn()
+		})
 	}
 	return pool
+}
+
+// connOpened and connClosed tell the schedulers how many connections they
+// serve.
+func (pool *ioTaskPool) connOpened() {
+	if pool.owned != nil {
+		pool.owned.AddKey()
+		pool.writes.AddKey()
+	}
+}
+
+func (pool *ioTaskPool) connClosed() {
+	if pool.owned != nil {
+		pool.owned.RemoveKey()
+		pool.writes.RemoveKey()
+	}
 }
 
 // submitWrite schedules one write turn. Unlike connection turns, a refused
 // write turn is reported to its caller, which still holds the write claim.
 func (pool *ioTaskPool) submitWrite(conn *fdConn) bool {
+	accepted, _ := pool.submitWriteWaking(conn)
+	return accepted
+}
+
+// submitWriteWaking is submitWrite that also reports whether the owned
+// scheduler woke a worker for the turn (see shardpool.Pool.Submit). A write
+// turn is submitted from outside the scheduler, one at a time, so it waits
+// for a worker already draining its shard rather than waking another.
+func (pool *ioTaskPool) submitWriteWaking(conn *fdConn) (accepted, woke bool) {
 	if pool == nil || conn == nil || pool.stopped.Load() {
-		return false
+		return false, false
 	}
 	if pool.writes != nil {
-		return pool.writes.Submit((*writeTurn)(conn))
+		return true, pool.writes.SubmitBehind((*writeTurn)(conn))
 	}
-	return pool.executor.Submit((*writeTurn)(conn))
+	return pool.executor.Submit((*writeTurn)(conn)), false
 }
 
 // submit schedules one already-serialized connection through the typed task
@@ -69,13 +101,11 @@ func (pool *ioTaskPool) submit(conn *fdConn) bool {
 	if pool == nil || conn == nil || pool.stopped.Load() {
 		return false
 	}
-	var accepted bool
 	if pool.owned != nil {
-		accepted = pool.owned.Submit(conn)
-	} else {
-		accepted = pool.executor.Submit(conn)
+		pool.owned.Submit(conn)
+		return true
 	}
-	if !accepted {
+	if !pool.executor.Submit(conn) {
 		pool.rejectBatch([]IOTask{conn})
 	}
 	return true
@@ -92,9 +122,7 @@ func (pool *ioTaskPool) submitBatch(tasks []IOTask) bool {
 	}
 	if pool.owned != nil {
 		for _, task := range tasks {
-			if !pool.owned.Submit(task.(*fdConn)) {
-				pool.rejectBatch([]IOTask{task})
-			}
+			pool.owned.Submit(task.(*fdConn))
 		}
 		return true
 	}
@@ -115,10 +143,7 @@ func (pool *ioTaskPool) submitConnBatch(conns []*fdConn, args []IOTask) bool {
 		if pool.stopped.Load() {
 			return false
 		}
-		accepted := pool.owned.SubmitBatch(conns)
-		if accepted != len(conns) {
-			pool.rejectBatch(connTasks(conns[accepted:]))
-		}
+		pool.owned.SubmitBatch(conns)
 		return true
 	}
 	if cap(args) < len(conns) {
@@ -150,25 +175,9 @@ func (pool *ioTaskPool) rejectBatch(tasks []IOTask) {
 		}
 		return
 	}
-	if pool.rejected == nil {
-		pool.rejected = taskgo.NewTask(func(task IOTask) {
-			task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
-		}, taskgo.WithConcurrency(ioRejectWorkers))
-	}
-	// Submitting under mu keeps stop from sealing the queue in between.
-	accepted := pool.rejected.SubmitBatch(tasks)
+	// Queueing under mu keeps stop from waiting out the queue in between.
+	pool.rejected.push(tasks)
 	pool.mu.Unlock()
-	for _, task := range tasks[accepted:] {
-		task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
-	}
-}
-
-func connTasks(conns []*fdConn) []IOTask {
-	tasks := make([]IOTask, len(conns))
-	for index, conn := range conns {
-		tasks[index] = conn
-	}
-	return tasks
 }
 
 // stop rejects future work and drains UIO's own queues. Callers join accepted
@@ -181,16 +190,55 @@ func (pool *ioTaskPool) stop() {
 	pool.stopOnce.Do(func() {
 		pool.mu.Lock()
 		pool.stopped.Store(true)
-		rejected := pool.rejected
 		pool.mu.Unlock()
 		if pool.owned != nil {
-			_ = pool.owned.Stop(context.Background())
+			pool.owned.Stop()
+			pool.writes.Stop()
 		}
-		if pool.writes != nil {
-			_ = pool.writes.Stop(context.Background())
-		}
-		if rejected != nil {
-			_ = rejected.Stop(context.Background())
-		}
+		pool.rejected.wait()
 	})
 }
+
+// rejectQueue runs refused turns' failure handling on at most
+// ioRejectWorkers goroutines, started while the queue has work and gone once
+// it is empty.
+type rejectQueue struct {
+	mu      sync.Mutex
+	tasks   []IOTask
+	next    int // index of the first task not yet taken
+	running int
+	done    sync.WaitGroup
+}
+
+func (queue *rejectQueue) push(tasks []IOTask) {
+	queue.mu.Lock()
+	queue.tasks = append(queue.tasks, tasks...)
+	for queue.running < ioRejectWorkers && queue.running < len(queue.tasks)-queue.next {
+		queue.running++
+		queue.done.Add(1)
+		go queue.drain()
+	}
+	queue.mu.Unlock()
+}
+
+func (queue *rejectQueue) drain() {
+	defer queue.done.Done()
+	for {
+		queue.mu.Lock()
+		if queue.next == len(queue.tasks) {
+			clear(queue.tasks)
+			queue.tasks, queue.next = queue.tasks[:0], 0
+			queue.running--
+			queue.mu.Unlock()
+			return
+		}
+		task := queue.tasks[queue.next]
+		queue.tasks[queue.next] = nil
+		queue.next++
+		queue.mu.Unlock()
+		task.(*fdConn).handleIOSubmitFailure(net.ErrClosed)
+	}
+}
+
+// wait returns once every queued task has been handled.
+func (queue *rejectQueue) wait() { queue.done.Wait() }

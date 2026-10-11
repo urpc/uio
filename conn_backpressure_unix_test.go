@@ -44,7 +44,7 @@ func startBackpressureServer(t *testing.T, onData func(conn Conn, n int) error) 
 	events.OnOpen = func(conn Conn) {
 		// Kernels that grow buffers on their own would take the backlog the
 		// test means to keep in user space.
-		_ = unix.SetsockoptInt(conn.(*fdConn).fd, unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer)
+		_ = unix.SetsockoptInt(int(conn.(*fdConn).fd), unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer)
 		opened <- conn.(*fdConn)
 	}
 	events.OnData = func(conn Conn) error {

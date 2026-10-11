@@ -132,13 +132,13 @@ block the event loop or callbacks for other connections. UWS does not add a
 second executor mailbox or copy message payloads between schedulers.
 
 Set `server.Events.Executor` or `dialer.Events.Executor` to provide the UIO
-connection-task scheduler. Without one, UIO uses taskgo, which keeps about one
-running worker per P (`runtime.GOMAXPROCS(0)`) while callbacks use the CPU and
-adds workers, up to a `512 * runtime.GOMAXPROCS(0)` ceiling, while callbacks
-block; idle workers are retained for 30 seconds so their grown stacks are
-reused. The executor's typed `Submit` and `SubmitBatch` methods must return
-promptly and must not execute tasks inline; rejection closes the affected
-connection. A custom taskgo scheduler can still be installed directly:
+connection-task scheduler. Without one, UIO uses its own sharded scheduler,
+which keeps each connection's turns on one worker while it keeps up and adds
+workers, up to 512 per P, while callbacks block; idle workers beyond one per
+shard exit after 30 seconds. The executor's typed `Submit` and `SubmitBatch`
+methods must return promptly and must not execute tasks inline; rejection
+closes the affected connection. Any scheduler with those methods can be
+installed, for example a taskgo queue:
 
 ```go
 workers := runtime.NumCPU() * 512

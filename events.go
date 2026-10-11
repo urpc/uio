@@ -55,6 +55,10 @@ type Executor interface {
 // interface copy of the slice header on every native read round.
 type readBuffer struct {
 	bytes []byte
+	// out is the reply space of the read round that borrowed this buffer:
+	// a native stream turn's reservations are laid out in it while it reads
+	// (see fdConn.scratch). Unset until a round reserves.
+	out *bytebuf.Buffer
 }
 
 // Events owns listeners, event loops, the native connection-task scheduler,
@@ -72,6 +76,7 @@ type Events struct {
 	closeReason    atomic.Pointer[error]
 	ioPool         *ioTaskPool
 	readPool       sync.Pool
+	readCache      readBufferCache
 	readBufferSize int
 
 	// Pollers is the number of event loops. On Unix each loop is one
@@ -87,8 +92,9 @@ type Events struct {
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
-	// creates a taskgo typed task queue with its built-in concurrency. When set,
-	// the executor lifecycle remains the caller's responsibility.
+	// runs connection turns on its own sharded scheduler (see
+	// internal/shardpool).
+	// When set, the executor lifecycle remains the caller's responsibility.
 	Executor Executor
 
 	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
@@ -301,6 +307,7 @@ func (ev *Events) initConfig() error {
 		ev.readBufferSize = ev.MaxBufferSize
 		size := ev.readBufferSize
 		ev.readPool.New = func() any { return &readBuffer{bytes: make([]byte, size)} }
+		ev.readCache.init()
 	}
 
 	return nil

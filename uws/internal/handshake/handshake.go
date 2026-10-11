@@ -328,8 +328,15 @@ func appendBase64SHA1(dst, sum []byte) []byte {
 }
 
 func validKey(key string) bool {
-	decoded, err := base64.StdEncoding.DecodeString(strings.TrimSpace(key))
-	return err == nil && len(decoded) == 16
+	key = strings.TrimSpace(key)
+	if len(key) != 24 {
+		// Only a key the decoder skips line breaks in can decode to 16 bytes.
+		decoded, err := base64.StdEncoding.DecodeString(key)
+		return err == nil && len(decoded) == 16
+	}
+	var decoded [18]byte
+	n, err := base64.StdEncoding.Decode(decoded[:], []byte(key))
+	return err == nil && n == 16
 }
 
 func parseTokens(values []string) ([]string, error) {

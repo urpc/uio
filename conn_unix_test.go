@@ -202,7 +202,7 @@ func startTestConnectionOn(t *testing.T, events *Events, fds [2]int) (testConnec
 	if err = unix.SetNonblock(fds[1], true); err != nil {
 		t.Fatal(err)
 	}
-	conn := &fdConn{fd: fds[0]}
+	conn := &fdConn{fd: int32(fds[0])}
 	conn.events = events
 	conn.loop = loop
 
@@ -558,7 +558,7 @@ func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d loopState=%d queued=%v stopped=%v",
 			testConn.conn.taskState.Load()&taskScheduledBit != 0, testConn.conn.close.phase.Load(),
-			testConn.conn.loop.ioState.Load(), false, testConn.conn.loop.stopping.Load())
+			testConn.conn.loop.ioTurnCount(), false, testConn.conn.loop.stopping.Load())
 	}
 }
 
@@ -1149,8 +1149,8 @@ func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			source := &fdConn{fd: sourceFDs[0]}
-			target := &fdConn{fd: targetFDs[0]}
+			source := &fdConn{fd: int32(sourceFDs[0])}
+			target := &fdConn{fd: int32(targetFDs[0])}
 			for _, conn := range []*fdConn{source, target} {
 				conn.events = events
 				conn.loop = loop
@@ -1227,8 +1227,8 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 	if err := unix.SetsockoptInt(targetFDs[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
 		t.Fatal(err)
 	}
-	source := &fdConn{fd: sourceFDs[0], commonConn: commonConn{events: events, loop: loop}}
-	target := &fdConn{fd: targetFDs[0], commonConn: commonConn{events: events, loop: loop}}
+	source := &fdConn{fd: int32(sourceFDs[0]), commonConn: commonConn{events: events, loop: loop}}
+	target := &fdConn{fd: int32(targetFDs[0]), commonConn: commonConn{events: events, loop: loop}}
 	payload := make([]byte, 1<<20)
 	for index := range payload {
 		payload[index] = byte(index)

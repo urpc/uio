@@ -18,10 +18,18 @@ type connConfig struct {
 
 	maxHeaderBytes         int
 	writeBufferedThreshold int
-	maxOutbound            int // the transport's MaxOutboundBuffered
-	batchBlockSize         int
-	closeTimeout           time.Duration
-	handshakeTimeout       time.Duration
+	// shortSendLimit is the largest payload a server sends through
+	// sendShortLocked: under 126 bytes, within the message and frame limits,
+	// and small enough to be buffered; -1 for a client, which masks.
+	shortSendLimit int
+	// shortReadLimit is the largest payload consumeShortFrame takes: under
+	// 126 bytes and within the frame and message limits; -1 for a client,
+	// whose frames arrive unmasked.
+	shortReadLimit   int
+	maxOutbound      int // the transport's MaxOutboundBuffered
+	batchBlockSize   int
+	closeTimeout     time.Duration
+	handshakeTimeout time.Duration
 
 	compressionEnabled         bool
 	compressionLevel           int
@@ -93,7 +101,18 @@ func newServerConnConfig(server *Server) *connConfig {
 	if server.HeartbeatInterval > 0 {
 		config.heartbeatConnections = &server.connections
 	}
+	config.shortSendLimit = config.shortSendPayloadLimit()
+	config.shortReadLimit = int(min(125, config.parser.MaxFramePayload, config.assembler.MaxMessage))
 	return config
+}
+
+func (config *connConfig) shortSendPayloadLimit() int {
+	if config.client || config.writeBufferedThreshold <= 0 {
+		return -1
+	}
+	limit := uint64(min(125, config.writeBufferedThreshold-3))
+	limit = min(limit, config.assembler.MaxMessage, config.parser.MaxFramePayload)
+	return int(limit)
 }
 
 // newDialerConnConfig freezes the dialer's protocol and timeout policy for all
@@ -113,7 +132,9 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 	compressionLevel := dialer.compressionLevel()
 
 	return &connConfig{
-		client: true,
+		client:         true,
+		shortSendLimit: -1,
+		shortReadLimit: -1,
 		parser: frame.ParserConfig{
 			AllowRSV1: dialer.EnableCompression, MaxFramePayload: maxFrame,
 		},

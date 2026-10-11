@@ -45,8 +45,8 @@ func TestStopRaceKeepsClaimReserved(t *testing.T) {
 		ioPool: pool,
 		ioIdle: make(chan struct{}),
 	}
-	conn := &fdConn{fd: sockets[0], commonConn: commonConn{events: events, loop: loop}}
-	if err := loop.fdMap.Put(conn.fd, conn); err != nil {
+	conn := &fdConn{fd: int32(sockets[0]), commonConn: commonConn{events: events, loop: loop}}
+	if err := loop.fdMap.Put(int(conn.fd), conn); err != nil {
 		t.Fatal(err)
 	}
 
@@ -68,7 +68,7 @@ func TestStopRaceKeepsClaimReserved(t *testing.T) {
 		t.Fatal("admission probe did not pause")
 	}
 	// The claim is visible now; the stop barrier must be able to see this turn.
-	if loop.ioState.Load()&^ioStopBit == 0 {
+	if loop.ioTurnCount() == 0 {
 		close(resume)
 		t.Fatal("scheduling claim was published without a turn reservation")
 	}
@@ -160,7 +160,7 @@ func TestShutdownJoinsPendingWake(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("wake admission did not pause")
 	}
-	if conn.loop.ioState.Load()&^ioStopBit == 0 {
+	if conn.loop.ioTurnCount() == 0 {
 		t.Fatal("claim visible without its turn reservation behind it")
 	}
 

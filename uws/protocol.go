@@ -250,6 +250,81 @@ func (sink *connFrameSink) AcceptFrame(f frame.Frame) error {
 	if err := c.acceptFrame(f); err != nil {
 		return err
 	}
+	return c.countFrame()
+}
+
+// consumeShortFrame delivers the frame a server reads most: complete, masked,
+// unfragmented text or binary of under 126 bytes, with no message being
+// reassembled. It makes ParseFrame's and acceptFrame's checks for that one
+// shape directly, unmasking in place, and reports false, having consumed
+// nothing, for any other frame or a frame that is not complete yet. When more
+// input follows the frame, the round's replies are batched.
+//
+// limit is the connection's shortReadLimit: the largest payload within the
+// frame and message limits, or -1 when frames are not expected masked.
+func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
+	if len(src) < 6 || c.assembler != nil {
+		return 0, false, nil
+	}
+	b0, b1 := src[0], src[1]
+	n := int(b1 &^ 0x80)
+	// b0 is FIN with the text or binary opcode, b1 the mask bit and a
+	// seven-bit length.
+	if b0-(0x80|byte(frame.Text)) > 1 || b1&0x80 == 0 || n > limit || len(src) < 6+n {
+		return 0, false, nil
+	}
+	size := 6 + n
+	payload := src[6:size:size]
+	ascii := unmaskShort(payload, binary.LittleEndian.Uint32(src[2:6]))
+	if size < len(src) {
+		c.beginWriteBatch()
+	}
+	if c.closed.Load() {
+		return size, true, ErrClosed
+	}
+	opcode := frame.OpCode(b0 & 0x0f)
+	if opcode == frame.Text && !ascii && c.config.assembler.ValidateUTF8 && !utf8.Valid(payload) {
+		return size, true, frame.ErrInvalidUTF8
+	}
+	// notifyMessage, inline: this runs for every frame of a pipelined round.
+	if c.closing.Load() {
+		return size, true, ErrClosed
+	}
+	if handler := c.handler; handler != nil {
+		handler.OnMessage(c, Message{Type: messageType(opcode), Payload: payload})
+	}
+	return size, true, nil
+}
+
+// unmaskShort unmasks a short payload in place a word at a time, key being the
+// four mask bytes read little-endian, and reports whether the result is all
+// ASCII, which settles a text payload's UTF-8 check in the same pass.
+func unmaskShort(payload []byte, key uint32) bool {
+	key64 := uint64(key) | uint64(key)<<32
+	var seen uint64
+	for len(payload) >= 8 {
+		word := binary.LittleEndian.Uint64(payload) ^ key64
+		binary.LittleEndian.PutUint64(payload, word)
+		seen |= word
+		payload = payload[8:]
+	}
+	if len(payload) >= 4 {
+		word := binary.LittleEndian.Uint32(payload) ^ key
+		binary.LittleEndian.PutUint32(payload, word)
+		seen |= uint64(word)
+		payload = payload[4:]
+	}
+	for i := range payload {
+		b := payload[i] ^ byte(key)
+		key >>= 8
+		payload[i] = b
+		seen |= uint64(b)
+	}
+	return seen&0x8080808080808080 == 0
+}
+
+// countFrame charges a delivered frame against the round's budget.
+func (c *Conn) countFrame() error {
 	c.readFrames++
 	if c.readFrames >= maxFramesPerDataEvent {
 		return errReadBudget
@@ -272,8 +347,22 @@ func (c *Conn) consumeFrames(data []byte) (int, error) {
 		return consumed, err
 	}
 	cfg := c.frameParserConfig()
+	limit := -1
+	if c.config != nil {
+		limit = c.config.shortReadLimit
+	}
 	consumed := 0
 	for consumed < len(data) {
+		if size, ok, err := c.consumeShortFrame(data[consumed:], limit); ok {
+			consumed += size
+			if err == nil {
+				err = c.countFrame()
+			}
+			if err != nil {
+				return consumed, err
+			}
+			continue
+		}
 		parsed, size, complete, err := frame.ParseFrame(data[consumed:], cfg)
 		if err != nil {
 			return consumed, err
@@ -577,7 +666,14 @@ func (c *Conn) ensureCloseTimer() {
 // UIO reports OnClose, so another close request cannot close the transport
 // again.
 func (c *Conn) tryCloseTransport() (bool, error) {
-	if !c.writes.close.claimTransportClose() {
+	if c.writes.close.closePending() {
+		return c.closePendingTransport()
+	}
+	return false, nil
+}
+
+func (c *Conn) closePendingTransport() (bool, error) {
+	if !c.writes.close.claimPendingTransportClose() {
 		return false, nil
 	}
 	c.stopCloseTimer()

@@ -33,9 +33,12 @@ type Conn struct {
 	readFrames int32       // frames delivered in the current read round
 	batching   atomic.Bool // a read round is batching the small frames it sends
 
-	batch     *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
-	heartbeat *heartbeatState
-	writes    connWriteState
+	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
+	// batchUntracked is the part of batch that batchMessageLocked appended
+	// and the pending count does not hold yet; guarded by writes.mu.
+	batchUntracked int
+	heartbeat      *heartbeatState
+	writes         connWriteState
 
 	userData   any
 	metadata   atomic.Pointer[connMetadata]

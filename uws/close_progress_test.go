@@ -446,3 +446,36 @@ func TestReadRoundsAndExternalSendersNeverStrandBatch(t *testing.T) {
 		t.Fatalf("pending = %d, transport queued = %d", pending, raw.queuedBytes())
 	}
 }
+
+// Replies batched in a read round are counted as pending only when the batch
+// is handed over, so a peer Close in the same round must still not let the
+// transport close before they and the Close reply have retired.
+func TestPeerCloseInARoundWaitsForTheBatchedReplies(t *testing.T) {
+	raw := &limitedWire{}
+	conn := newBatchConn(raw, &batchEchoHandler{})
+	raw.inbound = append(maskedFrames("a", "bb"), frame.Append(nil, frame.Frame{
+		Fin: true, Opcode: frame.Close, Masked: true, Payload: []byte{3, 232},
+	}, [4]byte{1, 2, 3, 4})...)
+	raw.retire(conn, 0)
+	if err := conn.readAvailable(); err != nil && !errors.Is(err, ErrClosed) {
+		t.Fatal(err)
+	}
+	if raw.closeCount() != 0 {
+		t.Fatal("transport closed before the batched replies went out")
+	}
+	frames := raw.frames(t)
+	if len(frames) != 3 || string(frames[0].Payload) != "a" || string(frames[1].Payload) != "bb" || frames[2].Opcode != frame.Close {
+		t.Fatalf("wire = %v, want both replies then the Close reply", frames)
+	}
+	if pending := conn.writes.close.pendingBytes.Load(); pending != int64(raw.queuedBytes()) {
+		t.Fatalf("pending = %d, transport queued = %d", pending, raw.queuedBytes())
+	}
+	raw.retire(conn, 3+4)
+	if raw.closeCount() != 0 {
+		t.Fatal("transport closed before the Close reply retired")
+	}
+	raw.retire(conn, raw.queuedBytes())
+	if raw.closeCount() != 1 {
+		t.Fatalf("closes = %d, want 1", raw.closeCount())
+	}
+}

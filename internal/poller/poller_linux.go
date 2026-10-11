@@ -80,6 +80,30 @@ type Batch struct {
 	parkFile  *os.File
 	parkConn  syscall.RawConn
 	parkTried bool // a failed setup is not retried on every wait
+
+	// parkRead is the parked wait's read callback, bound once so that a wait
+	// allocates nothing; it leaves its result in parkN and parkErr.
+	parkRead func(uintptr) bool
+	parkEpfd int
+	parkN    int
+	parkErr  error
+}
+
+// readParked takes whatever is ready without waiting. A zero-timeout wait
+// never blocks, so on a host with Ps to spare it skips the runtime's syscall
+// accounting, as the raw probe does.
+func (batch *Batch) readParked(uintptr) bool {
+	if rawProbeEnabled {
+		r, _, errno := unix.RawSyscall6(unix.SYS_EPOLL_PWAIT, uintptr(batch.parkEpfd),
+			uintptr(unsafe.Pointer(&batch.rawEvents[0])), uintptr(len(batch.rawEvents)), 0, 0, 0)
+		batch.parkN, batch.parkErr = int(r), nil
+		if errno != 0 {
+			batch.parkN, batch.parkErr = 0, errno
+		}
+	} else {
+		batch.parkN, batch.parkErr = unix.EpollWait(batch.parkEpfd, batch.rawEvents[:], 0)
+	}
+	return batch.parkN != 0 || (batch.parkErr != nil && batch.parkErr != unix.EINTR)
 }
 
 // New creates epoll and registers its internal level-triggered waker.
@@ -274,10 +298,8 @@ func (poller *Poller) wait(batch *Batch, out []Event, timeout int, park bool) (i
 			poller.mountPark(batch)
 		}
 		if batch.parkConn != nil {
-			readErr := batch.parkConn.Read(func(uintptr) bool {
-				n, err = unix.EpollWait(poller.epfd, batch.rawEvents[:], 0)
-				return n != 0 || (err != nil && err != unix.EINTR)
-			})
+			readErr := batch.parkConn.Read(batch.parkRead)
+			n, err = batch.parkN, batch.parkErr
 			if readErr != nil {
 				// The runtime cannot poll the duplicate after all. Drop it and
 				// block instead, as the wait always could.
@@ -374,6 +396,8 @@ func (poller *Poller) mountPark(batch *Batch) {
 	}
 	batch.parkFile = file
 	batch.parkConn = conn
+	batch.parkEpfd = poller.epfd
+	batch.parkRead = batch.readParked
 }
 
 // Wake interrupts Wait. The eventfd counter is coalesced by the event loop, so

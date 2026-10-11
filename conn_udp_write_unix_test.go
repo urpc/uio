@@ -181,9 +181,9 @@ func TestUDPChildWriteAfterServerRelease(t *testing.T) {
 		_ = loop.poller.Close(nil)
 		loop.ioPool.stop()
 	}()
-	server := &fdConn{fd: fds[0], udp: &unixUDPState{peers: map[socket.UDPAddress]*fdConn{}}}
+	server := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{peers: map[socket.UDPAddress]*fdConn{}}}
 	server.events, server.loop, server.internal = events, loop, true
-	child := &fdConn{fd: fds[0], udp: &unixUDPState{server: server}}
+	child := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{server: server}}
 	child.events, child.loop = events, loop
 	if n, err := child.Write([]byte("x")); n != 1 || err != nil {
 		t.Fatalf("child write = %d, %v", n, err)
@@ -216,7 +216,7 @@ func TestExternalUDPWouldBlockPreservesConnection(t *testing.T) {
 		_ = loop.poller.Close(nil)
 		loop.ioPool.stop()
 	}()
-	conn := &fdConn{fd: fds[0], udp: &unixUDPState{}}
+	conn := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{}}
 	conn.events, conn.loop = events, loop
 	if n, err := conn.Write(payload); n != 0 || !isUDPSendBlocked(err) {
 		t.Fatalf("blocked external UDP write = %d, %v", n, err)
@@ -250,7 +250,7 @@ func TestExternalUDPWriteAndCloseOrdering(t *testing.T) {
 				_ = loop.poller.Close(nil)
 				loop.ioPool.stop()
 			}()
-			conn := &fdConn{fd: fds[0], udp: &unixUDPState{}}
+			conn := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{}}
 			conn.events, conn.loop = events, loop
 			defer func() {
 				if !conn.isReleased() {

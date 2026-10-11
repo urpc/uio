@@ -12,6 +12,9 @@ package uio
 // only in race-enabled builds; here they compile to nothing, so a violating
 // call proceeds instead of panicking.
 
+// inboundScope takes no space where the diagnostics are compiled out.
+type inboundScope struct{}
+
 func (fc *commonConn) beginInboundCallback() bool { return false }
 
 func (fc *commonConn) endInboundCallback(bool) {}

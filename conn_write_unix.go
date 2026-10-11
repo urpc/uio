@@ -156,10 +156,101 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 		}
 		return nil, err
 	}
+	if holder := conn.scratch; holder != nil {
+		out := holder.out
+		if out == nil {
+			out = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
+			holder.out = out
+		}
+		if out.Available() >= n {
+			buffer := out.AvailableBuffer()[:n:n]
+			out.CommitWrite(n)
+			return buffer, nil
+		}
+		conn.handOverScratch()
+	}
 	conn.submitMu.Lock()
 	buffer := conn.outbound.Reserve(n, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return buffer, nil
+}
+
+// handOverScratch moves the reply space of the running read round, with the
+// reservations made in it, to the end of outbound, so whatever the turn
+// queues or sends next goes out behind them. The space moves rather than its
+// bytes: a caller may still be filling a reservation in it.
+func (conn *fdConn) handOverScratch() {
+	if conn.scratch != nil {
+		conn.handOverScratchSpace()
+	}
+}
+
+func (conn *fdConn) handOverScratchSpace() {
+	holder := conn.scratch
+	if holder.out == nil || holder.out.Len() == 0 {
+		return
+	}
+	conn.submitMu.Lock()
+	conn.outbound.AppendOwned(holder.out)
+	conn.submitMu.Unlock()
+	holder.out = nil
+}
+
+// sendScratch sends the replies a read round reserved once it has ended,
+// straight from its reply space when nothing is queued ahead of them. What
+// the socket does not take, or everything when output is queued, the
+// connection is closing or the socket is full, is handed to outbound for the
+// turn's flush or the next writable edge. The turn holds the write claim,
+// which every reservation takes.
+func (conn *fdConn) sendScratch(holder *readBuffer) error {
+	out := holder.out
+	// pending counts every accepted byte, the reply space's included, so
+	// when it holds no more than that space nothing is queued or in flight
+	// ahead of it. A producer that reserves after this check is concurrent
+	// with the round, and its bytes follow.
+	if conn.pending.Load() != int64(out.Len()) || conn.writeBlocked() || conn.isClosing() {
+		conn.submitMu.Lock()
+		conn.outbound.AppendOwned(out)
+		conn.submitMu.Unlock()
+		holder.out = nil
+		return nil
+	}
+	var sendErr error
+	unsent := out.Bytes()
+	for len(unsent) > 0 {
+		written, err := socket.Send(int(conn.fd), unsent)
+		if err != nil && !isWouldBlock(err) {
+			sendErr = err
+			break
+		}
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			break
+		}
+		unsent = unsent[written:]
+	}
+	sent := out.Len() - len(unsent)
+	if len(unsent) > 0 {
+		if sent > 0 {
+			// Discard(0) would empty the buffer.
+			out.Discard(sent)
+		}
+		conn.submitMu.Lock()
+		conn.outbound.AppendOwned(out)
+		conn.submitMu.Unlock()
+		holder.out = nil
+	} else {
+		out.Reset()
+	}
+	if sent > 0 {
+		// OnOutbound runs here as in a flush; see flushOnLoop.
+		conn.turn |= turnFlushing
+		_, _ = conn.retireFlush(sent, nil)
+		conn.turn &^= turnFlushing
+	}
+	return sendErr
 }
 
 // coalesceBlockSize is the block size that small writes batched in one task
@@ -220,7 +311,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 	}
 	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
-	conn.kickWriter()
+	conn.kickWriterOutside()
 	return size, nil
 }
 
@@ -284,6 +375,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	if conn.isDatagram() {
 		return conn.sendUDPOnLoop(data)
 	}
+	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && len(data) < threshold)
 	if !queued && !conn.claimDirectSend() {
@@ -306,7 +398,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	defer conn.releaseWriteAndKick()
 
 	// The common callback path lends caller memory directly to the kernel.
-	written, err := socket.Send(conn.fd, data)
+	written, err := socket.Send(int(conn.fd), data)
 	if written < 0 {
 		written = 0
 	}
@@ -350,6 +442,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	if conn.isDatagram() {
 		return 0, errUnsupported
 	}
+	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && total < threshold)
 	if !queued && !conn.claimDirectSend() {
@@ -369,7 +462,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return total, nil
 	}
 	defer conn.releaseWriteAndKick()
-	written, err := socket.Writev(conn.fd, vec)
+	written, err := socket.Writev(int(conn.fd), vec)
 	if written < 0 {
 		written = 0
 	}
@@ -419,6 +512,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // a larger buffer already carries many frames and keeps its own writev
 // segment.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
+	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold
 	first := conn.turn&turnCorked != 0 && conn.turn&turnRoundWrote == 0 && conn.outboundEmpty() &&
 		!(threshold > 0 && size < threshold)
@@ -449,7 +543,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	}
 	defer conn.releaseWriteAndKick()
 
-	written, err := socket.Send(conn.fd, owned.Bytes())
+	written, err := socket.Send(int(conn.fd), owned.Bytes())
 	if written < 0 {
 		written = 0
 	}
@@ -517,9 +611,9 @@ func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
 // it is given, which every send to this peer shares.
 func (conn *fdConn) sendDatagram(data []byte) (written int, err error) {
 	if conn.udp.remote == nil {
-		written, err = syscall.Write(conn.fd, data)
+		written, err = syscall.Write(int(conn.fd), data)
 	} else {
-		err = syscall.Sendto(conn.fd, data, 0, conn.udp.remote)
+		err = syscall.Sendto(int(conn.fd), data, 0, conn.udp.remote)
 		if err == nil {
 			written = len(data)
 		}
@@ -615,7 +709,7 @@ func (conn *fdConn) Flush() error {
 	}
 	// Outside the task, Flush is a FIFO barrier and returns after giving the
 	// queued bytes a sender.
-	conn.kickWriter()
+	conn.kickWriterOutside()
 	return nil
 }
 
@@ -641,10 +735,12 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 	// pending is incremented before a producer publishes its buffer and
 	// decremented only after the corresponding bytes are sent. A zero
 	// value therefore proves that there is no stream payload to flush, while
-	// avoiding any atomic read-modify-write on the common empty path.
+	// avoiding any atomic read-modify-write on the common empty path. It
+	// counts the round's reply space too, which has nothing to hand over then.
 	if conn.isDatagram() || conn.pending.Load() == 0 {
 		return 0, nil
 	}
+	conn.handOverScratch()
 	// OnOutbound runs inside the flush, so the turn marks it: a Write that
 	// callback makes is queued rather than sent, and a flush it starts returns
 	// at once, so the callback never runs inside itself. A claim taken here
@@ -737,7 +833,7 @@ func (conn *fdConn) sendOutboundBlock() (int, error) {
 	for calls := 0; calls < 16 && conn.outbound.Blocks() == 1; calls++ {
 		chunk := conn.outbound.PeekChunk()
 		conn.submitMu.Unlock()
-		written, err := socket.Send(conn.fd, chunk)
+		written, err := socket.Send(int(conn.fd), chunk)
 		conn.submitMu.Lock()
 		if err != nil && !isWouldBlock(err) {
 			return totalWritten, err
@@ -758,7 +854,7 @@ func (conn *fdConn) sendOutboundBlock() (int, error) {
 func (conn *fdConn) sendInflightBlock() (int, error) {
 	totalWritten := 0
 	for calls := 0; calls < 16 && !conn.inflight.Empty(); calls++ {
-		written, err := socket.Send(conn.fd, conn.inflight.PeekChunk())
+		written, err := socket.Send(int(conn.fd), conn.inflight.PeekChunk())
 		if err != nil && !isWouldBlock(err) {
 			return totalWritten, err
 		}
@@ -784,7 +880,7 @@ func (conn *fdConn) sendInflightVec() (int, error) {
 	totalWritten := 0
 	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.inflight.Empty(); calls++ {
 		vec, _ := conn.inflight.PeekVecN(vecStorage[:0], len(vecStorage))
-		written, err := socket.Writev(conn.fd, vec)
+		written, err := socket.Writev(int(conn.fd), vec)
 		if err != nil && !isWouldBlock(err) {
 			return totalWritten, err
 		}

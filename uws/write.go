@@ -141,7 +141,16 @@ func (state *connCloseProgress) requestTransportClose() bool {
 // claimTransportClose claims shutdown once no Close frame waits for outbound
 // room and every accepted byte has retired.
 func (state *connCloseProgress) claimTransportClose() bool {
-	if state.phase() != transportClosePending || state.pendingBytes.Load() != 0 || state.closeIsDeferred() {
+	return state.closePending() && state.claimPendingTransportClose()
+}
+
+// closePending reports a transport close that waits for outbound to drain.
+func (state *connCloseProgress) closePending() bool {
+	return state.flags.Load()&transportPhaseMask == transportClosePending<<transportPhaseShift
+}
+
+func (state *connCloseProgress) claimPendingTransportClose() bool {
+	if state.pendingBytes.Load() != 0 || state.closeIsDeferred() {
 		return false
 	}
 	state.transitionMu.Lock()
@@ -371,7 +380,16 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 			c.unlockWrite()
 			return err
 		}
+	} else if sent, err := c.sendShortLocked(opcode, payload); sent {
+		c.unlockWrite()
+		return err
 	}
+	return c.sendLocked(opcode, payload)
+}
+
+// sendLocked is send for a message neither fast path covers. It requires
+// writes.mu and releases it.
+func (c *Conn) sendLocked(opcode frame.OpCode, payload []byte) error {
 	defer c.unlockWrite()
 	if !c.opened.Load() {
 		return ErrNotReady
@@ -526,15 +544,24 @@ func (c *Conn) writeFrameOwned(f frame.Frame, maskKey [4]byte, wireSize int) err
 // small, uncompressed, from a server with no heartbeat or close in progress.
 // It makes send's checks and appends the frame to the batch in one step. It
 // reports false, having done nothing, for any message it does not cover.
+//
+// The frame's bytes join the pending count when the batch is handed over, in
+// one addition for the whole batch. Until then they cannot retire, and no
+// graceful close can claim the transport: its Close frame is counted, and it
+// either follows them in the batch or hands the batch over first.
 func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, error) {
 	config := c.config
-	if config == nil || config.client || c.heartbeat != nil || c.compression != nil ||
+	if config == nil || c.heartbeat != nil || c.compression != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
 		return false, nil
 	}
-	size := uint64(len(payload))
-	if size > config.assembler.MaxMessage || size > config.parser.MaxFramePayload {
-		return false, nil
+	if len(payload) > config.shortSendLimit {
+		// shortSendLimit settles the next checks for the common small reply;
+		// -1 for a client keeps it off this path.
+		size := uint64(len(payload))
+		if config.client || size > config.assembler.MaxMessage || size > config.parser.MaxFramePayload {
+			return false, nil
+		}
 	}
 	wireSize := frameWireSize(len(payload), false)
 	if config.writeBufferedThreshold <= 0 || wireSize >= config.writeBufferedThreshold || !c.outboundHasRoom(wireSize) {
@@ -547,10 +574,45 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 			return true, err
 		}
 	}
-	c.writes.close.pendingBytes.Add(int64(wireSize))
-	dst := frame.AppendHeader(batch.AvailableBuffer()[:0], frame.Frame{Fin: true, Opcode: opcode, Payload: payload}, [4]byte{})
-	copy(dst[len(dst):wireSize], payload)
+	c.batchUntracked += wireSize
+	dst := batch.AvailableBuffer()[:wireSize]
+	if len(payload) < 126 {
+		dst[0], dst[1] = 0x80|byte(opcode), byte(len(payload))
+		copy(dst[2:], payload)
+	} else {
+		header := frame.AppendHeader(dst[:0], frame.Frame{Fin: true, Opcode: opcode, Payload: payload}, [4]byte{})
+		copy(dst[len(header):], payload)
+	}
 	batch.CommitWrite(wireSize)
+	return true, nil
+}
+
+// sendShortLocked is send for a server's common single reply: a small,
+// uncompressed message of under 126 bytes, with no batch to hand over first,
+// no heartbeat and no close in progress. It encodes the frame straight into the
+// transport's outbound queue, which the connection's own task can reserve. It
+// reports false, having done nothing, for any message it does not cover,
+// including one sent from outside that task.
+func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error) {
+	size := len(payload)
+	if c.config == nil || size > c.config.shortSendLimit || c.heartbeat != nil || c.compression != nil || c.batch != nil ||
+		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
+		return false, nil
+	}
+	// The transport refuses a reservation past its outbound limit, after
+	// flushing what it can, which is the check send's other paths make too.
+	wireSize := size + 2
+	c.writes.close.pendingBytes.Add(int64(wireSize))
+	dst, err := c.raw.ReserveOutbound(wireSize)
+	if err == uio.ErrReserveUnsupported {
+		c.rollbackOutbound(wireSize)
+		return false, nil
+	}
+	if err != nil {
+		return true, c.finishFrameWrite(opcode, 0, wireSize, err)
+	}
+	dst[0], dst[1] = 0x80|byte(opcode), byte(size)
+	copy(dst[2:], payload)
 	return true, nil
 }
 
@@ -566,10 +628,10 @@ func (c *Conn) batchBlockSize() int {
 // writes.mu: the queue only shrinks while it is held, so bytes admitted here
 // are still admitted when they reach the transport.
 func (c *Conn) outboundHasRoom(wireSize int) bool {
-	limit := c.maxOutbound()
-	if limit <= 0 {
-		return true
-	}
+	return c.config == nil || c.config.maxOutbound <= 0 || c.outboundHasRoomWithin(c.config.maxOutbound, wireSize)
+}
+
+func (c *Conn) outboundHasRoomWithin(limit, wireSize int) bool {
 	batched := 0
 	if c.batch != nil {
 		batched = c.batch.Len()
@@ -612,6 +674,10 @@ func (c *Conn) flushBatchLocked() error {
 		return nil
 	}
 	c.batch = nil
+	if c.batchUntracked != 0 {
+		c.writes.close.pendingBytes.Add(int64(c.batchUntracked))
+		c.batchUntracked = 0
+	}
 	want := batch.Len()
 	n, err := c.raw.WriteOwned(batch)
 	if errors.Is(err, uio.ErrOutboundOverflow) {
@@ -658,7 +724,7 @@ func (c *Conn) unlockWrite() {
 		_ = c.flushBatchLocked()
 	}
 	c.writes.mu.Unlock()
-	if c.writes.close.phase() == transportClosePending {
+	if c.writes.close.closePending() {
 		_, _ = c.tryCloseTransport()
 	}
 }
