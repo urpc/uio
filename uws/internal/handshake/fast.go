@@ -1,6 +1,9 @@
 package handshake
 
-import "bytes"
+import (
+	"bytes"
+	"unsafe"
+)
 
 // Fast-path header names and request-line shape. Package-level slices keep the
 // comparisons with bytes.EqualFold allocation-free.
@@ -102,7 +105,7 @@ func parseServerRequestFast(block []byte, options ServerOptions) (Request, bool)
 			versionOK = bytes.Equal(value, []byte("13"))
 		case bytes.EqualFold(name, fastHeaderKey):
 			keySeen++
-			key = string(value)
+			key = unsafe.String(unsafe.SliceData(value), len(value))
 		case bytes.EqualFold(name, fastHeaderProtocol):
 			protocols = append(protocols, string(value))
 		case bytes.EqualFold(name, fastHeaderExtensions):

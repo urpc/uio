@@ -958,3 +958,45 @@ func TestCloseTimerCancelCoversEveryArm(t *testing.T) {
 	case <-time.After(100 * time.Millisecond):
 	}
 }
+
+// A request that arrives in one read is parsed where it lies; only one split
+// across reads is copied, and the copy does not alias the read buffer.
+func TestHandshakeCopiesOnlyARequestSplitAcrossReads(t *testing.T) {
+	request := []byte("GET /chat HTTP/1.1\r\n" +
+		"Host: example.com\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
+	newConn := func() (*Conn, *handshakeState) {
+		handler := &recordingHandler{}
+		conn := &Conn{raw: newSegmentedProbeConn(), handler: handler, config: testServerConfig(NewServer(handler))}
+		state := &handshakeState{}
+		conn.handshake.Store(state)
+		return conn, state
+	}
+
+	whole, state := newConn()
+	if err := whole.consumeHandshake(append([]byte(nil), request...)); err != nil {
+		t.Fatal(err)
+	}
+	if !whole.opened.Load() || state.data != nil {
+		t.Fatalf("opened %v, copied %d bytes of a request read whole", whole.opened.Load(), len(state.data))
+	}
+
+	split, state := newConn()
+	first := append([]byte(nil), request[:40]...)
+	if err := split.consumeHandshake(first); err != nil {
+		t.Fatal(err)
+	}
+	clear(first) // the read buffer is reused once the callback returns
+	if string(state.data) != string(request[:40]) {
+		t.Fatalf("the partial request was not kept: %q", state.data)
+	}
+	if err := split.consumeHandshake(append([]byte(nil), request[40:]...)); err != nil {
+		t.Fatal(err)
+	}
+	if !split.opened.Load() {
+		t.Fatal("a request split across reads did not open the connection")
+	}
+}

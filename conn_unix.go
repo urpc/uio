@@ -210,7 +210,27 @@ type connCloseState struct {
 	deferred *closeRequest
 }
 
+// closeRequest is never modified once recorded, so the requests for the
+// causes most closes carry are shared instead of allocated per close.
 type closeRequest struct{ cause error }
+
+var (
+	closeWithoutCause = &closeRequest{}
+	closeAtEOF        = &closeRequest{cause: io.EOF}
+	closeAtReset      = &closeRequest{cause: syscall.ECONNRESET}
+)
+
+func newCloseRequest(err error) *closeRequest {
+	switch err {
+	case nil:
+		return closeWithoutCause
+	case io.EOF:
+		return closeAtEOF
+	case syscall.ECONNRESET:
+		return closeAtReset
+	}
+	return &closeRequest{cause: err}
+}
 
 func (state *connCloseState) isClosing() bool  { return state.phase.Load() >= closeRequested }
 func (state *connCloseState) isReleased() bool { return state.phase.Load() >= closeResourcesReleased }
@@ -814,10 +834,8 @@ func (conn *fdConn) takeDeferredCloseCause() error {
 }
 
 func (conn *fdConn) setDeferredCloseLocked(err error) {
-	if conn.close.deferred == nil {
-		conn.close.deferred = &closeRequest{cause: err}
-	} else if conn.close.deferred.cause == nil && err != nil {
-		conn.close.deferred.cause = err
+	if conn.close.deferred == nil || conn.close.deferred.cause == nil && err != nil {
+		conn.close.deferred = newCloseRequest(err)
 	}
 }
 
@@ -1502,12 +1520,27 @@ func (conn *fdConn) teardown(cause error) (error, bool) {
 	return conn.releaseResources(cause, flushErr), true
 }
 
+// joinCloseErrors is errors.Join for the three causes a close collects. Most
+// closes have one, which is returned as it is: errors.Join would allocate a
+// wrapper and its slice for it on every connection that closes.
+func joinCloseErrors(cause, deferred, flush error) error {
+	switch {
+	case deferred == nil && flush == nil:
+		return cause
+	case cause == nil && flush == nil:
+		return deferred
+	case cause == nil && deferred == nil:
+		return flush
+	}
+	return errors.Join(cause, deferred, flush)
+}
+
 // releaseResources is teardown after the close flush: it closes the
 // descriptor, drops the buffers, and returns the final cause.
 func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	remaining := conn.pending.Load()
 	deferredCloseErr := conn.takeDeferredCloseCause()
-	finalErr := errors.Join(cause, deferredCloseErr, flushErr)
+	finalErr := joinCloseErrors(cause, deferredCloseErr, flushErr)
 	if remaining > 0 {
 		finalErr = errors.Join(finalErr, UnflushedError{Remaining: remaining})
 	}

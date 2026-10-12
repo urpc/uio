@@ -382,3 +382,35 @@ func TestPollerSharedByWaiters(t *testing.T) {
 		_ = unix.Close(pipe[1])
 	}
 }
+
+// A parked wait allocates nothing once its batch is set up: its read
+// callback is bound once instead of built per wait.
+func TestParkedWaitDoesNotAllocate(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	poller, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer poller.Close(nil)
+	// A level-triggered writable socket makes every wait return at once.
+	if err = poller.Add(fds[0], Writable); err != nil {
+		t.Fatal(err)
+	}
+	var batch Batch
+	out := make([]Event, 8)
+	if n, err := poller.WaitBatchParked(&batch, out); n != 1 || err != nil {
+		t.Fatalf("first parked wait = %d, %v", n, err)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		if n, err := poller.WaitBatchParked(&batch, out); n != 1 || err != nil {
+			t.Fatalf("parked wait = %d, %v", n, err)
+		}
+	}); allocations != 0 {
+		t.Fatalf("a parked wait allocates %.1f times", allocations)
+	}
+}

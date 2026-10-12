@@ -483,20 +483,32 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	if state == nil {
 		return ErrClosed
 	}
-	state.data = append(state.data, data...)
 	if c.isClient() {
+		state.data = append(state.data, data...)
 		err := c.consumeClientHandshake()
 		if errors.Is(err, io.ErrUnexpectedEOF) {
 			return nil
 		}
 		return err
 	}
-	req, consumed, err := handshake.ParseServerRequest(state.data, handshake.ServerOptions{
+	// A request that arrived in one read is parsed where it lies: the read
+	// round discards it only after this returns, and OnOpen, the last user of
+	// the request, runs before. Only a request split across reads is gathered
+	// into state.data.
+	input := data
+	if len(state.data) > 0 {
+		state.data = append(state.data, data...)
+		input = state.data
+	}
+	req, consumed, err := handshake.ParseServerRequest(input, handshake.ServerOptions{
 		MaxHeaderBytes: c.config.maxHeaderBytes,
 		CheckOrigin:    c.config.checkOrigin,
 	})
 	if err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
+			if len(state.data) == 0 {
+				state.data = append(state.data, data...)
+			}
 			return nil
 		}
 		return err
@@ -537,7 +549,7 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	if c.heartbeat != nil {
 		c.config.heartbeatConnections.Store(c, c)
 	}
-	extra := append([]byte(nil), state.data[consumed:]...)
+	extra := append([]byte(nil), input[consumed:]...)
 	c.notifyOpen()
 	if len(extra) > 0 {
 		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {

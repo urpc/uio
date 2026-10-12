@@ -15,10 +15,16 @@ import (
 // Executor refused, and so the OnClose callbacks they run at once.
 const ioRejectWorkers = 4
 
-// writeShardCapacity bounds a write shard's queue. A connection has at most
-// one write turn queued or running, which holds its write claim, so a shard
-// queues no more write turns than it has connections sending from outside.
-const writeShardCapacity = 1024
+// turnShardCapacity and writeShardCapacity bound a shard's queue, which is
+// allocated up front: 16 KiB at 1024 tasks, for each of 2×GOMAXPROCS shards
+// per pool. A connection has at most one connection turn and one write turn
+// queued or running, the latter holding its write claim, so a shard queues no
+// more turns than it has connections; a fuller one runs the excess on
+// goroutines of their own (see shardpool.Pool.Submit).
+const (
+	turnShardCapacity  = 1024
+	writeShardCapacity = 1024
+)
 
 // ioTaskPool runs connection turns and write turns on UIO's own sharded
 // schedulers, both keyed by descriptor (see internal/shardpool), or on a
@@ -50,7 +56,7 @@ func newIOTaskPool(executor Executor) *ioTaskPool {
 	pool := &ioTaskPool{executor: executor}
 	if pool.executor == nil {
 		procs := runtime.GOMAXPROCS(0)
-		pool.owned = shardpool.New(procs, 0, turnKey, (*fdConn).runIOTask)
+		pool.owned = shardpool.New(procs, turnShardCapacity, turnKey, (*fdConn).runIOTask)
 		pool.writes = shardpool.New(procs, writeShardCapacity, writeTurnKey, func(turn *writeTurn) {
 			(*fdConn)(turn).runWriteTurn()
 		})

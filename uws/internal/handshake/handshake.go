@@ -34,7 +34,9 @@ type ServerOptions struct {
 // Request is the validated subset of an HTTP upgrade needed to build the
 // response and negotiate WebSocket features.
 type Request struct {
-	HTTP         *http.Request
+	HTTP *http.Request
+	// Key is the client's Sec-WebSocket-Key. From the fast path it references
+	// the caller's input, as raw does.
 	Key          string
 	Subprotocols []string
 	Extensions   []string

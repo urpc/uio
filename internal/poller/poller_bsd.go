@@ -68,6 +68,19 @@ type Batch struct {
 	parkFile  *os.File
 	parkConn  syscall.RawConn
 	parkTried bool
+
+	// parkRead is the parked wait's read callback, bound once so that a wait
+	// allocates nothing; it leaves its result in parkN and parkErr.
+	parkRead func(uintptr) bool
+	parkKq   int
+	parkN    int
+	parkErr  error
+}
+
+// readParked takes whatever is ready without waiting.
+func (batch *Batch) readParked(uintptr) bool {
+	batch.parkN, batch.parkErr = unix.Kevent(batch.parkKq, nil, batch.rawEvents[:], &zeroTimeout)
+	return batch.parkN != 0 || (batch.parkErr != nil && batch.parkErr != unix.EINTR)
 }
 
 // New creates kqueue and registers the read end of its wake pipe.
@@ -255,10 +268,8 @@ func (poller *Poller) wait(batch *Batch, out []Event, timeout int, park bool) (i
 		poller.mountPark(batch)
 	}
 	if park && batch.parkConn != nil {
-		readErr := batch.parkConn.Read(func(uintptr) bool {
-			n, err = unix.Kevent(poller.kqfd, nil, batch.rawEvents[:], &zeroTimeout)
-			return n != 0 || (err != nil && err != unix.EINTR)
-		})
+		readErr := batch.parkConn.Read(batch.parkRead)
+		n, err = batch.parkN, batch.parkErr
 		if readErr != nil {
 			// The runtime cannot poll the duplicate after all. Drop it and
 			// block instead, as the wait always could.
@@ -332,6 +343,7 @@ func (poller *Poller) mountPark(batch *Batch) {
 	}
 	poller.mu.Lock()
 	batch.parkFile, batch.parkConn = file, conn
+	batch.parkKq, batch.parkRead = poller.kqfd, batch.readParked
 	poller.parked = append(poller.parked, batch)
 	poller.mu.Unlock()
 }
