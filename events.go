@@ -36,6 +36,11 @@ type CompositeBuffer = bytebuf.CompositeBuffer
 // and may run beside the connection turn.
 type IOTask interface {
 	RunTask()
+	// ShardKey is the same for every task of one connection, its turns and
+	// its write turns alike, so an Executor that keeps a key's tasks on one
+	// worker keeps the connection's work, and the kernel's state for its
+	// socket, on one CPU. An Executor may ignore it.
+	ShardKey() uint32
 }
 
 // Executor schedules native connection I/O rounds. Both methods must return
@@ -92,8 +97,9 @@ type Events struct {
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
-	// runs connection turns on its own sharded scheduler (see
-	// internal/shardpool).
+	// runs connection turns on a taskgo queue sharded by descriptor (see
+	// taskgo.NewTaskKeyed) and write turns on a sharded scheduler of its own
+	// (see internal/shardpool).
 	// When set, the executor lifecycle remains the caller's responsibility.
 	Executor Executor
 

@@ -517,9 +517,9 @@ func TestSubmitBatchOverMoreThan64Shards(t *testing.T) {
 	batch := tasks(total)
 	pool.SubmitBatch(batch)
 	waitFor(t, "every task", func() bool { return ran.Load() == total })
-	for i := range pool.shards[procs:] {
-		if pool.shards[procs+i].head.Load() == 0 {
-			t.Fatalf("shard %d past the base ran nothing", procs+i)
+	for i := range pool.shards[:2*procs] {
+		if pool.shards[i].head.Load() == 0 {
+			t.Fatalf("shard %d ran nothing", i)
 		}
 	}
 }
@@ -737,4 +737,37 @@ func TestWakeIdleWithAStaleCountFindsNone(t *testing.T) {
 		t.Fatal("wakeIdle sent a worker it did not have")
 	}
 	s.idleCount.Store(0)
+}
+
+// The pool doubles its shards a second time once the keys are many enough,
+// and goes back through the matching merge threshold.
+func TestSecondDoublingAndItsMerge(t *testing.T) {
+	pool := New(2, 0, taskKey, func(*task) {})
+	defer pool.Stop()
+	for range 2 * SplitKeysPerShard4 {
+		pool.AddKey()
+	}
+	if got := pool.active.Load(); got != 8 {
+		t.Fatalf("active shards at the second split = %d, want 8", got)
+	}
+	for range 2*SplitKeysPerShard4 - 2*MergeKeysPerShard4 - 1 {
+		pool.RemoveKey()
+	}
+	if got := pool.active.Load(); got != 8 {
+		t.Fatalf("active shards above the second merge = %d, want 8", got)
+	}
+	pool.RemoveKey()
+	if got := pool.active.Load(); got != 4 {
+		t.Fatalf("active shards at the second merge = %d, want 4", got)
+	}
+	// Tasks of every key still run whichever tier is active.
+	var ran atomic.Int32
+	runner := New(2, 0, taskKey, func(*task) { ran.Add(1) })
+	defer runner.Stop()
+	for range 2 * SplitKeysPerShard4 {
+		runner.AddKey()
+	}
+	batch := tasks(200)
+	runner.SubmitBatch(batch)
+	waitFor(t, "every task", func() bool { return ran.Load() == 200 })
 }

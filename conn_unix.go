@@ -412,6 +412,11 @@ func (conn *fdConn) handleWriteSubmitFailure() {
 // submitting a write turn allocates nothing.
 type writeTurn fdConn
 
+// ShardKey implements IOTask: a connection's turns and its write turns share
+// its descriptor as their key.
+func (conn *fdConn) ShardKey() uint32    { return uint32(conn.fd) }
+func (turn *writeTurn) ShardKey() uint32 { return uint32(turn.fd) }
+
 // RunTask implements IOTask for the write turn.
 func (turn *writeTurn) RunTask() {
 	conn := (*fdConn)(turn)

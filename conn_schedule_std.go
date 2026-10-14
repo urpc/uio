@@ -30,4 +30,5 @@ func (conn *fdConn) scheduleOpen()                { conn.scheduleIO(ioEventOpen)
 func (conn *fdConn) noteIO(uint32) bool           { return false }
 func (conn *fdConn) skipsEdge(poller.Events) bool { return false }
 func (conn *fdConn) RunTask()                     {}
+func (conn *fdConn) ShardKey() uint32             { return 0 }
 func (conn *fdConn) handleIOSubmitFailure(error)  {}

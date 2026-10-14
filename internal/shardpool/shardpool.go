@@ -31,14 +31,18 @@
 // blocks holds up the tasks behind it for about that long.
 //
 // The pool keeps one shard per P until the caller reports, through AddKey,
-// SplitKeysPerShard keys per shard, and then spreads keys over twice as many
-// shards, until they drop back to MergeKeysPerShard. A shard serving many
-// keys keeps a backlog, and every worker the backlog brings in takes its next
-// task from whichever key is next, so the more keys a shard has the more of
-// their tasks change workers: with 4096 echoing connections on 24 Ps a task
-// ran on the worker of its key's previous task 71% of the time with a shard
-// per P and 83% with two, and throughput rose 2%. With 512 the extra shards
-// only park and wake their workers more often, which cost 3%. A key whose
+// SplitKeysPerShard keys per shard, and doubles its shards there and again at
+// SplitKeysPerShard4, until the count drops back through the matching merge
+// thresholds. A shard serving many keys keeps a backlog, and every worker the
+// backlog brings in takes its next task from whichever key is next, so the
+// more keys a shard has the more of their tasks change workers: with 4096
+// echoing connections on 24 Ps a task ran on the worker of its key's previous
+// task 71% of the time with a shard per P and 83% with two, and throughput
+// rose 2%. Longer queues are also a longer wait for everyone in them, which
+// is why the doubling goes on: with 10000 echoing connections the second
+// doubling halved the median round trip and raised throughput 2%. With 512
+// the extra shards only park and wake their workers more often, which cost
+// 3%, and the first doubling waits for 64 keys per base shard. A key whose
 // shard changes when the count does is the caller's to keep consistent: the
 // pool orders nothing across shards.
 package shardpool
@@ -61,12 +65,22 @@ const (
 	// MaxIdle is how long a parked worker beyond the first of its shard
 	// waits for work before it exits.
 	MaxIdle = 30 * time.Second
-	// SplitKeysPerShard and MergeKeysPerShard are the keys per base shard at
-	// which the pool spreads keys over twice as many shards and goes back;
-	// the gap keeps a count that hovers around one from switching back and
-	// forth.
-	SplitKeysPerShard = 64
-	MergeKeysPerShard = 32
+	// The keys per base shard at which the pool doubles its active shards,
+	// and the counts it goes back at. SplitKeysPerShard and MergeKeysPerShard
+	// are the first doubling, SplitKeysPerShard4 and MergeKeysPerShard4 the
+	// second; the gap between a split and its merge keeps a count that hovers
+	// around one from switching back and forth. More shards mean shorter
+	// queues per shard and more of them drained at once, which is what a
+	// connection's wait divides over: with 10000 echoing connections on 24 Ps
+	// (417 per base shard), the second doubling cut the median round trip from
+	// 3.1ms to 1.6ms and raised throughput 2%; at 6000 connections, and on
+	// four and eight Ps at the same connections per shard, it was a wash,
+	// which is why it waits for 256. Every tier's queues are allocated up
+	// front, 16 KiB per shard.
+	SplitKeysPerShard  = 64
+	MergeKeysPerShard  = 32
+	SplitKeysPerShard4 = 256
+	MergeKeysPerShard4 = 192
 
 	cacheLineSize = 64
 	janitorTick   = time.Second
@@ -155,7 +169,7 @@ func New[T any](procs, capacity int, key func(T) uint32, run func(T)) *Pool[T] {
 	}
 	capacity = 1 << bits.Len(uint(max(capacity, 2)-1))
 	pool := &Pool[T]{
-		shards: make([]shard[T], 2*base),
+		shards: make([]shard[T], 4*base),
 		key:    key,
 		run:    run,
 		base:   int32(base),
@@ -183,13 +197,19 @@ func New[T any](procs, capacity int, key func(T) uint32, run func(T)) *Pool[T] {
 // connections, and switch the number of active shards when the count reaches
 // a threshold.
 func (pool *Pool[T]) AddKey() {
-	if pool.keys.Add(1) == int64(pool.base)*SplitKeysPerShard {
+	switch pool.keys.Add(1) {
+	case int64(pool.base) * SplitKeysPerShard:
+		pool.active.Store(2 * pool.base)
+	case int64(pool.base) * SplitKeysPerShard4:
 		pool.active.Store(int32(len(pool.shards)))
 	}
 }
 
 func (pool *Pool[T]) RemoveKey() {
-	if pool.keys.Add(-1) == int64(pool.base)*MergeKeysPerShard {
+	switch pool.keys.Add(-1) {
+	case int64(pool.base) * MergeKeysPerShard4:
+		pool.active.Store(2 * pool.base)
+	case int64(pool.base) * MergeKeysPerShard:
 		pool.active.Store(pool.base)
 	}
 }

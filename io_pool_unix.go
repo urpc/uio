@@ -3,11 +3,14 @@
 package uio
 
 import (
+	"context"
 	"net"
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/limpo1989/taskgo"
 	"github.com/urpc/uio/internal/shardpool"
 )
 
@@ -15,23 +18,27 @@ import (
 // Executor refused, and so the OnClose callbacks they run at once.
 const ioRejectWorkers = 4
 
-// turnShardCapacity and writeShardCapacity bound a shard's queue, which is
-// allocated up front: 16 KiB at 1024 tasks, for each of 2×GOMAXPROCS shards
-// per pool. A connection has at most one connection turn and one write turn
-// queued or running, the latter holding its write claim, so a shard queues no
-// more turns than it has connections; a fuller one runs the excess on
-// goroutines of their own (see shardpool.Pool.Submit).
-const (
-	turnShardCapacity  = 1024
-	writeShardCapacity = 1024
-)
+// writeShardCapacity bounds a write scheduler shard's queue, which is
+// allocated up front: 16 KiB at 1024 tasks, for each of 2×GOMAXPROCS shards. A
+// connection has at most one write turn queued or running, holding its write
+// claim, so a shard queues no more turns than it has connections; a fuller one
+// runs the excess on goroutines of their own (see shardpool.Pool.Submit).
+const writeShardCapacity = 1024
 
-// ioTaskPool runs connection turns and write turns on UIO's own sharded
-// schedulers, both keyed by descriptor (see internal/shardpool), or on a
-// caller-supplied Executor. Input and output bytes always remain owned by
-// their connection rather than the scheduler queue. The pool keeps no
-// per-task accounting of its own: every submitted turn is already counted by
-// its loop's turn count, which Events joins before stopping the pool.
+// turnShardsPerP is how many ingress shards the connection turn queue has per
+// P. A worker keeps serving its shard until the shard runs dry, so the turns
+// of a connection, and the kernel's state for its socket, stay on one CPU.
+// On an echo server saturating 24 Ps, 48 shards took 9% more requests than
+// one shared queue at the same CPU; 96 took as many, with a longer tail.
+const turnShardsPerP = 2
+
+// ioTaskPool runs connection turns on a taskgo queue and write turns on UIO's
+// own sharded scheduler, both keyed by descriptor (see taskgo.NewTaskKeyed and
+// internal/shardpool), or both on a caller-supplied Executor. Input and output
+// bytes always remain owned by their connection rather than the scheduler
+// queue. The pool keeps no per-task accounting of its own: every submitted
+// turn is already counted by its loop's turn count, which Events joins before
+// stopping the pool.
 //
 // Write turns have workers of their own. A write turn sends output from other
 // goroutines, so it is submitted from outside, one at a time, and waits for a
@@ -41,7 +48,7 @@ const (
 // 60% higher.
 type ioTaskPool struct {
 	executor Executor
-	owned    *shardpool.Pool[*fdConn]
+	owned    *taskgo.Task[*fdConn]
 	writes   *shardpool.Pool[*writeTurn]
 	rejected rejectQueue // turns the executor refused
 	mu       sync.Mutex  // publishes stopped against rejectBatch
@@ -56,7 +63,13 @@ func newIOTaskPool(executor Executor) *ioTaskPool {
 	pool := &ioTaskPool{executor: executor}
 	if pool.executor == nil {
 		procs := runtime.GOMAXPROCS(0)
-		pool.owned = shardpool.New(procs, turnShardCapacity, turnKey, (*fdConn).runIOTask)
+		// taskgo keeps about one worker per P running and adds workers, up to
+		// the ceiling, only while callbacks block; parked workers wait long
+		// enough to reuse their grown stacks.
+		pool.owned = taskgo.NewTaskKeyed((*fdConn).runIOTask, turnKey, turnShardsPerP*procs,
+			taskgo.WithConcurrency(512*procs),
+			taskgo.WithMaxIdle(30*time.Second),
+		)
 		pool.writes = shardpool.New(procs, writeShardCapacity, writeTurnKey, func(turn *writeTurn) {
 			(*fdConn)(turn).runWriteTurn()
 		})
@@ -64,18 +77,16 @@ func newIOTaskPool(executor Executor) *ioTaskPool {
 	return pool
 }
 
-// connOpened and connClosed tell the schedulers how many connections they
-// serve.
+// connOpened and connClosed tell the write scheduler how many connections it
+// serves.
 func (pool *ioTaskPool) connOpened() {
-	if pool.owned != nil {
-		pool.owned.AddKey()
+	if pool.writes != nil {
 		pool.writes.AddKey()
 	}
 }
 
 func (pool *ioTaskPool) connClosed() {
-	if pool.owned != nil {
-		pool.owned.RemoveKey()
+	if pool.writes != nil {
 		pool.writes.RemoveKey()
 	}
 }
@@ -107,11 +118,13 @@ func (pool *ioTaskPool) submit(conn *fdConn) bool {
 	if pool == nil || conn == nil || pool.stopped.Load() {
 		return false
 	}
+	var accepted bool
 	if pool.owned != nil {
-		pool.owned.Submit(conn)
-		return true
+		accepted = pool.owned.Submit(conn)
+	} else {
+		accepted = pool.executor.Submit(conn)
 	}
-	if !pool.executor.Submit(conn) {
+	if !accepted {
 		pool.rejectBatch([]IOTask{conn})
 	}
 	return true
@@ -128,7 +141,9 @@ func (pool *ioTaskPool) submitBatch(tasks []IOTask) bool {
 	}
 	if pool.owned != nil {
 		for _, task := range tasks {
-			pool.owned.Submit(task.(*fdConn))
+			if !pool.owned.Submit(task.(*fdConn)) {
+				pool.rejectBatch([]IOTask{task})
+			}
 		}
 		return true
 	}
@@ -149,7 +164,9 @@ func (pool *ioTaskPool) submitConnBatch(conns []*fdConn, args []IOTask) bool {
 		if pool.stopped.Load() {
 			return false
 		}
-		pool.owned.SubmitBatch(conns)
+		if accepted := pool.owned.SubmitBatch(conns); accepted != len(conns) {
+			pool.rejectBatch(connTasks(conns[accepted:]))
+		}
 		return true
 	}
 	if cap(args) < len(conns) {
@@ -198,11 +215,20 @@ func (pool *ioTaskPool) stop() {
 		pool.stopped.Store(true)
 		pool.mu.Unlock()
 		if pool.owned != nil {
-			pool.owned.Stop()
+			_ = pool.owned.Stop(context.Background())
 			pool.writes.Stop()
 		}
 		pool.rejected.wait()
 	})
+}
+
+// connTasks boxes refused connections for rejectBatch.
+func connTasks(conns []*fdConn) []IOTask {
+	tasks := make([]IOTask, len(conns))
+	for index, conn := range conns {
+		tasks[index] = conn
+	}
+	return tasks
 }
 
 // rejectQueue runs refused turns' failure handling on at most
