@@ -254,11 +254,12 @@ func (sink *connFrameSink) AcceptFrame(f frame.Frame) error {
 }
 
 // consumeShortFrame delivers the frame a server reads most: complete, masked,
-// unfragmented text or binary of under 126 bytes, with no message being
-// reassembled. It makes ParseFrame's and acceptFrame's checks for that one
-// shape directly, unmasking in place, and reports false, having consumed
-// nothing, for any other frame or a frame that is not complete yet. When more
-// input follows the frame, the round's replies are batched.
+// unfragmented text or binary of seven-bit length, or of 16-bit length within
+// the frame and message limits, with no message being reassembled. It makes
+// ParseFrame's and acceptFrame's checks for that one shape directly,
+// unmasking in place, and reports false, having consumed nothing, for any
+// other frame or a frame that is not complete yet. When more input follows
+// the frame, the round's replies are batched.
 //
 // limit is the connection's shortReadLimit: the largest payload within the
 // frame and message limits, or -1 when frames are not expected masked.
@@ -267,15 +268,34 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 		return 0, false, nil
 	}
 	b0, b1 := src[0], src[1]
-	n := int(b1 &^ 0x80)
-	// b0 is FIN with the text or binary opcode, b1 the mask bit and a
-	// seven-bit length.
-	if b0-(0x80|byte(frame.Text)) > 1 || b1&0x80 == 0 || n > limit || len(src) < 6+n {
+	if b0-(0x80|byte(frame.Text)) > 1 || b1&0x80 == 0 {
 		return 0, false, nil
 	}
-	size := 6 + n
-	payload := src[6:size:size]
-	ascii := unmaskShort(payload, binary.LittleEndian.Uint32(src[2:6]))
+	n := int(b1 &^ 0x80)
+	head := 2
+	if n == 126 {
+		// A 16-bit length, one header step wider at the same fused cost: the
+		// length moves the mask key and payload two bytes on. The frame and
+		// message limits gate this branch, where the seven-bit one is
+		// bounded by its encoding. 64-bit lengths keep the generic path.
+		if limit < 0 || len(src) < 8 {
+			return 0, false, nil
+		}
+		n = int(binary.BigEndian.Uint16(src[2:4]))
+		head = 4
+		if (c.config.parser.MaxFramePayload != 0 && uint64(n) > c.config.parser.MaxFramePayload) ||
+			(c.config.assembler.MaxMessage != 0 && uint64(n) > c.config.assembler.MaxMessage) {
+			return 0, false, nil
+		}
+	} else if n > limit {
+		return 0, false, nil
+	}
+	if len(src) < head+4+n {
+		return 0, false, nil
+	}
+	size := head + 4 + n
+	payload := src[head+4 : size : size]
+	ascii := unmaskShort(payload, binary.LittleEndian.Uint32(src[head:head+4]))
 	if size < len(src) {
 		c.beginWriteBatch()
 	}

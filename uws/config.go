@@ -18,10 +18,15 @@ type connConfig struct {
 
 	maxHeaderBytes         int
 	writeBufferedThreshold int
-	// shortSendLimit is the largest payload a server sends through
-	// sendShortLocked: under 126 bytes, within the message and frame limits,
-	// and small enough to be buffered; -1 for a client, which masks.
+	// shortSendLimit is the largest payload a server sends through the
+	// batching send path: under 126 bytes, within the message and frame
+	// limits, and small enough to be buffered; -1 for a client, which masks.
 	shortSendLimit int
+	// shortSendDirect is the largest payload sendShortLocked takes on the
+	// non-batching path, where the reply takes one transport reservation:
+	// up to a 16-bit length, within the message and frame limits, and small
+	// enough to be buffered; -1 for a client, which masks.
+	shortSendDirect int
 	// shortReadLimit is the largest payload consumeShortFrame takes: under
 	// 126 bytes and within the frame and message limits; -1 for a client,
 	// whose frames arrive unmasked.
@@ -102,8 +107,21 @@ func newServerConnConfig(server *Server) *connConfig {
 		config.heartbeatConnections = &server.connections
 	}
 	config.shortSendLimit = config.shortSendPayloadLimit()
+	config.shortSendDirect = config.shortSendDirectPayloadLimit()
 	config.shortReadLimit = int(min(125, config.parser.MaxFramePayload, config.assembler.MaxMessage))
 	return config
+}
+
+// shortSendDirectPayloadLimit is the largest payload sendShortLocked takes
+// on the non-batching send path: up to a 16-bit length, within the message
+// and frame limits, and small enough for the transport to buffer.
+func (config *connConfig) shortSendDirectPayloadLimit() int {
+	if config.client || config.writeBufferedThreshold <= 0 {
+		return -1
+	}
+	limit := uint64(min(0xFFFF, config.writeBufferedThreshold-3))
+	limit = min(limit, config.assembler.MaxMessage, config.parser.MaxFramePayload)
+	return int(limit)
 }
 
 func (config *connConfig) shortSendPayloadLimit() int {

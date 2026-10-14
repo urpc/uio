@@ -595,13 +595,18 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 // including one sent from outside that task.
 func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error) {
 	size := len(payload)
-	if c.config == nil || size > c.config.shortSendLimit || c.heartbeat != nil || c.compression != nil || c.batch != nil ||
+	if c.config == nil || size > c.config.shortSendDirect || c.heartbeat != nil || c.compression != nil || c.batch != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
 		return false, nil
 	}
+	// A 16-bit length replies through the same one reservation: its header
+	// is four bytes instead of two, the payload copy identical.
+	wireSize, head := size+2, 2
+	if size > 125 {
+		wireSize, head = size+4, 4
+	}
 	// The transport refuses a reservation past its outbound limit, after
 	// flushing what it can, which is the check send's other paths make too.
-	wireSize := size + 2
 	c.writes.close.pendingBytes.Add(int64(wireSize))
 	dst, err := c.raw.ReserveOutbound(wireSize)
 	if err == uio.ErrReserveUnsupported {
@@ -611,8 +616,13 @@ func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error
 	if err != nil {
 		return true, c.finishFrameWrite(opcode, 0, wireSize, err)
 	}
-	dst[0], dst[1] = 0x80|byte(opcode), byte(size)
-	copy(dst[2:], payload)
+	if head == 4 {
+		dst[0], dst[1] = 0x80|byte(opcode), 126
+		binary.BigEndian.PutUint16(dst[2:4], uint16(size))
+	} else {
+		dst[0], dst[1] = 0x80|byte(opcode), byte(size)
+	}
+	copy(dst[head:], payload)
 	return true, nil
 }
 
