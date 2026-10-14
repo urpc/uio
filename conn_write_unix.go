@@ -255,6 +255,12 @@ func (conn *fdConn) sendScratch(holder *readBuffer) error {
 
 // coalesceBlockSize is the block size that small writes batched in one task
 // share: one read round's replies usually fit in one of them.
+// midFlushThreshold is how many queued replies a read round accumulates
+// before it sends them mid-round (see readRound).
+func (conn *fdConn) midFlushThreshold() int {
+	return min(64<<10, conn.events.readBufferSize*4)
+}
+
 func (conn *fdConn) coalesceBlockSize() int {
 	return min(64<<10, conn.events.readBufferSize*2)
 }
@@ -514,9 +520,13 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold
-	first := conn.turn&turnCorked != 0 && conn.turn&turnRoundWrote == 0 && conn.outboundEmpty() &&
-		!(threshold > 0 && size < threshold)
-	queued := !first && (!conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold))
+	// A corked read round never sends directly, exactly as writevOnLoop does
+	// not: its replies queue, coalesced, and leave together when the round
+	// ends, or at the mid-round flush once they pass midFlushThreshold.
+	// Sending the round's first reply from inside its callback measured a
+	// pipeline 4-6% slower - it made every later reply of the round its own
+	// writev segment - and no faster at echo, whose round has one reply.
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
 	}
@@ -537,9 +547,6 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		}
 		conn.submitMu.Unlock()
 		return size, nil
-	}
-	if first {
-		conn.turn |= turnRoundWrote
 	}
 	defer conn.releaseWriteAndKick()
 

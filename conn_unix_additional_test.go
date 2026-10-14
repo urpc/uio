@@ -467,13 +467,13 @@ func TestLoopWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 	conn.pending.Store(0)
 }
 
-func TestCorkedOwnedWritesCoalesceAfterFirstSegment(t *testing.T) {
+func TestCorkedOwnedWritesCoalesceInRound(t *testing.T) {
 	loop := &eventLoop{}
 	events := &Events{MaxOutboundBuffered: 64 << 10, readBufferSize: 16 << 10}
-	// The round's first output has left for the socket already — that write
-	// goes direct, see TestRoundFirstWriteGoesOutBeforeTheCallbackReturns —
-	// so the writes that follow are the ones that coalesce here.
-	conn := &fdConn{fd: -1, turn: turnCorked | turnRoundWrote}
+	// The round's first write opens the queue on its own; the writes that
+	// follow coalesce into one more block, so the round's final flush hands
+	// the peer two segments in one call.
+	conn := &fdConn{fd: -1, turn: turnCorked}
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.events = events
 	conn.loop = loop

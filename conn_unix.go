@@ -175,10 +175,6 @@ const (
 	// unread raises no further edge, and the rounds that read those bytes,
 	// redelivered ones included, must read on until the socket reports it.
 	turnHangup
-	// turnRoundWrote records that a corked round's first output left for the
-	// socket on its own: the round's later writes coalesce and leave in its
-	// final flush as before.
-	turnRoundWrote
 	// turnReadToEnd makes rounds read on like turnHangup does, for a hangup
 	// that may not be this connection's, until a read finds the socket empty
 	// rather than at its end.
@@ -950,7 +946,7 @@ func (conn *fdConn) runIOTask() {
 		if err := conn.fireOnData(); err != nil {
 			conn.requestClose(err)
 		}
-		conn.turn &^= turnCorked | turnRoundWrote
+		conn.turn &^= turnCorked
 	}
 	if conn.udp != nil && conn.udp.peers != nil {
 		conn.settlePeers()
@@ -1171,7 +1167,7 @@ func (conn *fdConn) onRead() error {
 	// of one syscall per reply.
 	conn.turn |= turnCorked
 	err := conn.readRound(holder.bytes)
-	conn.turn &^= turnCorked | turnRoundWrote
+	conn.turn &^= turnCorked
 	conn.scratch = nil
 	if out := holder.out; out != nil && out.Len() > 0 {
 		if sendErr := conn.sendScratch(holder); err == nil {
@@ -1236,12 +1232,15 @@ func (conn *fdConn) readRound(buffer []byte) error {
 			// which is why the round reads on once the poller reported one.
 			return nil
 		}
-		// The round reads on. Once its replies fill a coalescing block, send
+		// The round reads on. Once its replies fill four read buffers, send
 		// them before reading further: a peer that keeps a window of requests
 		// in flight is otherwise left waiting for the whole round, which can
 		// run to 256 reads, and its pipeline empties. Smaller bursts still
-		// leave in one write when the round ends.
-		if conn.pending.Load() >= int64(conn.coalesceBlockSize()) {
+		// leave in one write when the round ends. The threshold is four read
+		// buffers rather than the coalescing block size: a mid-round send pays
+		// a syscall and a writev of two blocks, and at one block of replies it
+		// cost a pipeline 4-6% against waiting for the round's end.
+		if conn.pending.Load() >= int64(conn.midFlushThreshold()) {
 			if _, err := conn.flushOnLoop(); err != nil {
 				return err
 			}

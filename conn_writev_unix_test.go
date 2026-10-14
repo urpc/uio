@@ -88,15 +88,16 @@ func TestWritevTakesVectorsLongerThanOneSyscall(t *testing.T) {
 // in is usually its only writer. A write the threshold would buffer keeps
 // joining the round's batch in the first position, so the configuration's
 // promise holds there as everywhere.
-func TestRoundFirstWriteGoesOutBeforeTheCallbackReturns(t *testing.T) {
+func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
+	// A corked round never sends directly: both writes stay queued, and the
+	// round's final flush hands the peer one "onetwo" in order. The buffered
+	// threshold plays no part inside the round.
 	tests := []struct {
-		name       string
-		threshold  int
-		wantFirst  int // buffered bytes right after the round's first write
-		wantSecond int
+		name      string
+		threshold int
 	}{
-		{name: "threshold-disabled", threshold: 0, wantFirst: 0, wantSecond: 3},
-		{name: "below-threshold-joins-the-batch", threshold: 64, wantFirst: 3, wantSecond: 6},
+		{name: "threshold-disabled", threshold: 0},
+		{name: "below-threshold-joins-the-batch", threshold: 64},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -149,14 +150,13 @@ func TestRoundFirstWriteGoesOutBeforeTheCallbackReturns(t *testing.T) {
 			case <-time.After(3 * time.Second):
 				t.Fatal("the round never ran")
 			}
-			if got.first != tt.wantFirst {
-				t.Fatalf("buffered after the round's first write = %d, want %d", got.first, tt.wantFirst)
+			if got.first != 3 {
+				t.Fatalf("buffered after the round's first write = %d, want 3", got.first)
 			}
-			if got.second != tt.wantSecond {
-				t.Fatalf("buffered after the round's second write = %d, want %d", got.second, tt.wantSecond)
+			if got.second != 6 {
+				t.Fatalf("buffered after the round's second write = %d, want 6", got.second)
 			}
-			// The round's final flush publishes what coalesced, behind the
-			// first write, in order.
+			// The round's final flush publishes both writes, in order.
 			if err = client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
 				t.Fatal(err)
 			}
