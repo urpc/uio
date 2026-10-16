@@ -75,7 +75,8 @@ type Events struct {
 	// OnData runs while inbound access methods are valid.
 	OnData func(c Conn) error
 
-	// OnClose is final and never overlaps OnOpen or OnData for its connection.
+	// OnClose is final and never overlaps OnOpen or OnData for its connection;
+	// only a connection that got OnOpen gets it.
 	OnClose func(c Conn, err error)
 
 	// OnInbound runs before OnData and shares its inbound-access scope.

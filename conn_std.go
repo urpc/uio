@@ -48,6 +48,12 @@ type stdUDPState struct {
 	sock  *net.UDPConn
 	svr   *fdConn
 	peers map[string]*fdConn
+
+	// Datagrams are sent on whichever goroutine writes them, and the bytes
+	// they report wait in outboundPending for whoever holds outboundClaim; see
+	// reportOutbound.
+	outboundPending atomic.Int64
+	outboundClaim   atomic.Bool
 }
 
 type fdConn struct {
@@ -279,7 +285,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		}
 
 		if n > 0 {
-			fc.events.onSocketBytesWrite(fc, n)
+			fc.reportOutbound(n)
 		}
 		return
 	}
@@ -322,6 +328,43 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	}
 
 	return
+}
+
+// reportOutbound runs OnOutbound for a datagram send. Datagrams are sent on
+// whichever goroutine writes them, so the calls for one connection go through
+// a claim: a sender adds its bytes and reports them itself if it takes the
+// claim, and otherwise leaves them to the holder, which reports until nothing
+// is pending, so the calls never overlap and a send made inside OnOutbound is
+// reported once that call returns. Nobody waits for the claim, so OnOutbound
+// callbacks that write to each other cannot deadlock.
+func (fc *fdConn) reportOutbound(n int) {
+	if fc.events.OnOutbound == nil {
+		return
+	}
+	udp := fc.udp
+	udp.outboundPending.Add(int64(n))
+	for udp.outboundClaim.CompareAndSwap(false, true) {
+		fc.drainOutboundReports()
+		// Bytes added between the last drain and the release found the
+		// claim taken; look again.
+		if udp.outboundPending.Load() == 0 {
+			return
+		}
+	}
+}
+
+// drainOutboundReports reports pending bytes while holding the claim, and
+// releases it even when OnOutbound panics.
+func (fc *fdConn) drainOutboundReports() {
+	udp := fc.udp
+	defer udp.outboundClaim.Store(false)
+	for {
+		pending := udp.outboundPending.Swap(0)
+		if pending == 0 {
+			return
+		}
+		fc.events.OnOutbound(fc, int(pending))
+	}
 }
 
 // Writev preserves large source segments as separate owned blocks when the
@@ -768,6 +811,11 @@ func (fc *fdConn) readUDPLoop() {
 		}
 
 		fc.callbackMu.Lock()
+		if fc.isClosing() {
+			// OnClose may already have run; see readLoop.
+			fc.callbackMu.Unlock()
+			return
+		}
 		fc.inboundTail = buffer[:n]
 
 		// trigger inbound event.
@@ -805,6 +853,12 @@ func (fc *fdConn) readLoop() {
 			// A Reader may return payload and a terminal error together. Deliver the
 			// payload before closing so the final stream segment is not lost.
 			fc.callbackMu.Lock()
+			if fc.isClosing() {
+				// OnClose may already have run: a close requested while this
+				// read was returning ends the stream here.
+				fc.callbackMu.Unlock()
+				return
+			}
 			fc.inboundTail = buffer[:n]
 			fc.events.onSocketBytesRead(fc, n)
 			started := fc.beginInboundCallback()
@@ -906,6 +960,12 @@ func (fc *fdConn) listenUDP() error {
 		}
 
 		udpConn.callbackMu.Lock()
+		if udpConn.isClosing() {
+			// The peer closed while this packet waited for its callback
+			// mutex, and OnClose may already have run.
+			udpConn.callbackMu.Unlock()
+			continue
+		}
 		udpConn.inboundTail = buffer[:n]
 
 		// trigger inbound event

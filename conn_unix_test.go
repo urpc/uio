@@ -542,23 +542,34 @@ func TestConnectionTaskHandoffPublishesNewOwnerAfterPreviousTask(t *testing.T) {
 	_ = testConn.conn.Close()
 }
 
+// A refused open turn closes the connection before OnOpen ever ran, so it
+// gets no OnClose either: the two always come as a pair.
 func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
-	closed := make(chan error, 1)
+	var opened, closed atomic.Int32
 	events := &Events{Pollers: 1, Executor: rejectingNativeExecutor{}}
-	events.OnClose = func(_ Conn, err error) { closed <- err }
+	events.OnOpen = func(Conn) { opened.Add(1) }
+	events.OnClose = func(Conn, error) { closed.Add(1) }
 	testConn, registered := startTestConnection(t, events)
 	if err := <-registered; err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-closed:
-		if !errors.Is(err, net.ErrClosed) {
-			t.Fatalf("executor rejection close error = %v", err)
+	conn := testConn.conn
+	for deadline := time.Now().Add(time.Second); conn.close.phase.Load() != closeCallbackDelivered ||
+		conn.taskState.Load()&taskScheduledBit != 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d turns=%d",
+				conn.taskState.Load()&taskScheduledBit != 0, conn.close.phase.Load(), conn.loop.ioTurnCount())
 		}
-	case <-time.After(time.Second):
-		t.Fatalf("executor rejection did not close connection: scheduled=%v phase=%d loopState=%d queued=%v stopped=%v",
-			testConn.conn.taskState.Load()&taskScheduledBit != 0, testConn.conn.close.phase.Load(),
-			testConn.conn.loop.ioTurnCount(), false, testConn.conn.loop.stopping.Load())
+		time.Sleep(time.Millisecond)
+	}
+	if got := opened.Load(); got != 0 {
+		t.Fatalf("OnOpen ran %d times for a refused open turn", got)
+	}
+	if got := closed.Load(); got != 0 {
+		t.Fatalf("OnClose ran %d times for a connection that never opened", got)
+	}
+	if _, err := conn.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Write after the refused open turn = %v, want net.ErrClosed", err)
 	}
 }
 

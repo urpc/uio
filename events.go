@@ -50,7 +50,11 @@ type IOTask interface {
 // is unsupported. The batch slice is callback-scoped, so an executor must copy
 // references it retains after SubmitBatch returns. Submit false means the task
 // was not run; a short SubmitBatch result means the rejected suffix was not run.
-// Rejection closes the affected connection. A native connection may have its
+// Rejection closes the affected connection, and what a refused turn still owes
+// — OnClose, and OnOutbound for the close's final flush — runs on UIO's own
+// goroutines, a few at a time. A connection whose first turn is refused never
+// got OnOpen, so it closes without OnClose too; a Dial that returned it has
+// handed its caller a closed connection. A native connection may have its
 // connection turn and a write turn in flight at once; both arrive here.
 type Executor interface {
 	Submit(task IOTask) bool
@@ -148,9 +152,9 @@ type Events struct {
 	OnData func(c Conn) error
 
 	// OnClose is the final callback for a connection and never overlaps its
-	// OnOpen or OnData callback. Close only requests the close: the
-	// connection is released, and OnClose runs, once the callback that closed
-	// it has returned.
+	// OnOpen or OnData callback; only a connection that got OnOpen gets it.
+	// Close only requests the close: the connection is released, and OnClose
+	// runs, once the callback that closed it has returned.
 	OnClose func(c Conn, err error)
 
 	// OnInbound reports bytes read from the socket before OnData and shares its
@@ -160,11 +164,13 @@ type Events struct {
 	// OnOutbound reports bytes successfully written to the socket. It may run on
 	// a backend writer goroutine or a native write turn, concurrently with the
 	// connection's other callbacks, and does not grant inbound-buffer access.
+	// The final flush of a closing native connection reports from the goroutine
+	// that releases it, which during shutdown is the one returning from Serve.
 	// Calls for one connection never overlap each other: on the native backend
-	// a Write made inside OnOutbound is queued and sent after it returns. A
-	// native UDP connection's datagrams leave on the goroutines that write
-	// them, and OnOutbound may report several of them, on any one of those
-	// goroutines, after its send.
+	// a Write made inside OnOutbound is queued and sent after it returns. A UDP
+	// connection's datagrams leave on the goroutines that write them, and
+	// OnOutbound may report several of them, on any one of those goroutines,
+	// after its send.
 	OnOutbound func(c Conn, writeBytes int)
 
 	// OnStart runs synchronously after initialization and before listeners

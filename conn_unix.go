@@ -1580,9 +1580,11 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 }
 
 // closeCallbackDue reports whether the connection gets OnClose: every user
-// connection that entered its loop does.
+// connection whose open turn has started does. One whose open turn is still
+// owed, refused by the Executor, never got OnOpen, so it gets no OnClose
+// either.
 func (conn *fdConn) closeCallbackDue() bool {
-	return !conn.internal && conn.events.OnClose != nil
+	return !conn.internal && conn.events.OnClose != nil && conn.taskState.Load()&ioEventOpen == 0
 }
 
 // deliverClose runs OnClose for a released connection on the owner that

@@ -1108,3 +1108,144 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 		t.Fatal("read loop did not exit after terminal error")
 	}
 }
+
+// A close requested while a read is returning its bytes may deliver OnClose
+// before the read loop takes the callback mutex; the loop must then drop the
+// bytes rather than run OnData after the final callback.
+func TestStdReadLoopRunsNoDataAfterOnClose(t *testing.T) {
+	events := &Events{Pollers: 1, MaxBufferSize: 64}
+	closed := make(chan struct{})
+	var closedFlag, dataAfterClose atomic.Bool
+	events.OnClose = func(Conn, error) {
+		closedFlag.Store(true)
+		close(closed)
+	}
+	events.OnData = func(conn Conn) error {
+		if closedFlag.Load() {
+			dataAfterClose.Store(true)
+		}
+		_, err := conn.Discard(-1)
+		return err
+	}
+	serveDone := startStdTestEvents(t, events)
+
+	raw := newStdRegistrationConn(0)
+	conn := newStdFDConn(events, raw)
+	var reads atomic.Int32
+	raw.readFunc = func(buffer []byte) (int, error) {
+		if reads.Add(1) == 1 {
+			// The bytes have arrived; the close and its OnClose run before
+			// the read loop delivers them.
+			_ = conn.Close()
+			select {
+			case <-closed:
+			case <-time.After(time.Second):
+				t.Error("OnClose did not run")
+			}
+			return copy(buffer, "x"), nil
+		}
+		<-raw.closed
+		return 0, net.ErrClosed
+	}
+	registerDone := make(chan error, 1)
+	task := acquireTask(registerTask, conn)
+	task.done = registerDone
+	if !conn.loop.submitTask(task) {
+		releaseTask(task)
+		t.Fatal("register task was rejected")
+	}
+	if err := <-registerDone; err != nil {
+		t.Fatalf("register error = %v", err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("OnClose did not run")
+	}
+	// Serve joins the read loop, so its handling of the bytes is over.
+	stopStdTestEvents(t, events, serveDone, errors.New("stop"))
+	if dataAfterClose.Load() {
+		t.Fatal("OnData ran after OnClose")
+	}
+}
+
+// OnOutbound calls for one UDP connection never overlap, though its datagrams
+// leave on the goroutines that write them: a sender that finds another one
+// reporting leaves its bytes to that one and returns.
+func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
+	server, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+	client, err := net.DialUDP("udp", nil, server.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	var in, overlap, calls atomic.Int32
+	var reported atomic.Int64
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	events := &Events{}
+	events.OnOutbound = func(_ Conn, n int) {
+		if in.Add(1) > 1 {
+			overlap.Add(1)
+		}
+		reported.Add(int64(n))
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+		in.Add(-1)
+	}
+	conn := &fdConn{udp: &stdUDPState{sock: client}}
+	conn.events = events
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := conn.Write([]byte("first"))
+		firstDone <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("OnOutbound did not run for the first datagram")
+	}
+	if _, err := conn.Write([]byte("second!")); err != nil {
+		t.Fatalf("second Write error = %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("OnOutbound ran %d times while the first call was still running", got)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first Write error = %v", err)
+	}
+	if got := reported.Load(); got != int64(len("first")+len("second!")) {
+		t.Fatalf("OnOutbound reported %d bytes, want %d", got, len("first")+len("second!"))
+	}
+
+	// Many senders at once: the reports never overlap and add up to what was sent.
+	var sent atomic.Int64
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 200 {
+				if n, err := conn.Write([]byte("burst")); err == nil {
+					sent.Add(int64(n))
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if n := overlap.Load(); n != 0 {
+		t.Fatalf("OnOutbound overlapped %d times for one UDP connection", n)
+	}
+	if want := int64(len("first")+len("second!")) + sent.Load(); reported.Load() != want {
+		t.Fatalf("OnOutbound reported %d bytes, want %d", reported.Load(), want)
+	}
+}
