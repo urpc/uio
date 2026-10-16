@@ -587,12 +587,13 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 	return true, nil
 }
 
-// sendShortLocked is send for a server's common single reply: a small,
-// uncompressed message of under 126 bytes, with no batch to hand over first,
-// no heartbeat and no close in progress. It encodes the frame straight into the
-// transport's outbound queue, which the connection's own task can reserve. It
-// reports false, having done nothing, for any message it does not cover,
-// including one sent from outside that task.
+// sendShortLocked is send for a server's common single reply: an
+// uncompressed message of up to shortSendDirect bytes, a 16-bit length at
+// most, with no batch to hand over first, no heartbeat and no close in
+// progress. It encodes the frame straight into the transport's outbound
+// queue, which the connection's own task can reserve. It reports false,
+// having done nothing, for any message it does not cover, including one sent
+// from outside that task and every message of a client, whose limit is -1.
 func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error) {
 	size := len(payload)
 	if c.config == nil || size > c.config.shortSendDirect || c.heartbeat != nil || c.compression != nil || c.batch != nil ||

@@ -18,18 +18,15 @@ type connConfig struct {
 
 	maxHeaderBytes         int
 	writeBufferedThreshold int
-	// shortSendLimit is the largest payload a server sends through the
-	// batching send path: under 126 bytes, within the message and frame
-	// limits, and small enough to be buffered; -1 for a client, which masks.
-	shortSendLimit int
-	// shortSendDirect is the largest payload sendShortLocked takes on the
-	// non-batching path, where the reply takes one transport reservation:
-	// up to a 16-bit length, within the message and frame limits, and small
-	// enough to be buffered; -1 for a client, which masks.
-	shortSendDirect int
-	// shortReadLimit is the largest payload consumeShortFrame takes: under
-	// 126 bytes and within the frame and message limits; -1 for a client,
-	// whose frames arrive unmasked.
+	// The limits of the fused short paths, all set by settleShortLimits and
+	// -1 where a path is off. shortSendLimit is the largest payload a server
+	// sends through the batching send path, under 126 bytes; shortSendDirect
+	// the largest sendShortLocked takes on the non-batching path, up to a
+	// 16-bit length; both within the message and frame limits and small
+	// enough to be buffered. shortReadLimit is the largest seven-bit payload
+	// consumeShortFrame takes, within the frame and message limits.
+	shortSendLimit   int
+	shortSendDirect  int
 	shortReadLimit   int
 	maxOutbound      int // the transport's MaxOutboundBuffered
 	batchBlockSize   int
@@ -106,31 +103,47 @@ func newServerConnConfig(server *Server) *connConfig {
 	if server.HeartbeatInterval > 0 {
 		config.heartbeatConnections = &server.connections
 	}
-	config.shortSendLimit = config.shortSendPayloadLimit()
-	config.shortSendDirect = config.shortSendDirectPayloadLimit()
-	config.shortReadLimit = int(min(125, config.parser.MaxFramePayload, config.assembler.MaxMessage))
+	config.settleShortLimits()
 	return config
 }
 
-// shortSendDirectPayloadLimit is the largest payload sendShortLocked takes
-// on the non-batching send path: up to a 16-bit length, within the message
-// and frame limits, and small enough for the transport to buffer.
-func (config *connConfig) shortSendDirectPayloadLimit() int {
-	if config.client || config.writeBufferedThreshold <= 0 {
-		return -1
+// settleShortLimits derives the limits of the fused short paths. Both
+// constructors call it last, once the fields it reads are set: a client takes
+// none of the paths, since it masks what it sends and reads frames unmasked,
+// so every limit is -1 there.
+func (config *connConfig) settleShortLimits() {
+	if config.client {
+		config.shortSendLimit, config.shortSendDirect, config.shortReadLimit = -1, -1, -1
+		return
 	}
-	limit := uint64(min(0xFFFF, config.writeBufferedThreshold-3))
-	limit = min(limit, config.assembler.MaxMessage, config.parser.MaxFramePayload)
-	return int(limit)
+	config.shortSendLimit = config.withinMessageLimits(bufferedPayloadLimit(config.writeBufferedThreshold, 125))
+	config.shortSendDirect = config.withinMessageLimits(bufferedPayloadLimit(config.writeBufferedThreshold, 0xFFFF))
+	config.shortReadLimit = config.withinMessageLimits(125)
 }
 
-func (config *connConfig) shortSendPayloadLimit() int {
-	if config.client || config.writeBufferedThreshold <= 0 {
+// bufferedPayloadLimit is the largest unmasked payload of at most maxPayload
+// bytes whose frame is smaller than threshold, the size below which the
+// transport buffers a write, or -1 when no frame is that small. A payload of
+// 126 bytes or more takes a 16-bit length and a header two bytes wider.
+func bufferedPayloadLimit(threshold, maxPayload int) int {
+	if limit := min(threshold-5, maxPayload); limit >= 126 {
+		return limit
+	}
+	return max(-1, min(threshold-3, 125, maxPayload))
+}
+
+// withinMessageLimits lowers limit to the frame and message limits, either of
+// which is unlimited at zero, as the parser and assembler read them.
+func (config *connConfig) withinMessageLimits(limit int) int {
+	if limit < 0 {
 		return -1
 	}
-	limit := uint64(min(125, config.writeBufferedThreshold-3))
-	limit = min(limit, config.assembler.MaxMessage, config.parser.MaxFramePayload)
-	return int(limit)
+	for _, bound := range [...]uint64{config.parser.MaxFramePayload, config.assembler.MaxMessage} {
+		if bound != 0 && bound < uint64(limit) {
+			limit = int(bound)
+		}
+	}
+	return limit
 }
 
 // newDialerConnConfig freezes the dialer's protocol and timeout policy for all
@@ -149,10 +162,8 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 	handshakeTimeout := dialer.handshakeTimeout()
 	compressionLevel := dialer.compressionLevel()
 
-	return &connConfig{
-		client:         true,
-		shortSendLimit: -1,
-		shortReadLimit: -1,
+	config := &connConfig{
+		client: true,
 		parser: frame.ParserConfig{
 			AllowRSV1: dialer.EnableCompression, MaxFramePayload: maxFrame,
 		},
@@ -169,6 +180,8 @@ func newDialerConnConfig(dialer *Dialer) *connConfig {
 		compressionLevel:       compressionLevel,
 		subprotocols:           append([]string(nil), dialer.Subprotocols...),
 	}
+	config.settleShortLimits()
+	return config
 }
 
 func (config *connConfig) clientExtensions() string {

@@ -261,8 +261,9 @@ func (sink *connFrameSink) AcceptFrame(f frame.Frame) error {
 // other frame or a frame that is not complete yet. When more input follows
 // the frame, the round's replies are batched.
 //
-// limit is the connection's shortReadLimit: the largest payload within the
-// frame and message limits, or -1 when frames are not expected masked.
+// limit is the connection's shortReadLimit: the largest seven-bit payload
+// within the frame and message limits, or -1 when frames are not expected
+// masked.
 func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 	if len(src) < 6 || c.assembler != nil {
 		return 0, false, nil
@@ -283,7 +284,9 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 		}
 		n = int(binary.BigEndian.Uint16(src[2:4]))
 		head = 4
-		if (c.config.parser.MaxFramePayload != 0 && uint64(n) > c.config.parser.MaxFramePayload) ||
+		// A length under 126 encoded in 16 bits is not canonical: the
+		// generic parser refuses it with a protocol error.
+		if n < 126 || (c.config.parser.MaxFramePayload != 0 && uint64(n) > c.config.parser.MaxFramePayload) ||
 			(c.config.assembler.MaxMessage != 0 && uint64(n) > c.config.assembler.MaxMessage) {
 			return 0, false, nil
 		}

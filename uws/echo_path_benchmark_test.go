@@ -2,6 +2,7 @@ package uws
 
 import (
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/urpc/uio"
@@ -16,6 +17,7 @@ type echoPathConn struct {
 	inbound  []byte
 	out      []byte
 	userdata any
+	closes   atomic.Int32 // CloseWith calls, from the close timer among others
 }
 
 func (c *echoPathConn) PeekChunk() []byte    { return c.inbound }
@@ -23,6 +25,11 @@ func (c *echoPathConn) InboundBuffered() int { return len(c.inbound) }
 func (c *echoPathConn) Userdata() any        { return c.userdata }
 func (c *echoPathConn) Flush() error         { return nil }
 func (c *echoPathConn) YieldRead() error     { return nil }
+
+func (c *echoPathConn) CloseWith(error) error {
+	c.closes.Add(1)
+	return nil
+}
 
 func (c *echoPathConn) Discard(n int) (int, error) {
 	c.inbound = c.inbound[n:]
