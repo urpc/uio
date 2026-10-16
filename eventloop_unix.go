@@ -72,6 +72,42 @@ func loopWaiters(procs, loops int) int {
 // kernel as before.
 const parkedWaiters = 8
 
+// A waiter that is its loop's only waiter parks in the runtime's netpoller
+// while its rounds are busy, and blocks in the kernel once they go quiet: an
+// event wakes the blocked thread directly, without the runtime's netpoll pass
+// a parked waiter pays on every event, a hand-off measured at one futex wake
+// per request on a ten-connection echo. Under load the parked wait wins
+// again, since a waiter that blocks holds its P through every wait; that cost
+// up to nine percent of throughput on a saturated host. So quietWaits rounds
+// in a row of quietBatch events or fewer, which a loaded waiter never sees,
+// send it to block, and a round of parkBatch events or more sends it back to
+// park. Rounds in between hold the mode and only break the quiet streak.
+//
+// Only a loop's only waiter takes this up (see waitMode): two blocked waiters
+// on one poller both wake for every event, each holding a P that a small host
+// has none of to spare, which cost the pipeline up to 34 and 17 percent on
+// two- and four-P hosts. A host that runs more waiters than parkedWaiters
+// keeps the blocking wait it always had.
+const (
+	parkBatch  = 16
+	quietBatch = 4
+	quietWaits = 50
+)
+
+// waitMode is how a loop's waiters wait; see the quietBatch block.
+type waitMode uint8
+
+const (
+	// waitAdaptive parks while the loop is busy and blocks once it goes
+	// quiet; a loop's only waiter takes it where the host runs few enough
+	// waiters (see initLoops).
+	waitAdaptive waitMode = iota
+	// waitPark always parks in the runtime's netpoller.
+	waitPark
+	// waitBlock always blocks in the kernel.
+	waitBlock
+)
+
 // flushEvery bounds how many readiness events a waiter folds before the
 // connections collected so far are handed to the executor, so a connection at
 // the head of a deep batch reaches running workers without waiting out the
@@ -111,6 +147,27 @@ type loopWaiter struct {
 	evbuf []poller.Event
 	ready []*fdConn
 	args  []IOTask
+
+	// block selects the blocking wait over the parked one, adaptive lets the
+	// waiter's own load switch between them, and quiet counts the quiet
+	// rounds in a row while it parks. See the quietBatch block.
+	block    bool
+	adaptive bool
+	quiet    int
+}
+
+// noteLoad folds one round of events into the waiter's wait mode.
+func (waiter *loopWaiter) noteLoad(events int) {
+	switch {
+	case events >= parkBatch:
+		waiter.block, waiter.quiet = false, 0
+	case events > quietBatch:
+		waiter.quiet = 0
+	case !waiter.block:
+		if waiter.quiet++; waiter.quiet == quietWaits {
+			waiter.block, waiter.quiet = true, 0
+		}
+	}
 }
 
 // newEventLoop creates one poller. Events shares one ioPool across all loops;
@@ -231,12 +288,14 @@ func (loop *eventLoop) newWaiter() *loopWaiter {
 	return waiter
 }
 
-// start runs count waiters on the poller.
-func (loop *eventLoop) start(count int, parked, lockOSThread bool) {
+// start runs count waiters on the poller, waiting as mode says.
+func (loop *eventLoop) start(count int, mode waitMode, lockOSThread bool) {
 	// A waiter yields unless it is the process's only one.
 	yield := count > 1 || len(loop.events.loops) > 1
 	for range count {
 		waiter := loop.newWaiter()
+		waiter.block = mode == waitBlock
+		waiter.adaptive = mode == waitAdaptive
 		loop.waiters.Add(1)
 		go func() {
 			defer loop.waiters.Done()
@@ -247,7 +306,7 @@ func (loop *eventLoop) start(count int, parked, lockOSThread bool) {
 			if testHookWaiterStarted != nil {
 				testHookWaiterStarted(lockOSThread)
 			}
-			if err := loop.serve(waiter, yield, parked); err != nil {
+			if err := loop.serve(waiter, yield); err != nil {
 				loop.events.initiateClose(err)
 			}
 		}()
@@ -258,7 +317,9 @@ func (loop *eventLoop) start(count int, parked, lockOSThread bool) {
 // thread association it took; nil outside tests.
 var testHookWaiterStarted func(locked bool)
 
-// serve dispatches the loop's readiness until the poller is closed.
+// serve dispatches the loop's readiness until the poller is closed. A waiter
+// waits as its mode says: adapted to its own load, parked, or blocked; see
+// the quietBatch block.
 //
 // Unless it is the only waiter in the process, a waiter that handed tasks to
 // the executor yields before it waits again. The executor's wake-ups queue the
@@ -266,14 +327,14 @@ var testHookWaiterStarted func(locked bool)
 // while other Ps may sit idle; yielding runs them at once while the other
 // waiters keep collecting. The only waiter of a process must not yield: it
 // would queue behind the very workers it woke, with nobody collecting.
-func (loop *eventLoop) serve(waiter *loopWaiter, yield, parked bool) error {
+func (loop *eventLoop) serve(waiter *loopWaiter, yield bool) error {
 	for {
 		var n int
 		var err error
-		if parked {
-			n, err = loop.poller.WaitBatchParked(&waiter.batch, waiter.evbuf)
-		} else {
+		if waiter.block {
 			n, err = loop.poller.WaitBatch(&waiter.batch, waiter.evbuf, -1)
+		} else {
+			n, err = loop.poller.WaitBatchParked(&waiter.batch, waiter.evbuf)
 		}
 		if loop.poller.Closed() {
 			loop.submit(waiter)
@@ -281,6 +342,9 @@ func (loop *eventLoop) serve(waiter *loopWaiter, yield, parked bool) error {
 		}
 		if err != nil {
 			return err
+		}
+		if waiter.adaptive {
+			waiter.noteLoad(n)
 		}
 		submitted := loop.dispatch(waiter, waiter.evbuf[:n])
 		if loop.submit(waiter) {

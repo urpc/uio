@@ -16,7 +16,7 @@ type testLoopStop struct {
 // loop of its Events, so a white-box test drives a loop the way Serve does.
 func startTestLoop(events *Events, loop *eventLoop) {
 	events.loops = []*eventLoop{loop}
-	loop.start(1, false, false)
+	loop.start(1, waitBlock, false)
 }
 
 // stopTestLoop shuts loop down in the order Events does and returns a channel

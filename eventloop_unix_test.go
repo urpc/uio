@@ -538,3 +538,44 @@ func TestFlushCountsFilteredEvents(t *testing.T) {
 		t.Fatalf("ready list = %d, want flushed at the mark", len(waiter.ready))
 	}
 }
+
+// TestWaiterNoteLoadSwitchesOnQuietAndLoad pins the adaptive wait's
+// thresholds: a lone waiter parks while its rounds carry parkBatch events or
+// more, blocks after quietWaits rounds of quietBatch events or fewer, and a
+// round in between only breaks the quiet streak.
+func TestWaiterNoteLoadSwitchesOnQuietAndLoad(t *testing.T) {
+	waiter := &loopWaiter{}
+	quiet := func(rounds int) {
+		t.Helper()
+		for range rounds {
+			waiter.noteLoad(quietBatch)
+		}
+	}
+
+	quiet(quietWaits - 1)
+	if waiter.block {
+		t.Fatalf("a waiter blocked short of %d quiet rounds", quietWaits)
+	}
+	waiter.noteLoad(quietBatch + 1)
+	quiet(quietWaits - 1)
+	if waiter.block {
+		t.Fatalf("a round of %d events did not break the quiet streak", quietBatch+1)
+	}
+	quiet(1)
+	if !waiter.block {
+		t.Fatalf("a waiter did not block after %d quiet rounds", quietWaits)
+	}
+
+	quiet(quietWaits)
+	if !waiter.block {
+		t.Fatal("a quiet round took a blocked waiter out of its wait")
+	}
+	waiter.noteLoad(parkBatch)
+	if waiter.block {
+		t.Fatalf("a round of %d events did not send a blocked waiter back to park", parkBatch)
+	}
+	waiter.noteLoad(quietBatch)
+	if waiter.block {
+		t.Fatal("one quiet round blocked a waiter that had just parked")
+	}
+}
