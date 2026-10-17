@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
@@ -370,4 +371,80 @@ func (c *batchCaptureConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 	c.written = append(c.written, buffer.Bytes()...)
 	uio.ReleaseBuffer(buffer)
 	return n, nil
+}
+
+// textOfLength builds valid UTF-8 of exactly size bytes. With multibyte it
+// starts off a 32-byte boundary and repeats two-, three- and four-byte
+// sequences, so they straddle every vector and word boundary.
+func textOfLength(size int, multibyte bool) []byte {
+	if !multibyte {
+		return bytes.Repeat([]byte("{\"k\":1}"), size/7+1)[:size]
+	}
+	out := make([]byte, 0, size)
+	out = append(out, "abc"[:min(3, size)]...)
+	runes := []string{"é", "€", "😀"}
+	for i := 0; len(out) < size; i++ {
+		r := runes[i%len(runes)]
+		if len(out)+len(r) > size {
+			out = append(out, bytes.Repeat([]byte{'x'}, size-len(out))...)
+			break
+		}
+		out = append(out, r...)
+	}
+	return out
+}
+
+// Text frames take the vector unmask from frame.VectorUnmaskMin bytes with
+// the ASCII verdict folded in: every length around the word and vector steps
+// delivers ASCII and multibyte UTF-8 byte for byte as text, and refuses
+// invalid UTF-8 wherever it sits, before the handler sees it.
+func TestShortPathTextFramesValidateAcrossTheVectorThreshold(t *testing.T) {
+	sizes := []int{0, 1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 125, 126, 127, 128, 129, 130, 159, 160, 161,
+		255, 256, 257, 511, 1023, 1024, 1025, 4095, 4096, 4097, 65535, 70000}
+	bad := [][]byte{{0xff}, {0xc0, 0xaf}, {0xed, 0xa0, 0x80}, {0xe2, 0x82}, {0x80}}
+	run := func(payload []byte) ([]Message, error, bool) {
+		var got []Message
+		server := NewServer(messageLog{&got})
+		server.config = newServerConnConfig(server)
+		raw := &echoPathConn{}
+		conn := server.newConnection(raw)
+		conn.opened.Store(true)
+		raw.userdata = conn
+		defer server.onClose(raw, io.EOF)
+		raw.inbound = frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: payload}, [4]byte{0xf1, 0x80, 0x3c, 0x9a})
+		raw.out = make([]byte, 0, 64) // room for the Close frame a refusal sends
+		err := server.onData(raw)
+		return got, err, conn.closing.Load()
+	}
+	for _, size := range sizes {
+		for _, multibyte := range []bool{false, true} {
+			payload := textOfLength(size, multibyte)
+			if !utf8.Valid(payload) || len(payload) != size {
+				t.Fatalf("size %d multibyte %v: the generator broke", size, multibyte)
+			}
+			got, err, closing := run(append([]byte(nil), payload...))
+			if err != nil || closing || len(got) != 1 || got[0].Type != TextMessage || !bytes.Equal(got[0].Payload, payload) {
+				t.Fatalf("size %d multibyte %v: err %v closing %v, %d messages", size, multibyte, err, closing, len(got))
+			}
+		}
+		for _, seq := range bad {
+			if size < len(seq) {
+				continue
+			}
+			for _, at := range []int{0, size / 2, size - len(seq), 31, 32, 127, 128} {
+				if at < 0 || at+len(seq) > size {
+					continue
+				}
+				payload := textOfLength(size, false)
+				copy(payload[at:], seq)
+				if utf8.Valid(payload) {
+					continue
+				}
+				got, err, closing := run(payload)
+				if (err == nil && !closing) || len(got) != 0 {
+					t.Fatalf("size %d: invalid UTF-8 %x at %d accepted (err %v closing %v, %d messages)", size, seq, at, err, closing, len(got))
+				}
+			}
+		}
+	}
 }

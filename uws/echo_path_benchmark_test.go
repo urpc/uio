@@ -1,9 +1,11 @@
 package uws
 
 import (
+	"bytes"
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
@@ -154,5 +156,66 @@ func BenchmarkServerEchoPathSplitReads(b *testing.B) {
 			}
 			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*frames), "ns/frame")
 		})
+	}
+}
+
+type echoTextHandler struct{}
+
+func (echoTextHandler) OnOpen(*Conn) {}
+
+func (echoTextHandler) OnMessage(conn *Conn, message Message) { _ = conn.SendText(message.Payload) }
+
+func (echoTextHandler) OnClose(*Conn, CloseEvent) {}
+
+// Run with:
+//
+//	go test -run '^$' -bench '^BenchmarkServerEchoPathText$' -benchmem ./uws
+//
+// BenchmarkServerEchoPath for text frames, which also pay the UTF-8 check:
+// ASCII JSON, and text that is mostly multibyte.
+func BenchmarkServerEchoPathText(b *testing.B) {
+	for _, multibyte := range []bool{false, true} {
+		for _, size := range []int{128, 1024, 4000} {
+			b.Run(fmt.Sprintf("multibyte=%v/payload=%d", multibyte, size), func(b *testing.B) {
+				server := NewServer(echoTextHandler{})
+				server.config = newServerConnConfig(server)
+				raw := &echoPathConn{}
+				conn := server.newConnection(raw)
+				conn.opened.Store(true)
+				raw.userdata = conn
+
+				unit := []byte(`{"k":"v"}`)
+				if multibyte {
+					unit = []byte("文本帧")
+				}
+				payload := bytes.Repeat(unit, size/len(unit)+1)[:size/len(unit)*len(unit)]
+				// ASCII fills the rest, so every case is exactly its size and
+				// the 128-byte one reaches frame.VectorUnmaskMin.
+				payload = append(payload, bytes.Repeat([]byte{'x'}, size-len(payload))...)
+				if len(payload) != size || !utf8.Valid(payload) {
+					b.Fatalf("payload of %d bytes (valid UTF-8 %v), want %d", len(payload), utf8.Valid(payload), size)
+				}
+				const frames = 8
+				var wire []byte
+				for range frames {
+					wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: payload}, [4]byte{1, 2, 3, 4})
+				}
+				chunk := make([]byte, len(wire))
+				raw.out = make([]byte, 0, frames*(len(payload)+14))
+
+				b.SetBytes(int64(frames * len(payload)))
+				b.ReportAllocs()
+				b.ResetTimer()
+				for range b.N {
+					copy(chunk, wire)
+					raw.inbound = chunk
+					raw.out = raw.out[:0]
+					if err := server.onData(raw); err != nil {
+						b.Fatal(err)
+					}
+				}
+				b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*frames), "ns/frame")
+			})
+		}
 	}
 }

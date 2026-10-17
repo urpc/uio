@@ -298,14 +298,17 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 	}
 	size := head + 4 + n
 	payload := src[head+4 : size : size]
-	// A binary payload needs no ASCII verdict for the UTF-8 check below, and
-	// from VectorUnmaskMin bytes the frame package's vector unmask beats the
-	// fused word loop, which a text payload keeps.
+	// From VectorUnmaskMin bytes the frame package's vector unmask beats the
+	// fused word loop: a binary payload needs no ASCII verdict for the UTF-8
+	// check below, and a text payload takes it from the same pass.
 	ascii := false
-	if b0 == 0x80|byte(frame.Binary) && n >= frame.VectorUnmaskMin {
-		frame.Unmask(payload, [4]byte(src[head:head+4]))
-	} else {
+	switch {
+	case n < frame.VectorUnmaskMin:
 		ascii = unmaskShort(payload, binary.LittleEndian.Uint32(src[head:head+4]))
+	case b0 == 0x80|byte(frame.Binary):
+		frame.Unmask(payload, [4]byte(src[head:head+4]))
+	default:
+		ascii = frame.UnmaskASCII(payload, [4]byte(src[head:head+4]))
 	}
 	if size < len(src) {
 		c.beginWriteBatch()
