@@ -638,10 +638,10 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 	}
 	defer loop.poller.Close(nil)
 	events.loops = []*eventLoop{loop}
-	if events.selectLoop(1) != loop {
+	if events.selectLoop() != loop {
 		t.Fatal("the only loop was not selected")
 	}
-	if (&Events{}).selectLoop(1) != nil {
+	if (&Events{}).selectLoop() != nil {
 		t.Fatal("selectLoop returned a loop from an empty set")
 	}
 

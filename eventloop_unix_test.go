@@ -579,3 +579,94 @@ func TestWaiterNoteLoadSwitchesOnQuietAndLoad(t *testing.T) {
 		t.Fatal("one quiet round blocked a waiter that had just parked")
 	}
 }
+
+// TestAcceptedConnectionsGoRoundTheLoops pins how accepted connections are
+// spread: in turn, whatever their descriptor numbers. Clients dialing from
+// this process take every other descriptor, so the connections the server
+// accepts all have numbers of one parity, and placing them by number would put
+// every one of them on the same one of two loops.
+func TestAcceptedConnectionsGoRoundTheLoops(t *testing.T) {
+	loopWaitersOverride = 1
+	t.Cleanup(func() { loopWaitersOverride = 0 })
+
+	const conns = 20
+	opened := make(chan *fdConn, conns)
+	events := &Events{Pollers: 2}
+	events.OnOpen = func(c Conn) { opened <- c.(*fdConn) }
+	addr := startEchoEvents(t, events)
+
+	perLoop := map[*eventLoop]int{}
+	fdParity := map[int32]int{}
+	for i := 0; i < conns; i++ {
+		client, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		select {
+		case conn := <-opened:
+			perLoop[conn.loop]++
+			fdParity[conn.fd%2]++
+		case <-time.After(5 * time.Second):
+			t.Fatal("connection was not opened")
+		}
+	}
+	if len(fdParity) != 1 {
+		t.Logf("accepted descriptors were not all of one parity (%v); the spread still holds", fdParity)
+	}
+	if len(perLoop) != 2 {
+		t.Fatalf("accepted connections used %d loops, want 2: %v", len(perLoop), perLoop)
+	}
+	for loop, n := range perLoop {
+		if n != conns/2 {
+			t.Fatalf("loop %p took %d of %d connections, want %d", loop, n, conns, conns/2)
+		}
+	}
+}
+
+// TestSelectLoopGoesRoundTheLoops pins the same spread for connections that
+// are dialed or adopted rather than accepted.
+func TestSelectLoopGoesRoundTheLoops(t *testing.T) {
+	loops := []*eventLoop{{}, {}, {}}
+	events := &Events{}
+	events.loops = loops
+	got := map[*eventLoop]int{}
+	for range 3 * len(loops) {
+		got[events.selectLoop()]++
+	}
+	for i, loop := range loops {
+		if got[loop] != 3 {
+			t.Fatalf("loop %d picked %d times out of %d, want 3", i, got[loop], 3*len(loops))
+		}
+	}
+}
+
+// TestTurnKeyKeepsALoopOnItsOwnShards pins how turns are keyed: where the
+// shards are a multiple of the loops, every connection of a loop lands on the
+// loop's own subset of shards, and the loop's connections spread over all of
+// that subset, whatever descriptors they have.
+func TestTurnKeyKeepsALoopOnItsOwnShards(t *testing.T) {
+	const loops, shards = 6, 48
+	for index := uint32(0); index < loops; index++ {
+		loop := &eventLoop{index: index, count: loops}
+		seen := map[uint32]bool{}
+		for fd := int32(3); fd < 3+4*shards; fd++ {
+			conn := &fdConn{fd: fd}
+			conn.loop = loop
+			shard := conn.turnKey() % shards
+			if shard%loops != index {
+				t.Fatalf("fd %d of loop %d went to shard %d, outside the loop's subset", fd, index, shard)
+			}
+			if (*writeTurn)(conn).ShardKey() != conn.ShardKey() {
+				t.Fatalf("fd %d: write turn key differs from the connection's", fd)
+			}
+			seen[shard] = true
+		}
+		if len(seen) != shards/loops {
+			t.Fatalf("loop %d used %d shards, want its %d", index, len(seen), shards/loops)
+		}
+	}
+	if got := (&fdConn{fd: 9}).turnKey(); got != 9 {
+		t.Fatalf("a connection without a loop is keyed %d, want its descriptor", got)
+	}
+}

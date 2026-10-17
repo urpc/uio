@@ -33,8 +33,9 @@ const writeShardCapacity = 1024
 const turnShardsPerP = 2
 
 // ioTaskPool runs connection turns on a taskgo queue and write turns on UIO's
-// own sharded scheduler, both keyed by descriptor (see taskgo.NewTaskKeyed and
-// internal/shardpool), or both on a caller-supplied Executor. Input and output
+// own sharded scheduler, both keyed by connection (see fdConn.turnKey,
+// taskgo.NewTaskKeyed and internal/shardpool), or both on a caller-supplied
+// Executor. Input and output
 // bytes always remain owned by their connection rather than the scheduler
 // queue. The pool keeps no per-task accounting of its own: every submitted
 // turn is already counted by its loop's turn count, which Events joins before
@@ -56,8 +57,8 @@ type ioTaskPool struct {
 	stopOnce sync.Once
 }
 
-func turnKey(conn *fdConn) uint32         { return uint32(conn.fd) }
-func writeTurnKey(turn *writeTurn) uint32 { return uint32(turn.fd) }
+func turnKey(conn *fdConn) uint32         { return conn.turnKey() }
+func writeTurnKey(turn *writeTurn) uint32 { return (*fdConn)(turn).turnKey() }
 
 func newIOTaskPool(executor Executor) *ioTaskPool {
 	pool := &ioTaskPool{executor: executor}

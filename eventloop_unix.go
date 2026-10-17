@@ -139,6 +139,12 @@ type eventLoop struct {
 	ioIdle     chan struct{}
 	ioIdleOnce sync.Once
 	waiters    sync.WaitGroup
+
+	// index is the loop's position among count loops; together they key the
+	// turns of the loop's connections (see fdConn.turnKey). A loop made on its
+	// own counts as the only one.
+	index uint32
+	count uint32
 }
 
 // loopWaiter is one waiter goroutine's private dispatch state.
@@ -154,6 +160,11 @@ type loopWaiter struct {
 	block    bool
 	adaptive bool
 	quiet    int
+
+	// accepted counts the connections the waiter accepted, which go round
+	// the loops in turn (see Events.loopAt); a count of its own keeps the
+	// accepting waiters off one shared counter.
+	accepted uint32
 }
 
 // noteLoad folds one round of events into the waiter's wait mode.
@@ -190,6 +201,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		ioPool:      ioPool,
 		ioPoolOwner: owner,
 		ioIdle:      make(chan struct{}),
+		count:       1,
 	}, nil
 }
 
@@ -458,7 +470,8 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 		conn := &fdConn{}
 		conn.fd = int32(nfd)
 		conn.events = loop.events
-		conn.loop = loop.events.selectLoop(nfd)
+		conn.loop = loop.events.loopAt(waiter.accepted)
+		waiter.accepted++
 		conn.addr = l.pair
 		if l.tcp {
 			conn.remoteAddr = socket.SockaddrToAddrPort(sa)

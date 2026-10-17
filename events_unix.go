@@ -24,6 +24,7 @@ import (
 	"net/url"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/urpc/uio/internal/socket"
@@ -84,7 +85,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 	}
 	fdc.setRemoteAddr(remoteAddr)
 	fdc.SetUserdata(userdata)
-	fdc.loop = ev.selectLoop(fd)
+	fdc.loop = ev.selectLoop()
 	if err = ev.addConn(fdc); err != nil {
 		return nil, err
 	}
@@ -146,7 +147,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	fdc.setLocalAddr(lAddr)
 	fdc.setRemoteAddr(rAddr)
 	fdc.events = ev
-	fdc.loop = ev.selectLoop(nfd)
+	fdc.loop = ev.selectLoop()
 	if strings.HasPrefix(u.Scheme, "udp") {
 		fdc.udp = &unixUDPState{}
 	}
@@ -160,8 +161,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 // loopState is this backend's share of Events: the event loops, each one
 // poller and the goroutines that wait on it, and the signal that ends Serve.
 type loopState struct {
-	loops   []*eventLoop
-	stopped chan struct{} // closed once Close has been requested
+	loops    []*eventLoop
+	stopped  chan struct{} // closed once Close has been requested
+	nextLoop atomic.Uint32 // picks the loops of connections not accepted by a waiter
 }
 
 // initLoops creates the shared connection scheduler and Pollers loops, and
@@ -186,6 +188,9 @@ func (ev *Events) initLoops() (err error) {
 			ev.ioPool.stop()
 			return err
 		}
+	}
+	for idx, loop := range ev.loops {
+		loop.index, loop.count = uint32(idx), uint32(len(ev.loops))
 	}
 	procs := runtime.GOMAXPROCS(0)
 	waiters := loopWaiters(procs, len(ev.loops))
@@ -287,11 +292,24 @@ func (ev *Events) stopIOPool() {
 	ev.ioPool.stop()
 }
 
-func (ev *Events) selectLoop(fd int) *eventLoop {
+// selectLoop picks the loop a dialed, adopted or UDP connection registers
+// with; see loopAt.
+func (ev *Events) selectLoop() *eventLoop {
 	if len(ev.loops) == 0 {
 		return nil
 	}
-	return ev.loops[fd%len(ev.loops)]
+	return ev.loopAt(ev.nextLoop.Add(1))
+}
+
+// loopAt is the loop of the nth pick. Connections go round the loops in turn
+// rather than by descriptor number: descriptors are handed out lowest first,
+// so a server that opens a few of them per connection, as a proxy pairs each
+// client with an upstream, would put every connection of one kind on the
+// same few loops. A loop's connections share its poller, and with it the
+// waiter that collects their readiness and the lock their registrations and
+// closes take.
+func (ev *Events) loopAt(n uint32) *eventLoop {
+	return ev.loops[n%uint32(len(ev.loops))]
 }
 
 func (ev *Events) addConn(fdc *fdConn) error {

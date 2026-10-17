@@ -109,7 +109,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			peers: make(map[socket.UDPAddress]*fdConn),
 		}
 		l.file = nil
-		l.udpSvr.loop = ld.events.selectLoop(l.fd)
+		l.udpSvr.loop = ld.events.selectLoop()
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
 		l.udpSvr.addr = l.pair

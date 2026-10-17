@@ -409,9 +409,24 @@ func (conn *fdConn) handleWriteSubmitFailure() {
 type writeTurn fdConn
 
 // ShardKey implements IOTask: a connection's turns and its write turns share
-// its descriptor as their key.
-func (conn *fdConn) ShardKey() uint32    { return uint32(conn.fd) }
-func (turn *writeTurn) ShardKey() uint32 { return uint32(turn.fd) }
+// one key; see turnKey.
+func (conn *fdConn) ShardKey() uint32    { return conn.turnKey() }
+func (turn *writeTurn) ShardKey() uint32 { return (*fdConn)(turn).turnKey() }
+
+// turnKey keys a connection's turns by its loop first, its descriptor second.
+// The loop collects their readiness and hands them over in one batch per
+// round, and where the shards are a multiple of the loops, as they are by
+// default, the loop's connections share a subset of the shards of their own:
+// a round's batch then wakes the few workers serving that subset with several
+// turns each, rather than one worker per turn. Keyed by descriptor alone, as
+// the loops pick connections in turn (see Events.loopAt), a closed-loop echo's
+// p99 at 512 connections rose by 60%.
+func (conn *fdConn) turnKey() uint32 {
+	if conn.loop == nil {
+		return uint32(conn.fd)
+	}
+	return conn.loop.index + conn.loop.count*uint32(conn.fd)
+}
 
 // RunTask implements IOTask for the write turn.
 func (turn *writeTurn) RunTask() {
