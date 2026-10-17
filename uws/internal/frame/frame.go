@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"unicode/utf8"
 
 	"github.com/urpc/uio/internal/pool"
 )
@@ -679,7 +678,7 @@ func (a *Assembler) exceedsPayloadLimit(incoming int, compressed bool) bool {
 }
 
 func (a *Assembler) emitMessage(m Message, onMessage func(Message) error) error {
-	if assemblerValidateUTF8(a.cfg) && m.Opcode == Text && !m.Compressed && !utf8.Valid(m.Payload) {
+	if assemblerValidateUTF8(a.cfg) && m.Opcode == Text && !m.Compressed && !ValidUTF8(m.Payload) {
 		return ErrInvalidUTF8
 	}
 	return onMessage(m)
@@ -762,7 +761,7 @@ func ValidateClosePayload(payload []byte) error {
 	if !validCloseCode(code) {
 		return protocolError("invalid close code %d", code)
 	}
-	if !utf8.Valid(payload[2:]) {
+	if !ValidUTF8(payload[2:]) {
 		return ErrInvalidUTF8
 	}
 	return nil

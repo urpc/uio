@@ -9,7 +9,6 @@ import (
 	"net"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
@@ -317,7 +316,7 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 		return size, true, ErrClosed
 	}
 	opcode := frame.OpCode(b0 & 0x0f)
-	if opcode == frame.Text && !ascii && c.config.assembler.ValidateUTF8 && !utf8.Valid(payload) {
+	if opcode == frame.Text && !ascii && c.config.assembler.ValidateUTF8 && !frame.ValidUTF8(payload) {
 		return size, true, frame.ErrInvalidUTF8
 	}
 	// notifyMessage, inline: this runs for every frame of a pipelined round.
@@ -783,7 +782,7 @@ func (c *Conn) acceptFrame(f frame.Frame) error {
 			if cfg.MaxMessage != 0 && uint64(len(f.Payload)) > cfg.MaxMessage {
 				return frame.ErrMessageTooBig
 			}
-			if f.Opcode == frame.Text && cfg.ValidateUTF8 && !utf8.Valid(f.Payload) {
+			if f.Opcode == frame.Text && cfg.ValidateUTF8 && !frame.ValidUTF8(f.Payload) {
 				return frame.ErrInvalidUTF8
 			}
 			return c.notifyMessage(Message{Type: messageType(f.Opcode), Payload: f.Payload})
@@ -819,7 +818,7 @@ func (c *Conn) acceptMessage(message frame.Message) error {
 			return frame.ErrProtocol
 		}
 		return c.compression.decoder.DecodeBorrowed(message.Payload, c.maxMessageSizeInt(), func(payload []byte) error {
-			if message.Opcode == frame.Text && c.utf8ValidationEnabled() && !utf8.Valid(payload) {
+			if message.Opcode == frame.Text && c.utf8ValidationEnabled() && !frame.ValidUTF8(payload) {
 				return frame.ErrInvalidUTF8
 			}
 			return c.notifyMessage(Message{Type: messageType(message.Opcode), Payload: payload})
