@@ -972,10 +972,12 @@ func (fc *fdConn) listenUDP() error {
 		fc.events.onSocketBytesRead(udpConn, n)
 
 		// fire udp on-data event.
+		started := udpConn.beginInboundCallback()
 		err = fc.events.onData(udpConn)
 
 		// drop unread udp packet.
 		_, _ = udpConn.Discard(-1)
+		udpConn.endInboundCallback(started)
 		udpConn.callbackMu.Unlock()
 
 		if nil != err {

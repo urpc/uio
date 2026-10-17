@@ -1175,11 +1175,10 @@ func (conn *fdConn) ReserveInbound(n int) error {
 func (conn *fdConn) onRead() error {
 	holder := conn.events.readPool.Get()
 	conn.scratch = holder
-	// A read round is corked: the round's first reply goes straight to the
-	// socket from inside its callback, and the replies after it accumulate in
-	// outbound and are flushed once when the event ends, or each time they
-	// fill a coalescing block, so a burst of reads costs one writev instead
-	// of one syscall per reply.
+	// A read round is corked: its replies accumulate in outbound and are
+	// flushed once when the event ends, or at the mid-round flush once they
+	// pass midFlushThreshold, so a burst of reads costs one writev instead of
+	// one syscall per reply.
 	conn.turn |= turnCorked
 	err := conn.readRound(holder.bytes)
 	conn.turn &^= turnCorked

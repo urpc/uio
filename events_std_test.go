@@ -1249,3 +1249,54 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 		t.Fatalf("OnOutbound reported %d bytes, want %d", reported.Load(), want)
 	}
 }
+
+// A UDP server's OnData runs inside the peer's inbound callback scope, so the
+// inbound methods work there, race-enabled builds included.
+func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
+	started := make(chan net.Addr, 1)
+	got := make(chan string, 1)
+	events := &Events{}
+	events.OnStart = func(ev *Events) {
+		for _, l := range ev.acceptor.listeners {
+			if l.udp != nil {
+				started <- l.udp.LocalAddr()
+				return
+			}
+		}
+	}
+	events.OnData = func(c Conn) error {
+		buf := make([]byte, c.InboundBuffered())
+		n, err := c.Read(buf)
+		got <- string(buf[:n])
+		return err
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-serveDone
+	})
+
+	var addr net.Addr
+	select {
+	case addr = <-started:
+	case err := <-serveDone:
+		t.Fatalf("Serve returned early: %v", err)
+	}
+	client, err := net.Dial("udp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err := client.Write([]byte("datagram")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case s := <-got:
+		if s != "datagram" {
+			t.Fatalf("OnData read %q, want %q", s, "datagram")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnData did not run for the datagram")
+	}
+}
