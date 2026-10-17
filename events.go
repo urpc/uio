@@ -137,9 +137,12 @@ type Events struct {
 	// receive side with MaxInboundBuffered. Zero disables the limit.
 	MaxOutboundBuffered int
 
-	// MaxInboundBuffered limits payload left unread after a callback returns.
-	// Exceeding it closes the connection with ErrInboundOverflow. Zero disables
-	// the limit.
+	// MaxInboundBuffered bounds payload read but not yet consumed. Once
+	// callbacks leave this much unconsumed, the connection stops reading its
+	// socket, so TCP flow control slows the peer instead of the buffer
+	// growing; a Wake whose OnData consumes below the limit reads again. The
+	// buffer exceeds the limit by at most one read. A ReserveInbound larger
+	// than the limit returns ErrInboundOverflow. Zero disables the limit.
 	MaxInboundBuffered int
 
 	// OnOpen fires first for every connection, in the connection's first

@@ -124,6 +124,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			fdc.setLocalAddr(conn.LocalAddr())
 			fdc.setRemoteAddr(conn.RemoteAddr())
 			fdc.writeSig = make(chan struct{}, 1)
+			fdc.readResume = make(chan struct{}, 1)
 
 			_ = ld.events.addConn(fdc)
 		}

@@ -1300,3 +1300,154 @@ func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
 		t.Fatal("OnData did not run for the datagram")
 	}
 }
+
+// Two goroutines setting the read deadline at once leave the held wait and
+// the socket agreeing: the first setter is stopped between its two updates
+// while the second runs, and whichever value ends up recorded is the one the
+// socket enforces once reads resume.
+func TestStdHeldReadDeadlineAgreesWithTheSocket(t *testing.T) {
+	const limit = 16 << 10
+	var consume atomic.Bool
+	closed := make(chan error, 1)
+	events := &Events{
+		Pollers:            1,
+		MaxBufferSize:      4 << 10,
+		MaxInboundBuffered: limit,
+		OnData: func(c Conn) error {
+			if consume.Load() {
+				_, _ = c.Discard(-1)
+			}
+			return nil
+		},
+		OnClose: func(_ Conn, err error) { closed <- err },
+	}
+	client, server := serveInboundTest(t, events)
+	writeUntilStalled(t, client, 16<<20)
+
+	paused, release := make(chan struct{}), make(chan struct{})
+	var stopped atomic.Bool
+	readDeadlineNotedForTest = func() {
+		// Only the first setter stops; sync.Once would make the second wait
+		// for it, ordering the two setters itself.
+		if stopped.CompareAndSwap(false, true) {
+			close(paused)
+			<-release
+		}
+	}
+	t.Cleanup(func() { readDeadlineNotedForTest = nil })
+
+	first := make(chan error, 1)
+	go func() { first <- server.SetReadDeadline(time.Now().Add(100 * time.Millisecond)) }()
+	<-paused
+	second := make(chan error, 1)
+	go func() { second <- server.SetReadDeadline(time.Time{}) }()
+	time.Sleep(50 * time.Millisecond) // the second setter runs, or waits for the first
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-second; err != nil {
+		t.Fatal(err)
+	}
+
+	// Held, the recorded deadline decides; resumed, the socket's does. Either
+	// both expire or neither does.
+	expiredHeld := false
+	select {
+	case <-closed:
+		expiredHeld = true
+	case <-time.After(300 * time.Millisecond):
+	}
+	if expiredHeld {
+		return
+	}
+	consume.Store(true)
+	if err := server.Wake(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("the held wait had no deadline, but the resumed socket read expired: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A deadline cleared while a held wait is deciding it has expired either
+// loses, so the clear reports the connection closed, or wins, so the
+// connection is not closed by the old deadline afterwards: once the clear
+// returns success, the old deadline can no longer close the connection.
+func TestStdHeldDeadlineExpiryAndClearAreOrdered(t *testing.T) {
+	const limit = 16 << 10
+	closed := make(chan error, 1)
+	events := &Events{
+		Pollers:            1,
+		MaxBufferSize:      4 << 10,
+		MaxInboundBuffered: limit,
+		OnData:             func(Conn) error { return nil },
+		OnClose:            func(_ Conn, err error) { closed <- err },
+	}
+	client, server := serveInboundTest(t, events)
+	writeUntilStalled(t, client, 16<<20)
+
+	paused, release := make(chan struct{}), make(chan struct{})
+	var stopped atomic.Bool
+	heldDeadlineExpiredForTest = func() {
+		if stopped.CompareAndSwap(false, true) {
+			close(paused)
+			<-release
+		}
+	}
+	t.Cleanup(func() { heldDeadlineExpiredForTest = nil })
+
+	if err := server.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-paused:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the held wait never found its deadline passed")
+	}
+	cleared := make(chan error, 1)
+	go func() { cleared <- server.SetReadDeadline(time.Time{}) }()
+	time.Sleep(50 * time.Millisecond) // the clear returns, or waits for the expiry
+	close(release)
+	if err := <-cleared; err != nil {
+		if !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("clear error = %v, want success or net.ErrClosed", err)
+		}
+		return // the expiry came first, and the clear saw the connection closing
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("the clear succeeded, but the old deadline closed the connection: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A read deadline the socket refuses leaves the held wait's deadline as it
+// was: both keep the value last set successfully.
+func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
+	const limit = 16 << 10
+	closed := make(chan error, 1)
+	events := &Events{
+		Pollers:            1,
+		MaxBufferSize:      4 << 10,
+		MaxInboundBuffered: limit,
+		OnData:             func(Conn) error { return nil },
+		OnClose:            func(_ Conn, err error) { closed <- err },
+	}
+	client, server := serveInboundTest(t, events)
+	writeUntilStalled(t, client, 16<<20)
+
+	// Closing the socket underneath makes every setter fail while the
+	// connection itself is not closing yet: the held wait reads no socket.
+	_ = server.(*fdConn).conn.Close()
+	if err := server.SetReadDeadline(time.Now().Add(-time.Second)); err == nil {
+		t.Fatal("the socket accepted a deadline after being closed")
+	}
+	select {
+	case err := <-closed:
+		t.Fatalf("a deadline the socket refused closed the connection: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+}

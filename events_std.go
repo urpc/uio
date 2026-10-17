@@ -69,8 +69,9 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 			events: ev,
 			addr:   &addrPair{local: conn.LocalAddr()},
 		},
-		conn:     conn,
-		writeSig: make(chan struct{}, 1),
+		conn:       conn,
+		writeSig:   make(chan struct{}, 1),
+		readResume: make(chan struct{}, 1),
 	}
 	fdc.setRemoteAddr(conn.RemoteAddr())
 	fdc.SetUserdata(userdata)
@@ -133,6 +134,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	fdc.events = ev
 	fdc.loop = ev.selectLoop(fdc.Fd())
 	fdc.writeSig = make(chan struct{}, 1)
+	if fdc.conn != nil {
+		fdc.readResume = make(chan struct{}, 1)
+	}
 
 	if err = ev.addConnContext(dialCtx, fdc); nil != err {
 		return nil, err

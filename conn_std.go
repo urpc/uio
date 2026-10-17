@@ -22,6 +22,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -71,6 +72,19 @@ type fdConn struct {
 	closing    atomic.Bool
 	callbackMu sync.Mutex // serializes OnData, Wake, and OnClose
 	internal   bool       // framework-owned endpoint, not a user connection
+
+	// readHeld stops the read goroutine once callbacks leave
+	// MaxInboundBuffered bytes unconsumed; it waits on readResume until a Wake
+	// consumes below the limit, the read deadline passes, or the connection
+	// closes. readHeld is guarded by callbackMu; readResume, buffered by one so
+	// no signal waits for the reader, is made with the stream connection. The
+	// held wait reads no socket, so it keeps the read deadline the socket
+	// enforces on a Read: deadlineMu orders each setter's two updates, so
+	// readDeadline and the socket always hold the same value.
+	readHeld     bool
+	readResume   chan struct{}
+	deadlineMu   sync.Mutex
+	readDeadline time.Time
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -228,8 +242,21 @@ func (fc *fdConn) SetWriteDeadline(deadline time.Time) error {
 	return fc.applyDeadline(deadlineWrite, deadline)
 }
 
+// readDeadlineNotedForTest, when a test sets it, runs between setting a read
+// deadline on the socket and recording it for the held wait.
+var readDeadlineNotedForTest func()
+
+// heldDeadlineExpiredForTest, when a test sets it, runs once a held wait has
+// found its read deadline passed and before it acts on that.
+var heldDeadlineExpiredForTest func()
+
 // applyDeadline delegates directly to the blocking net.Conn; unlike native
-// timers, the Go network poller owns interruption and reset semantics.
+// timers, the Go network poller owns interruption and reset semantics. A read
+// deadline the socket accepted is also recorded for a held read, which reads
+// no socket. deadlineMu orders the two updates against other setters and
+// against the held wait's expiry, which closes the connection under it: a
+// setter either finds the connection closing or replaces the deadline before
+// the wait can act on the old one.
 func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if fc.isClosing() {
 		return net.ErrClosed
@@ -243,14 +270,33 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if target == nil {
 		return errUnsupported
 	}
+	fc.deadlineMu.Lock()
+	defer fc.deadlineMu.Unlock()
+	if fc.isClosing() {
+		return net.ErrClosed
+	}
+	var err error
 	switch kind {
 	case deadlineBoth:
-		return target.SetDeadline(deadline)
+		err = target.SetDeadline(deadline)
 	case deadlineRead:
-		return target.SetReadDeadline(deadline)
+		err = target.SetReadDeadline(deadline)
 	default:
-		return target.SetWriteDeadline(deadline)
+		err = target.SetWriteDeadline(deadline)
 	}
+	if err != nil || kind == deadlineWrite || fc.conn == nil {
+		return err
+	}
+	if readDeadlineNotedForTest != nil {
+		readDeadlineNotedForTest()
+	}
+	fc.readDeadline = deadline
+	// Wake a held wait to re-time against the new deadline.
+	select {
+	case fc.readResume <- struct{}{}:
+	default:
+	}
+	return nil
 }
 
 func (fc *fdConn) applySocketOption(socketOptionKind, int) error { return errUnsupported }
@@ -690,6 +736,13 @@ func (fc *fdConn) fdClose(err error) bool {
 		default:
 		}
 	}
+	// A reader held by MaxInboundBuffered waits for a resume; the close is one.
+	if fc.readResume != nil {
+		select {
+		case fc.readResume <- struct{}{}:
+		default:
+		}
+	}
 
 	// delete connection fd-mapping.
 	fc.loop.delConn(fc)
@@ -761,6 +814,15 @@ func (fc *fdConn) deliverWake() {
 	defer fc.endInboundCallback(started)
 	if err := fc.events.onData(fc); err != nil {
 		fc.requestClose(err)
+		return
+	}
+	if fc.readHeld && fc.inbound.Len() < fc.events.MaxInboundBuffered {
+		fc.readHeld = false
+		// A close may have filled the slot already; either signal resumes.
+		select {
+		case fc.readResume <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -869,22 +931,76 @@ func (fc *fdConn) readLoop() {
 				return
 			}
 			if len(fc.inboundTail) > 0 {
-				if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.InboundBuffered() > limit {
-					fc.inboundTail = nil
-					fc.endInboundCallback(started)
-					fc.callbackMu.Unlock()
-					fc.events.closeConn(fc, ErrInboundOverflow)
-					return
-				}
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
+				if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.inbound.Len() >= limit {
+					fc.readHeld = true
+				}
 			}
+			held := fc.readHeld
 			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
+			if held && !fc.waitHeldRead() {
+				return
+			}
 		}
 		if readErr != nil {
 			fc.events.closeConn(fc, readErr)
 			return
+		}
+	}
+}
+
+// waitHeldRead keeps a held read in the socket until a Wake consumes below
+// MaxInboundBuffered, and reports whether the read loop goes on. A close ends
+// it, and so does the read deadline, which closes the connection as an
+// expired Read would. A changed deadline also signals readResume, so the wait
+// re-times against it.
+func (fc *fdConn) waitHeldRead() bool {
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	for {
+		var expired <-chan time.Time
+		fc.deadlineMu.Lock()
+		deadline := fc.readDeadline
+		if !deadline.IsZero() && !time.Now().Before(deadline) {
+			// Closed under the lock, so a setter that replaces this deadline
+			// either comes first or finds the connection closing. The close
+			// request only queues a task, so holding the lock costs nothing.
+			if heldDeadlineExpiredForTest != nil {
+				heldDeadlineExpiredForTest()
+			}
+			fc.events.closeConn(fc, os.ErrDeadlineExceeded)
+			fc.deadlineMu.Unlock()
+			return false
+		}
+		fc.deadlineMu.Unlock()
+		if !deadline.IsZero() {
+			wait := time.Until(deadline)
+			if timer == nil {
+				timer = time.NewTimer(wait)
+			} else {
+				timer.Reset(wait)
+			}
+			expired = timer.C
+		}
+		select {
+		case <-fc.readResume:
+		case <-expired:
+			continue // rechecked above, against a deadline moved meanwhile
+		}
+		if fc.isClosing() {
+			return false
+		}
+		fc.callbackMu.Lock()
+		held := fc.readHeld
+		fc.callbackMu.Unlock()
+		if !held {
+			return true
 		}
 	}
 }

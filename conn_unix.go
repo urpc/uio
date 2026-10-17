@@ -38,6 +38,10 @@ const (
 	// readStalledFlag marks ET read work owed after a yield or a read round
 	// that ran out of budget.
 	readStalledFlag uint32 = 1 << iota
+	// readHeldFlag marks reads stopped because callbacks left
+	// MaxInboundBuffered bytes unconsumed. Only the connection's turn sets or
+	// clears it; see holdsRead and resumeHeldRead.
+	readHeldFlag
 )
 
 type fdConn struct {
@@ -77,7 +81,7 @@ type fdConn struct {
 	taskState  atomic.Uint32
 	writeState atomic.Uint32 // send state and the write claim; see writeOwnerFlag
 	pollTag    atomic.Uint32 // registration generation echoed by the poller
-	flags      atomic.Uint32 // readStalledFlag; see below
+	flags      atomic.Uint32 // readStalledFlag, readHeldFlag; see below
 }
 
 // unixUDPState contains fields that TCP connections never use. A UDP
@@ -533,6 +537,32 @@ func (conn *fdConn) clearReadStalled() bool {
 	return conn.flags.And(^readStalledFlag)&readStalledFlag != 0
 }
 
+// readHeld reports reads stopped by MaxInboundBuffered. The poller reads it
+// to drop read edges; only the connection's turn changes it.
+func (conn *fdConn) readHeld() bool { return conn.flags.Load()&readHeldFlag != 0 }
+
+// holdsRead stops reads once callbacks have left MaxInboundBuffered bytes
+// unconsumed, so TCP flow control slows the peer instead of the buffer
+// growing. It runs only after a callback left bytes behind.
+func (conn *fdConn) holdsRead() bool {
+	if limit := conn.events.MaxInboundBuffered; limit > 0 && conn.inbound.Len() >= limit {
+		conn.flags.Or(readHeldFlag)
+		return true
+	}
+	return false
+}
+
+// resumeHeldRead reads again once a callback has consumed the inbound buffer
+// below MaxInboundBuffered. Edges that arrived while reads were held were
+// dropped, so the read is scheduled here rather than left to the next edge.
+func (conn *fdConn) resumeHeldRead() {
+	if conn.inbound.Len() >= conn.events.MaxInboundBuffered || conn.isClosing() {
+		return
+	}
+	conn.flags.And(^readHeldFlag)
+	conn.taskState.Or(ioEventRead)
+}
+
 func (conn *fdConn) Fd() int { return int(conn.fd) }
 
 // RemoteAddr builds the net.Addr on demand: the connection keeps only the
@@ -577,16 +607,18 @@ func (conn *fdConn) afterRegister()                   {}
 // skipsEdge reports a readiness event its connection's turn would have
 // nothing to do with, so the poller drops it instead of scheduling a turn.
 //   - A read left owed by a yield or a spent budget is redelivered on its own,
-//     so read edges until then carry nothing new. Writable and hangup edges
-//     still pass: queued output waits for the one, and a hangup must reach the
-//     turn to mark the rounds that read on to the end of the stream.
+//     and a read held by MaxInboundBuffered is resumed by the callback that
+//     consumes below it, so read edges until then carry nothing new. Writable
+//     and hangup edges still pass: queued output waits for the one, and a
+//     hangup must reach the turn to mark the rounds that read on to the end of
+//     the stream.
 //   - A write-only edge with nothing to send: registration arms every stream
 //     with one, and kqueue raises one each time an acknowledgement frees send
 //     space. Output is sent without an edge; only a write-blocked socket, or
 //     queued output whose sender may be waiting on an edge, needs it.
 func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
-		return conn.readStalled()
+		return conn.flags.Load()&(readStalledFlag|readHeldFlag) != 0
 	}
 	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
 }
@@ -949,7 +981,9 @@ func (conn *fdConn) runIOTask() {
 		var err error
 		if conn.isDatagram() {
 			err = conn.onRecvUDP()
-		} else {
+		} else if !conn.readHeld() {
+			// A held read stays in the socket, a hangup behind it included,
+			// until a callback consumes below the limit; see resumeHeldRead.
 			err = conn.onRead()
 		}
 		if err != nil {
@@ -962,6 +996,9 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 		conn.turn &^= turnCorked
+		if conn.readHeld() {
+			conn.resumeHeldRead()
+		}
 	}
 	if conn.udp != nil && conn.udp.peers != nil {
 		conn.settlePeers()
@@ -1227,15 +1264,11 @@ func (conn *fdConn) readRound(buffer []byte) error {
 			return nil
 		}
 		if len(conn.inboundTail) > 0 {
-			started := conn.beginInboundCallback()
-			if limit := conn.events.MaxInboundBuffered; limit > 0 && conn.InboundBuffered() > limit {
-				conn.inboundTail = nil
-				conn.endInboundCallback(started)
-				return ErrInboundOverflow
-			}
 			_, _ = conn.inbound.Write(conn.inboundTail)
 			conn.inboundTail = nil
-			conn.endInboundCallback(started)
+			if conn.holdsRead() {
+				return nil
+			}
 		}
 		if conn.readStalled() {
 			return nil

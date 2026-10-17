@@ -1520,25 +1520,66 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 	}
 }
 
-func TestInboundLimitClosesConnection(t *testing.T) {
-	closed := make(chan error, 1)
+// A read round that leaves the limit's worth unconsumed holds further reads:
+// the round stops, and the turn leaves read edges alone until a callback
+// consumes below the limit.
+func TestInboundLimitHoldsTheReadRound(t *testing.T) {
+	var calls atomic.Int32
 	events := &Events{
 		Pollers:            1,
-		MaxInboundBuffered: 4,
-		OnData:             func(Conn) error { return nil },
-		OnClose:            func(_ Conn, err error) { closed <- err },
+		MaxBufferSize:      4,
+		MaxInboundBuffered: 8,
+		OnData:             func(Conn) error { calls.Add(1); return nil },
 	}
 	testConn := newTestConnection(t, events)
-	if _, err := unix.Write(testConn.peer, []byte("12345")); err != nil {
+	if _, err := unix.Write(testConn.peer, []byte("0123456789abcdef")); err != nil {
 		t.Fatal(err)
 	}
-	select {
-	case err := <-closed:
-		if !errors.Is(err, ErrInboundOverflow) {
-			t.Fatalf("close error = %v", err)
+	deadline := time.Now().Add(time.Second)
+	for !testConn.conn.readHeld() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !testConn.conn.readHeld() {
+		t.Fatal("reads were not held at the limit")
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("OnData ran %d times, want 2: the read held at 8 buffered bytes", got)
+	}
+	if testConn.conn.isClosing() {
+		t.Fatal("the connection closed at the limit")
+	}
+}
+
+// A held read stays held whatever event reaches the turn: a writable edge
+// that carries read readiness, as epoll reports one, or a hangup, must not
+// restart it.
+func TestInboundLimitHeldReadIgnoresEdges(t *testing.T) {
+	var calls atomic.Int32
+	events := &Events{
+		Pollers:            1,
+		MaxBufferSize:      4,
+		MaxInboundBuffered: 8,
+		OnData:             func(Conn) error { calls.Add(1); return nil },
+	}
+	testConn := newTestConnection(t, events)
+	if _, err := unix.Write(testConn.peer, []byte("0123456789abcdef")); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !testConn.conn.readHeld() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !testConn.conn.readHeld() {
+		t.Fatal("reads were not held at the limit")
+	}
+	held := calls.Load()
+	for _, events := range []uint32{ioEventRead | ioEventWrite, ioEventRead | ioEventHangup, ioEventRead} {
+		testConn.conn.scheduleIO(events)
+		time.Sleep(20 * time.Millisecond)
+		if got := calls.Load(); got != held {
+			t.Fatalf("events %#x restarted a held read: OnData ran %d more times", events, got-held)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("inbound overflow did not close connection")
 	}
 }
 
