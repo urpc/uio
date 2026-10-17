@@ -1,245 +1,181 @@
-# uws
+<p align="center">
+  <img src="assets/banner.svg" alt="uws: WebSocket for Go, on uio" width="100%">
+</p>
 
-`uws` is an asynchronous WebSocket implementation built on UIO. It implements
-RFC 6455 framing and message rules, and RFC 7692 `permessage-deflate`.
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/urpc/uio/uws"><img src="https://pkg.go.dev/badge/github.com/urpc/uio/uws.svg" alt="Go Reference"></a>
+  <a href="autobahn/README.md"><img src="https://img.shields.io/badge/Autobahn-0%20failed%20of%20517-22D3EE" alt="Autobahn"></a>
+  <a href="https://github.com/urpc/uio/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+</p>
 
-## Server
+**uws** is a WebSocket server and client for Go, built on the
+[uio](https://github.com/urpc/uio) event engine. The handshake, frame parsing
+and your handler all run in the connection's own turn on a shared worker pool,
+so a connection costs no goroutine of its own, and a message that arrives in one
+frame reaches you straight from the read buffer.
+
+## Highlights
+
+- **Standards first.** RFC 6455 framing and close handshake, RFC 7692
+  permessage-deflate, and a clean run of the
+  [Autobahn test suite](autobahn/README.md).
+- **Three ways in.** A native server that parses the upgrade itself, an
+  `http.Handler` for existing `net/http` servers, and a client.
+- **Zero-copy reads.** Frames are unmasked in place, and an unfragmented,
+  uncompressed message is handed to `OnMessage` straight from the read buffer.
+- **Send from anywhere.** `SendText`, `SendBinary` and `Ping` are safe from any
+  goroutine and keep their order; they never block on the socket.
+- **Batched replies.** Small replies to the frames of one read are encoded
+  together and handed to the socket as one write.
+- **Bounded by design.** Limits on frame and message size, outbound queue,
+  handshake and close time, with heartbeats built in.
+
+## Install
+
+```bash
+go get github.com/urpc/uio/uws
+```
+
+## Quick start
 
 ```go
-import (
-	"context"
-	"log"
-	"net/http"
+package main
 
-	"github.com/urpc/uio"
+import (
+	"log"
+
 	"github.com/urpc/uio/uws"
 )
 
-type handler struct{}
+type echo struct{}
 
-func (handler) OnOpen(*uws.Conn) {}
+func (echo) OnOpen(*uws.Conn)                  {}
+func (echo) OnClose(*uws.Conn, uws.CloseEvent) {}
 
-func (handler) OnMessage(conn *uws.Conn, message uws.Message) {
-	if message.Type == uws.TextMessage {
-		_ = conn.SendText(message.Payload)
+func (echo) OnMessage(c *uws.Conn, m uws.Message) {
+	if m.Type == uws.TextMessage {
+		_ = c.SendText(m.Payload)
 	} else {
-		_ = conn.SendBinary(message.Payload)
+		_ = c.SendBinary(m.Payload)
 	}
 }
 
-func (handler) OnClose(*uws.Conn, uws.CloseEvent) {}
-
-server := uws.NewServer(handler{})
-server.CheckOrigin = func(*http.Request) bool { return true }
-server.EnableCompression = true
-server.MaxMessageSize = uws.DefaultMaxFramePayload
-server.Events.MaxOutboundBuffered = int(server.MaxMessageSize) + 14
-log.Fatal(server.Serve(":8080"))
+func main() {
+	server := uws.NewServer(echo{})
+	server.EnableCompression = true
+	log.Fatal(server.Serve(":8080"))
+}
 ```
 
-The same Server also implements `http.Handler`. Start its UIO event loops
-without a listener before accepting HTTP requests:
+`Serve` takes any number of addresses and returns once every connection has
+finished.
+
+## How it works
+
+<p align="center">
+  <img src="assets/message-path.svg" alt="A WebSocket message is upgraded, parsed, handled by OnMessage and replied to in one batched write, all in the connection's turn; sends from other goroutines join the same ordered queue" width="100%">
+</p>
+
+1. **Upgrade.** `Serve` parses the HTTP upgrade natively; behind `net/http`
+   the request is hijacked and the socket moved onto uio.
+2. **Parse.** Frames are unmasked in place. Text is validated as UTF-8, with a
+   SIMD validator on amd64, and compressed messages are inflated.
+3. **Handle.** `OnMessage` runs in the connection's turn. Callbacks of one
+   connection are ordered and never overlap.
+4. **Reply.** What the handler sends is queued; small replies to one read's
+   frames are batched into one write. Sends from other goroutines join the same
+   queue in order.
+
+## Behind `net/http`
+
+`Server` is also an `http.Handler`. Start its event loops with `Serve()` (no
+address), then mount it like any other handler:
 
 ```go
-server := uws.NewServer(handler{})
-ready := make(chan struct{})
-serveDone := make(chan error, 1)
-server.Events.OnStart = func(*uio.Events) { close(ready) }
-go func() { serveDone <- server.Serve() }()
-select {
-case <-ready:
-case err := <-serveDone:
-	log.Fatal(err)
-}
+server := uws.NewServer(echo{})
+go func() { log.Fatal(server.Serve()) }()
 
-httpServer := &http.Server{
-	Addr:    ":8080",
-	Handler: server,
-}
-defer server.Close(nil)
-log.Fatal(httpServer.ListenAndServe())
+http.Handle("/ws", server)
+log.Fatal(http.ListenAndServe(":8080", nil))
 ```
 
-`Server.Serve` accepts multiple listening addresses, or no address for use as
-an `http.Handler`.
-
-Calling `ServeHTTP` before `Serve` is ready returns HTTP 500 and does not start
-UIO implicitly. The Handler adapter supports plain HTTP/1.1 TCP connections. It
-validates the request, hijacks it, rejects any client bytes already buffered
-after the HTTP header, and transfers the socket to UIO before sending the 101
-response. Local TLS termination and HTTP/2 cannot be transferred to the native
-poller; place a TLS proxy in front of the HTTP server when those protocols are
-required. The application remains responsible for shutting down its
-`http.Server`, while `Server.Close` stops UWS connections and UIO event loops.
-Configure `http.Server.MaxHeaderBytes` for this path; `Server.MaxHeaderBytes`
-applies to the native `Server.Serve` parser.
-
-Set `CheckOrigin` to an application-specific policy for browser-facing
-servers; a nil policy accepts all origins.
-
-Servers and dialers are single-lifecycle objects and cannot be restarted after
-`Close`. Their `Close` methods request transport shutdown without waiting for
-the calling connection task, so they are safe inside a callback.
-`Server.Serve` is the server join point and returns only after all event loops
-and connection tasks have exited. Connection completion and its cause are
-reported by `OnClose` and `CloseEvent`. Use `Userdata` and `SetUserdata` for
-connection-specific state from ordered connection callbacks; synchronize
-access when using other goroutines.
-
-Callbacks run in the owning UIO connection task and messages are ordered per
-connection. `Message.Payload` is borrowed until `OnMessage` returns; call
-`Message.Clone` before retaining it or passing it to another goroutine.
-
-`SendText`, `SendBinary`, and `Ping` do not wait for socket writability and are
-safe to call from any goroutine. They can return `uws.ErrNotReady`,
-`uws.ErrClosed`, validation errors, or `uws.ErrBackpressure` when the message
-does not fit `Events.MaxOutboundBuffered`. Transport write errors can also be
-returned; `Ping` can report a flush error. A nil return means the message was
-accepted in order, not that the peer received it. Accepted data is flushed by
-the current or next connection task. Concurrent senders wait for each other
-while a message is encoded and handed to the transport. A message larger than
-`MaxFramePayload` is split into fragments. Before the first fragment, UWS
-checks that the whole wire message fits the outbound limit; a later transport
-failure can leave a partial message on the wire and closes the connection.
-
-Configure connection-level outbound backpressure with
-`Events.MaxOutboundBuffered`; zero disables the transport limit. Size it to
-hold the largest message that a callback may need to buffer, including all
-fragment headers. The server example limits incoming messages to one default
-frame payload so a full-sized echo fits its outbound budget when the queue is
-otherwise empty.
-
-UWS defaults a zero `Events.WriteBufferedThreshold` to 4 KiB so consecutive
-small frames can share transport storage and a flush. Ping and Close still
-establish explicit flush boundaries. An explicit nonzero threshold is
-preserved; use a negative value to disable this small-frame coalescing policy.
-
-When one read carries several frames, the replies their callbacks send below
-that threshold are encoded into a single batch and handed to UIO together when
-the frames of that read have been delivered. A full batch block can be handed
-over earlier, so the number of hand-offs and socket writes depends on the
-frames and transport state. A send from another goroutine during that time, or
-a Pong the read answers, can join the batch in order. Each batched frame is
-checked against `Events.MaxOutboundBuffered` when accepted; an unexpected
-transport refusal during hand-off aborts the connection. On native transports,
-a lone small frame can be encoded directly into the outbound queue. The
-outbound limit still applies per message.
-
-On native Unix transports, UIO runs the complete per-connection path as one
-serialized connection task: socket I/O, WebSocket parsing and decompression,
-then `OnOpen`, `OnMessage`, or `OnClose`. A slow connection therefore does not
-block the event loop or callbacks for other connections. UWS does not add a
-second executor mailbox or copy message payloads between schedulers.
-
-Set `server.Events.Executor` or `dialer.Events.Executor` to provide the UIO
-connection-task scheduler. Without one, UIO uses its own sharded scheduler,
-which keeps each connection's turns on one worker while it keeps up and adds
-workers, up to 512 per P, while callbacks block; idle workers beyond one per
-shard exit after 30 seconds. The executor's typed `Submit` and `SubmitBatch`
-methods must return promptly and must not execute tasks inline; rejection
-closes the affected connection. Any scheduler with those methods can be
-installed, for example a taskgo queue:
-
-```go
-workers := runtime.NumCPU() * 512
-executor := taskgo.NewTask[uio.IOTask](
-	func(task uio.IOTask) { task.RunTask() },
-	taskgo.WithConcurrency(workers),
-	taskgo.WithMaxIdle(30*time.Second),
-	taskgo.WithMaxPending(10128), // connection runners plus scheduling headroom
-)
-server.Events.Executor = executor
-defer executor.Stop(context.Background())
-```
-
-Keep the pending limit larger than the expected number of simultaneously ready
-connections. UIO applies a per-connection transport outbound budget and pauses
-reads when that connection exhausts its budget. Worker needs
-depend on the ratio and duration of blocking callbacks; size the pool from a
-production profile rather than connection count alone. The stdio/Windows
-backend keeps its dedicated per-connection blocking read/write goroutines and
-delivers callbacks synchronously from the read path.
-
-On an open connection, `Close` starts a graceful close handshake: its frame
-follows every message accepted before it, and no message is accepted after it.
-Before the handshake completes, `Close` closes the transport directly. When
-`Events.MaxOutboundBuffered` has no room for the frame, the frame waits for the
-transport to drain instead of failing. The transport then waits for the peer
-response; `CloseTimeout` bounds the whole handshake.
-Protocol errors are reported as close code 1002; invalid UTF-8 uses 1007;
-oversized messages use 1009.
-
-`HandshakeTimeout` closes connections that do not complete the HTTP upgrade in
-time. This bounds per-connection handshake state and protects the descriptor
-budget from slow or deliberately incomplete handshakes.
-
-`Conn.SetDeadline`, `SetReadDeadline`, and `SetWriteDeadline` forward directly
-to the UIO transport. Applications own deadline policy; pass a zero time to
-clear a deadline.
-
-Compression is negotiated only when `EnableCompression` is set. The default
-server policy uses no context takeover to bound per-connection state. Set
-`AllowCompressionContextTakeover` when retaining compression history is
-acceptable. Window sizes are negotiated according to RFC 7692.
-
-Text messages are validated as UTF-8 as required by RFC 6455. Trusted-peer
-deployments may set `DisableUTF8Check` to skip Text Message validation;
-close-frame reasons remain validated. Enabling this option is not RFC 6455
-compliant.
+The handler takes over plain HTTP/1.1 connections. TLS and HTTP/2 connections
+cannot be moved onto uio's event loops, so terminate TLS in a proxy in front.
+A request that arrives before `Serve` has started gets HTTP 500.
 
 ## Client
 
 ```go
-import (
-	"context"
-	"log"
+type client struct{}
 
-	"github.com/urpc/uio/uws"
-)
-
-type clientHandler struct{}
-
-func (clientHandler) OnOpen(conn *uws.Conn) {
-	_ = conn.SendText([]byte("hello"))
-}
-
-func (clientHandler) OnMessage(conn *uws.Conn, message uws.Message) {}
-
-func (clientHandler) OnClose(conn *uws.Conn, info uws.CloseEvent) {
-	if info.Err != nil {
-		log.Printf("websocket closed: %v", info.Err)
+func (client) OnOpen(c *uws.Conn)                  { _ = c.SendText([]byte("hello")) }
+func (client) OnMessage(c *uws.Conn, m uws.Message) { log.Printf("%s", m.Payload) }
+func (client) OnClose(c *uws.Conn, e uws.CloseEvent) {
+	if e.Err != nil {
+		log.Println("closed:", e.Err)
 	}
 }
 
 dialer := uws.NewDialer()
-_, err := dialer.Dial(context.Background(), "ws://127.0.0.1:8080/", clientHandler{})
-if err != nil {
+if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", client{}); err != nil {
 	log.Fatal(err)
 }
 ```
 
-`Dial` can return errors from setup, the network dial, or writing and flushing
-the HTTP upgrade request. WebSocket handshake completion is asynchronous:
-`OnOpen` means the connection is ready for application messages, while a
-handshake response failure calls `OnClose` without a preceding `OnOpen` and
-places the cause in `CloseEvent.Err`.
+`Dial` returns once the upgrade request is sent and the handshake finishes in
+the background. `OnOpen` means the connection is ready; a failed handshake
+calls `OnClose` without `OnOpen`, with the cause in `CloseEvent.Err`. The
+context bounds the dial and the handshake, not the connection after it.
 
-The context passed to `Dial` is checked before UIO starts its network dial and
-then bounds the WebSocket handshake. The network connection itself follows
-`uio.Events.Dial` semantics. After `OnOpen`, the Dial context no longer affects
-the established connection. `OnClose` reports the transport or protocol error
-through `CloseEvent.Err`.
+## Configuration
 
-## Linux benchmark
+Every field is optional.
 
-Compare UWS backends and other libraries with the same client version, worker
-count, payload, connection count, CPU affinity, and warmup. Do not use a
-single run as a performance claim; report multiple runs and include P99
-latency. For a like-for-like comparison, assign disjoint CPU sets to the
-server and load generator, then give events the same poller count as the
-stdio server's `GOMAXPROCS`. In the current 24-CPU Linux test, events slightly
-outperforms stdio while using substantially less memory. Increasing events
-or stdio `MaxBufferSize` from 4 KiB to 16 KiB did not materially improve the
-tested 1 KiB WebSocket pipeline workload; stdio also retained more memory at
-16 KiB. Buffer sizing should follow the actual payload and protocol. Measure
-both on the deployment platform.
+| `Server` field | Default | What it does |
+| --- | --- | --- |
+| `CheckOrigin` | accept all | Origin policy. Set one for browser-facing servers. |
+| `Subprotocols` | none | Subprotocols to negotiate. |
+| `MaxFramePayload` | 16 MiB | Largest frame read; larger outgoing messages are fragmented. |
+| `MaxMessageSize` | 64 MiB | Largest message, after decompression. |
+| `EnableCompression` | off | Negotiates permessage-deflate. |
+| `CompressionLevel` | default | flate level when compression is on. |
+| `AllowCompressionContextTakeover` | off | Keeps compression history between messages, at more memory per connection. |
+| `HandshakeTimeout` | 10 s | Bounds the HTTP upgrade. |
+| `CloseTimeout` | 5 s | Bounds the close handshake. |
+| `HeartbeatInterval` | off | Sends a ping at this interval. |
+| `HeartbeatTimeout` | 2 × interval | Closes the connection when a ping gets no pong in time. |
+| `MaxHeaderBytes` | 32 KiB | Upgrade header limit for `Serve`. |
+| `DisableUTF8Check` | off | Skips text validation for trusted peers. Not RFC compliant. |
+| `Events` | uio defaults | The underlying [`uio.Events`](https://github.com/urpc/uio#configuration): event loops, buffers, outbound limit. uws turns on `WriteBufferedThreshold` at 4 KiB unless you set it; a negative value turns it off. |
+
+`Dialer` has the same limits, compression, timeout and `Events` fields for the
+client side.
+
+## Rules of the road
+
+- **Payloads are borrowed.** `Message.Payload` is valid until `OnMessage`
+  returns. Call `Message.Clone` to keep it or hand it to another goroutine.
+- **Accepted is not delivered.** A nil error from `SendText`, `SendBinary` or
+  `Ping` means the message was queued in order, not that the peer has it.
+  Past `Events.MaxOutboundBuffered` they return `ErrBackpressure`; size that
+  limit to fit the largest message you send.
+- **State without locks.** Callbacks of one connection never overlap, so state
+  kept with `SetUserdata` needs no locking from them.
+- **Closing.** `Conn.Close(code, reason)` sends its close frame after everything
+  already accepted and waits for the peer, up to `CloseTimeout`. Protocol
+  errors close with 1002, invalid UTF-8 with 1007, oversized messages with
+  1009.
+- **Lifecycle.** `Server.Close` and `Dialer.Close` request shutdown and return
+  at once, so they are safe inside callbacks. A server or dialer cannot be
+  restarted.
+
+The [API reference](https://pkg.go.dev/github.com/urpc/uio/uws) documents every
+type and method.
+
+## License
+
+[Apache License 2.0](https://github.com/urpc/uio/blob/main/LICENSE)
+
+The Go gopher in the banner is based on the original design by
+[Renée French](https://reneefrench.blogspot.com/), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

@@ -1,385 +1,210 @@
-# UIO - Ultra Fast I/O Framework for Go
+<p align="center">
+  <img src="assets/banner.svg" alt="uio: event-driven networking for Go" width="100%">
+</p>
 
-[![GoDoc][1]][2] [![license-Apache 2][3]][4]
+<p align="center">
+  <a href="https://pkg.go.dev/github.com/urpc/uio"><img src="https://pkg.go.dev/badge/github.com/urpc/uio.svg" alt="Go Reference"></a>
+  <a href="https://github.com/urpc/uio/actions/workflows/ci.yml"><img src="https://github.com/urpc/uio/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
+</p>
 
-[1]: https://godoc.org/github.com/urpc/uio?status.svg
-[2]: https://godoc.org/github.com/urpc/uio
-[3]: https://img.shields.io/badge/license-Apache%202-blue.svg
-[4]: LICENSE
+**uio** is an event-driven networking library for Go. You write a few
+callbacks; uio watches the sockets, runs your code when a connection has
+something to say, and sends your replies in as few system calls as it can —
+without a goroutine per connection.
 
-**UIO** (pronounced "ultra-IO") is a high-performance, event-driven networking framework for Go, designed for building scalable and efficient TCP/UDP servers and clients. It leverages modern I/O multiplexing techniques and provides a lightweight, non-blocking API for low-latency applications.
+## Highlights
 
-## Features
+- **Callbacks, not goroutines.** `OnOpen`, `OnData` and `OnClose` run in order
+  for each connection, so per-connection state needs no locks, and on
+  epoll/kqueue an idle connection is a small struct rather than a parked
+  goroutine.
+- **A slow handler stalls nothing else.** On epoll/kqueue, event loops only
+  collect readiness; callbacks run on a worker pool, and work stuck behind a
+  blocked callback is handed to another worker within milliseconds.
+- **Write from anywhere.** `Write`, `WriteOwned` and `Close` are safe from any
+  goroutine; bytes leave in the order they were written.
+- **Zero-copy where it counts.** Decode packets straight from the read buffer,
+  encode replies straight into the send queue, and send a round of replies
+  together, usually in one `writev`.
+- **Built-in backpressure.** Per-connection limits on buffered input and
+  output turn a slow or flooding peer into an error instead of unbounded
+  memory.
+- **Cross-platform.** epoll on Linux, kqueue on macOS and the BSDs, and a
+  portable goroutine-per-connection backend on Windows (or anywhere with
+  `-tags stdio`).
+- **TCP, UDP and Unix sockets**, listening and dialing, IPv4 and IPv6.
 
-- 🚀 **Event-Driven Architecture**: Built on epoll/kqueue (Unix-like) for optimal I/O scheduling and `stdio` for others platform (Windows).
-- 🌐 **Cross-Platform**: Supports Linux, macOS, BSD variants, and Windows.
-- 🔄 **Protocol Support**: TCP, TCP4/TCP6, UDP, UDP4/UDP6, Unix domain sockets.
-- ⚡  **Zero-Copy Optimizations**: Batched read/write operations minimize memory copies.
-- 🧩 **Flexible Event Hooks**: `OnOpen`, `OnData`, `OnClose` callbacks for connection lifecycle management.
-- 🔧 **Tunable Parameters**:
-    - Custom buffer sizes
-    - Write buffering thresholds
-    - Per-connection inbound/outbound limits
-    - SO_REUSEPORT support
-
-## Installation
+## Install
 
 ```bash
 go get github.com/urpc/uio
 ```
 
-## Overview
+uio needs Go 1.25 or newer.
 
-```go
+## Quick start
 
-type Events struct {
-	// Pollers is the number of event loops. On Unix each loop is one
-	// epoll or kqueue instance that a few goroutines wait on; they collect
-	// readiness and hand runnable connections to the Executor. The default is
-	// one loop per four Ps, between one and eight, capped by
-	// runtime.GOMAXPROCS(0).
-	Pollers int
-
-	// Executor optionally supplies an asynchronous native connection-task
-	// scheduler with typed single and batch submission.
-	Executor Executor
-
-	// ReusePort indicates whether to set up the SO_REUSEPORT socket option.
-	// The default value is false.
-	ReusePort bool
-
-	// LockOSThread is used to determine whether each I/O event-loop is associated to an OS thread.
-	// The default value is false.
-	LockOSThread bool
-
-	// MaxBufferSize is the buffer size of each socket read. The default is 4 KiB.
-	MaxBufferSize int
-
-	// WriteBufferedThreshold batches smaller native callback writes until the
-	// connection task flushes. Zero disables size-based buffering.
-	WriteBufferedThreshold int
-
-	// MaxOutboundBuffered limits accepted but unsent payload bytes per
-	// connection. Native transports pause that connection's reads while its
-	// backlog is high. Zero disables the limit.
-	MaxOutboundBuffered int
-
-	// MaxInboundBuffered limits payload left unread after a callback returns.
-	// Zero disables the limit.
-	MaxInboundBuffered int
-
-	// Lifecycle and data callbacks are serialized per connection; different
-	// connections may execute concurrently.
-	OnOpen func(c Conn)
-
-	// OnData runs while inbound access methods are valid.
-	OnData func(c Conn) error
-
-	// OnClose is final and never overlaps OnOpen or OnData for its connection;
-	// only a connection that got OnOpen gets it.
-	OnClose func(c Conn, err error)
-
-	// OnInbound runs before OnData and shares its inbound-access scope.
-	OnInbound func(c Conn, readBytes int)
-
-	// OnOutbound may run on a backend writer goroutine or a native write turn,
-	// concurrently with the connection's other callbacks, and does not grant
-	// inbound-buffer access.
-	OnOutbound func(c Conn, writeBytes int)
-
-	// OnStart it triggers on the server initialized.
-	OnStart func(ev *Events)
-
-	// OnStop it triggers on the server closed.
-	OnStop func(ev *Events)
-}
-```
-
-## Quick Start
-
-Basic Echo Server
-
-On native Unix, a connection is owned by its turn: one serialized task on the
-configured `Executor` or UIO's own connection scheduler runs all of the
-connection's callbacks, reads its socket, and also releases the connection
-once it is closing. The event loops only collect readiness. Each loop is one
-epoll or kqueue instance; stream listeners, connections and UDP sockets are
-spread over the loops in turn, whatever their descriptor numbers, and the
-loop's waiters accept on its listeners, register what they accept, and hand
-runnable connections to the scheduler, without ever running a callback or
-waiting for a connection. One blocked connection therefore blocks neither a
-loop nor another connection. Several loops keep a connection's events within
-one cluster of cores. By default, from 8 to 63 Ps each loop has one waiter,
-which parks in the Go runtime's netpoller while its loop is busy and blocks in
-the kernel once the loop goes quiet; below 8 Ps the waiters always park (two on
-the one loop from 2 Ps up), and a host that runs more than eight waiters
-blocks them all.
-
-A stream connection's first turn runs `OnOpen`, then reads whatever the peer
-already sent and runs `OnData` for it in the same turn. Registration stays
-with the waiters, not the turns: the kernel serializes registrations per
-epoll or kqueue instance, and a few waiters per loop contend for it far less
-than every worker would. A connection that closes in a callback is released when that
-callback returns, and `OnClose` is delivered in the same turn. A close
-requested from another goroutine, a deadline, or shutdown marks the
-connection and schedules its turn, which releases it the same way. Socket
-options and deadlines set from other goroutines apply on the caller's
-goroutine.
-
-Output a connection's own callbacks write leaves when the read round ends, or
-once it fills a coalescing block. Output written from other goroutines, such as
-replies an RPC handler finishes after its request's callback returned, is sent
-by a write turn: a short task that only moves queued bytes to the socket, so
-it is not held behind a read round or a slow callback of the same connection.
-The exception is a turn whose callback reserved outbound bytes with
-`ReserveOutbound`, as the uws server does for its replies: it keeps the socket
-until it ends, as every turn did before write turns. One claim per connection
-orders all senders, so bytes leave in the order they were accepted; with an
-`Executor`, write turns are submitted to it as well; without one they run on
-a sharded scheduler of their own, beside the one for connection turns.
-
-A UDP listener is a connection of its own whose turns read every peer's
-datagrams and run the peers' callbacks, since the peers share its socket. A
-UDP `Write` or `WriteOwned` sends its datagram before returning, from any
-goroutine. The `stdio`/Windows backend instead uses dedicated blocking
-read/write goroutines per connection; `Executor` does not apply there.
-Without an external executor, native UIO runs connection turns on a sharded
-taskgo queue, two shards per P (`runtime.GOMAXPROCS(0)`). All of a
-connection's turns go to one shard, picked by its loop first and its
-descriptor second, so the connections of one loop share a subset of the shards
-and a loop's batch of runnable connections wakes few workers. A worker keeps
-serving its shard until the shard runs dry, so a connection's turns stay on
-one CPU, whose caches then hold its socket. Workers that run out of work take
-over shards still holding tasks, and a shard whose worker is blocked in a
-callback is handed to another worker after a few milliseconds, so a callback
-that blocks holds up no other shard and its own only briefly. Workers are
-added only while callbacks block, up to 512 per P, and idle ones exit after 30
-seconds. Write turns run on a sharded scheduler of their own under the same
-key.
-
-`Events.Dial` and `Events.DialContext` perform synchronous resolution and
-connection setup, and register the new connection on the calling goroutine.
-Native callbacks run on task workers and may dial, but the synchronous
-operation occupies that worker; move long dials to an application goroutine
-when appropriate. A synchronous dial similarly blocks a stdio connection's
-callback path. On the stdio backend, a call from an event-loop goroutine
-returns `ErrDialOnEventLoop`. Use `DialContext` when the operation needs
-cancellation or a deadline.
-`Events.Serve` listens on every supplied address. Call `Serve()` without an
-address when using an Events instance only for outbound dialing.
-
-`Events.Close` only publishes shutdown and always returns without waiting. The
-return of `Serve` is the usual lifecycle join point; `Events.Wait` is available
-when shutdown is initiated from another goroutine. `Wait` includes event loops,
-connection tasks, stdio I/O goroutines, and `OnStop`, and must not be called
-from one of those callbacks.
-
-`Events.Adopt` transfers an already-established stream connection into the
-event loops. The `Events` instance must already be serving, and ownership is
-consumed on both success and failure; the caller must never use the original
-`net.Conn` again after calling it.
-
-`MaxOutboundBuffered` is the only outbound backpressure budget. It is applied
-per connection: a write that would push buffered unsent data beyond it returns
-`ErrOutboundOverflow`, and reads are never paused by it — a full-duplex peer
-can always drain its side. `MaxInboundBuffered` closes a connection with
-`ErrInboundOverflow` when a callback leaves too much input unconsumed. Both
-limits default to zero, which disables them.
-
-The inbound buffer is callback-scoped. `Peek`, `PeekChunk`, `Discard`,
-`InboundBuffered`, `ReserveInbound`, `Read`, `WriteTo` and the slices they
-return may only be used inside the current invocation of this connection's
-`OnOpen`, `OnInbound`, `OnData` or `OnClose` callback — not from
-`OnOutbound` and not from another goroutine. `PeekChunk` (and `Peek`) may
-return a borrowed slice, and any call that consumes inbound data — `Read`,
-`WriteTo`, `Discard` — or the callback's return invalidates it as the
-consumed blocks go back to the pool, so copy anything processed
-asynchronously. Race-enabled builds panic on a call outside a callback as a
-misuse diagnostic; builds without the race detector compile that diagnostic
-out, and there the contract rests on the documentation and on the connection
-turn's serialization alone. Cross-goroutine access is
-per method, not per type: `Write` and `Close` are documented safe from other
-goroutines, the inbound methods are not, and every other method's comment says
-where it may be called — never assume the whole `Conn` is goroutine-safe.
-
-A codec that decodes length-prefixed packets in place, from `PeekChunk`, can
-keep doing so for a packet that spans many reads with `Conn.ReserveInbound`.
-Once the header has given the packet's length, each call moves the bytes
-buffered so far into one block with room for the whole packet, so a packet
-that has arrived is one chunk and is decoded without first being copied out
-with `Peek`. Call it in every callback while the packet is incomplete and once
-more when it is complete; each call copies only the bytes read since the last.
-The block is allocated by the first call, so reserve only lengths the codec
-has already checked against its limit, and for large ones consider waiting
-until part of the packet has arrived:
-
-```go
-total := 4 + size // header plus payload
-if err := conn.ReserveInbound(total); err != nil {
-	return err
-}
-if chunk := conn.PeekChunk(); len(chunk) >= total {
-	err := decode(chunk[4:total])
-	_, _ = conn.Discard(total)
-	return err
-}
-return errIncomplete // more callbacks follow as the rest arrives
-```
-
-For encoders that can write into caller-provided storage, `AcquireBuffer` and
-`Conn.WriteOwned` avoid copying the encoded result into asynchronous outbound
-storage. `WriteOwned` consumes the buffer on both success and failure, with one
-exception: `ErrOutboundOverflow` means nothing was accepted, so the buffer
-remains the caller's to resubmit or release. When a direct write partially
-reached the socket and the remainder cannot be queued, the error is
-`io.ErrShortWrite` instead: that buffer is consumed and the stream is closing,
-so the partial frame is never resubmitted:
-
-```go
-buffer := uio.AcquireBuffer(size)
-dst := buffer.AvailableBuffer()[:size]
-n, err := encode(dst)
-if err != nil {
-	uio.ReleaseBuffer(buffer)
-	return err
-}
-buffer.CommitWrite(n)
-_, err = conn.WriteOwned(buffer)
-if err == uio.ErrOutboundOverflow {
-	uio.ReleaseBuffer(buffer)
-}
-return err
-```
-
-Inside a native stream connection's own callback, `Conn.ReserveOutbound`
-goes one step further: it appends the requested bytes to the connection's
-outbound queue and returns them for the encoder to fill in place, so a round
-of small replies can share a few pooled blocks and be flushed together after
-the callback returns. Fill every reserved byte before the callback returns or
-flushes. Elsewhere, including on the `stdio` backend, or while output written
-from another goroutine is queued for or being sent by a write turn, it returns
-`ErrReserveUnsupported` and the caller falls back to another write:
-
-```go
-dst, err := conn.ReserveOutbound(size)
-if errors.Is(err, uio.ErrReserveUnsupported) {
-	// not in the connection's callback: encode into a buffer and WriteOwned it
-} else if err == nil {
-	encode(dst)
-}
-```
+An echo server:
 
 ```go
 package main
 
 import (
-	"fmt"
+	"log"
 
 	"github.com/urpc/uio"
 )
 
 func main() {
-
 	var events uio.Events
 
 	events.OnOpen = func(c uio.Conn) {
-		fmt.Println("connection opened:", c.RemoteAddr())
+		log.Println("hello", c.RemoteAddr())
 	}
 
 	events.OnData = func(c uio.Conn) error {
-		_, err := c.WriteTo(c)
+		_, err := c.WriteTo(c) // echo everything that arrived
 		return err
 	}
 
 	events.OnClose = func(c uio.Conn, err error) {
-		fmt.Println("connection closed:", c.RemoteAddr())
+		log.Println("bye", c.RemoteAddr(), err)
 	}
 
-	if err := events.Serve(":9527"); nil != err {
-		fmt.Println("server exited with error:", err)
+	log.Fatal(events.Serve(":9527"))
+}
+```
+
+`Serve` accepts several addresses at once, with an optional scheme:
+`":9527"`, `"tcp6://[::1]:9527"`, `"udp://:5353"`, `"unix:///tmp/app.sock"`.
+Once `Serve` is running (`Serve()` with no address for a dial-only client),
+the same `Events` can dial out with `Dial` or `DialContext`, or take over an
+established stream `net.Conn` with `Adopt`.
+
+## How it works
+
+<p align="center">
+  <img src="assets/architecture.svg" alt="Event loops collect readiness, a sharded scheduler queues each connection on its own core, a connection turn reads and runs your callbacks, and a write turn sends writes from other goroutines" width="100%">
+</p>
+
+1. **Watch.** A few event loops — epoll or kqueue instances, one per four Ps
+   by default — accept connections and collect readiness. They never run your
+   code.
+2. **Queue.** A ready connection is handed to a sharded worker pool. A
+   connection always lands on the same shard, so its work tends to return to
+   the same CPU, where its socket is still warm in cache. You can supply your
+   own scheduler through `Events.Executor`.
+3. **Serve.** A connection's *turn* reads the socket, runs `OnData`, and then
+   flushes every reply the callback wrote in one go. Turns of one connection
+   never overlap; different connections run in parallel.
+
+A write from another goroutine — say, an RPC reply that finishes later — is
+queued and sent by a short *write turn*, so it does not wait for a slow read.
+Only one sender touches a socket at a time, and bytes leave in the order they
+were written.
+
+This describes the native epoll/kqueue backend. The portable `stdio` backend
+used on Windows (or with `-tags stdio`) gives each stream connection its own
+reader and writer goroutines instead.
+
+## Configuration
+
+Everything is optional; the zero `Events` is ready to use.
+
+| Field | Default | What it does |
+| --- | --- | --- |
+| `Pollers` | one per 4 Ps, 1–8 | Number of event loops, never more than `GOMAXPROCS`. |
+| `Executor` | built-in sharded pool | Your own scheduler for connection and write turns (native backend). |
+| `MaxBufferSize` | 4 KiB | Bytes read per socket read. |
+| `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnData` are batched either way. |
+| `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
+| `MaxInboundBuffered` | off | Per-connection limit on unread bytes; past it the connection closes with `ErrInboundOverflow`. |
+| `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
+| `LockOSThread` | off | Locks each event-loop goroutine to its own OS thread; callback workers are unaffected. |
+
+Besides the three main callbacks there are `OnInbound` and `OnOutbound`, which
+report bytes read and written, and `OnStart` and `OnStop` for the server's
+lifecycle.
+
+## Going faster
+
+These are optional. Plain `Read`, `Write` and `WriteTo` work on every backend.
+
+**Decode in place.** `PeekChunk` returns the first chunk of buffered bytes
+without copying.
+For a length-prefixed protocol, `ReserveInbound` gathers a packet that spans
+several reads into one chunk, so it can still be decoded in place:
+
+```go
+events.OnData = func(c uio.Conn) error {
+	var header [4]byte
+	for {
+		h := c.Peek(header[:]) // copies only if the header spans reads
+		if len(h) < 4 {
+			return nil // wait for the header
+		}
+		size := binary.BigEndian.Uint32(h)
+		if size > maxPacket {
+			return errTooBig // check before reserving: it allocates
+		}
+		total := 4 + int(size)
+		if err := c.ReserveInbound(total); err != nil {
+			return err
+		}
+		chunk := c.PeekChunk()
+		if len(chunk) < total {
+			return nil // the rest is on its way
+		}
+		handle(chunk[4:total])
+		c.Discard(total)
 	}
 }
-
 ```
 
-## tcpkali2 Benchmark (2026-09-25)
+**Encode in place.** Inside a stream connection's own callback on the native
+backend, `ReserveOutbound` hands you room in the send queue to encode a reply
+into. Anywhere else it returns an error; encode into a pooled buffer and give
+it away with `WriteOwned` instead:
 
-The following results use [tcpkali2 0.4.0](https://github.com/limpo1989/tcpkali2)
-on a dual-socket Xeon E5-2690 v3 host with 48 logical CPUs. Server and client
-CPU resources were isolated with `taskset`: the server used all 24 logical
-CPUs in NUMA node 0 (`0-11,24-35`) and tcpkali2 used all 24 logical CPUs in
-NUMA node 1 (`12-23,36-47`). Both events and stdio ran with `GOMAXPROCS=24`;
-events additionally used 24 pollers, while tcpkali2 used `-w 24`. At that
-revision, Linux events collected stream readiness on a shared data poller, so
-the pollers handled accept, registration and close rather than stream
-readiness.
-
-The load used 1,000 loopback connections, a 3-second warmup, a 10-second
-measurement window, 1 KiB random messages, `--pipeline`, and the default
-TCP_NODELAY setting. Each table row is the run with the median request rate
-from three runs, and the runs of all eight configurations were interleaved.
-Every run completed with a 100% success rate and zero connection errors. The
-UWS server had compression disabled. P99 is saturated pipeline latency, not
-idle single-request latency. UIO revision `b23241d` (taskgo v1.5.0) was built
-with Go 1.27.1 on Ubuntu 22.04.5 with Linux 6.8.0.
-
-Plain TCP was run with:
-
-```bash
-GOMAXPROCS=24 taskset -c 0-11,24-35 ./echo -pollers 24 -buffer 4096
-
-taskset -c 12-23,36-47 tcpkali2 -w 24 -c 1000 \
-  --connect-rate 2000 -T 10s --warmup 3s -s 1024 \
-  --pipeline 127.0.0.1:9527
+```go
+if dst, err := c.ReserveOutbound(n); err == nil {
+	encode(dst) // fill every byte before the callback returns or flushes
+} else {
+	buf := uio.AcquireBuffer(n)
+	encode(buf.AvailableBuffer()[:n])
+	buf.CommitWrite(n)
+	if _, err := c.WriteOwned(buf); err == uio.ErrOutboundOverflow {
+		uio.ReleaseBuffer(buf) // overflow is the only error that hands it back
+	}
+}
 ```
 
-`./echo` is built from `examples/bench/echo`, with `-tags stdio` for the stdio
-backend. Both backends were tested with the default 4 KiB `MaxBufferSize` and
-a custom 16 KiB value (`-buffer 16384`). The UWS server runs the
-`uws/examples/echo` handler with the same `Pollers` and `MaxBufferSize`
-settings; the UWS run adds `--websocket` and targets port `19701`.
+## Rules of the road
 
-| Service | Backend | MaxBufferSize | Server CPUs | Requests/s | Avg latency | P99 latency | Bandwidth | Peak RSS |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| UIO TCP echo | events | 4 KiB | 24 | 8,902,695 | 3.53 ms | 4.92 ms | 18,233 MB/s | 12.5 MiB |
-| UIO TCP echo | events | 16 KiB | 24 | 9,816,081 | 2.94 ms | 5.71 ms | 20,103 MB/s | 12.5 MiB |
-| UIO TCP echo | stdio | 4 KiB | 24 | 8,981,015 | 3.51 ms | 10.58 ms | 18,393 MB/s | 56.6 MiB |
-| UIO TCP echo | stdio | 16 KiB | 24 | 9,686,031 | 3.20 ms | 9.56 ms | 19,837 MB/s | 83.4 MiB |
-| UWS echo | events | 4 KiB | 24 | 5,471,521 | 4.17 ms | 14.38 ms | 11,206 MB/s | 31.7 MiB |
-| UWS echo | events | 16 KiB | 24 | 5,435,586 | 4.21 ms | 14.46 ms | 11,132 MB/s | 32.0 MiB |
-| UWS echo | stdio | 4 KiB | 24 | 5,369,671 | 4.33 ms | 14.44 ms | 10,997 MB/s | 76.4 MiB |
-| UWS echo | stdio | 16 KiB | 24 | 5,364,657 | 4.28 ms | 14.26 ms | 10,987 MB/s | 108.8 MiB |
+- The inbound methods — `Read`, `WriteTo`, `Peek`, `PeekChunk`, `Discard`,
+  `InboundBuffered` and `ReserveInbound` — may only be called inside the
+  connection's own callback. Slices they return are valid until the callback
+  returns or consumes more input; copy anything you hand to another goroutine.
+  Builds with `-race` catch most misuse with a panic.
+- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close` and
+  `CloseWith` are safe from any goroutine.
+- `OnOutbound` can run concurrently with the connection's other callbacks.
+- `Events.Close` only requests shutdown and returns at once; `Serve` returns
+  once everything has stopped, or call `Events.Wait` from another goroutine.
+- `Dial` blocks the goroutine that calls it. From a callback, prefer dialing on
+  a goroutine of your own.
+- On the `stdio` backend, `Executor` is not used and `OnOpen` runs on an
+  event-loop goroutine: keep it short, and do not `Dial` from it (that returns
+  `ErrDialOnEventLoop`).
 
-Bandwidth is aggregate application traffic in both directions. Peak RSS was
-sampled every 100 ms during the selected median-throughput run. stdio's
-per-connection read/write goroutines and buffers account for most of its
-higher memory use and scale with the number of live connections.
-
-### Selection guidance
-
-- `MaxBufferSize` still helps plain TCP batching. Raising it from 4 KiB to
-  16 KiB improved TCP echo throughput by about 10% for events and about 8% for
-  stdio. At 4 KiB the two backends are within 1% of each other, and events has
-  less than half of stdio's P99 latency. With both tuned to 16 KiB, events was
-  about 1% faster, had lower average and P99 latency, and used about one
-  seventh of stdio's RSS.
-- For UWS, events is about 2% faster than stdio in this test, with slightly
-  lower average latency, about the same P99, and roughly 60% lower RSS at
-  4 KiB. Raising `MaxBufferSize` to 16 KiB did not materially improve either
-  backend for the 1 KiB WebSocket workload, and increased stdio RSS by about
-  40%, so 4 KiB remains the better choice for this profile.
-- Tune `MaxBufferSize` against the application protocol and payload. Larger
-  reads reduce syscall and callback overhead for streaming TCP, but they are
-  not a universal throughput improvement.
-- For large numbers of long-lived or mostly idle connections, prefer events:
-  its memory footprint is shared by event loops instead of being proportional
-  to two goroutines and a read buffer per connection.
-- Results remain workload dependent. Pipeline saturation amplifies queueing
-  latency, and placing server and client on separate NUMA nodes adds inter-node
-  loopback traffic. Use the same client version, connection count, payload,
-  Go version, poller/worker counts, CPU placement, and warmup when comparing a
-  deployment.
+The [API reference](https://pkg.go.dev/github.com/urpc/uio) has the full
+contract of every method.
 
 ## License
 
-The repository released under version 2.0 of the Apache License.
+[Apache License 2.0](LICENSE)
+
+The Go gopher in the banner is based on the original design by
+[Renée French](https://reneefrench.blogspot.com/), licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/).

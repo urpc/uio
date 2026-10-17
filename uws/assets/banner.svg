@@ -1,0 +1,89 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="188" viewBox="0 0 960 188">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0F1A2E"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0.35"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#818CF8" stop-opacity="0.22"/>
+    <stop offset="1" stop-color="#818CF8" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0"/>
+    <stop offset="0.5" stop-color="#22D3EE" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="word" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#A5F3FC"/>
+  </linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="#22304A"/>
+  </pattern>
+</defs>
+<rect width="960" height="188" rx="16" fill="url(#bg)"/>
+<rect width="960" height="188" rx="16" fill="url(#dots)" opacity="0.55"/>
+<rect x="0.5" y="0.5" width="959" height="187" rx="15.5" fill="none" stroke="#22304A"/>
+<circle cx="770" cy="94.0" r="96" fill="url(#glow)"/>
+<circle cx="600" cy="94.0" r="70" fill="url(#glow2)"/>
+<line x1="520" y1="72.0" x2="736" y2="72.0" stroke="#22D3EE" stroke-width="1.2" opacity="0.55"/>
+<path d="M734,72.0 l-7,-4 v8 z" fill="#22D3EE" opacity="0.8"/>
+<rect x="530.0" y="62.0" width="46.8" height="20" rx="5" fill="#0B1220" stroke="#22D3EE" stroke-opacity="0.85"/><text x="553.4" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="middle" font-weight="600">TEXT</text>
+<rect x="586.8" y="62.0" width="61.2" height="20" rx="5" fill="#0B1220" stroke="#22D3EE" stroke-opacity="0.85"/><text x="617.4" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="middle" font-weight="600">BINARY</text>
+<rect x="658.0" y="62.0" width="46.8" height="20" rx="5" fill="#0B1220" stroke="#94A3B8" stroke-opacity="0.85"/><text x="681.4" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#94A3B8" text-anchor="middle" font-weight="600">PING</text>
+<line x1="736" y1="116.0" x2="520" y2="116.0" stroke="#818CF8" stroke-width="1.2" opacity="0.55"/>
+<path d="M518,116.0 l7,-4 v8 z" fill="#818CF8" opacity="0.8"/>
+<rect x="536" y="101.0" width="134" height="30" rx="8" fill="none" stroke="#818CF8" stroke-opacity="0.45" stroke-dasharray="3 4"/>
+<rect x="542.0" y="106.0" width="38.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="561.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">TEXT</text>
+<rect x="584.0" y="106.0" width="38.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="603.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">TEXT</text>
+<rect x="626.0" y="106.0" width="38.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="645.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">PONG</text>
+<text x="603.0" y="146.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="middle" font-weight="400">one write</text>
+<circle cx="770" cy="94.0" r="32" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="1"/>
+<circle cx="770" cy="94.0" r="41" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="0.45"/>
+<circle cx="770" cy="94.0" r="51" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="0.2"/>
+<circle cx="770" cy="94.0" r="31" fill="#0B1220"/>
+<defs><clipPath id="uwsclip"><circle cx="50" cy="50" r="50"/></clipPath><linearGradient id="uwssky" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38BDF8"/><stop offset="1" stop-color="#0284C7"/></linearGradient></defs>
+<g transform="translate(742.00 66.00) scale(0.5600)">
+<circle cx="50" cy="50" r="50" fill="url(#uwssky)"/>
+<g clip-path="url(#uwsclip)">
+<circle cx="21" cy="31" r="10" fill="#CFEFF7" stroke="#14181F" stroke-width="2.3"/>
+<circle cx="22" cy="32" r="4.8" fill="#A9DDEA"/>
+<circle cx="84" cy="28" r="9" fill="#CFEFF7" stroke="#14181F" stroke-width="2.3"/>
+<circle cx="85" cy="29" r="4.3" fill="#A9DDEA"/>
+<path d="M7,104 C5,72 9,42 25,28 C40,15 66,14 81,25 C95,36 99,62 97,104 Z" fill="#CFEFF7" stroke="#14181F" stroke-width="2.3" stroke-linejoin="round"/>
+<path d="M89,40 C94,56 94,80 93,104 L97,104 C99,72 97,52 89,40 Z" fill="#A9DDEA" opacity="0.8"/>
+<path d="M46,18 C45,13 47,10 51,8" fill="none" stroke="#14181F" stroke-width="2.3" stroke-linecap="round"/>
+<path d="M53,17 C54,12 57,10 61,9" fill="none" stroke="#14181F" stroke-width="2.3" stroke-linecap="round"/>
+<path d="M59,18 C62,14 65,13 69,14" fill="none" stroke="#14181F" stroke-width="2.3" stroke-linecap="round"/>
+<ellipse cx="38" cy="47" rx="15" ry="16.5" fill="#fff" stroke="#14181F" stroke-width="2.3"/>
+<circle cx="31.5" cy="48" r="5.2" fill="#14181F"/>
+<circle cx="33.1" cy="46.2" r="1.6" fill="#fff"/>
+<ellipse cx="70" cy="41" rx="15.5" ry="17" fill="#fff" stroke="#14181F" stroke-width="2.3"/>
+<circle cx="73" cy="43" r="5.2" fill="#14181F"/>
+<circle cx="74.6" cy="41.2" r="1.6" fill="#fff"/>
+<path d="M48,68 C48,83 54,89.5 60,89.5 C67,89.5 72,83 72,68 Z" fill="#5B1F2A" stroke="#14181F" stroke-width="2.3" stroke-linejoin="round"/>
+<path d="M51.5,83 C54,78.5 66,78.5 68.5,83 C66,88.5 54,88.5 51.5,83 Z" fill="#F07E8E"/>
+<rect x="54.4" y="66" width="5.2" height="15" rx="1.4" fill="#fff" stroke="#14181F" stroke-width="1.84"/>
+<rect x="60.4" y="66" width="5.2" height="15" rx="1.4" fill="#fff" stroke="#14181F" stroke-width="1.84"/>
+<ellipse cx="60" cy="64" rx="15" ry="9.5" fill="#F3CF9E" stroke="#14181F" stroke-width="2.3"/>
+<ellipse cx="60" cy="58.8" rx="6.2" ry="4" fill="#14181F"/>
+<ellipse cx="58.2" cy="57.6" rx="1.8" ry="1" fill="#fff" opacity="0.7"/>
+</g>
+<circle cx="50" cy="50" r="49" fill="none" stroke="#0B1220" stroke-opacity="0.25" stroke-width="2"/>
+</g>
+<rect x="840" y="49.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="64.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">RFC 6455</text>
+<rect x="840" y="83.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="98.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">RFC 7692</text>
+<rect x="840" y="117.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="132.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">Autobahn</text>
+<text x="52.0" y="92.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" fill="url(#word)" text-anchor="start" font-weight="700" letter-spacing="-2">uws</text>
+<text x="196.0" y="66.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#E6EDF6" text-anchor="start" font-weight="500">WebSocket for Go, on uio</text>
+<text x="196.0" y="90.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A9BB4" text-anchor="start" font-weight="400">No goroutine per connection.</text>
+<rect x="56" y="122" width="274" height="30" rx="8" fill="#0A1628" stroke="#22304A"/>
+<text x="70.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#22D3EE" text-anchor="start" font-weight="400">$</text>
+<text x="84.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#CBD5E1" text-anchor="start" font-weight="400">go get github.com/urpc/uio/uws</text>
+<text x="346.0" y="141.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">server · client · net/http</text>
+</svg>

@@ -1,0 +1,96 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="424" viewBox="0 0 960 424">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0F1A2E"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0.35"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#818CF8" stop-opacity="0.22"/>
+    <stop offset="1" stop-color="#818CF8" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0"/>
+    <stop offset="0.5" stop-color="#22D3EE" stop-opacity="0.9"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </linearGradient>
+  <linearGradient id="word" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#A5F3FC"/>
+  </linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="#22304A"/>
+  </pattern>
+</defs>
+<rect width="960" height="424" rx="16" fill="url(#bg)"/>
+<rect width="960" height="424" rx="16" fill="url(#dots)" opacity="0.55"/>
+<rect x="0.5" y="0.5" width="959" height="423" rx="15.5" fill="none" stroke="#22304A"/>
+<text x="40.0" y="52.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">ARCHITECTURE</text>
+<text x="40.0" y="80.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#E6EDF6" text-anchor="start" font-weight="600">How a connection is served</text>
+<text x="920.0" y="80.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8A9BB4" text-anchor="end" font-weight="400">native epoll / kqueue backend</text>
+<text x="40.0" y="128.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="start" font-weight="400">sockets</text>
+<rect x="40" y="146" width="60" height="14" rx="4" fill="#0E182B" stroke="#22304A" stroke-opacity="1"/>
+<circle cx="50" cy="153" r="2.4" fill="#3A4A66"/>
+<rect x="58" y="151.5" width="18" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="168" width="60" height="14" rx="4" fill="#0E2A36" stroke="#22D3EE" stroke-opacity="0.9"/>
+<circle cx="50" cy="175" r="2.4" fill="#22D3EE"/>
+<rect x="58" y="173.5" width="25" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="190" width="60" height="14" rx="4" fill="#0E182B" stroke="#22304A" stroke-opacity="1"/>
+<circle cx="50" cy="197" r="2.4" fill="#3A4A66"/>
+<rect x="58" y="195.5" width="32" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="212" width="60" height="14" rx="4" fill="#0E182B" stroke="#22304A" stroke-opacity="1"/>
+<circle cx="50" cy="219" r="2.4" fill="#3A4A66"/>
+<rect x="58" y="217.5" width="19" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="234" width="60" height="14" rx="4" fill="#0E2A36" stroke="#22D3EE" stroke-opacity="0.9"/>
+<circle cx="50" cy="241" r="2.4" fill="#22D3EE"/>
+<rect x="58" y="239.5" width="26" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="256" width="60" height="14" rx="4" fill="#0E182B" stroke="#22304A" stroke-opacity="1"/>
+<circle cx="50" cy="263" r="2.4" fill="#3A4A66"/>
+<rect x="58" y="261.5" width="33" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<rect x="40" y="278" width="60" height="14" rx="4" fill="#0E182B" stroke="#22304A" stroke-opacity="1"/>
+<circle cx="50" cy="285" r="2.4" fill="#3A4A66"/>
+<rect x="58" y="283.5" width="20" height="3" rx="1.5" fill="#3A4A66" opacity="0.8"/>
+<line x1="106" y1="201" x2="140" y2="201" stroke="#22D3EE" stroke-width="1.3" opacity="0.8"/>
+<path d="M146,201 l-7,-4 v8 z" fill="#22D3EE"/>
+<text x="126.0" y="192.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">ready</text>
+<rect x="146" y="126" width="214" height="150" rx="12" fill="#0E182B" stroke="#22304A" stroke-opacity="1" stroke-width="1"/>
+<rect x="164" y="126" width="34" height="2" fill="#22D3EE"/>
+<text x="164.0" y="154.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="1.2">01  WATCH</text>
+<text x="164.0" y="178.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" fill="#E6EDF6" text-anchor="start" font-weight="600">Event loops</text>
+<text x="164.0" y="202.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">epoll / kqueue, one per 4 Ps</text>
+<text x="164.0" y="221.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">accept and collect readiness</text>
+<text x="164.0" y="240.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">never run your callbacks</text>
+<line x1="360" y1="201" x2="426" y2="201" stroke="#22D3EE" stroke-width="1.3" opacity="0.8"/>
+<path d="M432,201 l-7,-4 v8 z" fill="#22D3EE"/>
+<text x="396.0" y="192.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">queue</text>
+<rect x="432" y="126" width="214" height="150" rx="12" fill="#0E182B" stroke="#22304A" stroke-opacity="1" stroke-width="1"/>
+<rect x="450" y="126" width="34" height="2" fill="#22D3EE"/>
+<text x="450.0" y="154.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="1.2">02  QUEUE</text>
+<text x="450.0" y="178.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" fill="#E6EDF6" text-anchor="start" font-weight="600">Turn scheduler</text>
+<text x="450.0" y="202.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">sharded, keyed by connection</text>
+<text x="450.0" y="221.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">so it keeps returning to</text>
+<text x="450.0" y="240.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">the same core</text>
+<line x1="646" y1="201" x2="712" y2="201" stroke="#22D3EE" stroke-width="1.3" opacity="0.8"/>
+<path d="M718,201 l-7,-4 v8 z" fill="#22D3EE"/>
+<text x="682.0" y="192.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">run</text>
+<rect x="718" y="126" width="214" height="150" rx="12" fill="#0E182B" stroke="#22D3EE" stroke-opacity="0.85" stroke-width="1.3"/>
+<rect x="736" y="126" width="34" height="2" fill="#22D3EE"/>
+<text x="736.0" y="154.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="1.2">03  SERVE</text>
+<text x="736.0" y="178.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16" fill="#E6EDF6" text-anchor="start" font-weight="600">Connection turn</text>
+<text x="736.0" y="202.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">read, then OnOpen / OnData</text>
+<text x="736.0" y="221.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">one at a time per connection</text>
+<text x="736.0" y="240.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">replies leave in one writev</text>
+<rect x="40" y="318" width="300" height="72" rx="12" fill="#0E182B" stroke="#22304A"/>
+<text x="58.0" y="348.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#E6EDF6" text-anchor="start" font-weight="600">your goroutines</text>
+<text x="58.0" y="370.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8A9BB4" text-anchor="start" font-weight="400">conn.Write · WriteOwned · Close</text>
+<line x1="340" y1="354" x2="712" y2="354" stroke="#818CF8" stroke-width="1.3" opacity="0.8" stroke-dasharray="4 5"/>
+<path d="M718,354 l-7,-4 v8 z" fill="#818CF8"/>
+<text x="529.0" y="345.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">queued in order</text>
+<rect x="718" y="318" width="214" height="72" rx="12" fill="#0E182B" stroke="#818CF8" stroke-opacity="0.7"/>
+<rect x="736" y="318" width="34" height="2" fill="#818CF8"/>
+<text x="736.0" y="348.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" fill="#E6EDF6" text-anchor="start" font-weight="600">Write turn</text>
+<text x="736.0" y="370.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#8A9BB4" text-anchor="start" font-weight="400">never waits behind a read</text>
+<line x1="742" y1="276" x2="742" y2="318" stroke="#3A4A66" stroke-width="1" stroke-dasharray="2 4"/>
+<text x="708.0" y="301.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#8A9BB4" text-anchor="end" font-weight="400">one sender at a time</text>
+</svg>
