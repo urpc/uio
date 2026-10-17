@@ -613,3 +613,48 @@ func FuzzParserNeverPanics(f *testing.F) {
 		_, _ = parser.Feed(data, func(Frame) error { return nil })
 	})
 }
+
+// FinishFrame completes only the frame a parser holds: it stops at the
+// boundary after it, takes all of src while the frame has not ended, and takes
+// nothing at a boundary, so a caller can parse the frames that follow its own
+// way.
+func TestParserFinishFrameStopsAtTheBoundary(t *testing.T) {
+	cfg := ParserConfig{ExpectMask: true}
+	first := Append(nil, Frame{Fin: true, Opcode: Binary, Masked: true, Payload: bytes.Repeat([]byte{'a'}, 300)}, [4]byte{9, 8, 7, 6})
+	rest := Append(nil, Frame{Fin: true, Opcode: Text, Masked: true, Payload: []byte("next")}, [4]byte{1, 2, 3, 4})
+	wire := append(append([]byte(nil), first...), rest...)
+
+	for _, split := range []int{1, 2, 3, 4, 7, 8, 100, len(first) - 1} {
+		parser := NewParser(cfg)
+		var got []Frame
+		sink := emitFunc(func(f Frame) error {
+			got = append(got, Frame{Opcode: f.Opcode, Payload: append([]byte(nil), f.Payload...)})
+			return nil
+		})
+		src := append([]byte(nil), wire...)
+		if n, err := parser.FeedTo(src[:split], sink); err != nil || n != split || len(got) != 0 || parser.AtFrameBoundary() {
+			t.Fatalf("split %d: FeedTo = %d, %v, %d frames, boundary %v", split, n, err, len(got), parser.AtFrameBoundary())
+		}
+
+		// A chunk that ends before the frame does is taken whole.
+		if split < len(first)-1 {
+			mid := split + 1
+			n, err := parser.FinishFrame(src[split:mid], sink)
+			if err != nil || n != 1 || len(got) != 0 || parser.AtFrameBoundary() {
+				t.Fatalf("split %d: partial FinishFrame = %d, %v, %d frames", split, n, err, len(got))
+			}
+			split = mid
+		}
+
+		n, err := parser.FinishFrame(src[split:], sink)
+		if err != nil || n != len(first)-split {
+			t.Fatalf("split %d: FinishFrame = %d, %v; want %d, nil", split, n, err, len(first)-split)
+		}
+		if !parser.AtFrameBoundary() || len(got) != 1 || got[0].Opcode != Binary || !bytes.Equal(got[0].Payload, bytes.Repeat([]byte{'a'}, 300)) {
+			t.Fatalf("split %d: after FinishFrame boundary %v, frames %d", split, parser.AtFrameBoundary(), len(got))
+		}
+		if n, err := parser.FinishFrame(src[len(first):], sink); n != 0 || err != nil || len(got) != 1 {
+			t.Fatalf("split %d: FinishFrame at a boundary = %d, %v, %d frames; want 0, nil, 1", split, n, err, len(got))
+		}
+	}
+}

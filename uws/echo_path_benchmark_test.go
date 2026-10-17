@@ -103,3 +103,56 @@ func BenchmarkServerEchoPath(b *testing.B) {
 		}
 	}
 }
+
+// Run with:
+//
+//	go test -run '^$' -bench '^BenchmarkServerEchoPathSplitReads$' -benchmem ./uws
+//
+// A pipelining client keeps several batches in flight, so a read round takes
+// them in full reads that end inside a frame: here 248 binary frames of 256
+// bytes arrive as four 16 KiB reads, as go-websocket-benchmark's pipeline
+// sends them, and every read after the first starts mid-frame.
+func BenchmarkServerEchoPathSplitReads(b *testing.B) {
+	const readSize = 16 << 10
+	for _, size := range []int{64, 256, 1024} {
+		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
+			server := NewServer(echoPathHandler{})
+			server.config = newServerConnConfig(server)
+			raw := &echoPathConn{}
+			conn := server.newConnection(raw)
+			conn.opened.Store(true)
+			raw.userdata = conn
+
+			var wire []byte
+			frames := 0
+			for len(wire) < 4*readSize-size {
+				wire = frame.Append(wire, frame.Frame{
+					Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, size),
+				}, [4]byte{1, 2, 3, 4})
+				frames++
+			}
+			chunk := make([]byte, len(wire))
+			raw.out = make([]byte, 0, frames*(size+14))
+
+			b.SetBytes(int64(frames * size))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				copy(chunk, wire)
+				raw.out = raw.out[:0]
+				for read := chunk; len(read) > 0; {
+					n := min(readSize, len(read))
+					raw.inbound = read[:n]
+					if err := server.onData(raw); err != nil {
+						b.Fatal(err)
+					}
+					if len(raw.inbound) != 0 {
+						b.Fatalf("%d bytes of a read left unconsumed", len(raw.inbound))
+					}
+					read = read[n:]
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Nanoseconds())/float64(b.N*frames), "ns/frame")
+		})
+	}
+}

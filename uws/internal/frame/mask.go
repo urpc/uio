@@ -8,6 +8,13 @@ const (
 	vectorUnmaskThreshold = 128
 )
 
+// VectorUnmaskMin is the payload length from which Unmask takes the vector
+// path where the CPU has one.
+const VectorUnmaskMin = vectorUnmaskThreshold
+
+// Unmask removes a frame's mask from its whole payload in place.
+func Unmask(payload []byte, key [4]byte) { unmask(payload, key, 0) }
+
 // unmask applies the repeating four-byte mask starting at the frame-relative
 // offset. The word-at-a-time body handles native endian order explicitly while
 // prefix and suffix loops cover unaligned bytes. On amd64 with AVX2 the bulk

@@ -298,7 +298,15 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 	}
 	size := head + 4 + n
 	payload := src[head+4 : size : size]
-	ascii := unmaskShort(payload, binary.LittleEndian.Uint32(src[head:head+4]))
+	// A binary payload needs no ASCII verdict for the UTF-8 check below, and
+	// from VectorUnmaskMin bytes the frame package's vector unmask beats the
+	// fused word loop, which a text payload keeps.
+	ascii := false
+	if b0 == 0x80|byte(frame.Binary) && n >= frame.VectorUnmaskMin {
+		frame.Unmask(payload, [4]byte(src[head:head+4]))
+	} else {
+		ascii = unmaskShort(payload, binary.LittleEndian.Uint32(src[head:head+4]))
+	}
 	if size < len(src) {
 		c.beginWriteBatch()
 	}
@@ -357,24 +365,30 @@ func (c *Conn) countFrame() error {
 
 // consumeFrames is feedFrames for a read round: complete frames are parsed in
 // place and delivered without an intermediate callback, and only a frame that
-// spans input chunks takes a pooled incremental parser.
+// spans input chunks takes a pooled incremental parser. That parser finishes
+// the one frame it holds and no more: a pipelining peer keeps several batches
+// in flight, so most reads of a busy round start inside a frame, and the
+// frames after it belong on the paths below like any others.
 func (c *Conn) consumeFrames(data []byte) (int, error) {
 	sink := (*connFrameSink)(c)
+	consumed := 0
 	if c.parser != nil {
 		c.beginWriteBatch()
-		consumed, err := c.parser.FeedTo(data, sink)
+		n, err := c.parser.FinishFrame(data, sink)
+		consumed = n
 		if err != nil || c.parser.AtFrameBoundary() {
 			releaseIncrementalParser(c.parser)
 			c.parser = nil
 		}
-		return consumed, err
+		if err != nil || c.parser != nil {
+			return consumed, err
+		}
 	}
 	cfg := c.frameParserConfig()
 	limit := -1
 	if c.config != nil {
 		limit = c.config.shortReadLimit
 	}
-	consumed := 0
 	for consumed < len(data) {
 		if size, ok, err := c.consumeShortFrame(data[consumed:], limit); ok {
 			consumed += size

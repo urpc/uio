@@ -158,9 +158,25 @@ func (p *Parser) Feed(src []byte, emit func(Frame) error) (int, error) {
 
 // FeedTo is Feed with frames delivered to sink.
 func (p *Parser) FeedTo(src []byte, sink Sink) (int, error) {
+	return p.feedTo(src, sink, false)
+}
+
+// FinishFrame consumes from src only the rest of the frame p holds, delivers
+// it to sink, and returns at the frame boundary, leaving the frames that
+// follow for a caller with a faster path for complete frames. It consumes all
+// of src, delivering nothing, when the frame does not end in it, and nothing
+// when p is already at a frame boundary.
+func (p *Parser) FinishFrame(src []byte, sink Sink) (int, error) {
+	return p.feedTo(src, sink, true)
+}
+
+func (p *Parser) feedTo(src []byte, sink Sink, finish bool) (int, error) {
 	consumed := 0
 	for consumed < len(src) {
 		if p.headerLen == 0 {
+			if finish {
+				return consumed, nil
+			}
 			frame, size, complete, err := ParseFrame(src[consumed:], p.cfg)
 			if err != nil {
 				return consumed, err

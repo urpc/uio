@@ -3,6 +3,7 @@ package uws
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/urpc/uio"
@@ -222,3 +223,107 @@ func TestShortSendLimitsFollowTheThreshold(t *testing.T) {
 		}
 	}
 }
+
+// messageLog keeps a copy of every message with its type.
+type messageLog struct{ messages *[]Message }
+
+func (messageLog) OnOpen(*Conn) {}
+
+func (h messageLog) OnMessage(_ *Conn, message Message) {
+	*h.messages = append(*h.messages, Message{Type: message.Type, Payload: append([]byte(nil), message.Payload...)})
+}
+
+func (messageLog) OnClose(*Conn, CloseEvent) {}
+
+// Reads that end inside a frame, as a pipelining peer's full reads do, still
+// deliver every message in order and byte for byte: the frame carried over a
+// read is finished by the incremental parser, and the frames after it in the
+// same read take the short path again, binary and text, seven- and 16-bit,
+// around the vector unmask threshold.
+func TestReadsSplitInsideFramesDeliverEveryMessage(t *testing.T) {
+	want := []Message{
+		{Type: BinaryMessage, Payload: bytes.Repeat([]byte{0xA5}, 256)},
+		{Type: TextMessage, Payload: bytes.Repeat([]byte("ascii "), 50)},
+		{Type: BinaryMessage, Payload: []byte{1, 2, 3}},
+		{Type: TextMessage, Payload: []byte(strings.Repeat("ü€😀", 40))},
+		{Type: BinaryMessage, Payload: bytes.Repeat([]byte{0x7f}, frame.VectorUnmaskMin)},
+		{Type: BinaryMessage, Payload: bytes.Repeat([]byte{0x80}, frame.VectorUnmaskMin-1)},
+		{Type: TextMessage, Payload: []byte("short")},
+		{Type: BinaryMessage, Payload: bytes.Repeat([]byte{0x00, 0xff}, 600)},
+	}
+	var wire []byte
+	for round := 0; round < 3; round++ {
+		for i, message := range want {
+			opcode := frame.Binary
+			if message.Type == TextMessage {
+				opcode = frame.Text
+			}
+			key := [4]byte{byte(i + 1), byte(round + 7), 0x5a, byte(31 * i)}
+			wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: opcode, Masked: true, Payload: message.Payload}, key)
+		}
+	}
+	all := append(append(append([]Message(nil), want...), want...), want...)
+
+	for _, readSize := range []int{1, 2, 3, 5, 8, 13, 64, 127, 128, 262, 263, 264, 265, 700, 1024, 4096, len(wire)} {
+		var got []Message
+		server := NewServer(messageLog{&got})
+		server.config = newServerConnConfig(server)
+		raw := &echoPathConn{}
+		conn := server.newConnection(raw)
+		conn.opened.Store(true)
+		raw.userdata = conn
+
+		src := append([]byte(nil), wire...)
+		for len(src) > 0 {
+			n := min(readSize, len(src))
+			raw.inbound = src[:n]
+			if err := server.onData(raw); err != nil {
+				t.Fatalf("reads of %d: round failed: %v", readSize, err)
+			}
+			if len(raw.inbound) != 0 {
+				t.Fatalf("reads of %d: %d bytes left unconsumed", readSize, len(raw.inbound))
+			}
+			src = src[n:]
+		}
+		if len(got) != len(all) {
+			t.Fatalf("reads of %d: %d messages, want %d", readSize, len(got), len(all))
+		}
+		for i := range all {
+			if got[i].Type != all[i].Type || !bytes.Equal(got[i].Payload, all[i].Payload) {
+				t.Fatalf("reads of %d: message %d differs: type %v len %d, want type %v len %d",
+					readSize, i, got[i].Type, len(got[i].Payload), all[i].Type, len(all[i].Payload))
+			}
+		}
+	}
+}
+
+// A text frame that follows a frame finished across reads is still validated:
+// invalid UTF-8 there fails the round as it does anywhere else.
+func TestShortPathAfterASplitFrameValidatesText(t *testing.T) {
+	var got []Message
+	server := NewServer(messageLog{&got})
+	server.config = newServerConnConfig(server)
+	raw := &echoPathConn{}
+	conn := server.newConnection(raw)
+	conn.opened.Store(true)
+	raw.userdata = conn
+	t.Cleanup(func() { server.onClose(raw, io.EOF) })
+
+	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: bytes.Repeat([]byte{1}, 300)}, [4]byte{1, 2, 3, 4})
+	split := len(wire) - 10
+	wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte{0xff, 0xfe, 'x'}}, [4]byte{5, 6, 7, 8})
+
+	raw.inbound = append([]byte(nil), wire[:split]...)
+	if err := server.onData(raw); err != nil {
+		t.Fatalf("first read failed: %v", err)
+	}
+	raw.inbound = append([]byte(nil), wire[split:]...)
+	err := server.onData(raw)
+	if err == nil && !conn.closing.Load() {
+		t.Fatal("invalid UTF-8 after a frame finished across reads was accepted")
+	}
+	if len(got) != 1 {
+		t.Fatalf("%d messages delivered, want only the binary one", len(got))
+	}
+}
+
