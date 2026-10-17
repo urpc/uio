@@ -588,6 +588,11 @@ func TestWaiterNoteLoadSwitchesOnQuietAndLoad(t *testing.T) {
 func TestAcceptedConnectionsGoRoundTheLoops(t *testing.T) {
 	loopWaitersOverride = 1
 	t.Cleanup(func() { loopWaitersOverride = 0 })
+	// Events runs no more loops than Ps.
+	if procs := runtime.GOMAXPROCS(0); procs < 2 {
+		runtime.GOMAXPROCS(2)
+		t.Cleanup(func() { runtime.GOMAXPROCS(procs) })
+	}
 
 	const conns = 20
 	opened := make(chan *fdConn, conns)
@@ -668,5 +673,34 @@ func TestTurnKeyKeepsALoopOnItsOwnShards(t *testing.T) {
 	}
 	if got := (&fdConn{fd: 9}).turnKey(); got != 9 {
 		t.Fatalf("a connection without a loop is keyed %d, want its descriptor", got)
+	}
+}
+
+// TestLoopWaitModeFollowsTheMeasuredRange pins where each wait is used under
+// the default sizing and with Pollers set: the adaptive wait only where a
+// loop has a single waiter on a host of adaptiveMinProcs Ps or more, the
+// blocking wait past parkedWaiters waiters, and parking everywhere else.
+func TestLoopWaitModeFollowsTheMeasuredRange(t *testing.T) {
+	names := map[waitMode]string{waitAdaptive: "adaptive", waitPark: "park", waitBlock: "block"}
+	cases := []struct {
+		procs, pollers int // pollers 0: the default
+		want           waitMode
+	}{
+		{1, 0, waitPark}, {2, 0, waitPark}, {4, 0, waitPark}, {6, 0, waitPark},
+		{8, 0, waitAdaptive}, {24, 0, waitAdaptive}, {32, 0, waitAdaptive}, {48, 0, waitAdaptive},
+		{64, 0, waitBlock}, {128, 0, waitBlock},
+		{4, 4, waitPark},  // one waiter per loop, but too few Ps to block
+		{24, 1, waitPark}, // six waiters sharing one loop
+	}
+	for _, c := range cases {
+		loops := c.pollers
+		if loops == 0 {
+			loops = defaultPollers(c.procs)
+		}
+		loops = min(loops, c.procs)
+		waiters := loopWaiters(c.procs, loops)
+		if got := loopWaitMode(c.procs, loops, waiters); got != c.want {
+			t.Errorf("%d Ps, %d loops × %d waiters: %s, want %s", c.procs, loops, waiters, names[got], names[c.want])
+		}
 	}
 }

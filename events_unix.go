@@ -194,17 +194,7 @@ func (ev *Events) initLoops() (err error) {
 	}
 	procs := runtime.GOMAXPROCS(0)
 	waiters := loopWaiters(procs, len(ev.loops))
-	// The wait to run the waiters with: a lone waiter per loop tunes its wait
-	// to its own load where the host runs few enough waiters, a host past
-	// parkedWaiters blocks as it always did, and everything else parks; see
-	// the quietBatch block.
-	mode := waitPark
-	switch {
-	case waiters*len(ev.loops) > parkedWaiters:
-		mode = waitBlock
-	case waiters == 1:
-		mode = waitAdaptive
-	}
+	mode := loopWaitMode(procs, len(ev.loops), waiters)
 	for _, loop := range ev.loops {
 		loop.start(waiters, mode, ev.LockOSThread)
 	}

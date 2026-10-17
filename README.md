@@ -104,14 +104,16 @@ configured `Executor` or UIO's own connection scheduler runs all of the
 connection's callbacks, reads its socket, and also releases the connection
 once it is closing. The event loops only collect readiness. Each loop is one
 epoll or kqueue instance; stream listeners, connections and UDP sockets are
-registered with the loop their descriptor picks, and the loop's waiters
-accept on its listeners, register what they accept, and hand runnable
-connections to the scheduler, without ever running a callback or waiting for
-a connection. One blocked connection therefore blocks neither a
+spread over the loops in turn, whatever their descriptor numbers, and the
+loop's waiters accept on its listeners, register what they accept, and hand
+runnable connections to the scheduler, without ever running a callback or
+waiting for a connection. One blocked connection therefore blocks neither a
 loop nor another connection. Several loops keep a connection's events within
-one cluster of cores, and with a few waiters per loop one of them collects the
-next batch while another is still handing its batch over; idle waiters park in
-the Go runtime's netpoller instead of holding a P.
+one cluster of cores. By default, from 8 to 63 Ps each loop has one waiter,
+which parks in the Go runtime's netpoller while its loop is busy and blocks in
+the kernel once the loop goes quiet; below 8 Ps the waiters always park (two on
+the one loop from 2 Ps up), and a host that runs more than eight waiters
+blocks them all.
 
 A stream connection's first turn runs `OnOpen`, then reads whatever the peer
 already sent and runs `OnData` for it in the same turn. Registration stays
@@ -141,14 +143,19 @@ datagrams and run the peers' callbacks, since the peers share its socket. A
 UDP `Write` or `WriteOwned` sends its datagram before returning, from any
 goroutine. The `stdio`/Windows backend instead uses dedicated blocking
 read/write goroutines per connection; `Executor` does not apply there.
-Without an external executor, native UIO runs connection turns on its own
-scheduler: one shard per P (`runtime.GOMAXPROCS(0)`), twice as many once there
-are 64 connections per P, each connection's turns queued on the shard its
-descriptor picks. A shard is served by one worker while that worker keeps up,
-so a connection's turns stay on one CPU, whose caches then hold its socket;
-a turn that finds another queued behind it brings in another worker first, so
-callbacks that block hold up neither their shard nor the others, up to 512
-workers per shard. Idle workers beyond one per shard exit after 30 seconds.
+Without an external executor, native UIO runs connection turns on a sharded
+taskgo queue, two shards per P (`runtime.GOMAXPROCS(0)`). All of a
+connection's turns go to one shard, picked by its loop first and its
+descriptor second, so the connections of one loop share a subset of the shards
+and a loop's batch of runnable connections wakes few workers. A worker keeps
+serving its shard until the shard runs dry, so a connection's turns stay on
+one CPU, whose caches then hold its socket. Workers that run out of work take
+over shards still holding tasks, and a shard whose worker is blocked in a
+callback is handed to another worker after a few milliseconds, so a callback
+that blocks holds up no other shard and its own only briefly. Workers are
+added only while callbacks block, up to 512 per P, and idle ones exit after 30
+seconds. Write turns run on a sharded scheduler of their own under the same
+key.
 
 `Events.Dial` and `Events.DialContext` perform synchronous resolution and
 connection setup, and register the new connection on the calling goroutine.

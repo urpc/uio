@@ -83,15 +83,18 @@ const parkedWaiters = 8
 // send it to block, and a round of parkBatch events or more sends it back to
 // park. Rounds in between hold the mode and only break the quiet streak.
 //
-// Only a loop's only waiter takes this up (see waitMode): two blocked waiters
-// on one poller both wake for every event, each holding a P that a small host
-// has none of to spare, which cost the pipeline up to 34 and 17 percent on
-// two- and four-P hosts. A host that runs more waiters than parkedWaiters
-// keeps the blocking wait it always had.
+// Only a loop's only waiter takes this up, and only on a host of at least
+// adaptiveMinProcs Ps (see waitMode): a waiter blocked in the kernel holds
+// its P until the runtime takes it back, and a small host has none to spare —
+// blocking cost the pipeline up to 34 and 17 percent on two- and four-P hosts,
+// and was measured to pay from eight Ps up. A host that runs more waiters than
+// parkedWaiters keeps the blocking wait it always had.
 const (
 	parkBatch  = 16
 	quietBatch = 4
 	quietWaits = 50
+
+	adaptiveMinProcs = 8
 )
 
 // waitMode is how a loop's waiters wait; see the quietBatch block.
@@ -99,14 +102,28 @@ type waitMode uint8
 
 const (
 	// waitAdaptive parks while the loop is busy and blocks once it goes
-	// quiet; a loop's only waiter takes it where the host runs few enough
-	// waiters (see initLoops).
+	// quiet; see loopWaitMode for where it is used.
 	waitAdaptive waitMode = iota
 	// waitPark always parks in the runtime's netpoller.
 	waitPark
 	// waitBlock always blocks in the kernel.
 	waitBlock
 )
+
+// loopWaitMode is the wait for the waiters of loops loops, waiters each, on
+// procs Ps: a host past parkedWaiters blocks as it always did, a loop's only
+// waiter tunes its wait to its own load where the host has the Ps for it, and
+// everything else parks.
+func loopWaitMode(procs, loops, waiters int) waitMode {
+	switch {
+	case waiters*loops > parkedWaiters:
+		return waitBlock
+	case waiters == 1 && procs >= adaptiveMinProcs:
+		return waitAdaptive
+	default:
+		return waitPark
+	}
+}
 
 // flushEvery bounds how many readiness events a waiter folds before the
 // connections collected so far are handed to the executor, so a connection at
@@ -115,9 +132,9 @@ const (
 const flushEvery = 16
 
 // eventLoop is one poller and the goroutines that wait on it. Connections,
-// stream listeners and UDP sockets are registered with the loop their
-// descriptor picks; its waiters collect their readiness, accept on its
-// listeners, and hand runnable connections to the executor. A waiter never
+// stream listeners and UDP sockets are spread over the loops in turn; a
+// loop's waiters collect their readiness, accept on its listeners, and hand
+// runnable connections to the executor. A waiter never
 // runs a callback and never waits for a connection: everything a connection
 // does, its registration and its close included, happens in its own turn.
 // The fd table is process-wide, so every loop resolves events through the
