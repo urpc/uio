@@ -8,6 +8,8 @@ import (
 	"net"
 	"testing"
 	"time"
+
+	"github.com/urpc/uio/internal/bytebuf"
 )
 
 // Writev takes vectors longer than one writev or sendmsg allows, which is
@@ -168,5 +170,33 @@ func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
 				t.Fatalf("peer received %q, want %q", wire, "onetwo")
 			}
 		})
+	}
+}
+
+// TestCoalesceOwnedCopiesOnlySmallOrSparseBuffers pins which owned writes a
+// corked round copies into its outbound blocks: small ones and mostly empty
+// ones, never one past half a coalescing block, and never a large, dense one
+// such as a write batch carrying a whole read's replies.
+func TestCoalesceOwnedCopiesOnlySmallOrSparseBuffers(t *testing.T) {
+	const block = 32 << 10
+	cases := []struct {
+		name      string
+		size, cap int
+		want      bool
+	}{
+		{"small", 512, 16 << 10, true},
+		{"at the small limit", coalesceOwnedMax, coalesceOwnedMax, true},
+		{"large and full", 16120, 16 << 10, false},
+		{"large and half empty", 6 << 10, 16 << 10, true},
+		{"large and half full", 8 << 10, 16 << 10, false},
+		{"past half a block", block/2 + 1, 64 << 10, false},
+	}
+	for _, c := range cases {
+		owned := bytebuf.AcquireBuffer(c.cap)
+		owned.CommitWrite(c.size)
+		if got := coalesceOwned(owned, c.size, block); got != c.want {
+			t.Errorf("%s: coalesceOwned(%d of %d) = %v, want %v", c.name, c.size, owned.Cap(), got, c.want)
+		}
+		bytebuf.ReleaseBuffer(owned)
 	}
 }

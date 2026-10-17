@@ -265,6 +265,25 @@ func (conn *fdConn) coalesceBlockSize() int {
 	return min(64<<10, conn.events.readBufferSize*2)
 }
 
+// coalesceOwnedMax is the largest owned buffer a corked round copies into its
+// outbound tail for its size alone: up to here the copy costs less than the
+// writev segment it saves.
+const coalesceOwnedMax = 4 << 10
+
+// coalesceOwned reports whether a corked round copies owned, holding size
+// bytes, into its outbound blocks rather than queueing it as a segment of its
+// own: a small one, and one that is mostly empty, which a queue the peer is
+// slow to drain would otherwise hold on to many times over. A large, dense
+// buffer keeps its segment. Copying such buffers - write batches of a whole
+// read's replies, three of every four reads of a pipelining round - was 8% of
+// the server's user time, to save two writev segments a round.
+func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
+	if size > block/2 {
+		return false
+	}
+	return size <= coalesceOwnedMax || 2*size < owned.Cap()
+}
+
 // sendUDPOutside sends one datagram from outside the connection's turn. A
 // datagram is never queued, so the send happens here, holding the descriptor
 // owner's submitMu, which keeps the socket from closing under the syscall;
@@ -513,10 +532,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // smaller writes (join the outbound batch) holds in the first position too.
 // The frames that follow keep zero-copy ownership as outbound's first
 // segment or are coalesced into pooled blocks, to keep the final writev batch
-// short. Buffers up to half a coalescing block are copied, which also keeps a
-// queue that the peer is slow to drain from holding many mostly empty blocks;
-// a larger buffer already carries many frames and keeps its own writev
-// segment.
+// short; see coalesceOwned for which are copied.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold
@@ -540,7 +556,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			return 0, ErrOutboundOverflow
 		}
 		conn.submitMu.Lock()
-		if conn.turn&turnCorked != 0 && !conn.outbound.Empty() && size <= conn.coalesceBlockSize()/2 {
+		if conn.turn&turnCorked != 0 && !conn.outbound.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
 			conn.outbound.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
 		} else {
 			conn.outbound.AppendOwned(owned)
