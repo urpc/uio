@@ -576,10 +576,18 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 	}
 	c.batchUntracked += wireSize
 	dst := batch.AvailableBuffer()[:wireSize]
-	if len(payload) < 126 {
-		dst[0], dst[1] = 0x80|byte(opcode), byte(len(payload))
+	// The header is written in place for the lengths a batch carries: built
+	// as a frame.Frame for AppendHeader, the struct's byte stores were read
+	// back as one wide load, a stalled store forward on every reply.
+	switch n := len(payload); {
+	case n < 126:
+		dst[0], dst[1] = 0x80|byte(opcode), byte(n)
 		copy(dst[2:], payload)
-	} else {
+	case n <= 0xFFFF:
+		dst[0], dst[1] = 0x80|byte(opcode), 126
+		binary.BigEndian.PutUint16(dst[2:4], uint16(n))
+		copy(dst[4:], payload)
+	default:
 		header := frame.AppendHeader(dst[:0], frame.Frame{Fin: true, Opcode: opcode, Payload: payload}, [4]byte{})
 		copy(dst[len(header):], payload)
 	}

@@ -327,3 +327,47 @@ func TestShortPathAfterASplitFrameValidatesText(t *testing.T) {
 	}
 }
 
+// A batching round writes each reply's header in place: every length
+// encoding, seven-bit, 16-bit and, past a threshold raised for it, 64-bit,
+// comes out byte for byte as the generic encoder writes it.
+func TestBatchedRepliesEncodeEveryLengthAsTheGenericEncoder(t *testing.T) {
+	sizes := []int{0, 1, 125, 126, 127, 4096, 65535, 65536, 70000}
+	server := NewServer(echoPathHandler{})
+	server.config = newServerConnConfig(server)
+	server.config.writeBufferedThreshold = 1 << 20
+	server.config.maxOutbound = 0
+	raw := &echoPathConn{}
+	conn := server.newConnection(raw)
+	conn.opened.Store(true)
+	raw.userdata = conn
+
+	var wire, want []byte
+	for i, size := range sizes {
+		payload := bytes.Repeat([]byte{byte(i + 1)}, size)
+		wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: payload}, [4]byte{3, 1, 4, 1})
+		want = frame.Append(want, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}, [4]byte{})
+	}
+	raw.inbound = wire
+	raw.out = make([]byte, 0, 2*len(want))
+	captured := &batchCaptureConn{echoPathConn: raw}
+	conn.raw = captured
+	if err := server.onData(captured); err != nil {
+		t.Fatalf("read round failed: %v", err)
+	}
+	if !bytes.Equal(captured.written, want) {
+		t.Fatalf("batched replies: %d bytes, want %d", len(captured.written), len(want))
+	}
+}
+
+// batchCaptureConn keeps what a write batch hands over.
+type batchCaptureConn struct {
+	*echoPathConn
+	written []byte
+}
+
+func (c *batchCaptureConn) WriteOwned(buffer *uio.Buffer) (int, error) {
+	n := buffer.Len()
+	c.written = append(c.written, buffer.Bytes()...)
+	uio.ReleaseBuffer(buffer)
+	return n, nil
+}
