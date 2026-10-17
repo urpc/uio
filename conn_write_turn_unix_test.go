@@ -749,8 +749,16 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	if n, err := io.ReadFull(client, got); err != nil || string(got) != "qw" {
 		t.Fatalf("client read %q (%d bytes), %v; want %q (readStalled=%v)", got[:n], n, err, "qw", server.readStalled())
 	}
-	if executor.recovered.Load() == 0 || !stalledAtPanic.Load() {
-		t.Fatalf("OnOutbound did not panic after a yielded read: recovered=%d", executor.recovered.Load())
+	// The turn's epilogue resumes reading while the panic unwinds, so the
+	// echo can arrive before the executor has counted the recovery.
+	for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("OnOutbound did not panic after a yielded read")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !stalledAtPanic.Load() {
+		t.Fatal("OnOutbound panicked before the yielded read had stalled")
 	}
 }
 
