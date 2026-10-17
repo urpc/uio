@@ -4,8 +4,6 @@ go 1.25.0
 
 replace github.com/urpc/uio => ../
 
-replace github.com/limpo1989/taskgo => ../../taskgo
-
 require (
 	github.com/antlabs/httparser v0.0.11
 	github.com/urpc/uio v0.0.0-20250506164505-ab569f41e6a0
