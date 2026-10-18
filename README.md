@@ -194,9 +194,7 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   once everything has stopped, or call `Events.Wait` from another goroutine.
 - `Dial` blocks the goroutine that calls it. From a callback, prefer dialing on
   a goroutine of your own.
-- On the `stdio` backend, `Executor` is not used and `OnOpen` runs on an
-  event-loop goroutine: keep it short, and do not `Dial` from it (that returns
-  `ErrDialOnEventLoop`).
+- On the `stdio` backend, `Executor` is not used.
 
 The [API reference](https://pkg.go.dev/github.com/urpc/uio) has the full
 contract of every method.

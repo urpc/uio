@@ -333,8 +333,8 @@ func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
 	if fdc.loop.inLoop() {
 		return fdc.loop.registerConn(fdc)
 	}
-	// External Dial returns after registration. Native OnOpen runs in the
-	// connection task; stdio invokes it synchronously during registration.
+	// External Dial returns after registration. OnOpen runs afterwards: in
+	// the connection task natively, first on the read goroutine here.
 	t := acquireTask(registerTask, fdc)
 	t.done = make(chan error, 1)
 	done := t.done

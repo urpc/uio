@@ -426,14 +426,8 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	if registeredForTest != nil {
 		registeredForTest(conn)
 	}
-	// Datagram callbacks and shared socket state stay on the loop. Stream
-	// callbacks run in their serialized connection task. Stdio's scheduleOpen
-	// starts its dedicated blocking I/O loops after OnOpen below.
-	if conn.isDatagram() {
-		conn.fireOnOpen()
-	} else {
-		conn.scheduleOpen()
-	}
+	// The connection's read goroutine runs OnOpen before its first read, so
+	// no callback runs on the loop.
 	if !conn.isClosing() {
 		conn.afterRegister()
 	}

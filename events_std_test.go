@@ -5,6 +5,7 @@ package uio
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"runtime"
@@ -250,15 +251,20 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 	stopStdTestEvents(t, events, serveDone, errors.New("ordered shutdown"))
 }
 
+// A burst of registrations cut short by shutdown: every registration
+// returns, no connection starts I/O before its OnOpen returns, and OnOpen and
+// OnClose stay paired. OnOpen runs on each connection's read goroutine, so a
+// connection that shutdown closes before that goroutine ran gets neither.
 func TestStdRegisterBurstAndClose(t *testing.T) {
 	const desiredTotal = 2048
 	total := min(desiredTotal, stdTestFDLimit())
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
-	var opened atomic.Int32
+	var opened, closed atomic.Int32
 	events.OnOpen = func(conn Conn) {
 		conn.(*fdConn).conn.(*stdRegistrationConn).openReturned.Store(true)
 		opened.Add(1)
 	}
+	events.OnClose = func(Conn, error) { closed.Add(1) }
 	serveDone := startStdTestEvents(t, events)
 
 	results := make([]chan error, total)
@@ -277,8 +283,8 @@ func TestStdRegisterBurstAndClose(t *testing.T) {
 	}
 
 	stopStdTestEvents(t, events, serveDone, errors.New("burst shutdown"))
-	if got := int(opened.Load()); got != total {
-		t.Fatalf("OnOpen called %d times, want %d", got, total)
+	if o, c := opened.Load(), closed.Load(); o != c || int(o) > total {
+		t.Fatalf("OnOpen called %d times and OnClose %d for %d connections, want them paired", o, c, total)
 	}
 	for i, result := range results {
 		select {
@@ -1449,5 +1455,34 @@ func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 	case err := <-closed:
 		t.Fatalf("a deadline the socket refused closed the connection: %v", err)
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// Every Wake delivered before OnOpen has run gets its own OnData after OnOpen,
+// as a Wake does once the connection is open: none is merged into another.
+// The Wakes are delivered first and the read goroutine's open runs after, the
+// order a Dial that returns before its read goroutine starts allows.
+func TestStdWakesBeforeOnOpenEachRunOnData(t *testing.T) {
+	const wakes = 3
+	var seq []string
+	events := &Events{
+		OnOpen: func(Conn) { seq = append(seq, "open") },
+		OnData: func(Conn) error { seq = append(seq, "data"); return nil },
+	}
+	conn := &fdConn{}
+	conn.events = events
+	for range wakes {
+		events.callbackWG.Add(1)
+		conn.deliverWake()
+	}
+	if len(seq) != 0 {
+		t.Fatalf("callbacks ran before OnOpen: %v", seq)
+	}
+	if !conn.openOnReader() {
+		t.Fatal("the connection did not open")
+	}
+	want := []string{"open", "data", "data", "data"}
+	if fmt.Sprint(seq) != fmt.Sprint(want) {
+		t.Fatalf("callbacks ran as %v, want %v", seq, want)
 	}
 }

@@ -70,8 +70,15 @@ type fdConn struct {
 	writeBatch bytebuf.CompositeBuffer
 	writeBytes int
 	closing    atomic.Bool
-	callbackMu sync.Mutex // serializes OnData, Wake, and OnClose
+	callbackMu sync.Mutex // serializes OnOpen, OnData, Wake, and OnClose
 	internal   bool       // framework-owned endpoint, not a user connection
+
+	// opened records that OnOpen has run, which a connection's read goroutine
+	// does first; only an opened connection gets OnClose. wakesAfterOpen
+	// counts the Wakes that arrived before OnOpen, for the read goroutine to
+	// deliver right after it, one OnData each. Both are guarded by callbackMu.
+	opened         bool
+	wakesAfterOpen int
 
 	// readHeld stops the read goroutine once callbacks leave
 	// MaxInboundBuffered bytes unconsumed; it waits on readResume until a Wake
@@ -111,9 +118,42 @@ func (fc *fdConn) isClosing() bool                  { return fc.closing.Load() |
 func (fc *fdConn) beginShutdown()                   {}
 func (fc *fdConn) isDatagram() bool                 { return fc.udp != nil }
 func (fc *fdConn) isClosedOnLoop() bool             { return fc.IsClosed() }
+
+// afterRegister starts the connection's read goroutine, which runs OnOpen and
+// then starts the writer; see openOnReader. OnOpen stays off the event loop,
+// so it may Dial and a slow one holds up no other connection.
 func (fc *fdConn) afterRegister() {
-	_ = fc.fireWriteEvent()
 	_ = fc.fireReadEvent()
+}
+
+// openOnReader runs OnOpen on the connection's read goroutine before its
+// first read, then starts the writer, so output written in OnOpen leaves after
+// it returns, as it did when OnOpen ran on the loop. Wakes that came first are
+// delivered right after, one OnData each. It reports whether the connection is still open; a
+// connection closed before its OnOpen gets neither OnOpen nor OnClose.
+func (fc *fdConn) openOnReader() bool {
+	fc.callbackMu.Lock()
+	if fc.isClosing() {
+		fc.callbackMu.Unlock()
+		return false
+	}
+	fc.fireOnOpen()
+	fc.opened = true
+	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
+		started := fc.beginInboundCallback()
+		err := fc.events.onData(fc)
+		fc.endInboundCallback(started)
+		if err != nil {
+			fc.requestClose(err)
+		}
+	}
+	closing := fc.isClosing()
+	fc.callbackMu.Unlock()
+	if closing {
+		return false
+	}
+	_ = fc.fireWriteEvent()
+	return true
 }
 
 func (fc *fdConn) fireOnOpen() {
@@ -717,7 +757,7 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 		defer fc.callbackMu.Unlock()
 		fc.inbound.Reset()
 		fc.inboundTail = nil
-		if callback := fc.events.OnClose; callback != nil && !fc.internal {
+		if callback := fc.events.OnClose; callback != nil && !fc.internal && fc.opened {
 			started := fc.beginInboundCallback()
 			callback(fc, err)
 			fc.endInboundCallback(started)
@@ -817,6 +857,11 @@ func (fc *fdConn) deliverWake() {
 	defer fc.callbackMu.Unlock()
 	if fc.isClosing() {
 		// The connection closed while this callback waited its turn.
+		return
+	}
+	if !fc.opened {
+		// OnOpen has not run yet; the read goroutine delivers this after it.
+		fc.wakesAfterOpen++
 		return
 	}
 	started := fc.beginInboundCallback()
@@ -1127,14 +1172,21 @@ func (fc *fdConn) fireWriteEvent() error {
 	return nil
 }
 
+// fireReadEvent starts the connection's read goroutine, which runs OnOpen
+// before its first read; see openOnReader.
 func (fc *fdConn) fireReadEvent() error {
 	fc.events.callbackWG.Add(1)
-	// udp client
-	if nil != fc.udp {
-		go fc.readUDPLoop()
-	} else {
-		go fc.readLoop()
-	}
+	go func() {
+		if !fc.openOnReader() {
+			fc.events.callbackWG.Done()
+			return
+		}
+		if fc.udp != nil {
+			fc.readUDPLoop() // connected UDP
+		} else {
+			fc.readLoop()
+		}
+	}()
 	return nil
 }
 
@@ -1180,6 +1232,7 @@ func (fc *fdConn) listenUDP() error {
 				onOpen(udpConn)
 				udpConn.endInboundCallback(started)
 			}
+			udpConn.opened = true
 			udpConn.callbackMu.Unlock()
 		}
 		if udpConn.isClosing() {

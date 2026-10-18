@@ -31,7 +31,10 @@ func serveInboundTest(t *testing.T, events *Events) (net.Conn, Conn) {
 		if onOpen != nil {
 			onOpen(c)
 		}
-		opened <- c
+		select { // only the first connection is returned
+		case opened <- c:
+		default:
+		}
 	}
 	started := make(chan struct{})
 	events.OnStart = func(*Events) { close(started) }
