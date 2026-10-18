@@ -96,11 +96,14 @@ type fdConn struct {
 	// writeShut records a CloseWrite, guarded by mux: no more output is
 	// accepted, and the writer shuts the socket's writing half once what was
 	// accepted before it is sent, then sets writeShutDone. readEOF records,
-	// on a connection that allows half-open, that the peer shut its own; the
-	// side that sets the second of the two closes the connection.
+	// on a connection that allows half-open, that the peer shut its own, and
+	// readEnded, set under callbackMu, that callbacks consumed everything it
+	// sent; the side that sets the second of writeShutDone and readEnded
+	// closes the connection.
 	writeShut     bool
 	writeShutDone atomic.Bool
 	readEOF       atomic.Bool
+	readEnded     atomic.Bool
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -870,6 +873,7 @@ func (fc *fdConn) deliverWake() {
 		fc.requestClose(err)
 		return
 	}
+	fc.noteReadEnded()
 	if fc.readHeld && fc.inbound.Len() < fc.events.MaxInboundBuffered {
 		fc.readHeld = false
 		// A close may have filled the slot already; either signal resumes.
@@ -949,7 +953,7 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	if !ready {
 		return nil
 	}
-	if fc.readEOF.Load() {
+	if fc.readEnded.Load() {
 		// Both halves end: closing sends the FIN behind what was sent.
 		fc.writeShutDone.Store(true)
 		fc.requestClose(io.EOF)
@@ -960,16 +964,29 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	if err != nil {
 		return err
 	}
-	if fc.readEOF.Load() {
+	if fc.readEnded.Load() {
 		fc.requestClose(io.EOF)
 	}
 	return nil
 }
 
+// noteReadEnded runs under callbackMu after an OnData past the peer's end of
+// stream. Once callbacks have consumed everything the peer sent, the reading
+// half is over and the connection closes if its writing half is shut too.
+func (fc *fdConn) noteReadEnded() {
+	if !fc.readEOF.Load() || fc.readEnded.Load() || !fc.inbound.Empty() || len(fc.inboundTail) != 0 {
+		return
+	}
+	fc.readEnded.Store(true)
+	if fc.writeShutDone.Load() {
+		fc.requestClose(io.EOF)
+	}
+}
+
 // onReadEOF ends the read goroutine of a half-open connection whose peer shut
 // its writing half: OnData runs once more, so the application sees Read
 // report io.EOF, and the connection closes once its own writing half is shut
-// as well.
+// as well and callbacks consumed what the peer sent.
 func (fc *fdConn) onReadEOF() {
 	fc.callbackMu.Lock()
 	if fc.isClosing() {
@@ -980,13 +997,12 @@ func (fc *fdConn) onReadEOF() {
 	started := fc.beginInboundCallback()
 	err := fc.events.onData(fc)
 	fc.endInboundCallback(started)
+	if err == nil {
+		fc.noteReadEnded()
+	}
 	fc.callbackMu.Unlock()
 	if err != nil {
 		fc.events.closeConn(fc, err)
-		return
-	}
-	if fc.writeShutDone.Load() {
-		fc.requestClose(io.EOF)
 	}
 }
 

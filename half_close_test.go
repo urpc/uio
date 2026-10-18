@@ -3,6 +3,7 @@ package uio
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -524,6 +525,92 @@ func TestAllowHalfOpenEOFBehindHeldReads(t *testing.T) {
 	}
 	if _, err := server.Write([]byte("still open")); err != nil {
 		t.Fatalf("write after the peer's end of stream: %v", err)
+	}
+}
+
+// Bytes callbacks leave unconsumed past the peer's end of stream keep a
+// half-open connection open once its own writing half is shut too, whether
+// CloseWrite came before or after that end of stream: they and the io.EOF
+// behind them reach a later Wake's OnData, and only then does it close.
+func TestHalfOpenKeepsUnconsumedBytesAfterBothHalvesShut(t *testing.T) {
+	for _, closeWriteFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("closeWriteFirst=%v", closeWriteFirst), func(t *testing.T) {
+			var consume atomic.Bool
+			var request bytes.Buffer
+			sawEOF := make(chan struct{})
+			closed := make(chan error, 1)
+			events := &Events{
+				Pollers:       1,
+				AllowHalfOpen: true,
+				OnOpen: func(c Conn) {
+					if closeWriteFirst {
+						_ = c.CloseWrite()
+					}
+				},
+				OnData: func(c Conn) error {
+					if !consume.Load() {
+						return nil
+					}
+					buf := make([]byte, 64)
+					for {
+						n, err := c.Read(buf)
+						request.Write(buf[:n])
+						if err == io.EOF {
+							close(sawEOF)
+							return nil
+						}
+						if n == 0 {
+							return err
+						}
+					}
+				},
+				OnClose: func(_ Conn, err error) { closed <- err },
+			}
+			client, server := serveInboundTest(t, events)
+			if closeWriteFirst {
+				if got := readAllWithin(t, client, 2*time.Second); len(got) != 0 {
+					t.Fatalf("read %q before the server's end of stream", got)
+				}
+			}
+			if _, err := client.Write([]byte("request")); err != nil {
+				t.Fatal(err)
+			}
+			_ = client.(*net.TCPConn).CloseWrite()
+			time.Sleep(100 * time.Millisecond) // the server reads to the end of the stream
+			if !closeWriteFirst {
+				if err := server.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				if got := readAllWithin(t, client, 2*time.Second); len(got) != 0 {
+					t.Fatalf("read %q before the server's end of stream", got)
+				}
+			}
+			select {
+			case err := <-closed:
+				t.Fatalf("closed with the request unconsumed: %v", err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			consume.Store(true)
+			if err := server.Wake(); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-sawEOF:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the Wake never reached the end of the stream")
+			}
+			if request.String() != "request" {
+				t.Fatalf("read %q, want %q", request.String(), "request")
+			}
+			select {
+			case err := <-closed:
+				if !errors.Is(err, io.EOF) {
+					t.Fatalf("close error = %v, want EOF", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("both halves ended, but the connection did not close")
+			}
+		})
 	}
 }
 

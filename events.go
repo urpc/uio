@@ -148,8 +148,9 @@ type Events struct {
 	// AllowHalfOpen keeps a stream connection open after its peer shuts its
 	// writing half. OnData then runs once more, Read reports io.EOF once the
 	// buffered bytes are consumed, and the connection can still write; it
-	// closes once its own writing half is shut too, by CloseWrite, or when it
-	// is closed. A reset after the end of the stream closes it on the native
+	// closes once its own writing half is shut too, by CloseWrite, and Read
+	// reports io.EOF, or when it is closed. Bytes left unconsumed, say for a
+	// later Wake, keep it open until a callback consumes them. A reset after the end of the stream closes it on the native
 	// backend at once, and on the stdio backend at the next write. Without it,
 	// the end of the peer's stream closes the connection with io.EOF.
 	AllowHalfOpen bool

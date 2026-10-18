@@ -589,6 +589,21 @@ func (conn *fdConn) Fd() int { return int(conn.fd) }
 // that allows half-open.
 func (conn *fdConn) readEOF() bool { return conn.flags.Load()&readEOFFlag != 0 }
 
+// readEnded reports a reading half that is over for the application as well:
+// the peer shut its writing half and callbacks consumed everything it sent,
+// so Read reports io.EOF. Bytes a callback leaves behind keep it open.
+func (conn *fdConn) readEnded() bool {
+	return conn.readEOF() && conn.inbound.Empty() && len(conn.inboundTail) == 0
+}
+
+// closeIfEnded closes a half-open connection whose two halves have both
+// ended, once a callback consumed the last bytes its peer sent.
+func (conn *fdConn) closeIfEnded() {
+	if conn.writeState.Load()&writeShutDoneFlag != 0 && conn.readEnded() {
+		conn.requestClose(io.EOF)
+	}
+}
+
 // outputClosed reports a connection that accepts no more output: closing, or
 // with its writing half shut by CloseWrite.
 func (conn *fdConn) outputClosed() bool {
@@ -599,7 +614,7 @@ func (conn *fdConn) outputClosed() bool {
 // peer has shut its writing half and the buffered bytes are consumed.
 func (conn *fdConn) Read(b []byte) (int, error) {
 	n, err := conn.commonConn.Read(b)
-	if n == 0 && err == nil && conn.readEOF() && conn.inbound.Empty() && len(conn.inboundTail) == 0 {
+	if n == 0 && err == nil && conn.readEnded() {
 		return 0, io.EOF
 	}
 	return n, err
@@ -633,8 +648,8 @@ func (conn *fdConn) CloseWrite() error {
 // accepted is left to send. It runs in the connection's turn, so no callback
 // writes meanwhile, and it takes the write claim, so no other sender does;
 // output still queued, or a sender holding the claim, schedules it again when
-// the claim is released. A half-open connection whose peer has shut its own
-// writing half closes now.
+// the claim is released. A half-open connection whose reading half has ended
+// as well closes now.
 func (conn *fdConn) shutWrite() {
 	state := conn.writeState.Load()
 	if state&(writeShutFlag|writeShutDoneFlag) != writeShutFlag || conn.isClosing() || conn.pending.Load() != 0 {
@@ -647,7 +662,7 @@ func (conn *fdConn) shutWrite() {
 		conn.releaseWriteAndKick()
 		return
 	}
-	if conn.readEOF() {
+	if conn.readEnded() {
 		// Both halves end: closing sends the FIN behind the output already
 		// sent, without a shutdown whose acknowledgement would wake the
 		// poller for a socket about to be released.
@@ -664,15 +679,13 @@ func (conn *fdConn) shutWrite() {
 		conn.requestClose(err)
 		return
 	}
-	if conn.readEOF() {
-		conn.requestClose(io.EOF)
-	}
+	conn.closeIfEnded()
 }
 
 // onReadEOF handles a peer that shut its writing half. Without half-open it
 // ends the connection as before. With it, reads stop, OnData runs once more so
 // the application sees Read report io.EOF, and the connection closes once its
-// own writing half is shut as well.
+// own writing half is shut as well and callbacks consumed what the peer sent.
 func (conn *fdConn) onReadEOF() error {
 	if !conn.events.AllowHalfOpen {
 		return io.EOF
@@ -682,9 +695,7 @@ func (conn *fdConn) onReadEOF() error {
 	if err := conn.fireOnData(); err != nil {
 		return err
 	}
-	if conn.writeState.Load()&writeShutDoneFlag != 0 {
-		return io.EOF
-	}
+	conn.closeIfEnded()
 	return nil
 }
 
@@ -1146,8 +1157,10 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 		conn.turn &^= turnCorked
-		if conn.readHeld() {
+		if flags := conn.flags.Load(); flags&readHeldFlag != 0 {
 			conn.resumeHeldRead()
+		} else if flags&readEOFFlag != 0 {
+			conn.closeIfEnded()
 		}
 	}
 	if conn.udp != nil && conn.udp.peers != nil {
