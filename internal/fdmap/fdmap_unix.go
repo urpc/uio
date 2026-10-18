@@ -32,38 +32,77 @@ func openFileCapacity(limit uint64) int {
 	return maxOpenFilesCeiling
 }
 
+// The table is segmented: descriptors under 32 Ki index one 256 KiB segment,
+// a large object that gets a span of its own, so the slots the loops touch
+// never share a cache line with unrelated allocations. A segment is allocated
+// the first time a descriptor in it is published, which keeps the live heap
+// the collector sees at the size actually in use instead of the whole
+// descriptor range.
+const (
+	segmentShift = 15
+	segmentSlots = 1 << segmentShift
+	maxSegments  = maxOpenFilesCeiling >> segmentShift
+)
+
+// segment is one contiguous range of the descriptor table.
+type segment[V any] struct {
+	slots [segmentSlots]*V
+}
+
 // Map is an atomic direct-index table shared by Unix event loops. Deletion must
 // be published before a descriptor is closed because the kernel may reuse its
 // integer immediately.
 type Map[V any] struct {
 	// Direct fd indexing avoids hashing. Entries are atomic because registration
-	// and lookup can occur on different loops.
-	store []*V
+	// and lookup can occur on different loops; segments are published the same
+	// way, so a loop touching a new descriptor range allocates one without
+	// locking.
+	segments [maxSegments]atomic.Pointer[segment[V]]
+	limit    int // the MaxOpenFiles this table was created for
 }
 
-// NewMap allocates the fixed descriptor table once; individual entries do not
-// allocate on Put or Delete.
+// NewMap returns an empty descriptor table; segments allocate with the
+// descriptors published into them.
 func NewMap[V any]() *Map[V] {
-	return &Map[V]{
-		store: make([]*V, MaxOpenFiles),
+	return &Map[V]{limit: min(MaxOpenFiles, maxOpenFilesCeiling)}
+}
+
+// slot bounds-checks k and resolves its segment, or returns nil.
+func (m *Map[V]) slot(k int) (*unsafe.Pointer, bool) {
+	if uint(k) >= uint(m.limit) {
+		return nil, false
 	}
+	seg := m.segments[k>>segmentShift].Load()
+	if seg == nil {
+		return nil, false
+	}
+	return (*unsafe.Pointer)(unsafe.Pointer(&seg.slots[k&(segmentSlots-1)])), true
 }
 
 // Put atomically publishes v at descriptor k.
 func (m *Map[V]) Put(k int, v *V) error {
-	if uint(k) >= uint(len(m.store)) {
+	if uint(k) >= uint(m.limit) {
 		return ErrOutOfRange
 	}
-	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(v))
+	idx := k >> segmentShift
+	seg := m.segments[idx].Load()
+	if seg == nil {
+		seg = new(segment[V])
+		if !m.segments[idx].CompareAndSwap(nil, seg) {
+			seg = m.segments[idx].Load()
+		}
+	}
+	atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&seg.slots[k&(segmentSlots-1)])), unsafe.Pointer(v))
 	return nil
 }
 
 // Get atomically resolves descriptor k, or returns nil when absent.
 func (m *Map[V]) Get(k int) *V {
-	if uint(k) >= uint(len(m.store)) {
+	p, ok := m.slot(k)
+	if !ok {
 		return nil
 	}
-	if val := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k]))); nil != val {
+	if val := atomic.LoadPointer(p); nil != val {
 		return (*V)(val)
 	}
 	return nil
@@ -73,9 +112,15 @@ func (m *Map[V]) Get(k int) *V {
 // producers. Callers may delete the yielded entry.
 func (m *Map[V]) Range() iter.Seq2[int, *V] {
 	return func(yield func(int, *V) bool) {
-		for i := 0; i < len(m.store); i++ {
-			if pointer := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[i]))); pointer != nil && !yield(i, (*V)(pointer)) {
-				return
+		for s := 0; s < maxSegments; s++ {
+			seg := m.segments[s].Load()
+			if seg == nil {
+				continue
+			}
+			for i := 0; i < segmentSlots && s*segmentSlots+i < MaxOpenFiles; i++ {
+				if pointer := atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&seg.slots[i]))); pointer != nil && !yield(s*segmentSlots+i, (*V)(pointer)) {
+					return
+				}
 			}
 		}
 	}
@@ -83,25 +128,33 @@ func (m *Map[V]) Range() iter.Seq2[int, *V] {
 
 // Delete atomically unpublishes descriptor k.
 func (m *Map[V]) Delete(k int) {
-	if uint(k) >= uint(len(m.store)) {
+	p, ok := m.slot(k)
+	if !ok {
 		return
 	}
 	// Swap publishes absence before the caller closes and potentially reuses fd.
-	atomic.SwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(nil))
+	atomic.SwapPointer(p, unsafe.Pointer(nil))
 }
 
 // DeleteValue removes k only while it still maps to v, so a holder that lost
 // the slot to another value leaves that value in place.
 func (m *Map[V]) DeleteValue(k int, v *V) {
-	if uint(k) >= uint(len(m.store)) {
+	p, ok := m.slot(k)
+	if !ok {
 		return
 	}
-	atomic.CompareAndSwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[k])), unsafe.Pointer(v), nil)
+	atomic.CompareAndSwapPointer(p, unsafe.Pointer(v), nil)
 }
 
 // Clear atomically removes every descriptor entry.
 func (m *Map[V]) Clear() {
-	for i := 0; i < len(m.store); i++ {
-		atomic.SwapPointer((*unsafe.Pointer)(unsafe.Pointer(&m.store[i])), unsafe.Pointer(nil))
+	for s := 0; s < maxSegments; s++ {
+		seg := m.segments[s].Swap(nil)
+		if seg == nil {
+			continue
+		}
+		for i := 0; i < segmentSlots; i++ {
+			atomic.StorePointer((*unsafe.Pointer)(unsafe.Pointer(&seg.slots[i])), unsafe.Pointer(nil))
+		}
 	}
 }
