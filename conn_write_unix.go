@@ -34,7 +34,7 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
-	if conn.isClosing() {
+	if conn.outputClosed() {
 		return 0, net.ErrClosed
 	}
 	if conn.directOwner() {
@@ -71,7 +71,7 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 	if total == 0 {
 		return 0, nil
 	}
-	if conn.isClosing() {
+	if conn.outputClosed() {
 		return 0, net.ErrClosed
 	}
 	if conn.isDatagram() {
@@ -104,7 +104,7 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, nil
 	}
-	if conn.isClosing() {
+	if conn.outputClosed() {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
 	}
@@ -134,7 +134,7 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	if n <= 0 {
 		return nil, nil
 	}
-	if conn.isClosing() {
+	if conn.outputClosed() {
 		return nil, net.ErrClosed
 	}
 	if conn.isDatagram() || !conn.directOwner() {
@@ -325,7 +325,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 	}
 	// Allocation and the only payload copy have already happened off-lock.
 	conn.submitMu.Lock()
-	if conn.loop == nil || conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.loop == nil || conn.outputClosed() || conn.events.closing.Load() || conn.loop.stopping.Load() {
 		conn.submitMu.Unlock()
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed

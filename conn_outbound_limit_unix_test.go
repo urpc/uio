@@ -3,12 +3,16 @@
 package uio
 
 import (
+	"bytes"
+	"errors"
+	"io"
 	"net"
 	"os"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/urpc/uio/internal/bytebuf"
 	"golang.org/x/sys/unix"
 )
 
@@ -127,4 +131,101 @@ func TestBidirectionalOutboundLimitTCP(t *testing.T) {
 	// bounded under -race on a loaded host; the mechanism is the same: the
 	// backlog sits past the old pause mark for the whole transfer.
 	runBidirectionalLimitTransfer(t, [2]net.Conn{first, second}, 2<<20)
+}
+
+// A write from another goroutine that passed its entry check before a
+// CloseWrite completed is still refused when it comes to queue its bytes:
+// queueing them after the end of the stream would leave them unsendable.
+func TestQueuedWriteAfterCloseWriteIsRefused(t *testing.T) {
+	events := &Events{Pollers: 1}
+	client, server := serveInboundTest(t, events)
+	if err := server.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAllWithin(t, client, 2*time.Second); len(got) != 0 {
+		t.Fatalf("read %q before the end of stream", got)
+	}
+	conn := server.(*fdConn)
+	if _, err := conn.queueOwnedWrite(bytebuf.CloneBuffer([]byte("late")), 4); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("queueing after CloseWrite = %v, want net.ErrClosed", err)
+	}
+	if n := conn.OutboundBuffered(); n != 0 {
+		t.Fatalf("%d bytes queued after the end of stream", n)
+	}
+}
+
+// A CloseWrite waiting for output that a full socket holds back schedules no
+// turns while it waits: the FIN follows the writable edge that lets the
+// output drain, and the peer then reads everything before the end of stream.
+func TestCloseWriteWaitsForAFullSocketWithoutSpinning(t *testing.T) {
+	executor := &countingExecutor{}
+	want := make([]byte, 8<<20)
+	for i := range want {
+		want[i] = byte(i * 13)
+	}
+	queued := make(chan error, 1)
+	events := &Events{
+		Pollers:  1,
+		Executor: executor,
+		OnOpen: func(c Conn) {
+			_, err := c.Write(want)
+			if err == nil {
+				err = c.CloseWrite()
+			}
+			queued <- err
+		},
+	}
+	client, _ := serveInboundTest(t, events)
+	if err := <-queued; err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the peer reads nothing: the socket stays full
+	before := executor.turns.Load()
+	time.Sleep(100 * time.Millisecond)
+	if spun := executor.turns.Load() - before; spun > 10 {
+		t.Fatalf("%d turns scheduled in 100ms while CloseWrite waited for a full socket", spun)
+	}
+	if got := readAllWithin(t, client, 20*time.Second); !bytes.Equal(got, want) {
+		t.Fatalf("read %d bytes before the end of stream, want %d intact", len(got), len(want))
+	}
+}
+
+// A half-open connection that answers its peer's end of stream with
+// CloseWrite closes in the turn that read the end of stream, as a connection
+// that does not allow half-open does: the CloseWrite costs no turn of its own.
+func TestHalfOpenCloseTakesNoExtraTurn(t *testing.T) {
+	for _, halfOpen := range []bool{false, true} {
+		executor := &countingExecutor{}
+		closed := make(chan struct{})
+		events := &Events{Pollers: 1, Executor: executor, AllowHalfOpen: halfOpen}
+		events.OnData = func(c Conn) error {
+			if _, err := c.WriteTo(c); err != nil {
+				return err
+			}
+			if _, err := c.Read(nil); err == io.EOF {
+				return c.CloseWrite()
+			}
+			return nil
+		}
+		events.OnClose = func(Conn, error) { close(closed) }
+		client, _ := serveInboundTest(t, events)
+		if _, err := client.Write(make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(client, make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		before := executor.turns.Load()
+		_ = client.Close()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("half-open %v: no close after the peer's end of stream", halfOpen)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if turns := executor.turns.Load() - before; turns != 1 {
+			t.Fatalf("half-open %v: closing took %d turns, want 1", halfOpen, turns)
+		}
+	}
 }

@@ -211,6 +211,16 @@ type Conn interface {
 	// connection's turn releases it once the callback that closed it has
 	// returned, and reports unsent accepted payload as UnflushedError.
 	CloseWith(err error) error
+
+	// CloseWrite shuts the connection's writing half: the peer reads the end
+	// of the stream once everything accepted before the call has been sent,
+	// and writes after it return net.ErrClosed. The connection keeps reading
+	// until the peer shuts its own writing half; with Events.AllowHalfOpen it
+	// then closes, without it the end of the stream closes it as before. It
+	// returns at once, may be called from any goroutine, and calling it again
+	// does nothing. Datagram connections, and stdio-backend connections whose
+	// net.Conn cannot shut one half, return an unsupported error.
+	CloseWrite() error
 }
 
 var errUnsupported = fmt.Errorf("unsupported method")

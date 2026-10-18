@@ -42,6 +42,11 @@ const (
 	// MaxInboundBuffered bytes unconsumed. Only the connection's turn sets or
 	// clears it; see holdsRead and resumeHeldRead.
 	readHeldFlag
+	// readEOFFlag marks a peer that has shut its writing half on a connection
+	// that allows half-open: nothing more is read, Read reports io.EOF once
+	// the buffer is drained, and the connection closes once its own writing
+	// half is shut too. Only the connection's turn sets it.
+	readEOFFlag
 )
 
 type fdConn struct {
@@ -162,6 +167,13 @@ const (
 	// batch before sending. Taking the claim clears it, so a lone producer,
 	// however many writes it makes, is never kept waiting.
 	writeContendedFlag
+	// writeShutFlag records a CloseWrite: no more output is accepted, and the
+	// connection's turn shuts the socket's writing half once everything
+	// accepted before it has been sent. It is set under submitMu, so a
+	// producer either queued its bytes first or finds it set.
+	writeShutFlag
+	// writeShutDoneFlag records that the writing half is shut.
+	writeShutDoneFlag
 )
 
 // Bits in fdConn.turn, read and written only by the running turn. The cork
@@ -343,6 +355,14 @@ func (conn *fdConn) releaseWrite() {
 		conn.writeState.And(^writeCloseWaitFlag)
 		// A stopped loop's shutdown pass releases the connection instead.
 		conn.scheduleTeardown()
+	}
+	if old&(writeShutFlag|writeShutDoneFlag) == writeShutFlag && conn.pending.Load() == 0 {
+		// Every send happens under the claim, so the release that leaves
+		// nothing pending is when a CloseWrite can shut the writing half.
+		// Output still pending waits for a writable edge, and the release
+		// after the send that drains it schedules this then; scheduling on
+		// every release would spin turns while the socket is full.
+		conn.scheduleIO(ioEventShutWrite)
 	}
 }
 
@@ -565,6 +585,131 @@ func (conn *fdConn) resumeHeldRead() {
 
 func (conn *fdConn) Fd() int { return int(conn.fd) }
 
+// readEOF reports a peer that has shut its writing half, on a connection
+// that allows half-open.
+func (conn *fdConn) readEOF() bool { return conn.flags.Load()&readEOFFlag != 0 }
+
+// outputClosed reports a connection that accepts no more output: closing, or
+// with its writing half shut by CloseWrite.
+func (conn *fdConn) outputClosed() bool {
+	return conn.isClosing() || conn.writeState.Load()&writeShutFlag != 0
+}
+
+// Read is commonConn.Read that reports io.EOF once a half-open connection's
+// peer has shut its writing half and the buffered bytes are consumed.
+func (conn *fdConn) Read(b []byte) (int, error) {
+	n, err := conn.commonConn.Read(b)
+	if n == 0 && err == nil && conn.readEOF() && conn.inbound.Empty() && len(conn.inboundTail) == 0 {
+		return 0, io.EOF
+	}
+	return n, err
+}
+
+// CloseWrite shuts the writing half once everything accepted before it has
+// been sent; see Conn.CloseWrite.
+func (conn *fdConn) CloseWrite() error {
+	if conn.isDatagram() {
+		return errUnsupported
+	}
+	if conn.loop == nil {
+		return net.ErrClosed
+	}
+	conn.submitMu.Lock()
+	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+		conn.submitMu.Unlock()
+		return net.ErrClosed
+	}
+	if conn.writeState.Load()&writeShutFlag != 0 {
+		conn.submitMu.Unlock()
+		return nil
+	}
+	conn.writeState.Or(writeShutFlag)
+	conn.submitMu.Unlock()
+	conn.scheduleIO(ioEventShutWrite)
+	return nil
+}
+
+// shutWrite shuts the writing half a CloseWrite requested, once nothing
+// accepted is left to send. It runs in the connection's turn, so no callback
+// writes meanwhile, and it takes the write claim, so no other sender does;
+// output still queued, or a sender holding the claim, schedules it again when
+// the claim is released. A half-open connection whose peer has shut its own
+// writing half closes now.
+func (conn *fdConn) shutWrite() {
+	state := conn.writeState.Load()
+	if state&(writeShutFlag|writeShutDoneFlag) != writeShutFlag || conn.isClosing() || conn.pending.Load() != 0 {
+		return
+	}
+	if !conn.tryClaimWrite(0) {
+		return
+	}
+	if conn.pending.Load() != 0 {
+		conn.releaseWriteAndKick()
+		return
+	}
+	if conn.readEOF() {
+		// Both halves end: closing sends the FIN behind the output already
+		// sent, without a shutdown whose acknowledgement would wake the
+		// poller for a socket about to be released.
+		conn.writeState.Or(writeShutDoneFlag)
+		conn.releaseWrite()
+		conn.requestClose(io.EOF)
+		return
+	}
+	err := syscall.Shutdown(int(conn.fd), syscall.SHUT_WR)
+	// Done before the release, so the release does not schedule this again.
+	conn.writeState.Or(writeShutDoneFlag)
+	conn.releaseWrite()
+	if err != nil {
+		conn.requestClose(err)
+		return
+	}
+	if conn.readEOF() {
+		conn.requestClose(io.EOF)
+	}
+}
+
+// onReadEOF handles a peer that shut its writing half. Without half-open it
+// ends the connection as before. With it, reads stop, OnData runs once more so
+// the application sees Read report io.EOF, and the connection closes once its
+// own writing half is shut as well.
+func (conn *fdConn) onReadEOF() error {
+	if !conn.events.AllowHalfOpen {
+		return io.EOF
+	}
+	conn.flags.Or(readEOFFlag)
+	conn.inboundTail = nil
+	if err := conn.fireOnData(); err != nil {
+		return err
+	}
+	if conn.writeState.Load()&writeShutDoneFlag != 0 {
+		return io.EOF
+	}
+	return nil
+}
+
+// probeAfterEOF checks a half-open connection whose peer has shut its writing
+// half when a hangup arrives: a reset raises the hangup, and nothing else
+// would read the socket to report it. Linux records that reset only as the
+// socket error, since a receive past the end of the stream keeps returning
+// zero; the BSDs report it on the receive.
+func (conn *fdConn) probeAfterEOF() error {
+	if errno, err := syscall.GetsockoptInt(int(conn.fd), syscall.SOL_SOCKET, syscall.SO_ERROR); err != nil {
+		return err
+	} else if errno != 0 {
+		return syscall.Errno(errno)
+	}
+	var b [1]byte
+	n, err := socket.Recv(int(conn.fd), b[:])
+	if err != nil && !isWouldBlock(err) {
+		return err
+	}
+	if n > 0 {
+		return errors.New("uio: data after end of stream")
+	}
+	return nil
+}
+
 // RemoteAddr builds the net.Addr on demand: the connection keeps only the
 // 32-byte value, so an accepted connection allocates nothing for its peer
 // address. Datagram connections report it as a UDP address, streams as TCP.
@@ -618,7 +763,7 @@ func (conn *fdConn) afterRegister()                   {}
 //     queued output whose sender may be waiting on an edge, needs it.
 func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
-		return conn.flags.Load()&(readStalledFlag|readHeldFlag) != 0
+		return conn.flags.Load()&(readStalledFlag|readHeldFlag|readEOFFlag) != 0
 	}
 	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
 }
@@ -650,6 +795,9 @@ const (
 	ioEventPeers uint32 = 1 << 20
 	// ioEventTeardown asks the turn of a closing connection to release it.
 	ioEventTeardown uint32 = 1 << 21
+	// ioEventShutWrite asks the connection's turn to shut the writing half a
+	// CloseWrite requested; see shutWrite.
+	ioEventShutWrite uint32 = 1 << 22
 	// taskScheduledBit claims the connection's one queued or running task. It
 	// shares taskState with the event bits so a producer sets claim and events
 	// with one atomic.
@@ -981,11 +1129,13 @@ func (conn *fdConn) runIOTask() {
 		var err error
 		if conn.isDatagram() {
 			err = conn.onRecvUDP()
-		} else if !conn.readHeld() {
-			// A held read stays in the socket, a hangup behind it included,
-			// until a callback consumes below the limit; see resumeHeldRead.
+		} else if flags := conn.flags.Load(); flags&(readHeldFlag|readEOFFlag) == 0 {
 			err = conn.onRead()
+		} else if flags&readEOFFlag != 0 && events&ioEventHangup != 0 {
+			err = conn.probeAfterEOF()
 		}
+		// A held read stays in the socket, a hangup behind it included, until
+		// a callback consumes below the limit; see resumeHeldRead.
 		if err != nil {
 			conn.requestClose(err)
 		}
@@ -1007,6 +1157,13 @@ func (conn *fdConn) runIOTask() {
 		if _, err := conn.flushOnLoop(); err != nil {
 			conn.requestClose(err)
 		}
+	}
+	if !conn.isClosing() && (events&ioEventShutWrite != 0 || conn.taskState.Load()&ioEventShutWrite != 0) {
+		// A CloseWrite this turn's own callbacks made is carried out now,
+		// not by a turn of its own: a half-open connection answering its
+		// peer's end of stream then closes in the turn that read it.
+		conn.taskState.And(^ioEventShutWrite)
+		conn.shutWrite()
 	}
 	ended = true
 }
@@ -1243,7 +1400,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 			return err
 		}
 		if n == 0 {
-			return io.EOF
+			return conn.onReadEOF()
 		}
 		totalRead += n
 		// inboundTail aliases the pooled read buffer. Unconsumed bytes are copied

@@ -85,6 +85,15 @@ type fdConn struct {
 	readResume   chan struct{}
 	deadlineMu   sync.Mutex
 	readDeadline time.Time
+
+	// writeShut records a CloseWrite, guarded by mux: no more output is
+	// accepted, and the writer shuts the socket's writing half once what was
+	// accepted before it is sent, then sets writeShutDone. readEOF records,
+	// on a connection that allows half-open, that the peer shut its own; the
+	// side that sets the second of the two closes the connection.
+	writeShut     bool
+	writeShutDone atomic.Bool
+	readEOF       atomic.Bool
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -352,7 +361,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	}
 
 	fc.mux.Lock()
-	if fc.isClosing() {
+	if fc.isClosing() || fc.writeShut {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -456,7 +465,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 			}
 		}
 		fc.mux.Lock()
-		if fc.isClosing() {
+		if fc.isClosing() || fc.writeShut {
 			fc.mux.Unlock()
 			releaseStdBuffers(owned)
 			return 0, net.ErrClosed
@@ -477,7 +486,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return total, nil
 	}
 	fc.mux.Lock()
-	if fc.isClosing() {
+	if fc.isClosing() || fc.writeShut {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -535,7 +544,7 @@ func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 	}
 
 	fc.mux.Lock()
-	if fc.isClosing() {
+	if fc.isClosing() || fc.writeShut {
 		fc.mux.Unlock()
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
@@ -841,11 +850,109 @@ func (fc *fdConn) writeLoop() {
 		if written > 0 {
 			fc.events.onSocketBytesWrite(fc, written)
 		}
+		if err == nil {
+			err = fc.shutWriteIfDrained()
+		}
 		if err != nil {
 			fc.events.closeConn(fc, err)
 			return
 		}
 	}
+}
+
+// halfCloser is a net.Conn that can shut its writing half, as *net.TCPConn
+// and *net.UnixConn can.
+type halfCloser interface{ CloseWrite() error }
+
+// CloseWrite shuts the writing half once the writer has sent everything
+// accepted before it; see Conn.CloseWrite.
+func (fc *fdConn) CloseWrite() error {
+	if fc.udp != nil {
+		return errUnsupported
+	}
+	if _, ok := fc.conn.(halfCloser); !ok {
+		return errUnsupported
+	}
+	fc.mux.Lock()
+	if fc.isClosing() {
+		fc.mux.Unlock()
+		return net.ErrClosed
+	}
+	if fc.writeShut {
+		fc.mux.Unlock()
+		return nil
+	}
+	fc.writeShut = true
+	fc.mux.Unlock()
+	select {
+	case fc.writeSig <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+// shutWriteIfDrained runs on the writer after a drain and shuts the writing
+// half a CloseWrite requested once nothing accepted is left. Output is no
+// longer accepted then, so what is left only drains.
+func (fc *fdConn) shutWriteIfDrained() error {
+	if fc.writeShutDone.Load() {
+		return nil
+	}
+	fc.mux.Lock()
+	ready := fc.writeShut && fc.outbound.Len() == 0 && fc.writeBytes == 0
+	fc.mux.Unlock()
+	if !ready {
+		return nil
+	}
+	if fc.readEOF.Load() {
+		// Both halves end: closing sends the FIN behind what was sent.
+		fc.writeShutDone.Store(true)
+		fc.requestClose(io.EOF)
+		return nil
+	}
+	err := fc.conn.(halfCloser).CloseWrite()
+	fc.writeShutDone.Store(true)
+	if err != nil {
+		return err
+	}
+	if fc.readEOF.Load() {
+		fc.requestClose(io.EOF)
+	}
+	return nil
+}
+
+// onReadEOF ends the read goroutine of a half-open connection whose peer shut
+// its writing half: OnData runs once more, so the application sees Read
+// report io.EOF, and the connection closes once its own writing half is shut
+// as well.
+func (fc *fdConn) onReadEOF() {
+	fc.callbackMu.Lock()
+	if fc.isClosing() {
+		fc.callbackMu.Unlock()
+		return
+	}
+	fc.readEOF.Store(true)
+	started := fc.beginInboundCallback()
+	err := fc.events.onData(fc)
+	fc.endInboundCallback(started)
+	fc.callbackMu.Unlock()
+	if err != nil {
+		fc.events.closeConn(fc, err)
+		return
+	}
+	if fc.writeShutDone.Load() {
+		fc.requestClose(io.EOF)
+	}
+}
+
+// Read is commonConn.Read that reports io.EOF once a half-open connection's
+// peer has shut its writing half and the buffered bytes are consumed.
+func (fc *fdConn) Read(b []byte) (int, error) {
+	n, err := fc.commonConn.Read(b)
+	if n == 0 && err == nil && fc.readEOF.Load() && fc.inbound.Empty() && len(fc.inboundTail) == 0 {
+		return 0, io.EOF
+	}
+	return n, err
 }
 
 // ReserveInbound implements Conn.ReserveInbound.
@@ -945,6 +1052,10 @@ func (fc *fdConn) readLoop() {
 			}
 		}
 		if readErr != nil {
+			if readErr == io.EOF && fc.events.AllowHalfOpen {
+				fc.onReadEOF()
+				return
+			}
 			fc.events.closeConn(fc, readErr)
 			return
 		}
