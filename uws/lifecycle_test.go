@@ -111,9 +111,9 @@ func (h *blockingCloseConnectionHandler) OnClose(conn *Conn, _ CloseEvent) {
 
 func TestUIOExecutorWritesFlushAutomatically(t *testing.T) {
 	_, addr, _ := startConfiguredLifecycleTestServer(t, lifecycleEchoHandler{}, func(server *Server) {
-		server.Events.Executor = goroutineExecutor{}
+		server.Options.Executor = goroutineExecutor{}
 	})
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	handler := &clientHandler{
 		open:    make(chan struct{}),
 		closed:  make(chan struct{}),
@@ -148,7 +148,7 @@ func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
 	handler := &slowConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
 	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
 	})
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	newClient := func() (*Conn, *clientHandler) {
 		clientHandler := &clientHandler{
@@ -206,7 +206,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 	handler := &blockingCloseConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
 	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
 	})
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	newClient := func() (*Conn, *clientHandler) {
 		clientHandler := &clientHandler{
@@ -281,13 +281,14 @@ func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	server := NewServer(handler)
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server := NewServer(Options{}, handler)
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	if configure != nil {
 		configure(server)
 	}
 	started := make(chan struct{})
-	server.Events.OnStart = func(*uio.Events) { close(started) }
+	server.startHook = func() { close(started) }
 	done := make(chan struct{})
 	go func() {
 		_ = server.Serve(addr)
@@ -311,7 +312,7 @@ func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure
 
 func TestDialerCloseIsReentrantFromOnClose(t *testing.T) {
 	_, addr, _ := startLifecycleTestServer(t, nil)
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	handler := &reentrantCloseHandler{
 		open:   make(chan struct{}),
 		closed: make(chan struct{}),
@@ -358,7 +359,7 @@ func TestServerCloseIsReentrantFromOnClose(t *testing.T) {
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 		t.Fatal(err)
 	}
@@ -391,10 +392,10 @@ func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
 	executor := &switchableExecutor{}
 	handler := &reentrantCloseHandler{open: make(chan struct{}), closed: make(chan struct{})}
 	server, addr, serveDone := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
-		server.Events.Executor = executor
+		server.Options.Executor = executor
 	})
 	handler.setCloseFunc(func() { _ = server.Close(nil) })
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	clientHandler := &clientHandler{
 		open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
 	}
@@ -433,7 +434,7 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	server, addr, serveDone := startLifecycleTestServer(t, handler)
 	handler.setCloseFunc(func() error { return server.Close(errors.New("close from server callback")) })
 
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	clientHandler := &clientHandler{
 		open:    make(chan struct{}),
 		closed:  make(chan struct{}),
@@ -479,7 +480,7 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 
 func TestDialerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	_, addr, _ := startLifecycleTestServer(t, lifecycleEchoHandler{})
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	handler := &closeFromMessageHandler{
 		open:        make(chan struct{}),
 		closed:      make(chan struct{}),

@@ -653,7 +653,7 @@ func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error
 
 func (c *Conn) batchBlockSize() int {
 	if c.config == nil || c.config.batchBlockSize <= 0 {
-		return writeBatchBlockSize(nil)
+		return Options{}.batchBlockSize()
 	}
 	return c.config.batchBlockSize
 }

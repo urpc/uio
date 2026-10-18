@@ -126,11 +126,8 @@ func (c *scriptedConn) Close() error { return c.CloseWith(io.EOF) }
 
 func testServerConn(raw *scriptedConn) *Conn {
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: 1024,
-			MaxMessageSize:  1024,
-		}),
+		raw:    raw,
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024}}),
 	}
 	conn.opened.Store(true)
 	return conn
@@ -246,7 +243,7 @@ func TestOversizedIncomingMessagesCloseWith1009BeforeCallback(t *testing.T) {
 			handler := &recordingHandler{}
 			conn := &Conn{
 				raw:     raw,
-				config:  testServerConfig(&Server{MaxFramePayload: 16 << 10, MaxMessageSize: maxMessage}),
+				config:  testServerConfig(&Server{Options: Options{MaxFramePayload: 16 << 10, MaxMessageSize: maxMessage}}),
 				handler: handler,
 			}
 			conn.opened.Store(true)
@@ -284,7 +281,7 @@ func TestOversizedCompressedFragmentsCloseWith1009BeforeFIN(t *testing.T) {
 	handler := &recordingHandler{}
 	conn := &Conn{
 		raw:     raw,
-		config:  testServerConfig(&Server{MaxFramePayload: maxCompressed, MaxMessageSize: 64, EnableCompression: true}),
+		config:  testServerConfig(&Server{Options: Options{MaxFramePayload: maxCompressed, MaxMessageSize: 64, EnableCompression: true}}),
 		handler: handler,
 	}
 	conn.opened.Store(true)
@@ -399,7 +396,7 @@ func TestControlAndMessageValidationErrors(t *testing.T) {
 
 func TestServerDisableUTF8CheckAllowsIncomingText(t *testing.T) {
 	handler := &recordingHandler{}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	server.DisableUTF8Check = true
 	raw := newScriptedConn()
 	server.onOpen(raw)
@@ -442,7 +439,7 @@ func TestSendAndTransportErrorPaths(t *testing.T) {
 	}
 
 	tooLarge := testServerConn(newScriptedConn())
-	tooLarge.config = testServerConfig(&Server{MaxFramePayload: 1})
+	tooLarge.config = testServerConfig(&Server{Options: Options{MaxFramePayload: 1}})
 	if err := tooLarge.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("xx")}); !errors.Is(err, frame.ErrMessageTooBig) {
 		t.Fatalf("oversized frame error = %v", err)
 	}
@@ -490,7 +487,7 @@ func TestReadAvailableHandshakeAndParserErrors(t *testing.T) {
 	badHandshake := &bufferedProbeConn{inbound: []byte("not HTTP\r\n\r\n")}
 	serverConn := &Conn{
 		raw:    badHandshake,
-		config: testServerConfig(NewServer(nil)),
+		config: testServerConfig(NewServer(Options{}, nil)),
 	}
 	if err := serverConn.readAvailable(); err == nil {
 		t.Fatal("malformed handshake was accepted")
@@ -529,7 +526,7 @@ func TestHandshakeAndCloseLifecycleErrors(t *testing.T) {
 		t.Fatal("expired handshake was opened")
 	}
 
-	client := &Conn{config: testDialerConfig(&Dialer{MaxHeaderBytes: 1})}
+	client := &Conn{config: testDialerConfig(&Dialer{Options: Options{MaxHeaderBytes: 1}})}
 	client.handshake.Store(&handshakeState{data: []byte("xx")})
 	if err := client.consumeClientHandshake(); !errors.Is(err, handshake.ErrBadRequest) {
 		t.Fatalf("oversized client handshake error = %v", err)
@@ -555,7 +552,7 @@ func TestHandshakeAndCloseLifecycleErrors(t *testing.T) {
 
 func TestSendCloseAndLimitStateBranches(t *testing.T) {
 	notReadyRaw := newScriptedConn()
-	notReady := &Conn{raw: notReadyRaw, config: testServerConfig(&Server{MaxMessageSize: 1024})}
+	notReady := &Conn{raw: notReadyRaw, config: testServerConfig(&Server{Options: Options{MaxMessageSize: 1024}})}
 	if err := notReady.SendBinary(nil); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("not-ready SendBinary error = %v", err)
 	}
@@ -590,7 +587,7 @@ func TestSendCloseAndLimitStateBranches(t *testing.T) {
 		t.Fatalf("duplicate close writes = %d, want 1", duplicateRaw.writes)
 	}
 
-	large := &Conn{config: testServerConfig(&Server{MaxMessageSize: math.MaxUint64})}
+	large := &Conn{config: testServerConfig(&Server{Options: Options{MaxMessageSize: math.MaxUint64}})}
 	if large.maxMessageSizeInt() != math.MaxInt {
 		t.Fatalf("max message int = %d, want %d", large.maxMessageSizeInt(), math.MaxInt)
 	}
@@ -673,7 +670,7 @@ func TestTimerReplacementAndDialerCloseTimeout(t *testing.T) {
 
 	raw := newScriptedConn()
 	raw.closed = make(chan struct{})
-	dialerConn := &Conn{raw: raw, config: testDialerConfig(&Dialer{CloseTimeout: 5 * time.Millisecond})}
+	dialerConn := &Conn{raw: raw, config: testDialerConfig(&Dialer{Options: Options{CloseTimeout: 5 * time.Millisecond}})}
 	dialerConn.startCloseTimer()
 	select {
 	case <-raw.closed:
@@ -683,7 +680,7 @@ func TestTimerReplacementAndDialerCloseTimeout(t *testing.T) {
 }
 
 func TestClientHandshakeRejectsInvalidResponses(t *testing.T) {
-	invalid := &Conn{config: testDialerConfig(&Dialer{MaxHeaderBytes: DefaultMaxHeaderBytes})}
+	invalid := &Conn{config: testDialerConfig(&Dialer{Options: Options{MaxHeaderBytes: DefaultMaxHeaderBytes}})}
 	invalid.handshake.Store(&handshakeState{
 		clientKey: testKey,
 		data:      []byte("HTTP/1.1 500 Error\r\n\r\n"),
@@ -698,7 +695,7 @@ func TestClientHandshakeRejectsInvalidResponses(t *testing.T) {
 		"Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n")
 	unexpectedExtension := &Conn{
 		raw:    newScriptedConn(),
-		config: testDialerConfig(&Dialer{MaxHeaderBytes: DefaultMaxHeaderBytes}),
+		config: testDialerConfig(&Dialer{Options: Options{MaxHeaderBytes: DefaultMaxHeaderBytes}}),
 	}
 	unexpectedExtension.handshake.Store(&handshakeState{clientKey: testKey, data: response})
 	if err := unexpectedExtension.consumeClientHandshake(); err == nil {

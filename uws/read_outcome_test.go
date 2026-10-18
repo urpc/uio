@@ -25,19 +25,19 @@ func TestOnDataPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
 			raw.wakeErr = wakeErr
 			conn := &Conn{raw: raw}
 			if tc.client {
-				conn.config = testDialerConfig(NewDialer())
+				conn.config = testDialerConfig(NewDialer(Options{}))
 			} else {
-				conn.config = testServerConfig(NewServer(nil))
+				conn.config = testServerConfig(NewServer(Options{}, nil))
 			}
 			conn.opened.Store(true)
 			seen := 0
 			conn.handler = handlerFuncs{onMessage: func(_ *Conn, _ Message) {
 				seen++
-				if seen == maxFramesPerDataEvent {
+				if seen == minFramesPerDataEvent {
 					conn.closing.Store(true)
 				}
 			}}
-			for i := 0; i < maxFramesPerDataEvent+1; i++ {
+			for i := 0; i < minFramesPerDataEvent+1; i++ {
 				raw.inbound = frame.Append(raw.inbound, frame.Frame{
 					Fin: true, Opcode: frame.Binary, Masked: !tc.client, Payload: []byte{byte(i)},
 				}, [4]byte{1, 2, 3, 4})
@@ -52,8 +52,8 @@ func TestOnDataPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
 			if !errors.Is(err, wakeErr) {
 				t.Fatalf("OnData error = %v, want %v", err, wakeErr)
 			}
-			if seen != maxFramesPerDataEvent {
-				t.Fatalf("messages = %d, want %d", seen, maxFramesPerDataEvent)
+			if seen != minFramesPerDataEvent {
+				t.Fatalf("messages = %d, want %d", seen, minFramesPerDataEvent)
 			}
 		})
 	}
@@ -76,7 +76,7 @@ func TestOnDataPropagatesFailedProtocolClose(t *testing.T) {
 			}, [4]byte{1, 2, 3, 4})
 			conn := testServerConn(raw)
 			if tc.client {
-				conn.config = testDialerConfig(NewDialer())
+				conn.config = testDialerConfig(NewDialer(Options{}))
 			}
 			raw.userdata = conn
 			var err error
@@ -110,7 +110,7 @@ func TestOnDataLeavesOwnedProtocolCloseToTransport(t *testing.T) {
 			}, [4]byte{1, 2, 3, 4})
 			conn := testServerConn(raw)
 			if tc.client {
-				conn.config = testDialerConfig(NewDialer())
+				conn.config = testDialerConfig(NewDialer(Options{}))
 			}
 			raw.userdata = conn
 			var err error

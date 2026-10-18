@@ -83,7 +83,7 @@ func maskedFrames(payloads ...string) []byte {
 }
 
 func newBatchConn(raw uio.Conn, handler Handler) *Conn {
-	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(NewServer(nil))}
+	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(NewServer(Options{OutboundHighWatermark: -1}, nil))}
 	conn.opened.Store(true)
 	return conn
 }
@@ -160,8 +160,8 @@ func TestBatchKeepsOrderWithOtherSenders(t *testing.T) {
 
 func TestBatchRespectsOutboundLimit(t *testing.T) {
 	raw := &batchProbeConn{outbound: 40}
-	server := NewServer(nil)
-	server.Events.MaxOutboundBuffered = 64
+	server := NewServer(Options{}, nil)
+	server.Options.maxOutbound = 64
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	raw.inbound = maskedFrames("0123456789", "0123456789", "0123456789")
@@ -199,7 +199,7 @@ func (c *failingBatchConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 
 func TestFailedBatchHandoffAbortsTransport(t *testing.T) {
 	raw := &failingBatchConn{err: errors.New("transport broke")}
-	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(nil))}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}, nil))}
 	conn.opened.Store(true)
 	raw.inbound = maskedFrames("a", "b")
 	if err := conn.readAvailable(); err != nil {
@@ -218,7 +218,7 @@ func TestFailedBatchHandoffAbortsTransport(t *testing.T) {
 
 func TestClosedTransportBatchHandoffDoesNotAbortAgain(t *testing.T) {
 	raw := &failingBatchConn{err: net.ErrClosed}
-	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(nil))}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}, nil))}
 	conn.opened.Store(true)
 	raw.inbound = maskedFrames("a", "b")
 	if err := conn.readAvailable(); err != nil {
@@ -357,8 +357,8 @@ func TestRefusedBatchHandoffAbortsInsteadOfDroppingFrames(t *testing.T) {
 func TestBatchUnderOutboundLimitIsNeverRefused(t *testing.T) {
 	raw := &limitedWire{limit: 500}
 	handler := &batchEchoHandler{}
-	server := NewServer(nil)
-	server.Events.MaxOutboundBuffered = raw.limit
+	server := NewServer(Options{}, nil)
+	server.Options.maxOutbound = raw.limit
 	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	// One reply per block, so the batch fills and is handed over mid-round.

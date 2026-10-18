@@ -39,7 +39,7 @@ func (echoHandler) OnMessage(conn *uws.Conn, message uws.Message) {
 func (echoHandler) OnClose(*uws.Conn, uws.CloseEvent) {}
 
 func main() {
-	server := uws.NewServer(echoHandler{})
+	server := uws.NewServer(uws.Options{}, echoHandler{})
 	go func() {
 		if err := server.Serve(); err != nil {
 			log.Fatal(err)

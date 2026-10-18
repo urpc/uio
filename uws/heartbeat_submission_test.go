@@ -11,7 +11,7 @@ import (
 // the Ping's own retirement starts the Pong timeout.
 func TestHeartbeatPingPositionFollowsEarlierPong(t *testing.T) {
 	raw := newScriptedConn()
-	conn := &Conn{raw: raw, config: testServerConfig(NewServer(nil)), heartbeat: &heartbeatState{}}
+	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}, nil)), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
 	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte{1}}); err != nil {
 		t.Fatal(err)

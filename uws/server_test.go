@@ -42,32 +42,37 @@ func (c *heartbeatWriteProbe) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return n, err
 }
 
-func TestConfigureWriteBuffer(t *testing.T) {
-	events := &uio.Events{}
-	configureWriteBuffer(events)
-	if got := events.WriteBufferedThreshold; got != defaultWriteBufferedThreshold {
-		t.Fatalf("default WriteBufferedThreshold = %d, want %d", got, defaultWriteBufferedThreshold)
+func TestResolveWriteCoalesce(t *testing.T) {
+	opts, err := (Options{}).resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := opts.WriteCoalesce; got != defaultWriteBufferedThreshold {
+		t.Fatalf("default WriteCoalesce = %d, want %d", got, defaultWriteBufferedThreshold)
 	}
 
 	const configured = 32 << 10
-	events.WriteBufferedThreshold = configured
-	configureWriteBuffer(events)
-	if got := events.WriteBufferedThreshold; got != configured {
-		t.Fatalf("configured WriteBufferedThreshold = %d, want %d", got, configured)
+	opts, err = Options{WriteCoalesce: configured}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := opts.WriteCoalesce; got != configured {
+		t.Fatalf("configured WriteCoalesce = %d, want %d", got, configured)
 	}
 
-	const disabled = -1
-	events.WriteBufferedThreshold = disabled
-	configureWriteBuffer(events)
-	if got := events.WriteBufferedThreshold; got != disabled {
-		t.Fatalf("disabled WriteBufferedThreshold = %d, want %d", got, disabled)
+	opts, err = Options{WriteCoalesce: -1}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := opts.WriteCoalesce; got != -1 {
+		t.Fatalf("disabled WriteCoalesce = %d, want -1", got)
 	}
 }
 
 func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
-	server := NewServer(nil)
-	server.Events = &uio.Events{Pollers: 1}
-	server.Events.OnStart = func(*uio.Events) { _ = server.Close(nil) }
+	server := NewServer(Options{}, nil)
+	server.Options.Pollers = 1
+	server.startHook = func() { _ = server.Close(nil) }
 	if err := server.Serve("127.0.0.1:0", "127.0.0.1:0"); err != nil {
 		t.Fatalf("Serve with multiple addresses: %v", err)
 	}
@@ -77,7 +82,7 @@ func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
 }
 
 func TestHeartbeatCanBeRestarted(t *testing.T) {
-	server := &Server{HeartbeatInterval: time.Millisecond}
+	server := &Server{Options: Options{HeartbeatInterval: time.Millisecond}}
 	server.startHeartbeat(testServerConfig(server))
 	server.startHeartbeat(testServerConfig(server))
 	server.stopHeartbeat()
@@ -89,7 +94,7 @@ func TestHeartbeatCanBeRestarted(t *testing.T) {
 }
 
 func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 5 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -132,7 +137,7 @@ func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
 }
 
 func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -163,7 +168,7 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 }
 
 func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
 	raw := newScriptedConn()
@@ -205,7 +210,7 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 }
 
 func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	raw := newScriptedConn()
 	raw.writeErr = uio.ErrOutboundOverflow
@@ -236,7 +241,7 @@ func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
 }
 
 func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	failure := errors.New("heartbeat write failed")
 	raw := newScriptedConn()
 	raw.writeErr = failure
@@ -253,7 +258,7 @@ func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
 }
 
 func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -324,7 +329,7 @@ func TestHeartbeatSendPaths(t *testing.T) {
 	raw := newScriptedConn()
 	conn := &Conn{
 		raw:       raw,
-		config:    testServerConfig(NewServer(nil)),
+		config:    testServerConfig(NewServer(Options{}, nil)),
 		heartbeat: &heartbeatState{},
 	}
 	conn.opened.Store(true)
@@ -338,7 +343,7 @@ func TestHeartbeatSendPaths(t *testing.T) {
 	writeErr := errors.New("heartbeat close write failed")
 	failedRaw := newScriptedConn()
 	failedRaw.writeErr = writeErr
-	failed := &Conn{raw: failedRaw, config: testServerConfig(NewServer(nil))}
+	failed := &Conn{raw: failedRaw, config: testServerConfig(NewServer(Options{}, nil))}
 	failed.opened.Store(true)
 	failed.sendHeartbeatClose(1001, "timeout")
 	if !failed.closing.Load() || failedRaw.closes != 1 {
@@ -351,7 +356,7 @@ func TestHeartbeatSendPaths(t *testing.T) {
 
 func TestHandshakeTimeoutClosesUnresponsiveConnection(t *testing.T) {
 	raw := &writeProbeConn{closed: make(chan struct{})}
-	conn := &Conn{raw: raw, config: testServerConfig(&Server{HandshakeTimeout: 5 * time.Millisecond})}
+	conn := &Conn{raw: raw, config: testServerConfig(&Server{Options: Options{HandshakeTimeout: 5 * time.Millisecond}})}
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 	select {
 	case <-raw.closed:
@@ -368,7 +373,7 @@ func TestHandshakeTimeoutClosesUnresponsiveConnection(t *testing.T) {
 
 func TestCompletedHandshakeCancelsTimeout(t *testing.T) {
 	raw := &writeProbeConn{closed: make(chan struct{})}
-	conn := &Conn{raw: raw, config: testServerConfig(&Server{HandshakeTimeout: 5 * time.Millisecond})}
+	conn := &Conn{raw: raw, config: testServerConfig(&Server{Options: Options{HandshakeTimeout: 5 * time.Millisecond}})}
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 	if !conn.markOpened() {
 		t.Fatal("markOpened returned false")
@@ -382,7 +387,7 @@ func TestCompletedHandshakeCancelsTimeout(t *testing.T) {
 }
 
 func TestServerCloseStopsHeartbeatBeforeEvents(t *testing.T) {
-	server := &Server{Events: &uio.Events{}, HeartbeatInterval: time.Hour}
+	server := &Server{Options: Options{HeartbeatInterval: time.Hour}}
 	server.startHeartbeat(testServerConfig(server))
 	if err := server.Close(nil); err != nil {
 		t.Fatal(err)
@@ -394,13 +399,13 @@ func TestServerCloseStopsHeartbeatBeforeEvents(t *testing.T) {
 }
 
 func TestServerServeRunsEventsOnCallerGoroutine(t *testing.T) {
-	server := NewServer(nil)
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, nil)
+	server.Options.Pollers = 1
 	caller := make(chan int64, 1)
 	onStart := make(chan int64, 1)
-	server.Events.OnStart = func(events *uio.Events) {
+	server.startHook = func() {
 		onStart <- goid.Get()
-		_ = events.Close(nil)
+		_ = server.Close(nil)
 	}
 	done := make(chan error, 1)
 	go func() {
@@ -440,10 +445,11 @@ func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
 	_ = probe.Close()
 
 	handler := &heartbeatHandler{closed: make(chan CloseEvent, 1)}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	server.HeartbeatInterval = 10 * time.Millisecond
 	server.HeartbeatTimeout = 25 * time.Millisecond
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {
@@ -504,19 +510,21 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	_ = probe.Close()
 
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(serverHandler)
+	server := NewServer(Options{}, serverHandler)
 	server.HeartbeatInterval = 10 * time.Millisecond
 	// The timeout must survive a starved CI runner: with 250ms a pong delayed
 	// by scheduling could close a client that responded promptly in program
 	// order, which is exactly what this test asserts cannot happen.
 	server.HeartbeatTimeout = 2 * time.Second
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 
 	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	dialer := NewDialer()
-	dialer.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	dialer := NewDialer(Options{})
+	dialer.Options.Pollers = 1
+	dialer.Options.ReadBufferSize = 4 << 10
 	var client *Conn
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)

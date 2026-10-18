@@ -99,7 +99,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 
 	wsConn := s.newConnection(nil)
 	wsConn.handshake.Store(&handshakeState{upgrade: upgrade})
-	_, err = s.Events.Adopt(tcpConn, wsConn)
+	_, err = s.events.Adopt(tcpConn, wsConn)
 	if err != nil {
 		return
 	}

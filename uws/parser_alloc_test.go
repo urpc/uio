@@ -9,7 +9,7 @@ import (
 )
 
 func TestCompleteFrameParsingDoesNotAllocateParser(t *testing.T) {
-	conn := &Conn{config: testDialerConfig(NewDialer())}
+	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("payload")}, [4]byte{})
 	emit := func(frame.Frame) error { return nil }
 	parse := func() {
@@ -25,7 +25,7 @@ func TestCompleteFrameParsingDoesNotAllocateParser(t *testing.T) {
 }
 
 func TestIncrementalFrameParserPoolReusesState(t *testing.T) {
-	conn := &Conn{config: testDialerConfig(NewDialer())}
+	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("payload")}, [4]byte{})
 	emit := func(frame.Frame) error { return nil }
 	parse := func() {
@@ -43,7 +43,7 @@ func TestIncrementalFrameParserPoolReusesState(t *testing.T) {
 }
 
 func TestCompleteMessageDoesNotAllocateAssembler(t *testing.T) {
-	conn := &Conn{config: testDialerConfig(NewDialer())}
+	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary}
 	accept := func() {
 		if err := conn.acceptFrame(message); err != nil || conn.assembler != nil {
@@ -57,7 +57,7 @@ func TestCompleteMessageDoesNotAllocateAssembler(t *testing.T) {
 }
 
 func TestFragmentedMessageAssemblerPoolReusesState(t *testing.T) {
-	conn := &Conn{config: testDialerConfig(NewDialer())}
+	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	first := frame.Frame{Opcode: frame.Binary}
 	last := frame.Frame{Fin: true, Opcode: frame.Continuation}
 	accept := func() {

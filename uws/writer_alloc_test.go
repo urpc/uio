@@ -13,7 +13,7 @@ func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
 		Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, 1024),
 	}, [4]byte{1, 2, 3, 4})
 	raw := &bufferedProbeConn{}
-	conn := &Conn{raw: raw, config: testServerConfig(NewServer(nil))}
+	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}, nil))}
 	conn.opened.Store(true)
 	read := func() {
 		raw.inbound = wire
@@ -29,10 +29,8 @@ func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
 
 func TestServerFrameScratchReusesAllocation(t *testing.T) {
 	conn := &Conn{
-		raw: &writeProbeConn{},
-		config: testServerConfig(&Server{
-			MaxFramePayload: 1024,
-		}),
+		raw:    &writeProbeConn{},
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: 1024}}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
 	if err := conn.sendFrameLocked(message); err != nil {
@@ -50,10 +48,8 @@ func TestServerFrameScratchReusesAllocation(t *testing.T) {
 
 func TestClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	conn := &Conn{
-		raw: &writeProbeConn{},
-		config: testDialerConfig(&Dialer{
-			MaxFramePayload: 1024,
-		}),
+		raw:    &writeProbeConn{},
+		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: 1024}}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
 	if err := conn.sendFrameLocked(message); err != nil {
@@ -72,10 +68,8 @@ func TestClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	const payloadSize = 1 << 20
 	conn := &Conn{
-		raw: &writeProbeConn{},
-		config: testDialerConfig(&Dialer{
-			MaxFramePayload: payloadSize,
-		}),
+		raw:    &writeProbeConn{},
+		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: payloadSize}}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, payloadSize)}
 	if err := conn.sendFrameLocked(message); err != nil {

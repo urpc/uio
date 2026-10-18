@@ -11,10 +11,8 @@ func BenchmarkClientMaskedFrameWrite(b *testing.B) {
 	for _, size := range []int{1024, 1 << 20} {
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
 			conn := &Conn{
-				raw: &writeProbeConn{},
-				config: testDialerConfig(&Dialer{
-					MaxFramePayload: uint64(size),
-				}),
+				raw:    &writeProbeConn{},
+				config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: uint64(size)}}),
 			}
 			message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, size)}
 			b.ReportAllocs()
@@ -33,10 +31,8 @@ func BenchmarkServerUnmaskedFrameWrite(b *testing.B) {
 	for _, size := range []int{1024, 1 << 20} {
 		b.Run(fmt.Sprintf("%d", size), func(b *testing.B) {
 			conn := &Conn{
-				raw: &writeProbeConn{},
-				config: testServerConfig(&Server{
-					MaxFramePayload: uint64(size),
-				}),
+				raw:    &writeProbeConn{},
+				config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(size)}}),
 			}
 			message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, size)}
 			b.ReportAllocs()

@@ -22,8 +22,8 @@ var textPaths = []string{"frame", "split", "fragments", "compressed"}
 func deliverText(t testing.TB, payload []byte, path string) ([]Message, bool) {
 	t.Helper()
 	var got []Message
-	server := NewServer(messageLog{&got})
-	server.config = newServerConnConfig(server)
+	server := NewServer(Options{}, messageLog{&got})
+	server.config = testServerConfig(server)
 	raw := &echoPathConn{}
 	conn := server.newConnection(raw)
 	conn.opened.Store(true)

@@ -12,10 +12,8 @@ func TestStdServerFrameWritevDoesNotAllocatePerPayload(t *testing.T) {
 	payload := make([]byte, 1<<20)
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: uint64(len(payload)),
-		}),
+		raw:    raw,
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}
 	if err := conn.sendFrameLocked(message); err != nil {

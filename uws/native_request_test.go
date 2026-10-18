@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/urpc/uio"
 )
 
 // nativeRequestHandler records what OnOpen observes through Conn.Request.
@@ -41,11 +39,12 @@ func startNativeTestServer(t *testing.T, handler Handler, configure func(*Server
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	if configure != nil {
 		configure(server)
 	}
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {

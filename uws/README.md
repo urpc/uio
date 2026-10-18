@@ -27,8 +27,10 @@ frame reaches you straight from the read buffer.
   goroutine and keep their order; they never block on the socket.
 - **Batched replies.** Small replies to the frames of one read are encoded
   together and handed to the socket as one write.
-- **Bounded by design.** Limits on frame and message size, outbound queue,
-  handshake and close time, with heartbeats built in.
+- **Bounded by design.** Limits on frame and message size; queued output is
+  capped by watermarks that pause the connection's reads instead of growing
+  memory; handshake and close time are bounded, and heartbeats work on both
+  ends.
 
 ## Install
 
@@ -61,8 +63,7 @@ func (echo) OnMessage(c *uws.Conn, m uws.Message) {
 }
 
 func main() {
-	server := uws.NewServer(echo{})
-	server.EnableCompression = true
+	server := uws.NewServer(uws.Options{EnableCompression: true}, echo{})
 	log.Fatal(server.Serve(":8080"))
 }
 ```
@@ -84,7 +85,8 @@ finished.
    connection are ordered and never overlap.
 4. **Reply.** What the handler sends is queued; small replies to one read's
    frames are batched into one write. Sends from other goroutines join the same
-   queue in order.
+   queue in order. When a peer stops reading and the queue reaches the high
+   watermark, the connection stops reading its socket until the queue drains.
 
 ## Behind `net/http`
 
@@ -92,7 +94,7 @@ finished.
 address), then mount it like any other handler:
 
 ```go
-server := uws.NewServer(echo{})
+server := uws.NewServer(uws.Options{}, echo{})
 go func() { log.Fatal(server.Serve()) }()
 
 http.Handle("/ws", server)
@@ -116,7 +118,7 @@ func (client) OnClose(c *uws.Conn, e uws.CloseEvent) {
 	}
 }
 
-dialer := uws.NewDialer()
+dialer := uws.NewDialer(uws.Options{})
 if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", client{}); err != nil {
 	log.Fatal(err)
 }
@@ -129,27 +131,52 @@ context bounds the dial and the handshake, not the connection after it.
 
 ## Configuration
 
-Every field is optional.
+`Options` holds every setting; `Server` and `Dialer` embed the same type and
+the zero value means the defaults, so the two ends cannot drift apart. Options
+are read when `Serve` or `Dial` first starts the transport and never again.
 
-| `Server` field | Default | What it does |
+| Field | Default | What it does |
 | --- | --- | --- |
-| `CheckOrigin` | accept all | Origin policy. Set one for browser-facing servers. |
-| `Subprotocols` | none | Subprotocols to negotiate. |
+| `Subprotocols` | none | Protocols to negotiate; a server prefers the order given. |
+| `MaxHeaderBytes` | 32 KiB | Upgrade headers this end reads: the request on a server, the response on a dialer. |
 | `MaxFramePayload` | 16 MiB | Largest frame read; larger outgoing messages are fragmented. |
 | `MaxMessageSize` | 64 MiB | Largest message, after decompression. |
 | `EnableCompression` | off | Negotiates permessage-deflate. |
-| `CompressionLevel` | default | flate level when compression is on. |
-| `AllowCompressionContextTakeover` | off | Keeps compression history between messages, at more memory per connection. |
+| `CompressionLevel` | default | flate level 1-9 when compression is on; there is no level 0. |
+| `KeepCompressionContext` | off | Keeps this end's compression history between messages; off starts every message fresh and asks the same of the peer. |
+| `DisableUTF8Check` | off | Skips text validation for trusted peers. Not RFC compliant. |
 | `HandshakeTimeout` | 10 s | Bounds the HTTP upgrade. |
 | `CloseTimeout` | 5 s | Bounds the close handshake. |
-| `HeartbeatInterval` | off | Sends a ping at this interval. |
+| `HeartbeatInterval` | off | Pings the peer at this interval; servers and dialers alike. |
 | `HeartbeatTimeout` | 2 × interval | Closes the connection when a ping gets no pong in time. |
-| `MaxHeaderBytes` | 32 KiB | Upgrade header limit for `Serve`. |
-| `DisableUTF8Check` | off | Skips text validation for trusted peers. Not RFC compliant. |
-| `Events` | uio defaults | The underlying [`uio.Events`](https://github.com/urpc/uio#configuration): event loops, buffers, outbound limit. uws turns on `WriteBufferedThreshold` at 4 KiB unless you set it; a negative value turns it off. |
+| `Pollers` | uio default | Event loops. |
+| `ReadBufferSize` | 4 KiB | Bytes per socket read; it also sizes the write batch blocks (clamped to 4-64 KiB). |
+| `WriteCoalesce` | 4 KiB | Writes smaller than this join the connection's outbound batch instead of taking a send of their own; a negative value turns size-based buffering off. |
+| `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
+| `Executor` | uio default | Runs connection and write turns. |
+| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection stops reading, so TCP flow control slows its peer instead of the queue growing. A negative value disables the bound. |
+| `OutboundLowWatermark` | High/4 | Queued output at which a paused connection reads again. |
 
-`Dialer` has the same limits, compression, timeout and `Events` fields for the
-client side.
+A `Server` adds `Handler` and `CheckOrigin`. The underlying transport is built
+from these options and is not otherwise exposed; `Executor` is the scheduling
+escape hatch. Invalid combinations, such as a low watermark not below the high
+one or a compression level outside 1-9, make `Serve` and `Dial` return
+`ErrInvalidOptions`.
+
+**Backpressure.** The watermarks bound what one connection may queue while its
+peer is slow. A connection whose queue reaches the high watermark stops
+consuming; the bytes pile up in the transport's inbound buffer until it stops
+reading the socket, and the peer's TCP window closes. Draining to the low
+watermark resumes reads; no message is dropped. `Server.Stats` and
+`Dialer.Stats` count the pauses and resumes.
+
+**Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
+transport bytes in both directions:
+
+```go
+func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }
+func (m metrics) OnOutbound(c *uws.Conn, n int) { m.written.Add(n) }
+```
 
 ## Rules of the road
 
@@ -157,8 +184,8 @@ client side.
   returns. Call `Message.Clone` to keep it or hand it to another goroutine.
 - **Accepted is not delivered.** A nil error from `SendText`, `SendBinary` or
   `Ping` means the message was queued in order, not that the peer has it.
-  Past `Events.MaxOutboundBuffered` they return `ErrBackpressure`; size that
-  limit to fit the largest message you send.
+  Queued output is bounded by the watermarks above: a peer that stops reading
+  pauses this connection's reads rather than growing memory.
 - **State without locks.** Callbacks of one connection never overlap, so state
   kept with `SetUserdata` needs no locking from them.
 - **Closing.** `Conn.Close(code, reason)` sends its close frame after everything

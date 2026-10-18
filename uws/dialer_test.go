@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 )
@@ -107,9 +106,10 @@ func TestDialerNegotiatesAndUsesSmallDeflateWindow(t *testing.T) {
 	}()
 
 	handler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	dialer.EnableCompression = true
-	dialer.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	dialer.Options.Pollers = 1
+	dialer.Options.ReadBufferSize = 4 << 10
 	client, err := dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", handler)
 	if err != nil {
 		t.Fatal(err)
@@ -177,9 +177,10 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	_ = probe.Close()
 
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(serverHandler)
+	server := NewServer(Options{}, serverHandler)
 	server.EnableCompression = true
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- server.Serve(addr) }()
 	for deadline := time.Now().Add(testIOTimeout()); time.Now().Before(deadline); {
@@ -192,9 +193,10 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	}
 
 	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	dialer.EnableCompression = true
-	dialer.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	dialer.Options.Pollers = 1
+	dialer.Options.ReadBufferSize = 4 << 10
 	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/chat", clientHandler)
 	if err != nil {
 		_ = server.Close(nil)
@@ -260,7 +262,7 @@ func TestDialerValidationAndConnectionFailure(t *testing.T) {
 		t.Fatalf("canceled Dial() = %v", err)
 	}
 
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	if _, err := dialer.Dial(nil, "http://example.test", nil); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("invalid scheme Dial() = %v", err)
@@ -281,7 +283,7 @@ func TestDialerValidationAndConnectionFailure(t *testing.T) {
 		t.Fatalf("Dialer.Close() with nil Events = %v", err)
 	}
 
-	closedDialer := NewDialer()
+	closedDialer := NewDialer(Options{})
 	closeErr := errors.New("closed before dial")
 	if err := closedDialer.Close(closeErr); err != nil {
 		t.Fatal(err)
@@ -296,7 +298,7 @@ func TestDialerHandshakeContextDeadline(t *testing.T) {
 	defer cancel()
 
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	raw := newScriptedConn()
 	raw.closeCause = make(chan error, 1)
 	raw.userdata = &dialSetup{Context: dialCtx, handler: handler, key: testKey}
@@ -324,7 +326,7 @@ func TestDialerHandshakeContextDeadline(t *testing.T) {
 
 func TestEstablishedConnectionOutlivesDialContext(t *testing.T) {
 	dialCtx, cancel := context.WithCancel(context.Background())
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	raw := newScriptedConn()
 	raw.closeCause = make(chan error, 1)
 	raw.userdata = &dialSetup{Context: dialCtx, key: testKey}
@@ -355,7 +357,7 @@ func TestEstablishedConnectionOutlivesDialContext(t *testing.T) {
 
 func TestDialerCloseCancelsInFlightAttempt(t *testing.T) {
 	type contextKey struct{}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	attemptCtx, cleanup, err := dialer.newAttemptContext(
 		context.WithValue(context.Background(), contextKey{}, "attempt"),
 	)
@@ -382,10 +384,10 @@ func TestDialerCloseCancelsInFlightAttempt(t *testing.T) {
 }
 
 func TestDialContextCancelsDuringDialerStartup(t *testing.T) {
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	entered := make(chan struct{})
 	release := make(chan struct{})
-	dialer.Events.OnStart = func(*uio.Events) {
+	dialer.startHook = func() {
 		close(entered)
 		<-release
 	}
@@ -421,43 +423,48 @@ func TestDialContextCancelsDuringDialerStartup(t *testing.T) {
 }
 
 func TestDialerCustomLimitsAndExtensions(t *testing.T) {
-	dialer := &Dialer{
-		MaxFramePayload:  11,
-		MaxMessageSize:   12,
-		HandshakeTimeout: 13 * time.Millisecond,
-		CompressionLevel: 1,
-	}
-	if dialer.maxFramePayload() != 11 || dialer.maxMessageSize() != 12 {
+	dialer := &Dialer{Options: Options{MaxFramePayload: 11, MaxMessageSize: 12, HandshakeTimeout: 13 * time.Millisecond, EnableCompression: true, CompressionLevel: 1}}
+	config := testDialerConfig(dialer)
+	if config.parser.MaxFramePayload != 11 || config.assembler.MaxMessage != 12 {
 		t.Fatal("custom frame/message limits were not preserved")
 	}
-	if dialer.handshakeTimeout() != 13*time.Millisecond {
+	if config.handshakeTimeout != 13*time.Millisecond {
 		t.Fatal("custom timeouts were not preserved")
 	}
-	if dialer.compressionLevel() != 1 {
-		t.Fatalf("compression level = %d", dialer.compressionLevel())
+	if config.compressionLevel != 1 {
+		t.Fatalf("compression level = %d", config.compressionLevel)
 	}
-	if extension := dialer.clientExtensions(); extension != "" {
-		t.Fatalf("disabled compression extension = %q", extension)
-	}
-	dialer.EnableCompression = true
-	if extension := dialer.clientExtensions(); !strings.Contains(extension, "permessage-deflate") {
+	if extension := config.clientExtensions(); !strings.Contains(extension, "permessage-deflate") {
 		t.Fatalf("compression extension = %q", extension)
 	}
+	if extension := config.clientExtensions(); !strings.Contains(extension, "client_no_context_takeover") ||
+		!strings.Contains(extension, "server_no_context_takeover") {
+		t.Fatalf("default context policy extension = %q", extension)
+	}
+	keeping := testDialerConfig(&Dialer{Options: Options{EnableCompression: true, KeepCompressionContext: true}})
+	if extension := keeping.clientExtensions(); strings.Contains(extension, "no_context_takeover") {
+		t.Fatalf("kept context extension = %q", extension)
+	}
 
-	defaults := new(Dialer)
-	if defaults.maxFramePayload() != DefaultMaxFramePayload || defaults.maxMessageSize() != DefaultMaxMessageSize ||
-		defaults.handshakeTimeout() != DefaultHandshakeTimeout ||
-		defaults.compressionLevel() != -1 {
+	defaults, err := (Options{}).resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if defaults.MaxFramePayload != DefaultMaxFramePayload || defaults.MaxMessageSize != DefaultMaxMessageSize ||
+		defaults.HandshakeTimeout != DefaultHandshakeTimeout {
 		t.Fatal("dialer defaults changed")
 	}
-	if err := defaults.Close(nil); err != nil {
-		t.Fatalf("Dialer.Close with nil Events = %v", err)
+	if level := compressionLevel(Options{EnableCompression: true}); level != -1 {
+		t.Fatalf("default compression level = %d", level)
+	}
+	if err := new(Dialer).Close(nil); err != nil {
+		t.Fatalf("Dialer.Close before start = %v", err)
 	}
 }
 
 func TestDialerDisableUTF8CheckConfiguresConnection(t *testing.T) {
 	handler := &recordingHandler{}
-	dialer := &Dialer{DisableUTF8Check: true}
+	dialer := &Dialer{Options: Options{DisableUTF8Check: true}}
 	setup := &dialSetup{Context: context.Background(), handler: handler}
 	conn := dialer.newClientConn(&writeProbeConn{}, setup)
 	conn.opened.Store(true)
@@ -473,7 +480,7 @@ func TestDialerDisableUTF8CheckConfiguresConnection(t *testing.T) {
 }
 
 func TestDialerCallbacksHandleLifecycleEdges(t *testing.T) {
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 
 	invalid := newScriptedConn()
 	dialer.onOpen(invalid)
@@ -538,7 +545,7 @@ func TestDialerCallbacksHandleLifecycleEdges(t *testing.T) {
 }
 
 func TestDialerCloseBeforeAsyncOnOpenAttachesPendingConnection(t *testing.T) {
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	handler := &recordingHandler{}
 	cleaned := atomic.Int64{}
 	setup := &dialSetup{
@@ -593,7 +600,7 @@ func TestDialerHandshakeFailureCallsOnCloseSynchronously(t *testing.T) {
 	}()
 
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	_, err = dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", handler)
 	if err != nil {
 		t.Fatal(err)
@@ -658,7 +665,7 @@ func TestDialerDeadlineClosesRealPendingHandshake(t *testing.T) {
 	dialCtx, cancel := context.WithCancelCause(context.Background())
 	defer cancel(ErrClosed)
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	_, err = dialer.Dial(dialCtx, "ws://"+listener.Addr().String()+"/", handler)
 	if err != nil {
 		t.Fatal(err)
@@ -702,7 +709,7 @@ func TestDialerDeadlineClosesRealPendingHandshake(t *testing.T) {
 
 func TestDialerHandshakeFailureCallsOnClose(t *testing.T) {
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	raw := newScriptedConn()
 	raw.userdata = &dialSetup{handler: handler, key: testKey}
 	dialer.onOpen(raw)

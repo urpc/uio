@@ -206,7 +206,7 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 }
 
 // readAvailable consumes borrowed UIO inbound chunks without copying complete
-// frames. It yields after maxFramesPerDataEvent callbacks for one chunk so a
+// frames. It yields after the connection's frame budget for one chunk so a
 // hot connection returns to the scheduler and cannot monopolize one worker.
 // A round that carries several frames batches the small replies they send and
 // hands them to the transport together when it ends.
@@ -220,7 +220,17 @@ func (c *Conn) readAvailable() error {
 
 func (c *Conn) readRound() error {
 	c.readFrames = 0
+	high := 0
+	if c.config != nil {
+		high = c.config.outboundHigh
+	}
 	for {
+		// Queued output at the high watermark: stop consuming, so the bytes
+		// build up in UIO's inbound and its hold stops the socket reads.
+		if high > 0 && c.raw.OutboundBuffered() >= high {
+			c.pauseReads()
+			return nil
+		}
 		data := c.raw.PeekChunk()
 		if len(data) == 0 {
 			return nil
@@ -375,7 +385,11 @@ func unmaskShort(payload []byte, key uint32) bool {
 // countFrame charges a delivered frame against the round's budget.
 func (c *Conn) countFrame() error {
 	c.readFrames++
-	if c.readFrames >= maxFramesPerDataEvent {
+	frameBudget := int32(minFramesPerDataEvent)
+	if c.config != nil && c.config.maxFramesPerDataEvent > 0 {
+		frameBudget = int32(c.config.maxFramesPerDataEvent)
+	}
+	if c.readFrames >= frameBudget {
 		return errReadBudget
 	}
 	return nil
@@ -642,6 +656,9 @@ func (c *Conn) consumeClientHandshake() error {
 	c.setSubprotocol(protocol)
 	if !c.markOpened() {
 		return context.DeadlineExceeded
+	}
+	if c.heartbeat != nil {
+		c.config.heartbeatConnections.Store(c, c)
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
 	c.notifyOpen()

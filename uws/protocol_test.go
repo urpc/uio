@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 )
@@ -20,7 +19,7 @@ func TestFrameParserIsRetainedOnlyAcrossIncompleteInput(t *testing.T) {
 	newConn := func(handler Handler) *Conn {
 		conn := &Conn{
 			raw:     &writeProbeConn{},
-			config:  testServerConfig(NewServer(nil)),
+			config:  testServerConfig(NewServer(Options{}, nil)),
 			handler: handler,
 		}
 		conn.opened.Store(true)
@@ -68,7 +67,7 @@ func TestAssemblerIsRetainedOnlyForFragmentedMessages(t *testing.T) {
 	handler := &assemblerStateHandler{}
 	conn := &Conn{
 		raw:     &writeProbeConn{},
-		config:  testServerConfig(NewServer(nil)),
+		config:  testServerConfig(NewServer(Options{}, nil)),
 		handler: handler,
 	}
 	conn.opened.Store(true)
@@ -108,7 +107,7 @@ func TestAssemblerIsRetainedOnlyForFragmentedMessages(t *testing.T) {
 }
 
 func TestAssemblerIsReleasedAfterErrorAndTransportClose(t *testing.T) {
-	config := testServerConfig(&Server{EnableCompression: true})
+	config := testServerConfig(&Server{Options: Options{EnableCompression: true}})
 	conn := &Conn{raw: &writeProbeConn{}, config: config}
 	conn.opened.Store(true)
 	if err := conn.acceptFrame(frame.Frame{RSV1: true, Opcode: frame.Binary, Payload: []byte("compressed")}); err != nil {
@@ -124,7 +123,7 @@ func TestAssemblerIsReleasedAfterErrorAndTransportClose(t *testing.T) {
 		t.Fatal("message callback error retained assembler state")
 	}
 
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	transport := newScriptedConn()
 	conn = &Conn{raw: transport, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -139,7 +138,7 @@ func TestAssemblerIsReleasedAfterErrorAndTransportClose(t *testing.T) {
 }
 
 func TestReleaseParserDropsIncompleteState(t *testing.T) {
-	conn := &Conn{config: testServerConfig(NewServer(nil))}
+	conn := &Conn{config: testServerConfig(NewServer(Options{}, nil))}
 	wire := frame.Append(nil, frame.Frame{
 		Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte("payload"),
 	}, [4]byte{1, 2, 3, 4})
@@ -156,7 +155,7 @@ func TestReleaseParserDropsIncompleteState(t *testing.T) {
 }
 
 func TestIncrementalParserReturnsToPoolAfterCallbackError(t *testing.T) {
-	conn := &Conn{config: testDialerConfig(NewDialer())}
+	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("payload")}, [4]byte{})
 	if _, err := conn.feedFrames(wire[:1], func(frame.Frame) error { return nil }); err != nil {
 		t.Fatal(err)
@@ -174,7 +173,7 @@ func TestIncrementalParserReturnsToPoolAfterCallbackError(t *testing.T) {
 }
 
 func TestIncrementalParserReturnsToPoolAfterProtocolError(t *testing.T) {
-	conn := &Conn{config: testServerConfig(NewServer(nil))}
+	conn := &Conn{config: testServerConfig(NewServer(Options{}, nil))}
 	if _, err := conn.feedFrames([]byte{0x82}, func(frame.Frame) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +195,7 @@ func TestReadAvailableParsesFrameAcrossInboundSegments(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
-		config:  testServerConfig(NewServer(nil)),
+		config:  testServerConfig(NewServer(Options{}, nil)),
 	}
 	conn.opened.Store(true)
 
@@ -222,7 +221,7 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
 	raw := newSegmentedProbeConn(request[:1], request[1:17], request[17:])
 	handler := &recordingHandler{}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
@@ -264,8 +263,9 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 }
 
 func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
+	config := testServerConfig(NewServer(Options{}, nil))
 	var wire []byte
-	for i := 0; i < maxFramesPerDataEvent+1; i++ {
+	for i := 0; i < config.maxFramesPerDataEvent+1; i++ {
 		wire = frame.Append(wire, frame.Frame{
 			Fin:     true,
 			Opcode:  frame.Binary,
@@ -282,7 +282,7 @@ func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
-		config:  testServerConfig(NewServer(nil)),
+		config:  testServerConfig(NewServer(Options{}, nil)),
 	}
 	conn.opened.Store(true)
 	if err := conn.readAvailable(); err != nil {
@@ -291,8 +291,8 @@ func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
 	handler.mu.Lock()
 	firstBatch := len(handler.messages)
 	handler.mu.Unlock()
-	if firstBatch != maxFramesPerDataEvent {
-		t.Fatalf("first batch messages = %d, want %d", firstBatch, maxFramesPerDataEvent)
+	if want := config.maxFramesPerDataEvent; firstBatch != want {
+		t.Fatalf("first batch messages = %d, want %d", firstBatch, want)
 	}
 	if raw.wakes != 1 {
 		t.Fatalf("wake calls after first batch = %d, want 1", raw.wakes)
@@ -302,8 +302,8 @@ func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
 	}
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
-	if len(handler.messages) != maxFramesPerDataEvent+1 {
-		t.Fatalf("total messages = %d, want %d", len(handler.messages), maxFramesPerDataEvent+1)
+	if len(handler.messages) != minFramesPerDataEvent+1 {
+		t.Fatalf("total messages = %d, want %d", len(handler.messages), minFramesPerDataEvent+1)
 	}
 	if raw.wakes != 1 {
 		t.Fatalf("total wake calls = %d, want 1", raw.wakes)
@@ -312,7 +312,7 @@ func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
 
 func TestReadBudgetWakeFailureIsReturned(t *testing.T) {
 	var wire []byte
-	for i := 0; i < maxFramesPerDataEvent+1; i++ {
+	for i := 0; i < minFramesPerDataEvent+1; i++ {
 		wire = frame.Append(wire, frame.Frame{
 			Fin:     true,
 			Opcode:  frame.Binary,
@@ -326,7 +326,7 @@ func TestReadBudgetWakeFailureIsReturned(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: &recordingHandler{},
-		config:  testServerConfig(NewServer(nil)),
+		config:  testServerConfig(NewServer(Options{}, nil)),
 	}
 	conn.opened.Store(true)
 
@@ -359,13 +359,14 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 	addr := probe.Addr().String()
 	_ = probe.Close()
 
-	const primaryFrames = maxFramesPerDataEvent + 1
+	const primaryFrames = minFramesPerDataEvent + 1
 	handler := &budgetIntegrationHandler{
 		opened:   make(chan struct{}, 2),
 		messages: make(chan Message, primaryFrames+1),
 	}
-	server := NewServer(handler)
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server := NewServer(Options{}, handler)
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {
@@ -484,8 +485,9 @@ func TestServerHandshakeAndMaskedMessage(t *testing.T) {
 	_ = probe.Close()
 
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(handler)
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server := NewServer(Options{}, handler)
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {
@@ -606,7 +608,7 @@ func TestServerHandshakeAndMaskedMessage(t *testing.T) {
 
 func TestCloseWaitsForPeerClose(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -626,7 +628,7 @@ func TestCloseWaitsForPeerClose(t *testing.T) {
 
 func TestCloseTimeoutTerminatesUnresponsivePeer(t *testing.T) {
 	raw := &writeProbeConn{closed: make(chan struct{})}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: 5 * time.Millisecond}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: 5 * time.Millisecond}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -641,7 +643,7 @@ func TestCloseTimeoutTerminatesUnresponsivePeer(t *testing.T) {
 
 func TestCloseDoesNotRecreateTimerAfterTransportClose(t *testing.T) {
 	raw := newScriptedConn()
-	server := NewServer(nil)
+	server := NewServer(Options{}, nil)
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	raw.userdata = conn
@@ -677,7 +679,7 @@ func TestClosedConnectionDoesNotCreateCloseTimer(t *testing.T) {
 
 func TestPingRejectedAfterCloseStarts(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024, CloseTimeout: time.Second}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.Close(1000, ""); err != nil {
@@ -691,7 +693,7 @@ func TestPingRejectedAfterCloseStarts(t *testing.T) {
 
 func TestSendFrameLockedRejectsDataAfterClosing(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	conn.closing.Store(true)
@@ -709,7 +711,7 @@ func TestClientHandshakeAcceptsSplitResponse(t *testing.T) {
 		"Upgrade: websocket\r\nConnection: Upgrade\r\n" +
 		"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" +
 		"Sec-WebSocket-Protocol: chat\r\n\r\n")
-	dialer := &Dialer{MaxHeaderBytes: DefaultMaxHeaderBytes, Subprotocols: []string{"chat"}}
+	dialer := &Dialer{Options: Options{MaxHeaderBytes: DefaultMaxHeaderBytes, Subprotocols: []string{"chat"}}}
 	conn := &Conn{
 		raw:    &writeProbeConn{},
 		config: testDialerConfig(dialer),
@@ -742,9 +744,10 @@ func TestServerPerMessageDeflate(t *testing.T) {
 	_ = probe.Close()
 
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	server.EnableCompression = true
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {
@@ -894,7 +897,7 @@ func TestCompressedMessageLimitUsesDecodedSize(t *testing.T) {
 				}
 				t.Run(mode, func(t *testing.T) {
 					accept := func(limit uint64, handler *recordingHandler) error {
-						server := &Server{MaxFramePayload: uint64(len(encoded)), MaxMessageSize: limit}
+						server := &Server{Options: Options{MaxFramePayload: uint64(len(encoded)), MaxMessageSize: limit}}
 						conn := &Conn{
 							raw:         &writeProbeConn{},
 							config:      testServerConfig(server),
@@ -938,7 +941,7 @@ func TestCompressedMessageLimitUsesDecodedSize(t *testing.T) {
 func TestCloseTimerCancelCoversEveryArm(t *testing.T) {
 	raw := newScriptedConn()
 	raw.closed = make(chan struct{})
-	conn := &Conn{raw: raw, config: testServerConfig(&Server{CloseTimeout: 25 * time.Millisecond})}
+	conn := &Conn{raw: raw, config: testServerConfig(&Server{Options: Options{CloseTimeout: 25 * time.Millisecond}})}
 	// An arm from either entry point must land in the connection's one shard,
 	// so a single cancel reaches every pending entry.
 	conn.startCloseTimer()
@@ -970,7 +973,7 @@ func TestHandshakeCopiesOnlyARequestSplitAcrossReads(t *testing.T) {
 		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
 	newConn := func() (*Conn, *handshakeState) {
 		handler := &recordingHandler{}
-		conn := &Conn{raw: newSegmentedProbeConn(), handler: handler, config: testServerConfig(NewServer(handler))}
+		conn := &Conn{raw: newSegmentedProbeConn(), handler: handler, config: testServerConfig(NewServer(Options{}, handler))}
 		state := &handshakeState{}
 		conn.handshake.Store(state)
 		return conn, state

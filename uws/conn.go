@@ -48,6 +48,10 @@ type Conn struct {
 
 	readFrames int32       // frames delivered in the current read round
 	batching   atomic.Bool // a read round is batching the small frames it sends
+	// readPaused marks a connection that stopped consuming because its queued
+	// output reached the high watermark; resumeReadsAfterDrain clears it once
+	// the queue falls to the low watermark.
+	readPaused atomic.Bool
 
 	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
 	// batchUntracked is the part of batch that batchMessageLocked appended
@@ -103,6 +107,32 @@ const (
 	transportPhaseShift = 2
 	transportPhaseMask  = uint32(3 << transportPhaseShift)
 )
+
+// pauseReads stops consuming while queued output is over the high watermark,
+// so UIO's inbound hold stops the socket reads. It counts the transition.
+func (c *Conn) pauseReads() {
+	if c.readPaused.CompareAndSwap(false, true) && c.config != nil && c.config.stats != nil {
+		c.config.stats.paused.Add(1)
+	}
+}
+
+// resumeReadsAfterDrain wakes a paused connection once its queued output has
+// fallen to the low watermark. The transport's outbound callback calls it.
+func (c *Conn) resumeReadsAfterDrain() {
+	config := c.config
+	if config == nil || config.outboundHigh <= 0 || !c.readPaused.Load() {
+		return
+	}
+	if c.raw.OutboundBuffered() >= config.outboundLow {
+		return
+	}
+	if c.readPaused.CompareAndSwap(true, false) {
+		if config.stats != nil {
+			config.stats.resumed.Add(1)
+		}
+		_ = c.raw.Wake()
+	}
+}
 
 // compressionState holds negotiated direction-specific RFC 7692 contexts.
 type compressionState struct {

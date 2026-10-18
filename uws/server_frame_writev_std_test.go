@@ -51,10 +51,8 @@ func TestStdServerFrameUsesSingleTransportCopy(t *testing.T) {
 	payload := bytes.Repeat([]byte{0xa5}, 1<<20)
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: uint64(len(payload)),
-		}),
+		raw:    raw,
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}}),
 	}
 	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
 		t.Fatal(err)
@@ -79,7 +77,7 @@ func TestStdClientFrameKeepsMaskedCopy(t *testing.T) {
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
 	conn := &Conn{
 		raw:    raw,
-		config: testDialerConfig(&Dialer{MaxFramePayload: uint64(len(payload))}),
+		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: uint64(len(payload))}}),
 	}
 	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
 		t.Fatal(err)
@@ -96,10 +94,8 @@ func BenchmarkStdServerFrame1MiB(b *testing.B) {
 	payload := make([]byte, 1<<20)
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: uint64(len(payload)),
-		}),
+		raw:    raw,
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}}),
 	}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}
 	b.ReportAllocs()

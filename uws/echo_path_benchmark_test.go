@@ -22,11 +22,13 @@ type echoPathConn struct {
 	closes   atomic.Int32 // CloseWith calls, from the close timer among others
 }
 
-func (c *echoPathConn) PeekChunk() []byte    { return c.inbound }
-func (c *echoPathConn) InboundBuffered() int { return len(c.inbound) }
-func (c *echoPathConn) Userdata() any        { return c.userdata }
-func (c *echoPathConn) Flush() error         { return nil }
-func (c *echoPathConn) YieldRead() error     { return nil }
+func (c *echoPathConn) PeekChunk() []byte { return c.inbound }
+
+func (c *echoPathConn) OutboundBuffered() int { return 0 }
+func (c *echoPathConn) InboundBuffered() int  { return len(c.inbound) }
+func (c *echoPathConn) Userdata() any         { return c.userdata }
+func (c *echoPathConn) Flush() error          { return nil }
+func (c *echoPathConn) YieldRead() error      { return nil }
 
 func (c *echoPathConn) CloseWith(error) error {
 	c.closes.Add(1)
@@ -71,8 +73,8 @@ func BenchmarkServerEchoPath(b *testing.B) {
 	for _, frames := range []int{1, 100} {
 		for _, size := range []int{128, 1024} {
 			b.Run(fmt.Sprintf("frames=%d/payload=%d", frames, size), func(b *testing.B) {
-				server := NewServer(echoPathHandler{})
-				server.config = newServerConnConfig(server)
+				server := NewServer(Options{}, echoPathHandler{})
+				server.config = testServerConfig(server)
 				raw := &echoPathConn{}
 				conn := server.newConnection(raw)
 				conn.opened.Store(true)
@@ -118,8 +120,8 @@ func BenchmarkServerEchoPathSplitReads(b *testing.B) {
 	const readSize = 16 << 10
 	for _, size := range []int{64, 256, 1024} {
 		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
-			server := NewServer(echoPathHandler{})
-			server.config = newServerConnConfig(server)
+			server := NewServer(Options{}, echoPathHandler{})
+			server.config = testServerConfig(server)
 			raw := &echoPathConn{}
 			conn := server.newConnection(raw)
 			conn.opened.Store(true)
@@ -177,8 +179,8 @@ func BenchmarkServerEchoPathText(b *testing.B) {
 	for _, multibyte := range []bool{false, true} {
 		for _, size := range []int{128, 1024, 4000} {
 			b.Run(fmt.Sprintf("multibyte=%v/payload=%d", multibyte, size), func(b *testing.B) {
-				server := NewServer(echoTextHandler{})
-				server.config = newServerConnConfig(server)
+				server := NewServer(Options{}, echoTextHandler{})
+				server.config = testServerConfig(server)
 				raw := &echoPathConn{}
 				conn := server.newConnection(raw)
 				conn.opened.Store(true)

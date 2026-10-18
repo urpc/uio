@@ -18,7 +18,7 @@ import (
 func TestTransportBackpressureMapsToUWSError(t *testing.T) {
 	raw := newScriptedConn()
 	raw.writeErr = uio.ErrOutboundOverflow
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 1024}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
@@ -37,11 +37,7 @@ func TestTransportBackpressureMapsToUWSError(t *testing.T) {
 
 func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{
-		Events:          &uio.Events{WriteBufferedThreshold: 64},
-		MaxFramePayload: 1024,
-		MaxMessageSize:  1024,
-	}
+	server := &Server{Options: Options{WriteCoalesce: 64, MaxFramePayload: 1024, MaxMessageSize: 1024}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
@@ -60,12 +56,8 @@ func TestServerFrameCoalescesOnlyBelowWriteBufferThreshold(t *testing.T) {
 
 	disabledRaw := &writeProbeConn{}
 	disabled := &Conn{
-		raw: disabledRaw,
-		config: testServerConfig(&Server{
-			Events:          &uio.Events{WriteBufferedThreshold: -1},
-			MaxFramePayload: 1024,
-			MaxMessageSize:  1024,
-		}),
+		raw:    disabledRaw,
+		config: testServerConfig(&Server{Options: Options{WriteCoalesce: -1, MaxFramePayload: 1024, MaxMessageSize: 1024}}),
 	}
 	disabled.opened.Store(true)
 	if err := disabled.SendBinary(make([]byte, 32)); err != nil {
@@ -95,11 +87,8 @@ func TestFrameWireSizesAndServerWrites(t *testing.T) {
 	}
 
 	conn := &Conn{
-		raw: &writeProbeConn{},
-		config: testServerConfig(&Server{
-			MaxFramePayload: DefaultMaxFramePayload,
-			MaxMessageSize:  DefaultMaxMessageSize,
-		}),
+		raw:    &writeProbeConn{},
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: DefaultMaxFramePayload, MaxMessageSize: DefaultMaxMessageSize}}),
 	}
 	conn.opened.Store(true)
 	if err := conn.SendBinary(make([]byte, 32)); err != nil {
@@ -112,7 +101,7 @@ func TestFrameWireSizesAndServerWrites(t *testing.T) {
 
 func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{MaxFramePayload: 1024, MaxMessageSize: 4}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 4}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 
@@ -134,11 +123,8 @@ func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 func TestFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 	raw := &failNthWriteConn{scriptedConn: newScriptedConn(), failAt: 2, err: uio.ErrOutboundOverflow}
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: 4,
-			MaxMessageSize:  1024,
-		}),
+		raw:    raw,
+		config: testServerConfig(&Server{Options: Options{MaxFramePayload: 4, MaxMessageSize: 1024}}),
 	}
 	conn.opened.Store(true)
 	if err := conn.SendBinary([]byte("abcdefgh")); !errors.Is(err, ErrBackpressure) {
@@ -170,8 +156,8 @@ func TestFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 // of them fit the outbound limit: nothing is queued otherwise.
 func TestFragmentedMessageAdmittedWholeOrNotAtAll(t *testing.T) {
 	raw := &limitedWire{limit: 20}
-	server := NewServer(nil)
-	server.Events.MaxOutboundBuffered = raw.limit
+	server := NewServer(Options{}, nil)
+	server.Options.maxOutbound = raw.limit
 	server.MaxFramePayload = 4
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -207,11 +193,8 @@ func TestCompressedFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 	writeErr := errors.New("compressed write failed")
 	raw := &failNthWriteConn{scriptedConn: newScriptedConn(), failAt: 2, err: writeErr}
 	conn := &Conn{
-		raw: raw,
-		config: testServerConfig(&Server{
-			MaxFramePayload: 4,
-			MaxMessageSize:  1024,
-		}),
+		raw:         raw,
+		config:      testServerConfig(&Server{Options: Options{MaxFramePayload: 4, MaxMessageSize: 1024}}),
 		compression: &compressionState{encoder: compress.NewEncoder(-1, true)},
 	}
 	conn.opened.Store(true)
@@ -261,11 +244,7 @@ func (conn *failNthWriteConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 
 func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 	raw := &writeProbeConn{}
-	server := &Server{
-		MaxFramePayload:  1024,
-		MaxMessageSize:   1024,
-		DisableUTF8Check: true,
-	}
+	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024, DisableUTF8Check: true}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	if err := conn.SendText([]byte{0xff}); err != nil {
@@ -285,10 +264,11 @@ func TestCompressedMessageFragmentsAfterEncoding(t *testing.T) {
 	_ = probe.Close()
 
 	handler := &compressedMessageHandler{ready: make(chan error, 1)}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	server.EnableCompression = true
 	server.MaxFramePayload = 8
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {
@@ -389,9 +369,10 @@ func TestMessageFragmentsByFrameLimit(t *testing.T) {
 	_ = probe.Close()
 
 	handler := &fragmentedMessageHandler{ready: make(chan error, 1)}
-	server := NewServer(handler)
+	server := NewServer(Options{}, handler)
 	server.MaxFramePayload = 3
-	server.Events = &uio.Events{Pollers: 1, MaxBufferSize: 4 << 10}
+	server.Options.Pollers = 1
+	server.Options.ReadBufferSize = 4 << 10
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- server.Serve(addr) }()
 	t.Cleanup(func() {

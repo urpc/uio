@@ -15,16 +15,24 @@ const testKey = "dGhlIHNhbXBsZSBub25jZQ=="
 
 func testServerConfig(server *Server) *connConfig {
 	if server == nil {
-		server = NewServer(nil)
+		server = NewServer(Options{}, nil)
 	}
-	return newServerConnConfig(server)
+	opts, err := server.Options.resolve()
+	if err != nil {
+		panic(err)
+	}
+	return newServerConnConfig(opts, server.Handler, server.CheckOrigin, &server.connections, &server.stats)
 }
 
 func testDialerConfig(dialer *Dialer) *connConfig {
 	if dialer == nil {
-		dialer = NewDialer()
+		dialer = NewDialer(Options{})
 	}
-	return newDialerConnConfig(dialer)
+	opts, err := dialer.Options.resolve()
+	if err != nil {
+		panic(err)
+	}
+	return newDialerConnConfig(opts, &dialer.connections, &dialer.stats)
 }
 
 func testIOTimeout() time.Duration {
@@ -75,6 +83,7 @@ type writeProbeConn struct {
 	flushes       int
 	wakes         int
 	wakeErr       error
+	outbound      int // reported by OutboundBuffered
 	closes        int
 	closed        chan struct{}
 	closeCause    chan error
@@ -91,6 +100,9 @@ type bufferedProbeConn struct {
 	writeProbeConn
 	inbound []byte
 }
+
+// OutboundBuffered reports the queued output tests simulate.
+func (c *writeProbeConn) OutboundBuffered() int { return c.outbound }
 
 func (c *bufferedProbeConn) YieldRead() error { return c.Wake() }
 

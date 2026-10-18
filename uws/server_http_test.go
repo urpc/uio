@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
@@ -29,8 +28,8 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 		echoHandler: baseHandler,
 		request:     make(chan *http.Request, 1),
 	}
-	server := NewServer(serverHandler)
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, serverHandler)
+	server.Options.Pollers = 1
 	server.Subprotocols = []string{"chat"}
 	server.EnableCompression = true
 	serveWithoutListener(t, server)
@@ -41,8 +40,8 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	dialer := NewDialer()
-	dialer.Events = &uio.Events{Pollers: 1}
+	dialer := NewDialer(Options{})
+	dialer.Options.Pollers = 1
 	dialer.Subprotocols = []string{"chat"}
 	dialer.EnableCompression = true
 	client, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), clientHandler)
@@ -115,8 +114,8 @@ func (h *httpEchoHandler) OnOpen(conn *Conn) {
 
 func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
 	opened := make(chan struct{}, 1)
-	server := NewServer(handlerFuncs{onOpen: func(*Conn) { opened <- struct{}{} }})
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, handlerFuncs{onOpen: func(*Conn) { opened <- struct{}{} }})
+	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	httpServer := httptest.NewServer(server)
 	t.Cleanup(httpServer.Close)
@@ -163,8 +162,8 @@ func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
 }
 
 func TestServerHTTPRequiresServe(t *testing.T) {
-	server := NewServer(nil)
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, nil)
+	server.Options.Pollers = 1
 	request := newHTTPUpgradeRequest()
 	recorder := httptest.NewRecorder()
 	server.ServeHTTP(recorder, request)
@@ -175,8 +174,8 @@ func TestServerHTTPRequiresServe(t *testing.T) {
 }
 
 func TestServerHTTPRequiresHijacker(t *testing.T) {
-	server := NewServer(nil)
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, nil)
+	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	request := newHTTPUpgradeRequest()
 	recorder := httptest.NewRecorder()
@@ -185,8 +184,8 @@ func TestServerHTTPRequiresHijacker(t *testing.T) {
 }
 
 func TestServerHTTPAfterCloseDoesNotHijack(t *testing.T) {
-	server := NewServer(nil)
-	server.Events = &uio.Events{Pollers: 1}
+	server := NewServer(Options{}, nil)
+	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	if err := server.Close(nil); err != nil {
 		t.Fatal(err)
@@ -210,10 +209,10 @@ func assertHTTPError(t *testing.T, recorder *httptest.ResponseRecorder, status i
 func serveWithoutListener(t *testing.T, server *Server) {
 	t.Helper()
 	started := make(chan struct{})
-	oldOnStart := server.Events.OnStart
-	server.Events.OnStart = func(events *uio.Events) {
-		if oldOnStart != nil {
-			oldOnStart(events)
+	oldHook := server.startHook
+	server.startHook = func() {
+		if oldHook != nil {
+			oldHook()
 		}
 		close(started)
 	}

@@ -21,7 +21,6 @@ import (
 	"errors"
 	"time"
 
-	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
 	"github.com/urpc/uio/uws/internal/handshake"
 )
@@ -58,11 +57,12 @@ const (
 	// (see uio's coalescing of owned writes).
 	minWriteBatchBlock = 4 << 10
 	maxWriteBatchBlock = 64 << 10
-	// maxFramesPerDataEvent bounds frame callbacks handled for one read chunk
-	// so a busy connection cannot starve other runnable connections. It sits
-	// well above the frames one read usually carries: stopping inside a chunk
-	// costs a whole extra connection turn, with a read and a write of its own.
-	maxFramesPerDataEvent = 1024
+	// minFramesPerDataEvent is the floor of the per-chunk frame budget: a busy
+	// connection cannot starve others, but the budget always covers every
+	// frame the smallest read can carry, since stopping inside a chunk costs a
+	// whole extra connection turn. Options raises it with ReadBufferSize; see
+	// connConfig.maxFramesPerDataEvent.
+	minFramesPerDataEvent = 1024
 )
 
 var (
@@ -114,33 +114,4 @@ type Handler interface {
 	// OnClose is called once after the transport closes. A client handshake
 	// failure may call it without a preceding OnOpen.
 	OnClose(*Conn, CloseEvent)
-}
-
-func configureWriteBuffer(events *uio.Events) {
-	if events.WriteBufferedThreshold == 0 {
-		events.WriteBufferedThreshold = defaultWriteBufferedThreshold
-	}
-}
-
-// writeBatchBlockSize sizes write batch blocks from the transport's read size.
-func writeBatchBlockSize(events *uio.Events) int {
-	readSize := 4 << 10 // uio's MaxBufferSize default
-	if events != nil && events.MaxBufferSize > 0 {
-		readSize = events.MaxBufferSize
-	}
-	return min(max(readSize, minWriteBatchBlock), maxWriteBatchBlock)
-}
-
-func maxOutboundBuffered(events *uio.Events) int {
-	if events == nil {
-		return 0
-	}
-	return events.MaxOutboundBuffered
-}
-
-func effectiveWriteBufferedThreshold(events *uio.Events) int {
-	if events == nil || events.WriteBufferedThreshold == 0 {
-		return defaultWriteBufferedThreshold
-	}
-	return events.WriteBufferedThreshold
 }

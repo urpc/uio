@@ -33,30 +33,8 @@ import (
 // Configure its fields before the first Dial; the first Dial freezes the
 // connection configuration.
 type Dialer struct {
-	// Events configures the underlying UIO transport. Nil uses a default Events.
-	Events *uio.Events
-	// Subprotocols lists protocols offered in preference order.
-	Subprotocols []string
-	// MaxHeaderBytes bounds the HTTP upgrade response header. Zero uses the default.
-	MaxHeaderBytes int
-	// MaxFramePayload bounds each wire frame payload. On reads, it also bounds
-	// aggregate compressed payload across a fragmented message.
-	MaxFramePayload uint64
-	// MaxMessageSize bounds a complete message after decompression.
-	MaxMessageSize uint64
-	// EnableCompression offers RFC 7692 permessage-deflate.
-	EnableCompression bool
-	// CompressionLevel selects the flate level. Zero uses default compression.
-	CompressionLevel int
-	// DisableUTF8Check skips Text Message UTF-8 validation. This violates RFC
-	// 6455 and should only be used with trusted peers. Close reasons remain validated.
-	DisableUTF8Check bool
-	// CloseTimeout bounds the graceful WebSocket close handshake. A zero value
-	// uses DefaultCloseTimeout.
-	CloseTimeout time.Duration
-	// HandshakeTimeout bounds the HTTP upgrade handshake. A zero value uses
-	// DefaultHandshakeTimeout.
-	HandshakeTimeout time.Duration
+	// Options configures the protocol, the transport and backpressure.
+	Options
 
 	startOnce       sync.Once
 	closeMu         sync.Mutex
@@ -68,12 +46,24 @@ type Dialer struct {
 	startResult     error
 	startResultOnce sync.Once
 	config          *connConfig
+	opts            Options     // resolved snapshot, fixed at first Dial
+	events          *uio.Events // private transport configuration
+	connections     sync.Map
+	heartbeat       heartbeatRunner
+	stats           statsCounters
+
+	// startHook runs inside the transport's OnStart before the start result
+	// is published; it lets tests observe or block startup.
+	startHook func()
 }
 
-// NewDialer returns a Dialer configured with default transport settings.
-func NewDialer() *Dialer {
-	return &Dialer{Events: &uio.Events{}}
+// NewDialer returns a Dialer using opts.
+func NewDialer(opts Options) *Dialer {
+	return &Dialer{Options: opts}
 }
+
+// Stats reports the read pausing of this dialer's connections.
+func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 
 // Dial starts a WebSocket connection. The supplied context bounds the TCP
 // connection and WebSocket handshake; it no longer affects the connection
@@ -121,7 +111,7 @@ func (d *Dialer) Dial(ctx context.Context, addr string, handler Handler) (*Conn,
 		key:     key,
 	}
 	setup.conn = d.newClientConn(nil, setup)
-	raw, err := d.Events.DialContext(attemptCtx, "tcp://"+target.Host, setup)
+	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup)
 	if err != nil {
 		cause := context.Cause(attemptCtx)
 		if deadline, ok := attemptCtx.Deadline(); cause == nil && ok && !time.Now().Before(deadline) {
@@ -163,12 +153,13 @@ func (d *Dialer) Close(err error) error {
 	cause := d.closeErr
 	cancel := d.lifecycleCancel
 	d.lifecycleCancel = nil
-	events := d.Events
+	events := d.events
 	if cancel != nil {
 		cancel(cause)
 	}
 	d.closeMu.Unlock()
 
+	d.stopHeartbeat()
 	if events == nil {
 		return nil
 	}
@@ -194,21 +185,24 @@ func (d *Dialer) start(ctx context.Context) error {
 			d.publishStartResult(setupErr)
 			return
 		}
-		if d.Events == nil {
-			d.Events = &uio.Events{}
+		opts, err := d.Options.resolve()
+		if err != nil {
+			d.closeMu.Unlock()
+			d.publishStartResult(err)
+			return
 		}
-		events := d.Events
-		configureWriteBuffer(events)
-		d.config = newDialerConnConfig(d)
-		oldOnStart := events.OnStart
+		d.opts = opts
+		d.config = newDialerConnConfig(opts, &d.connections, &d.stats)
+		events := opts.transportEvents()
+		d.events = events
 		events.OnStart = func(events *uio.Events) {
 			if err := d.closedCause(); err != nil {
 				d.publishStartResult(err)
 				_ = events.Close(err)
 				return
 			}
-			if oldOnStart != nil {
-				oldOnStart(events)
+			if hook := d.startHook; hook != nil {
+				hook()
 			}
 			if err := d.closedCause(); err != nil {
 				d.publishStartResult(err)
@@ -220,6 +214,8 @@ func (d *Dialer) start(ctx context.Context) error {
 		events.OnData = d.onData
 		events.OnClose = d.onClose
 		events.OnOutbound = d.onOutbound
+		events.OnInbound = d.onInbound
+		d.startHeartbeat(d.config)
 		go func() {
 			err := events.Serve()
 			startErr := err
@@ -290,13 +286,17 @@ func (d *Dialer) newAttemptContext(parent context.Context) (context.Context, fun
 	return attemptCtx, cleanup, nil
 }
 
-func (d *Dialer) clientExtensions() string {
-	if !d.EnableCompression {
-		return ""
+// startHeartbeat starts the scanner that pings this dialer's connections.
+func (d *Dialer) startHeartbeat(config *connConfig) {
+	if config == nil {
+		return
 	}
-	// Offer both window parameters so either endpoint may negotiate a smaller
-	// RFC 7692 window when it needs to bound compression state.
-	return "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+	d.heartbeat.start(config.heartbeatConnections, config.heartbeatInterval, config.heartbeatTimeout)
+}
+
+// stopHeartbeat ends the heartbeat scanner and waits for it to exit.
+func (d *Dialer) stopHeartbeat() {
+	d.heartbeat.stop()
 }
 
 func (d *Dialer) onOpen(raw uio.Conn) {
@@ -318,12 +318,16 @@ func (d *Dialer) onOpen(raw uio.Conn) {
 func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 	config := d.config
 	if config == nil {
-		config = newDialerConnConfig(d)
+		opts, _ := d.Options.resolve()
+		config = newDialerConnConfig(opts, &d.connections, &d.stats)
 	}
 	conn := &Conn{
 		raw:     raw,
 		config:  config,
 		handler: setup.handler,
+	}
+	if config.heartbeatConnections != nil {
+		conn.heartbeat = &heartbeatState{}
 	}
 	conn.handshake.Store(&handshakeState{
 		clientKey: setup.key,
@@ -344,11 +348,24 @@ func (d *Dialer) onData(raw uio.Conn) error {
 	return err
 }
 
+// onInbound reports transport bytes to a Handler that observes traffic.
+func (d *Dialer) onInbound(raw uio.Conn, n int) {
+	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
+		if observer, ok := conn.handler.(TrafficObserver); ok {
+			observer.OnInbound(conn, n)
+		}
+	}
+}
+
 func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		conn.releaseOutbound(n)
 		if conn.writes.close.closePending() {
 			conn.tryCloseTransport()
+		}
+		conn.resumeReadsAfterDrain()
+		if observer, ok := conn.handler.(TrafficObserver); ok {
+			observer.OnOutbound(conn, n)
 		}
 	}
 }
@@ -395,39 +412,12 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		return
 	}
 	conn.stopCloseTimer()
+	d.connections.Delete(conn)
 	info := conn.closeInfo()
 	if info.Err == nil {
 		info.Err = err
 	}
 	conn.notifyClose(info)
-}
-
-func (d *Dialer) maxFramePayload() uint64 {
-	if d.MaxFramePayload == 0 {
-		return DefaultMaxFramePayload
-	}
-	return d.MaxFramePayload
-}
-
-func (d *Dialer) maxMessageSize() uint64 {
-	if d.MaxMessageSize == 0 {
-		return DefaultMaxMessageSize
-	}
-	return d.MaxMessageSize
-}
-
-func (d *Dialer) handshakeTimeout() time.Duration {
-	if d.HandshakeTimeout <= 0 {
-		return DefaultHandshakeTimeout
-	}
-	return d.HandshakeTimeout
-}
-
-func (d *Dialer) compressionLevel() int {
-	if d.CompressionLevel == 0 {
-		return -1
-	}
-	return d.CompressionLevel
 }
 
 // dialSetup bridges synchronous TCP setup and asynchronous WebSocket handshake

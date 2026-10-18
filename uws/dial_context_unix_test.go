@@ -16,7 +16,7 @@ import (
 
 func TestDialContextBoundsTCPConnect(t *testing.T) {
 	addr := saturatedTCPListener(t)
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
@@ -33,7 +33,7 @@ func TestDialContextBoundsTCPConnect(t *testing.T) {
 
 func TestConcurrentDialCancelAndDialerCloseReturn(t *testing.T) {
 	addr := saturatedTCPListener(t)
-	dialer := NewDialer()
+	dialer := NewDialer(Options{})
 	const attempts = 16
 	start := make(chan struct{})
 	errs := make(chan error, attempts)

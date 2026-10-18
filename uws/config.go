@@ -41,13 +41,19 @@ type connConfig struct {
 	// 16-bit length; both within the message and frame limits and small
 	// enough to be buffered. shortReadLimit is the largest seven-bit payload
 	// consumeShortFrame takes, within the frame and message limits.
-	shortSendLimit   int
-	shortSendDirect  int
-	shortReadLimit   int
-	maxOutbound      int // the transport's MaxOutboundBuffered
-	batchBlockSize   int
-	closeTimeout     time.Duration
-	handshakeTimeout time.Duration
+	shortSendLimit  int
+	shortSendDirect int
+	shortReadLimit  int
+	// maxOutbound is reserved: the outbound limit is gone from the public
+	// API, and memory is bounded by pausing reads at outboundHigh instead.
+	maxOutbound    int
+	batchBlockSize int
+	// maxFramesPerDataEvent bounds the frames one OnData round consumes: at
+	// least minFramesPerDataEvent and always enough for one full read of the
+	// configured buffer, so a chunk of tiny frames never leaves a backlog.
+	maxFramesPerDataEvent int
+	closeTimeout          time.Duration
+	handshakeTimeout      time.Duration
 
 	compressionEnabled         bool
 	compressionLevel           int
@@ -60,64 +66,45 @@ type connConfig struct {
 	heartbeatConnections *sync.Map
 	heartbeatInterval    time.Duration
 	heartbeatTimeout     time.Duration
+
+	// outboundHigh pauses a connection's reads at this queued-output level;
+	// outboundLow resumes them. Zero disables the pause.
+	outboundHigh int
+	outboundLow  int
+	stats        *statsCounters
 }
 
-// newServerConnConfig resolves defaults and copies mutable slices so every
-// accepted connection observes one immutable startup snapshot.
-func newServerConnConfig(server *Server) *connConfig {
-	maxHeader := server.MaxHeaderBytes
-	if maxHeader <= 0 {
-		maxHeader = DefaultMaxHeaderBytes
-	}
-	maxFrame := server.MaxFramePayload
-	if maxFrame == 0 {
-		maxFrame = DefaultMaxFramePayload
-	}
-	maxMessage := server.MaxMessageSize
-	if maxMessage == 0 {
-		maxMessage = DefaultMaxMessageSize
-	}
-	closeTimeout := server.CloseTimeout
-	if closeTimeout <= 0 {
-		closeTimeout = DefaultCloseTimeout
-	}
-	handshakeTimeout := server.HandshakeTimeout
-	if handshakeTimeout <= 0 {
-		handshakeTimeout = DefaultHandshakeTimeout
-	}
-	compressionLevel := server.CompressionLevel
-	if server.EnableCompression && compressionLevel == 0 {
-		compressionLevel = -1
-	}
-	heartbeatTimeout := server.HeartbeatTimeout
-	if server.HeartbeatInterval > 0 && heartbeatTimeout <= 0 {
-		heartbeatTimeout = server.HeartbeatInterval * 2
-	}
-
+// newServerConnConfig freezes the resolved options into the immutable
+// per-connection policy a Server's connections share.
+func newServerConnConfig(opts Options, handler Handler, checkOrigin func(*http.Request) bool, connections *sync.Map, stats *statsCounters) *connConfig {
 	config := &connConfig{
 		parser: frame.ParserConfig{
-			ExpectMask: true, AllowRSV1: server.EnableCompression, MaxFramePayload: maxFrame,
+			ExpectMask: true, AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
 		},
 		assembler: frame.AssemblerConfig{
-			MaxMessage: maxMessage, MaxCompressedPayload: maxFrame, ValidateUTF8: !server.DisableUTF8Check,
+			MaxMessage: opts.MaxMessageSize, MaxCompressedPayload: opts.MaxFramePayload, ValidateUTF8: !opts.DisableUTF8Check,
 		},
-		maxHeaderBytes:             maxHeader,
-		writeBufferedThreshold:     effectiveWriteBufferedThreshold(server.Events),
-		maxOutbound:                maxOutboundBuffered(server.Events),
-		batchBlockSize:             writeBatchBlockSize(server.Events),
-		closeTimeout:               closeTimeout,
-		handshakeTimeout:           handshakeTimeout,
-		compressionEnabled:         server.EnableCompression,
-		compressionLevel:           compressionLevel,
-		compressionContextTakeover: server.AllowCompressionContextTakeover,
-		subprotocols:               append([]string(nil), server.Subprotocols...),
-		checkOrigin:                server.CheckOrigin,
-		handler:                    server.Handler,
-		heartbeatInterval:          server.HeartbeatInterval,
-		heartbeatTimeout:           heartbeatTimeout,
+		maxHeaderBytes:             opts.MaxHeaderBytes,
+		writeBufferedThreshold:     opts.WriteCoalesce,
+		batchBlockSize:             opts.batchBlockSize(),
+		maxFramesPerDataEvent:      opts.framesPerDataRead(),
+		closeTimeout:               opts.CloseTimeout,
+		handshakeTimeout:           opts.HandshakeTimeout,
+		compressionEnabled:         opts.EnableCompression,
+		compressionLevel:           compressionLevel(opts),
+		compressionContextTakeover: opts.KeepCompressionContext,
+		subprotocols:               opts.Subprotocols,
+		checkOrigin:                checkOrigin,
+		handler:                    handler,
+		heartbeatInterval:          opts.HeartbeatInterval,
+		heartbeatTimeout:           opts.HeartbeatTimeout,
+		outboundHigh:               opts.OutboundHighWatermark,
+		outboundLow:                opts.OutboundLowWatermark,
+		maxOutbound:                opts.maxOutbound,
+		stats:                      stats,
 	}
-	if server.HeartbeatInterval > 0 {
-		config.heartbeatConnections = &server.connections
+	if opts.HeartbeatInterval > 0 && connections != nil {
+		config.heartbeatConnections = connections
 	}
 	config.settleShortLimits()
 	return config
@@ -162,47 +149,64 @@ func (config *connConfig) withinMessageLimits(limit int) int {
 	return limit
 }
 
-// newDialerConnConfig freezes the dialer's protocol and timeout policy for all
-// connections created during its single lifecycle.
-func newDialerConnConfig(dialer *Dialer) *connConfig {
-	maxHeader := dialer.MaxHeaderBytes
-	if maxHeader <= 0 {
-		maxHeader = DefaultMaxHeaderBytes
-	}
-	maxFrame := dialer.maxFramePayload()
-	maxMessage := dialer.maxMessageSize()
-	closeTimeout := dialer.CloseTimeout
-	if closeTimeout <= 0 {
-		closeTimeout = DefaultCloseTimeout
-	}
-	handshakeTimeout := dialer.handshakeTimeout()
-	compressionLevel := dialer.compressionLevel()
-
+// newDialerConnConfig freezes the resolved options into the immutable
+// per-connection policy a Dialer's connections share.
+func newDialerConnConfig(opts Options, connections *sync.Map, stats *statsCounters) *connConfig {
 	config := &connConfig{
 		client: true,
 		parser: frame.ParserConfig{
-			AllowRSV1: dialer.EnableCompression, MaxFramePayload: maxFrame,
+			AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
 		},
 		assembler: frame.AssemblerConfig{
-			MaxMessage: maxMessage, MaxCompressedPayload: maxFrame, ValidateUTF8: !dialer.DisableUTF8Check,
+			MaxMessage: opts.MaxMessageSize, MaxCompressedPayload: opts.MaxFramePayload, ValidateUTF8: !opts.DisableUTF8Check,
 		},
-		maxHeaderBytes:         maxHeader,
-		writeBufferedThreshold: effectiveWriteBufferedThreshold(dialer.Events),
-		maxOutbound:            maxOutboundBuffered(dialer.Events),
-		batchBlockSize:         writeBatchBlockSize(dialer.Events),
-		closeTimeout:           closeTimeout,
-		handshakeTimeout:       handshakeTimeout,
-		compressionEnabled:     dialer.EnableCompression,
-		compressionLevel:       compressionLevel,
-		subprotocols:           append([]string(nil), dialer.Subprotocols...),
+		maxHeaderBytes:             opts.MaxHeaderBytes,
+		writeBufferedThreshold:     opts.WriteCoalesce,
+		batchBlockSize:             opts.batchBlockSize(),
+		maxFramesPerDataEvent:      opts.framesPerDataRead(),
+		closeTimeout:               opts.CloseTimeout,
+		handshakeTimeout:           opts.HandshakeTimeout,
+		compressionEnabled:         opts.EnableCompression,
+		compressionLevel:           compressionLevel(opts),
+		compressionContextTakeover: opts.KeepCompressionContext,
+		subprotocols:               opts.Subprotocols,
+		heartbeatInterval:          opts.HeartbeatInterval,
+		heartbeatTimeout:           opts.HeartbeatTimeout,
+		outboundHigh:               opts.OutboundHighWatermark,
+		outboundLow:                opts.OutboundLowWatermark,
+		maxOutbound:                opts.maxOutbound,
+		stats:                      stats,
+	}
+	if opts.HeartbeatInterval > 0 && connections != nil {
+		config.heartbeatConnections = connections
 	}
 	config.settleShortLimits()
 	return config
+}
+
+// compressionLevel maps the public level to flate's: zero asks for the
+// library default, and a disabled compression a level is never consulted.
+func compressionLevel(opts Options) int {
+	if !opts.EnableCompression {
+		return 0
+	}
+	if opts.CompressionLevel == 0 {
+		return -1 // flate's DefaultCompression
+	}
+	return opts.CompressionLevel
 }
 
 func (config *connConfig) clientExtensions() string {
 	if config == nil || !config.compressionEnabled {
 		return ""
 	}
-	return "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+	// Offer both window parameters so either endpoint may negotiate a smaller
+	// RFC 7692 window when it needs to bound compression state. Without a kept
+	// context also ask both directions to reset per message, which is what
+	// this end does with its own compressor.
+	extensions := "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+	if !config.compressionContextTakeover {
+		extensions += "; server_no_context_takeover; client_no_context_takeover"
+	}
+	return extensions
 }

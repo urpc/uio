@@ -19,7 +19,6 @@ package main
 import (
 	"log"
 
-	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws"
 )
 
@@ -45,12 +44,11 @@ func (echoHandler) OnMessage(conn *uws.Conn, message uws.Message) {
 func (echoHandler) OnClose(*uws.Conn, uws.CloseEvent) {}
 
 func main() {
-	server := uws.NewServer(echoHandler{})
-	server.Events = &uio.Events{
-		Pollers:       4,
-		MaxBufferSize: 4 << 10,
-	}
-	server.EnableCompression = true
+	server := uws.NewServer(uws.Options{
+		Pollers:           4,
+		ReadBufferSize:    4 << 10,
+		EnableCompression: true,
+	}, echoHandler{})
 	if err := server.Serve(":19701"); err != nil {
 		log.Fatal(err)
 	}

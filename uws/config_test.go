@@ -9,20 +9,8 @@ import (
 func TestServerConnectionsShareFrozenConfig(t *testing.T) {
 	handler := &recordingHandler{}
 	protocols := []string{"v1"}
-	server := &Server{
-		Handler:                         handler,
-		Subprotocols:                    protocols,
-		MaxHeaderBytes:                  101,
-		MaxFramePayload:                 102,
-		MaxMessageSize:                  103,
-		CloseTimeout:                    105 * time.Millisecond,
-		HandshakeTimeout:                106 * time.Millisecond,
-		EnableCompression:               true,
-		CompressionLevel:                1,
-		AllowCompressionContextTakeover: true,
-		CheckOrigin:                     func(*http.Request) bool { return true },
-	}
-	server.config = newServerConnConfig(server)
+	server := &Server{Options: Options{Subprotocols: protocols, MaxHeaderBytes: 101, MaxFramePayload: 102, MaxMessageSize: 103, CloseTimeout: 105 * time.Millisecond, HandshakeTimeout: 106 * time.Millisecond, EnableCompression: true, CompressionLevel: 1, KeepCompressionContext: true}, Handler: handler, CheckOrigin: func(*http.Request) bool { return true }}
+	server.config = testServerConfig(server)
 
 	protocols[0] = "mutated"
 	server.MaxFramePayload = 1
@@ -52,17 +40,8 @@ func TestServerConnectionsShareFrozenConfig(t *testing.T) {
 }
 
 func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
-	dialer := &Dialer{
-		Subprotocols:      []string{"v1"},
-		MaxHeaderBytes:    101,
-		MaxFramePayload:   102,
-		MaxMessageSize:    103,
-		CloseTimeout:      105 * time.Millisecond,
-		HandshakeTimeout:  106 * time.Millisecond,
-		EnableCompression: true,
-		CompressionLevel:  1,
-	}
-	dialer.config = newDialerConnConfig(dialer)
+	dialer := &Dialer{Options: Options{Subprotocols: []string{"v1"}, MaxHeaderBytes: 101, MaxFramePayload: 102, MaxMessageSize: 103, CloseTimeout: 105 * time.Millisecond, HandshakeTimeout: 106 * time.Millisecond, EnableCompression: true, CompressionLevel: 1}}
+	dialer.config = testDialerConfig(dialer)
 
 	dialer.Subprotocols[0] = "mutated"
 	dialer.MaxFramePayload = 1

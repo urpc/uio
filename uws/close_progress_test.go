@@ -130,8 +130,8 @@ func (c *limitedWire) Discard(n int) (int, error) {
 }
 
 func newLimitedConn(raw *limitedWire, closeTimeout time.Duration) *Conn {
-	server := NewServer(nil)
-	server.Events.MaxOutboundBuffered = raw.limit
+	server := NewServer(Options{}, nil)
+	server.Options.maxOutbound = raw.limit
 	server.CloseTimeout = closeTimeout
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -277,8 +277,8 @@ func (c *drainOnRefusalWire) WriteOwned(buffer *uio.Buffer) (int, error) {
 func TestDeferredCloseNoticesRoomFreedDuringRefusal(t *testing.T) {
 	limited := &limitedWire{limit: 64}
 	raw := &drainOnRefusalWire{limitedWire: limited}
-	server := NewServer(nil)
-	server.Events.MaxOutboundBuffered = limited.limit
+	server := NewServer(Options{}, nil)
+	server.Options.maxOutbound = limited.limit
 	server.CloseTimeout = time.Hour
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
