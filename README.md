@@ -28,8 +28,9 @@ without a goroutine per connection.
   encode replies straight into the send queue, and send a round of replies
   together, usually in one `writev`.
 - **Built-in backpressure.** Per-connection limits on buffered input and
-  output turn a slow or flooding peer into an error instead of unbounded
-  memory.
+  output: input past its limit pauses reads, so TCP flow control slows a
+  flooding peer, and output past its limit fails the write instead of growing
+  memory without bound.
 - **Cross-platform.** epoll on Linux, kqueue on macOS and the BSDs, and a
   portable goroutine-per-connection backend on Windows (or anywhere with
   `-tags stdio`).
@@ -119,13 +120,49 @@ Everything is optional; the zero `Events` is ready to use.
 | `MaxBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnData` are batched either way. |
 | `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
-| `MaxInboundBuffered` | off | Per-connection limit on unread bytes; past it the connection closes with `ErrInboundOverflow`. |
+| `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnData` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. |
+| `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnData` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes when both halves are shut. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `LockOSThread` | off | Locks each event-loop goroutine to its own OS thread; callback workers are unaffected. |
 
 Besides the three main callbacks there are `OnInbound` and `OnOutbound`, which
 report bytes read and written, and `OnStart` and `OnStop` for the server's
 lifecycle.
+
+## Backpressure
+
+`MaxInboundBuffered` alone does not slow a peer: it acts when a callback
+returns without consuming, and the bytes left behind grow the inbound buffer.
+So when a connection's data goes somewhere slower — a relay leg, an upstream
+call, another peer — stop consuming once that destination is behind, and wake
+the source when it drains:
+
+```go
+events := &uio.Events{MaxInboundBuffered: 256 << 10}
+events.OnData = func(c uio.Conn) error {
+	peer := peerOf(c) // the paired connection, e.g. from Userdata
+	if peer.OutboundBuffered() >= 256<<10 {
+		return nil // the far side is behind: leave the bytes unconsumed
+	}
+	_, err := c.WriteTo(peer)
+	return err
+}
+events.OnOutbound = func(c uio.Conn, _ int) {
+	if c.OutboundBuffered() < 128<<10 {
+		_ = peerOf(c).Wake() // the far side drained: resume its held reads
+	}
+}
+```
+
+Once the unconsumed bytes reach the limit, that connection stops reading and
+TCP flow control blocks whoever is feeding it, so memory stays bounded without
+closing anyone. Reads resume by themselves as soon as a callback consumes below
+the limit; but while they are held no I/O event arrives to run that callback,
+so it takes a `Wake` — it carries no data — to trigger it. A handler that
+always consumes its inbound never reaches the hold and needs none. A write past
+the destination's own `MaxOutboundBuffered` would fail with
+`ErrOutboundOverflow` instead — the check above stays below it, so a full queue
+pauses the source rather than erroring.
 
 ## Going faster
 
@@ -187,8 +224,10 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   connection's own callback. Slices they return are valid until the callback
   returns or consumes more input; copy anything you hand to another goroutine.
   Builds with `-race` catch most misuse with a panic.
-- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close` and
-  `CloseWith` are safe from any goroutine.
+- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`
+  and `CloseWith` are safe from any goroutine.
+- `CloseWrite` shuts a stream connection's writing half after everything
+  accepted has been sent; later writes return `net.ErrClosed`.
 - `OnOutbound` can run concurrently with the connection's other callbacks.
 - `Events.Close` only requests shutdown and returns at once; `Serve` returns
   once everything has stopped, or call `Events.Wait` from another goroutine.
