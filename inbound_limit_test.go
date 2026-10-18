@@ -9,7 +9,6 @@ import (
 	"os"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 )
@@ -83,7 +82,7 @@ func writeUntilStalled(t *testing.T, client net.Conn, total int) int {
 			if errors.As(err, &ne) && ne.Timeout() {
 				break
 			}
-			if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+			if isPeerGoneWrite(err) {
 				break // the server closed, as a deadline test may
 			}
 			t.Fatal(err)
