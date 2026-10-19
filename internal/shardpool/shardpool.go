@@ -127,6 +127,12 @@ type Pool[T any] struct {
 	done     chan struct{}
 	janitor  sync.Once      // started with the first shard that grows past one worker
 	workers  sync.WaitGroup // every started worker until it exits
+	// overflowMu orders starting a goroutine for a task its shard could not
+	// queue against Stop: Stop takes it before publishing stopped, so no such
+	// goroutine starts after Stop has begun waiting for the ones that did.
+	// overflow counts those goroutines, which the workers' group does not.
+	overflowMu sync.Mutex
+	overflow   sync.WaitGroup
 	// watching is set while the monitor runs (see watch), which ticks every
 	// tick: watchTick, or longer in tests.
 	watching atomic.Bool
@@ -248,7 +254,7 @@ func (pool *Pool[T]) shard(task T) *shard[T] {
 func (pool *Pool[T]) Submit(task T) bool {
 	s := pool.shard(task)
 	if !s.push(task) {
-		go s.overflow(task)
+		pool.runOverflow(s, task)
 		return false
 	}
 	return s.notify()
@@ -260,7 +266,7 @@ func (pool *Pool[T]) Submit(task T) bool {
 func (pool *Pool[T]) SubmitBehind(task T) bool {
 	s := pool.shard(task)
 	if !s.push(task) {
-		go s.overflow(task)
+		pool.runOverflow(s, task)
 		return false
 	}
 	return s.notifyBehind()
@@ -356,7 +362,7 @@ func (pool *Pool[T]) SubmitBatch(tasks []T) {
 	for _, task := range tasks {
 		index := pool.key(task) % active
 		if !pool.shards[index].push(task) {
-			go pool.shards[index].overflow(task)
+			pool.runOverflow(&pool.shards[index], task)
 			continue
 		}
 		touched |= 1 << index
@@ -579,6 +585,24 @@ func (w *worker[T]) park(pool *Pool[T]) *shard[T] {
 	return <-w.wake
 }
 
+// runOverflow runs a task its shard could not queue on a goroutine of its
+// own, which also helps drain the shard (see overflow). Stop waits for these
+// goroutines; one that would start after Stop has begun is dropped with its
+// task, which no caller may submit then.
+func (pool *Pool[T]) runOverflow(s *shard[T], task T) {
+	pool.overflowMu.Lock()
+	if pool.stopped.Load() {
+		pool.overflowMu.Unlock()
+		return
+	}
+	pool.overflow.Add(1)
+	pool.overflowMu.Unlock()
+	go func() {
+		defer pool.overflow.Done()
+		s.overflow(task)
+	}()
+}
+
 // overflow runs a task its full shard could not queue, then helps drain the
 // shard.
 func (s *shard[T]) overflow(task T) {
@@ -632,11 +656,18 @@ func (s *shard[T]) retireIdle(deadline int64) {
 
 // Stop runs the tasks still queued and waits for every worker to exit: the
 // parked ones are sent to drain their shards, and each worker exits when it
-// next finds nothing to do. No worker starts any more, so tasks a shard could
-// not hand to one are run on the caller's goroutine. Tasks submitted after
-// Stop returns are never run; the caller must not submit any.
+// next finds nothing to do. It waits for the goroutines that took tasks a
+// full shard could not queue as well, since they run those tasks and help
+// drain the shard. No worker starts any more, so tasks a shard could not hand
+// to one are run on the caller's goroutine. A task a full shard refused at the
+// moment Stop begins is dropped with the goroutine that would have run it:
+// the caller must not submit during or after Stop, and tasks submitted after
+// Stop returns are never run.
 func (pool *Pool[T]) Stop() {
-	if !pool.stopped.Swap(true) {
+	pool.overflowMu.Lock()
+	stopped := pool.stopped.Swap(true)
+	pool.overflowMu.Unlock()
+	if !stopped {
 		close(pool.done)
 		for i := range pool.shards {
 			s := &pool.shards[i]
@@ -652,6 +683,9 @@ func (pool *Pool[T]) Stop() {
 		}
 	}
 	pool.workers.Wait()
+	// An overflow goroutine runs its task, and whatever it finds queued
+	// behind it, before it exits.
+	pool.overflow.Wait()
 	for i := range pool.shards {
 		s := &pool.shards[i]
 		for task, ok := s.pop(); ok; task, ok = s.pop() {

@@ -771,3 +771,86 @@ func TestSecondDoublingAndItsMerge(t *testing.T) {
 	runner.SubmitBatch(batch)
 	waitFor(t, "every task", func() bool { return ran.Load() == 200 })
 }
+
+// Stop waits for a task a full shard ran on a goroutine of its own: that
+// goroutine outlives the pool's workers, and a Stop that returned while it ran
+// would report a shutdown its task was still inside. Every submission path
+// that starts one is covered.
+func TestStopWaitsForOverflowGoroutines(t *testing.T) {
+	for _, submit := range []struct {
+		name string
+		send func(pool *Pool[*task], one *task)
+	}{
+		{"Submit", func(pool *Pool[*task], one *task) { pool.Submit(one) }},
+		{"SubmitBehind", func(pool *Pool[*task], one *task) { pool.SubmitBehind(one) }},
+		{"SubmitBatch", func(pool *Pool[*task], one *task) { pool.SubmitBatch([]*task{one}) }},
+	} {
+		t.Run(submit.name, func(t *testing.T) {
+			workerStarted := make(chan struct{}, 1)
+			workerRelease := make(chan struct{})
+			overflowStarted := make(chan struct{}, 1)
+			overflowRelease := make(chan struct{})
+			var queued, overflowRan atomic.Int32
+			pool := New(1, 2, func(*task) uint32 { return 0 }, func(one *task) {
+				switch one.key {
+				case 0: // blocks the shard's only worker
+					workerStarted <- struct{}{}
+					<-workerRelease
+				case 3: // runs on the goroutine the full queue starts
+					overflowStarted <- struct{}{}
+					<-overflowRelease
+					overflowRan.Add(1)
+				default:
+					queued.Add(1)
+				}
+			})
+			pool.tick = time.Hour
+			var releaseOnce, workerOnce sync.Once
+			release := func() { releaseOnce.Do(func() { close(overflowRelease) }) }
+			releaseWorker := func() { workerOnce.Do(func() { close(workerRelease) }) }
+			defer func() {
+				releaseWorker()
+				release()
+				pool.Stop()
+			}()
+			pool.Submit(&task{key: 0})
+			receive(t, workerStarted, "the blocking task")
+			// No shard may start or lend a worker, so the two-slot queue fills
+			// and the next task has to run on a goroutine of its own.
+			for i := range pool.shards {
+				s := &pool.shards[i]
+				s.mu.Lock()
+				s.live = MaxWorkers
+				s.mu.Unlock()
+			}
+			pool.Submit(&task{key: 1})
+			pool.Submit(&task{key: 2})
+			submit.send(pool, &task{key: 3})
+			receive(t, overflowStarted, "the overflow task")
+
+			stopped := make(chan struct{})
+			go func() {
+				pool.Stop()
+				close(stopped)
+			}()
+			// The worker drains the queue and exits; Stop still owes the
+			// overflow task, which has not been released.
+			releaseWorker()
+			waitFor(t, "the queued tasks", func() bool { return queued.Load() == 2 })
+			select {
+			case <-stopped:
+				t.Fatal("Stop returned while an overflow task was still running")
+			case <-time.After(100 * time.Millisecond):
+			}
+			release()
+			select {
+			case <-stopped:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Stop did not return after the overflow task ended")
+			}
+			if got := overflowRan.Load(); got != 1 {
+				t.Fatalf("overflow task ran %d times", got)
+			}
+		})
+	}
+}
