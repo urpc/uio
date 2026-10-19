@@ -16,9 +16,9 @@ without a goroutine per connection.
 ## Highlights
 
 - **Callbacks, not goroutines.** `OnOpen`, `OnData` and `OnClose` run in order
-  for each connection, so per-connection state needs no locks, and on
-  epoll/kqueue an idle connection is a small struct rather than a parked
-  goroutine.
+  for each connection and never overlap, so the state they share needs no
+  locks, and on epoll/kqueue an idle connection is a small struct rather than
+  a parked goroutine.
 - **A slow handler stalls nothing else.** On epoll/kqueue, event loops only
   collect readiness; callbacks run on a worker pool, and work stuck behind a
   blocked callback is handed to another worker within milliseconds.
@@ -92,10 +92,10 @@ established stream `net.Conn` with `Adopt`.
 1. **Watch.** A few event loops — epoll or kqueue instances, one per four Ps
    by default — accept connections and collect readiness. They never run your
    code.
-2. **Queue.** A ready connection is handed to a sharded worker pool. A
-   connection always lands on the same shard, so its work tends to return to
-   the same CPU, where its socket is still warm in cache. You can supply your
-   own scheduler through `Events.Executor`.
+2. **Queue.** A ready connection is handed to a sharded worker pool. Its turns
+   go to the shard its key picks — the pool adds shards as connections grow —
+   so its work tends to return to the same CPU, where its socket is still warm
+   in cache. You can supply your own scheduler through `Events.Executor`.
 3. **Serve.** A connection's *turn* reads the socket, runs `OnData`, and then
    flushes every reply the callback wrote in one go. Turns of one connection
    never overlap; different connections run in parallel.
@@ -121,7 +121,7 @@ Everything is optional; the zero `Events` is ready to use.
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnData` are batched either way. |
 | `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
 | `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnData` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. |
-| `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnData` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes when both halves are shut. |
+| `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnData` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes once both halves are shut and the bytes the peer sent have been consumed. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `LockOSThread` | off | Locks each event-loop goroutine to its own OS thread; callback workers are unaffected. |
 

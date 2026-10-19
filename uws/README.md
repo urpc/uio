@@ -27,10 +27,10 @@ frame reaches you straight from the read buffer.
   goroutine and keep their order; they never block on the socket.
 - **Batched replies.** Small replies to the frames of one read are encoded
   together and handed to the socket as one write.
-- **Bounded by design.** Limits on frame and message size; queued output is
-  capped by watermarks that pause the connection's reads instead of growing
-  memory; handshake and close time are bounded, and heartbeats work on both
-  ends.
+- **Bounded by design.** Limits on frame and message size; replies are paced
+  by watermarks that pause the connection's reads instead of growing memory,
+  and an optional hard limit refuses any send past it; handshake and close
+  time are bounded, and heartbeats work on both ends.
 
 ## Install
 
@@ -80,9 +80,9 @@ finished.
 1. **Upgrade.** `Serve` parses the HTTP upgrade natively; behind `net/http`
    the request is hijacked and the socket moved onto uio.
 2. **Parse.** Frames are unmasked in place. Text is validated as UTF-8, with a
-   SIMD validator on amd64, and compressed messages are inflated.
-3. **Handle.** `OnMessage` runs in the connection's turn. Callbacks of one
-   connection are ordered and never overlap.
+   SIMD validator on amd64 with AVX2, and compressed messages are inflated.
+3. **Handle.** `OnMessage` runs in the connection's turn. The `Handler`
+   callbacks of one connection are ordered and never overlap.
 4. **Reply.** What the handler sends is queued; small replies to one read's
    frames are batched into one write. Sends from other goroutines join the same
    queue in order. When a peer stops reading and the queue reaches the high
@@ -138,7 +138,7 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | Field | Default | What it does |
 | --- | --- | --- |
 | `Subprotocols` | none | Protocols to negotiate; a server prefers the order given. |
-| `MaxHeaderBytes` | 32 KiB | Upgrade headers this end reads: the request on a server, the response on a dialer. |
+| `MaxHeaderBytes` | 32 KiB | Upgrade headers this end reads: the request on a server's native `Serve` path, the response on a dialer. Behind `net/http`, `http.Server.MaxHeaderBytes` applies instead. |
 | `MaxFramePayload` | 16 MiB | Largest frame read; larger outgoing messages are fragmented. |
 | `MaxMessageSize` | 64 MiB | Largest message, after decompression. |
 | `EnableCompression` | off | Negotiates permessage-deflate. |
@@ -153,25 +153,34 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `ReadBufferSize` | 4 KiB | Bytes per socket read; it also sizes the write batch blocks (clamped to 4-64 KiB). |
 | `WriteCoalesce` | 4 KiB | Writes smaller than this join the connection's outbound batch instead of taking a send of their own; a negative value turns size-based buffering off. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
-| `Executor` | uio default | Runs connection and write turns. |
-| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection stops reading, so TCP flow control slows its peer instead of the queue growing. A negative value disables the bound. |
-| `OutboundLowWatermark` | High/4 | Queued output at which a paused connection reads again. |
+| `Executor` | uio default | Runs connection and write turns on the native backend; the `stdio` backend does not use it. |
+| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection stops reading, so TCP flow control slows its peer instead of the replies piling up. A negative value disables the pause. |
+| `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
+| `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
 A `Server` adds `Handler` and `CheckOrigin`. The underlying transport is built
 from these options and is not otherwise exposed; `Executor` is the scheduling
 escape hatch. Invalid combinations, such as a low watermark not below the high
-one or a compression level outside 1-9, make `Serve` and `Dial` return
-`ErrInvalidOptions`.
+one, a high watermark above `MaxOutboundBuffered`, or a compression level
+outside 1-9, make `Serve` and `Dial` return `ErrInvalidOptions`.
 
-**Backpressure.** The watermarks bound what one connection may queue while its
-peer is slow. A connection whose queue reaches the high watermark stops
-consuming; the bytes pile up in the transport's inbound buffer until it stops
-reading the socket, and the peer's TCP window closes. Draining to the low
-watermark resumes reads; no message is dropped. `Server.Stats` and
+**Backpressure.** The watermarks pace what a connection's own reads produce
+while its peer is slow. A connection whose queue reaches the high watermark
+stops consuming; the bytes pile up in the transport's inbound buffer until it
+stops reading the socket, and the peer's TCP window closes. Draining to the
+low watermark resumes reads; no message is dropped. `Server.Stats` and
 `Dialer.Stats` count the pauses and resumes.
 
+Output that does not come from the connection's reads — a broadcast, a
+subscription push, any send from another goroutine — is not paced by the
+pause. Set `MaxOutboundBuffered` to bound it: past the limit `SendText`,
+`SendBinary` and `Ping` return `ErrBackpressure`, and the caller decides to
+drop, retry later or close.
+
 **Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
-transport bytes in both directions:
+transport bytes in both directions. `OnInbound` runs in the connection's turn
+like the other callbacks; `OnOutbound` runs wherever a send completes and may
+overlap them, so keep what it touches safe for concurrent use:
 
 ```go
 func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }
@@ -184,10 +193,12 @@ func (m metrics) OnOutbound(c *uws.Conn, n int) { m.written.Add(n) }
   returns. Call `Message.Clone` to keep it or hand it to another goroutine.
 - **Accepted is not delivered.** A nil error from `SendText`, `SendBinary` or
   `Ping` means the message was queued in order, not that the peer has it.
-  Queued output is bounded by the watermarks above: a peer that stops reading
-  pauses this connection's reads rather than growing memory.
-- **State without locks.** Callbacks of one connection never overlap, so state
-  kept with `SetUserdata` needs no locking from them.
+  Replies to a peer that stops reading pause this connection's reads; sends
+  from elsewhere are bounded only by `MaxOutboundBuffered`, past which they
+  return `ErrBackpressure`.
+- **State without locks.** The `Handler` callbacks of one connection never
+  overlap, so state kept with `SetUserdata` needs no locking from them;
+  `TrafficObserver.OnOutbound` is the exception.
 - **Closing.** `Conn.Close(code, reason)` sends its close frame after everything
   already accepted and waits for the peer, up to `CloseTimeout`. Protocol
   errors close with 1002, invalid UTF-8 with 1007, oversized messages with
