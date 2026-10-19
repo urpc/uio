@@ -157,7 +157,8 @@ func TestFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 func TestFragmentedMessageAdmittedWholeOrNotAtAll(t *testing.T) {
 	raw := &limitedWire{limit: 20}
 	server := NewServer(Options{}, nil)
-	server.Options.maxOutbound = raw.limit
+	server.Options.MaxOutboundBuffered = raw.limit
+	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	server.MaxFramePayload = 4
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)

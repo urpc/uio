@@ -49,8 +49,9 @@ type Conn struct {
 	readFrames int32       // frames delivered in the current read round
 	batching   atomic.Bool // a read round is batching the small frames it sends
 	// readPaused marks a connection that stopped consuming because its queued
-	// output reached the high watermark; resumeReadsAfterDrain clears it once
-	// the queue falls to the low watermark.
+	// output reached the high watermark; resumeReadsAfterDrain, or a read
+	// round that finds the queue drained, clears it once the queue falls to
+	// the low watermark.
 	readPaused atomic.Bool
 
 	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
@@ -108,12 +109,40 @@ const (
 	transportPhaseMask  = uint32(3 << transportPhaseShift)
 )
 
-// pauseReads stops consuming while queued output is over the high watermark,
-// so UIO's inbound hold stops the socket reads. It counts the transition.
-func (c *Conn) pauseReads() {
-	if c.readPaused.CompareAndSwap(false, true) && c.config != nil && c.config.stats != nil {
+// holdReads reports whether a read round stops consuming, so UIO's inbound
+// hold stops the socket reads. A connection pauses once its queued output
+// reaches the high watermark and stays paused until the queue drains to the
+// low watermark, whatever runs its next round: input that arrives in between
+// is left for later. It counts both transitions.
+//
+// The pause is published before the queue is looked at again, and
+// resumeReadsAfterDrain reads the pause after the transport has retired the
+// bytes it reports, so whichever of the two runs second sees the other: a
+// queue that drained between the round's check and the pause is caught here,
+// and the round goes on reading.
+func (c *Conn) holdReads() bool {
+	low := c.config.outboundLow
+	if c.readPaused.Load() {
+		if c.raw.OutboundBuffered() > low {
+			return true
+		}
+		// Drained: resume here. Losing the race to resumeReadsAfterDrain
+		// means it resumed, and woke the connection, already.
+		if c.readPaused.CompareAndSwap(true, false) && c.config.stats != nil {
+			c.config.stats.resumed.Add(1)
+		}
+		return false
+	}
+	if !c.readPaused.CompareAndSwap(false, true) {
+		return true
+	}
+	if c.raw.OutboundBuffered() <= low && c.readPaused.CompareAndSwap(true, false) {
+		return false
+	}
+	if c.config.stats != nil {
 		c.config.stats.paused.Add(1)
 	}
+	return true
 }
 
 // resumeReadsAfterDrain wakes a paused connection once its queued output has
@@ -123,7 +152,7 @@ func (c *Conn) resumeReadsAfterDrain() {
 	if config == nil || config.outboundHigh <= 0 || !c.readPaused.Load() {
 		return
 	}
-	if c.raw.OutboundBuffered() >= config.outboundLow {
+	if c.raw.OutboundBuffered() > config.outboundLow {
 		return
 	}
 	if c.readPaused.CompareAndSwap(true, false) {

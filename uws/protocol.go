@@ -225,10 +225,10 @@ func (c *Conn) readRound() error {
 		high = c.config.outboundHigh
 	}
 	for {
-		// Queued output at the high watermark: stop consuming, so the bytes
-		// build up in UIO's inbound and its hold stops the socket reads.
-		if high > 0 && c.raw.OutboundBuffered() >= high {
-			c.pauseReads()
+		// Queued output at the high watermark, or a pause that has not
+		// drained to the low watermark: stop consuming, so the bytes build up
+		// in UIO's inbound and its hold stops the socket reads.
+		if high > 0 && (c.readPaused.Load() || c.raw.OutboundBuffered() >= high) && c.holdReads() {
 			return nil
 		}
 		data := c.raw.PeekChunk()

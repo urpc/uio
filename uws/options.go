@@ -99,27 +99,41 @@ type Options struct {
 	// scheduler.
 	Executor uio.Executor
 
-	// OutboundHighWatermark bounds the bytes queued for one connection: at
-	// this level the connection stops reading its socket, so TCP flow control
-	// slows its peer instead of the queue growing. A negative value disables
-	// the bound. Zero uses 64 KiB.
+	// OutboundHighWatermark is the queued output at which a connection stops
+	// reading its socket, so TCP flow control slows its peer instead of the
+	// replies to its requests piling up. It paces only what the connection's
+	// own reads produce; output sent from elsewhere, such as a broadcast, is
+	// bounded by MaxOutboundBuffered. A negative value disables the pause.
+	// Zero uses 64 KiB.
 	OutboundHighWatermark int
 	// OutboundLowWatermark is the queued level at or below which a paused
 	// connection reads again. Zero uses a quarter of the high watermark.
 	OutboundLowWatermark int
-
-	// maxOutbound is the transport's write limit. There is no public knob: a
-	// full queue pauses reads instead of failing writes. Tests of the refusal
-	// paths set it directly.
-	maxOutbound int
+	// MaxOutboundBuffered bounds the bytes queued for one connection from any
+	// sender: a send that would pass it returns ErrBackpressure and queues
+	// nothing, so a slow peer cannot grow the queue without bound however the
+	// output is produced. Size it to fit the largest message sent. Zero means
+	// no limit.
+	MaxOutboundBuffered int
 }
 
 // TrafficObserver reports transport traffic. Implement it on the Handler to
-// receive both directions of every connection. It runs on the connection's
-// turn, like the Handler callbacks, and must not block.
+// receive both directions of every connection. OnInbound runs in the
+// connection's turn and never overlaps its Handler callbacks. OnOutbound runs
+// wherever the transport finishes a send — a write turn, a writer goroutine,
+// or the goroutine closing the connection — and may overlap the connection's
+// Handler callbacks and OnInbound, so state it shares with them must be safe
+// for concurrent use. Neither may block.
 type TrafficObserver interface {
 	OnInbound(*Conn, int)
 	OnOutbound(*Conn, int)
+}
+
+// implementsTrafficObserver reports whether h wants per-connection traffic
+// reports.
+func implementsTrafficObserver(h Handler) bool {
+	_, ok := h.(TrafficObserver)
+	return ok
 }
 
 // Stats reports per-connection read pausing, the effect of
@@ -207,6 +221,11 @@ func (r *Options) validate() error {
 		return invalid("ReadBufferSize %d is negative", r.ReadBufferSize)
 	case r.OutboundLowWatermark < 0:
 		return invalid("OutboundLowWatermark %d is negative", r.OutboundLowWatermark)
+	case r.MaxOutboundBuffered < 0:
+		return invalid("MaxOutboundBuffered %d is negative", r.MaxOutboundBuffered)
+	case r.MaxOutboundBuffered > 0 && r.OutboundHighWatermark > r.MaxOutboundBuffered:
+		return invalid("OutboundHighWatermark %d is above MaxOutboundBuffered %d: reads would never pause before sends fail",
+			r.OutboundHighWatermark, r.MaxOutboundBuffered)
 	case r.OutboundHighWatermark > 0 && r.OutboundLowWatermark >= r.OutboundHighWatermark:
 		return invalid("OutboundLowWatermark %d is not below OutboundHighWatermark %d",
 			r.OutboundLowWatermark, r.OutboundHighWatermark)
@@ -228,6 +247,7 @@ func (o Options) transportEvents() *uio.Events {
 		WriteBufferedThreshold: o.WriteCoalesce,
 		ReusePort:              o.ReusePort,
 		Executor:               o.Executor,
+		MaxOutboundBuffered:    o.MaxOutboundBuffered,
 		// The read pause of OutboundHighWatermark relies on UIO's inbound
 		// hold: stopping consumption past this bound stops socket reads.
 		MaxInboundBuffered: o.OutboundHighWatermark,

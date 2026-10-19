@@ -44,10 +44,8 @@ type connConfig struct {
 	shortSendLimit  int
 	shortSendDirect int
 	shortReadLimit  int
-	// maxOutbound is reserved: the outbound limit is gone from the public
-	// API, and memory is bounded by pausing reads at outboundHigh instead.
-	maxOutbound    int
-	batchBlockSize int
+	maxOutbound     int // MaxOutboundBuffered
+	batchBlockSize  int
 	// maxFramesPerDataEvent bounds the frames one OnData round consumes: at
 	// least minFramesPerDataEvent and always enough for one full read of the
 	// configured buffer, so a chunk of tiny frames never leaves a backlog.
@@ -62,6 +60,10 @@ type connConfig struct {
 	subprotocols []string
 	checkOrigin  func(*http.Request) bool
 	handler      Handler
+	// observeTraffic is set when the handler implements TrafficObserver, so
+	// the transport only installs the inbound hook and the outbound observer
+	// when something is listening.
+	observeTraffic bool
 
 	heartbeatConnections *sync.Map
 	heartbeatInterval    time.Duration
@@ -96,11 +98,12 @@ func newServerConnConfig(opts Options, handler Handler, checkOrigin func(*http.R
 		subprotocols:               opts.Subprotocols,
 		checkOrigin:                checkOrigin,
 		handler:                    handler,
+		observeTraffic:             implementsTrafficObserver(handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
 		outboundHigh:               opts.OutboundHighWatermark,
 		outboundLow:                opts.OutboundLowWatermark,
-		maxOutbound:                opts.maxOutbound,
+		maxOutbound:                opts.MaxOutboundBuffered,
 		stats:                      stats,
 	}
 	if opts.HeartbeatInterval > 0 && connections != nil {
@@ -174,7 +177,7 @@ func newDialerConnConfig(opts Options, connections *sync.Map, stats *statsCounte
 		heartbeatTimeout:           opts.HeartbeatTimeout,
 		outboundHigh:               opts.OutboundHighWatermark,
 		outboundLow:                opts.OutboundLowWatermark,
-		maxOutbound:                opts.maxOutbound,
+		maxOutbound:                opts.MaxOutboundBuffered,
 		stats:                      stats,
 	}
 	if opts.HeartbeatInterval > 0 && connections != nil {

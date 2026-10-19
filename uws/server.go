@@ -96,7 +96,9 @@ func (s *Server) Serve(addrs ...string) error {
 	events.OnData = s.onData
 	events.OnClose = s.onClose
 	events.OnOutbound = s.onOutbound
-	events.OnInbound = s.onInbound
+	if s.config.observeTraffic {
+		events.OnInbound = s.onInbound
+	}
 	s.startHeartbeat(s.config)
 	s.closeMu.Unlock()
 
@@ -248,8 +250,10 @@ func (s *Server) onOutbound(raw uio.Conn, n int) {
 			conn.tryCloseTransport()
 		}
 		conn.resumeReadsAfterDrain()
-		if observer, ok := conn.handler.(TrafficObserver); ok {
-			observer.OnOutbound(conn, n)
+		if conn.config != nil && conn.config.observeTraffic {
+			if observer, ok := conn.handler.(TrafficObserver); ok {
+				observer.OnOutbound(conn, n)
+			}
 		}
 	}
 }
