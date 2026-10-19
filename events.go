@@ -101,8 +101,7 @@ type Events struct {
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO
-	// runs connection turns on a sharded taskgo queue (see
-	// taskgo.NewTaskKeyed) and write turns on a sharded scheduler of its own
+	// runs connection turns and write turns on sharded schedulers of its own
 	// (see internal/shardpool), both keyed by connection: by its event loop
 	// first, so the connections of one loop share a subset of the shards, and
 	// by its descriptor within that subset (see IOTask.ShardKey).
