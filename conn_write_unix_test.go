@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
@@ -1374,5 +1377,678 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if n := lateOutbound.Load(); n != 0 {
 		t.Fatalf("%d OnOutbound calls after Serve returned", n)
+	}
+}
+
+// Writev takes vectors longer than one writev or sendmsg allows, which is
+// 1024 buffers on Linux and the BSDs, whether it sends them at once, as from
+// OnOpen, or queues them behind a read round's other replies.
+func TestWritevTakesVectorsLongerThanOneSyscall(t *testing.T) {
+	for _, callback := range []string{"OnOpen", "OnData"} {
+		t.Run(callback, func(t *testing.T) {
+			vec := make([][]byte, 2000)
+			var want []byte
+			for index := range vec {
+				vec[index] = []byte{byte('a' + index%26)}
+				want = append(want, vec[index]...)
+			}
+			events := &Events{Pollers: 1}
+			started := make(chan string, 1)
+			result := make(chan error, 1)
+			writev := func(conn Conn) {
+				n, err := conn.Writev(vec)
+				if err == nil && n != len(want) {
+					err = io.ErrShortWrite
+				}
+				result <- err
+			}
+			events.OnStart = func(ev *Events) {
+				for _, listener := range ev.acceptor.listeners {
+					started <- listener.pair.local.String()
+					return
+				}
+			}
+			events.OnOpen = func(conn Conn) {
+				if callback == "OnOpen" {
+					writev(conn)
+				}
+			}
+			events.OnData = func(conn Conn) error {
+				_, _ = conn.Discard(conn.InboundBuffered())
+				if callback == "OnData" {
+					writev(conn)
+				}
+				return nil
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+			t.Cleanup(func() {
+				_ = events.Close(nil)
+				<-serveDone
+			})
+			client, err := net.Dial("tcp", <-started)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if _, err = client.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			if err = <-result; err != nil {
+				t.Fatalf("Writev of %d buffers in %s: %v", len(vec), callback, err)
+			}
+			if err = client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			got := make([]byte, len(want))
+			if _, err = io.ReadFull(client, got); err != nil {
+				t.Fatalf("peer read: %v", err)
+			}
+			if !bytes.Equal(got, want) {
+				t.Fatal("peer received different bytes")
+			}
+		})
+	}
+}
+
+// A read round's first owned output leaves for the socket while the callback
+// that wrote it is still running — nothing of it shows as buffered — and the
+// writes after it coalesce into the round's final flush. This is the shape of
+// a reply batch handed over as one owned buffer: the round it was assembled
+// in is usually its only writer. A write the threshold would buffer keeps
+// joining the round's batch in the first position, so the configuration's
+// promise holds there as everywhere.
+func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
+	// A corked round never sends directly: both writes stay queued, and the
+	// round's final flush hands the peer one "onetwo" in order. The buffered
+	// threshold plays no part inside the round.
+	tests := []struct {
+		name      string
+		threshold int
+	}{
+		{name: "threshold-disabled", threshold: 0},
+		{name: "below-threshold-joins-the-batch", threshold: 64},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			type buffered struct{ first, second int }
+			events := &Events{Pollers: 1, WriteBufferedThreshold: tt.threshold}
+			started := make(chan string, 1)
+			measured := make(chan buffered, 8)
+			events.OnStart = func(ev *Events) {
+				for _, listener := range ev.acceptor.listeners {
+					started <- listener.pair.local.String()
+					return
+				}
+			}
+			ownedWrite := func(conn Conn, value string) error {
+				owned := AcquireBuffer(len(value))
+				copy(owned.AvailableBuffer()[:len(value)], value)
+				owned.CommitWrite(len(value))
+				_, err := conn.WriteOwned(owned)
+				return err
+			}
+			events.OnData = func(conn Conn) error {
+				_, _ = conn.Discard(conn.InboundBuffered())
+				if err := ownedWrite(conn, "one"); err != nil {
+					return err
+				}
+				first := conn.OutboundBuffered()
+				if err := ownedWrite(conn, "two"); err != nil {
+					return err
+				}
+				measured <- buffered{first: first, second: conn.OutboundBuffered()}
+				return nil
+			}
+			serveDone := make(chan error, 1)
+			go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+			t.Cleanup(func() {
+				_ = events.Close(nil)
+				<-serveDone
+			})
+			client, err := net.Dial("tcp", <-started)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			if _, err = client.Write([]byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			var got buffered
+			select {
+			case got = <-measured:
+			case <-time.After(3 * time.Second):
+				t.Fatal("the round never ran")
+			}
+			if got.first != 3 {
+				t.Fatalf("buffered after the round's first write = %d, want 3", got.first)
+			}
+			if got.second != 6 {
+				t.Fatalf("buffered after the round's second write = %d, want 6", got.second)
+			}
+			// The round's final flush publishes both writes, in order.
+			if err = client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			wire := make([]byte, 6)
+			if _, err = io.ReadFull(client, wire); err != nil {
+				t.Fatalf("peer read: %v", err)
+			}
+			if string(wire) != "onetwo" {
+				t.Fatalf("peer received %q, want %q", wire, "onetwo")
+			}
+		})
+	}
+}
+
+// TestCoalesceOwnedCopiesOnlySmallOrSparseBuffers pins which owned writes a
+// corked round copies into its outbound blocks: small ones and mostly empty
+// ones, never one past half a coalescing block, and never a large, dense one
+// such as a write batch carrying a whole read's replies.
+func TestCoalesceOwnedCopiesOnlySmallOrSparseBuffers(t *testing.T) {
+	const block = 32 << 10
+	cases := []struct {
+		name      string
+		size, cap int
+		want      bool
+	}{
+		{"small", 512, 16 << 10, true},
+		{"at the small limit", coalesceOwnedMax, coalesceOwnedMax, true},
+		{"large and full", 16120, 16 << 10, false},
+		{"large and half empty", 6 << 10, 16 << 10, true},
+		{"large and half full", 8 << 10, 16 << 10, false},
+		{"past half a block", block/2 + 1, 64 << 10, false},
+	}
+	for _, c := range cases {
+		owned := bytebuf.AcquireBuffer(c.cap)
+		owned.CommitWrite(c.size)
+		if got := coalesceOwned(owned, c.size, block); got != c.want {
+			t.Errorf("%s: coalesceOwned(%d of %d) = %v, want %v", c.name, c.size, owned.Cap(), got, c.want)
+		}
+		bytebuf.ReleaseBuffer(owned)
+	}
+}
+
+// runBidirectionalLimitTransfer pins that outbound backlog never stops reads:
+// both peers fill their own backlog past the limit's old pause mark while the
+// sockets hold small buffers, exactly the shape that used to leave each side
+// waiting for the other to read. Every byte must reach the far OnData.
+func runBidirectionalLimitTransfer(t *testing.T, raw [2]net.Conn, limit int) {
+	t.Helper()
+	total := int64(limit) * 7 / 8 // past the old pause mark, below the limit
+	releaseOpen := make(chan struct{})
+	var received [2]atomic.Int64
+	var conns [2]Conn
+	var events [2]*Events
+	var done [2]chan error
+	for i := range 2 {
+		started := make(chan struct{})
+		opened := make(chan Conn, 1)
+		ev := &Events{Pollers: 1, MaxOutboundBuffered: limit, MaxBufferSize: 16 << 10}
+		ev.OnStart = func(*Events) { close(started) }
+		ev.OnOpen = func(conn Conn) {
+			opened <- conn
+			// Hold the open until both sides have their output queued, so
+			// neither reads while the other is still filling.
+			<-releaseOpen
+		}
+		ev.OnData = func(conn Conn) error {
+			n, _ := conn.Discard(conn.InboundBuffered())
+			received[i].Add(int64(n))
+			return nil
+		}
+		events[i] = ev
+		done[i] = make(chan error, 1)
+		go func() { done[i] <- ev.Serve() }()
+		<-started
+		conn, err := ev.Adopt(raw[i], nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns[i] = conn
+		<-opened
+	}
+	t.Cleanup(func() {
+		for _, ev := range events {
+			_ = ev.Close(nil)
+		}
+		for _, ch := range done {
+			select {
+			case <-ch:
+			case <-time.After(3 * time.Second):
+				t.Error("Serve did not stop")
+			}
+		}
+	})
+
+	payload := make([]byte, total)
+	for _, conn := range conns {
+		if _, err := conn.Write(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(releaseOpen)
+
+	// The stall detector reports a mutual wait within a second; the deadline
+	// only bounds a slow-but-moving transfer, which a pinned-window pair under
+	// -race can be.
+	last, lastMoved := int64(-1), time.Now()
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); {
+		a, b := received[0].Load(), received[1].Load()
+		if a == total && b == total {
+			return
+		}
+		if a+b != last {
+			last, lastMoved = a+b, time.Now()
+		}
+		if time.Since(lastMoved) > time.Second {
+			first, second := conns[0].(*fdConn), conns[1].(*fdConn)
+			t.Fatalf("both directions stopped: received %d/%d and %d/%d; pending %d,%d; readStalled %v,%v; writeBlocked %v,%v",
+				a, total, b, total, first.pending.Load(), second.pending.Load(),
+				first.readStalled(), second.readStalled(), first.writeBlocked(), second.writeBlocked())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("bidirectional transfer did not complete")
+}
+
+func TestBidirectionalOutboundLimitUnix(t *testing.T) {
+	sockets, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw [2]net.Conn
+	for i, fd := range sockets {
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, pinnedSocketBuffer)
+		_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer)
+		file := os.NewFile(uintptr(fd), "bidirectional-peer")
+		raw[i], err = net.FileConn(file)
+		_ = file.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer raw[i].Close()
+	}
+	runBidirectionalLimitTransfer(t, raw, 1<<20)
+}
+
+func TestBidirectionalOutboundLimitTCP(t *testing.T) {
+	first, second := tcpConnectionPair(t)
+	defer first.Close()
+	defer second.Close()
+	for _, conn := range []net.Conn{first, second} {
+		_ = conn.(*net.TCPConn).SetReadBuffer(pinnedSocketBuffer)
+		_ = conn.(*net.TCPConn).SetWriteBuffer(pinnedSocketBuffer)
+	}
+	// A smaller budget than the Unix case keeps the pinned-window transfer
+	// bounded under -race on a loaded host; the mechanism is the same: the
+	// backlog sits past the old pause mark for the whole transfer.
+	runBidirectionalLimitTransfer(t, [2]net.Conn{first, second}, 2<<20)
+}
+
+// A write from another goroutine that passed its entry check before a
+// CloseWrite completed is still refused when it comes to queue its bytes:
+// queueing them after the end of the stream would leave them unsendable.
+func TestQueuedWriteAfterCloseWriteIsRefused(t *testing.T) {
+	events := &Events{Pollers: 1}
+	client, server := serveInboundTest(t, events)
+	if err := server.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readAllWithin(t, client, 2*time.Second); len(got) != 0 {
+		t.Fatalf("read %q before the end of stream", got)
+	}
+	conn := server.(*fdConn)
+	if _, err := conn.queueOwnedWrite(bytebuf.CloneBuffer([]byte("late")), 4); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("queueing after CloseWrite = %v, want net.ErrClosed", err)
+	}
+	if n := conn.OutboundBuffered(); n != 0 {
+		t.Fatalf("%d bytes queued after the end of stream", n)
+	}
+}
+
+// A CloseWrite waiting for output that a full socket holds back schedules no
+// turns while it waits: the FIN follows the writable edge that lets the
+// output drain, and the peer then reads everything before the end of stream.
+func TestCloseWriteWaitsForAFullSocketWithoutSpinning(t *testing.T) {
+	executor := &countingExecutor{}
+	want := make([]byte, 8<<20)
+	for i := range want {
+		want[i] = byte(i * 13)
+	}
+	queued := make(chan error, 1)
+	events := &Events{
+		Pollers:  1,
+		Executor: executor,
+		OnOpen: func(c Conn) {
+			_, err := c.Write(want)
+			if err == nil {
+				err = c.CloseWrite()
+			}
+			queued <- err
+		},
+	}
+	client, _ := serveInboundTest(t, events)
+	if err := <-queued; err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // the peer reads nothing: the socket stays full
+	before := executor.turns.Load()
+	time.Sleep(100 * time.Millisecond)
+	if spun := executor.turns.Load() - before; spun > 10 {
+		t.Fatalf("%d turns scheduled in 100ms while CloseWrite waited for a full socket", spun)
+	}
+	if got := readAllWithin(t, client, 20*time.Second); !bytes.Equal(got, want) {
+		t.Fatalf("read %d bytes before the end of stream, want %d intact", len(got), len(want))
+	}
+}
+
+// A half-open connection that answers its peer's end of stream with
+// CloseWrite closes in the turn that read the end of stream, as a connection
+// that does not allow half-open does: the CloseWrite costs no turn of its own.
+func TestHalfOpenCloseTakesNoExtraTurn(t *testing.T) {
+	for _, halfOpen := range []bool{false, true} {
+		executor := &countingExecutor{}
+		closed := make(chan struct{})
+		events := &Events{Pollers: 1, Executor: executor, AllowHalfOpen: halfOpen}
+		events.OnData = func(c Conn) error {
+			if _, err := c.WriteTo(c); err != nil {
+				return err
+			}
+			if _, err := c.Read(nil); err == io.EOF {
+				return c.CloseWrite()
+			}
+			return nil
+		}
+		events.OnClose = func(Conn, error) { close(closed) }
+		client, _ := serveInboundTest(t, events)
+		if _, err := client.Write(make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.ReadFull(client, make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(20 * time.Millisecond)
+		before := executor.turns.Load()
+		_ = client.Close()
+		select {
+		case <-closed:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("half-open %v: no close after the peer's end of stream", halfOpen)
+		}
+		time.Sleep(20 * time.Millisecond)
+		if turns := executor.turns.Load() - before; turns != 1 {
+			t.Fatalf("half-open %v: closing took %d turns, want 1", halfOpen, turns)
+		}
+	}
+}
+
+func TestExternalUDPServerPeerWrites(t *testing.T) {
+	started := make(chan string, 1)
+	peer := make(chan Conn, 1)
+	closed := make(chan struct{}, 1)
+	events := &Events{Pollers: 1, MaxOutboundBuffered: 8}
+	events.OnStart = func(ev *Events) {
+		ev.acceptor.mux.Lock()
+		for _, listener := range ev.acceptor.listeners {
+			started <- listener.pair.local.String()
+			break
+		}
+		ev.acceptor.mux.Unlock()
+	}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(-1)
+		select {
+		case peer <- conn:
+		default:
+		}
+		return nil
+	}
+	events.OnClose = func(Conn, error) { closed <- struct{}{} }
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
+	defer func() {
+		_ = events.Close(nil)
+		select {
+		case <-serveDone:
+		case <-time.After(3 * time.Second):
+			t.Error("UDP server did not stop")
+		}
+	}()
+
+	var address string
+	select {
+	case address = <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("UDP server did not start")
+	}
+	remote, err := net.ResolveUDPAddr("udp", address)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.DialUDP("udp", nil, remote)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	if _, err = client.Write([]byte("open")); err != nil {
+		t.Fatal(err)
+	}
+	var conn Conn
+	select {
+	case conn = <-peer:
+	case <-time.After(3 * time.Second):
+		t.Fatal("UDP peer callback did not run")
+	}
+
+	for _, payload := range []string{"plain", "owned"} {
+		var n int
+		if payload == "plain" {
+			n, err = conn.Write([]byte(payload))
+		} else {
+			buffer := AcquireBuffer(len(payload))
+			_, _ = buffer.WriteString(payload)
+			n, err = conn.WriteOwned(buffer)
+		}
+		if n != len(payload) || err != nil {
+			t.Fatalf("external UDP write %q = %d, %v", payload, n, err)
+		}
+		if err = client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var received [16]byte
+		read, readErr := client.Read(received[:])
+		if readErr != nil || string(received[:read]) != payload {
+			t.Fatalf("UDP datagram = %q, %v; want %q", received[:read], readErr, payload)
+		}
+	}
+	if n, err := conn.Write([]byte("too-large")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("UDP overflow = %d, %v", n, err)
+	}
+	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, errUnsupported) {
+		t.Fatalf("UDP Writev = %d, %v", n, err)
+	}
+	if got := conn.OutboundBuffered(); got != 0 {
+		t.Fatalf("pending UDP bytes = %d", got)
+	}
+	if err := conn.CloseWith(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("UDP peer close callback did not run")
+	}
+	if n, err := conn.Write([]byte("late")); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after close = %d, %v", n, err)
+	}
+}
+
+func TestExternalConnectedUDPWrites(t *testing.T) {
+	receiver, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer receiver.Close()
+	started := make(chan struct{}, 1)
+	events := &Events{Pollers: 1, OnStart: func(*Events) { started <- struct{}{} }}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve() }()
+	defer func() {
+		_ = events.Close(nil)
+		select {
+		case <-serveDone:
+		case <-time.After(3 * time.Second):
+			t.Error("dial-only Events did not stop")
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("dial-only Events did not start")
+	}
+	conn, err := events.DialContext(t.Context(), "udp://"+receiver.LocalAddr().String(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, payload := range []string{"first", "second"} {
+		var n int
+		if payload == "first" {
+			n, err = conn.Write([]byte(payload))
+		} else {
+			buffer := AcquireBuffer(len(payload))
+			_, _ = buffer.WriteString(payload)
+			n, err = conn.WriteOwned(buffer)
+		}
+		if n != len(payload) || err != nil {
+			t.Fatalf("connected UDP write %q = %d, %v", payload, n, err)
+		}
+		if err = receiver.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var received [16]byte
+		read, _, readErr := receiver.ReadFromUDP(received[:])
+		if readErr != nil || string(received[:read]) != payload {
+			t.Fatalf("connected UDP datagram = %q, %v; want %q", received[:read], readErr, payload)
+		}
+	}
+}
+
+// A UDP write from outside the connection's turn is sent on the caller's
+// goroutine, holding the server's submitMu: a child whose server is released
+// has no socket left to send on.
+func TestUDPChildWriteAfterServerRelease(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[1])
+	events := &Events{MaxBufferSize: 64}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = loop.poller.Close(nil)
+		loop.ioPool.stop()
+	}()
+	server := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{peers: map[socket.UDPAddress]*fdConn{}}}
+	server.events, server.loop, server.internal = events, loop, true
+	child := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{server: server}}
+	child.events, child.loop = events, loop
+	if n, err := child.Write([]byte("x")); n != 1 || err != nil {
+		t.Fatalf("child write = %d, %v", n, err)
+	}
+	if got := string(readPeer(t, fds[1], 1)); got != "x" {
+		t.Fatalf("datagram = %q", got)
+	}
+	if _, ok := server.teardown(nil); !ok {
+		t.Fatal("server was not released")
+	}
+	if n, err := child.Write([]byte("y")); n != 0 || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("write after the server's release = %d, %v", n, err)
+	}
+}
+
+func TestExternalUDPWouldBlockPreservesConnection(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	payload := fillDatagramSendBuffer(t, fds[0])
+	events := &Events{MaxBufferSize: 64}
+	loop, err := newEventLoop(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = loop.poller.Close(nil)
+		loop.ioPool.stop()
+	}()
+	conn := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{}}
+	conn.events, conn.loop = events, loop
+	if n, err := conn.Write(payload); n != 0 || !isUDPSendBlocked(err) {
+		t.Fatalf("blocked external UDP write = %d, %v", n, err)
+	}
+	if conn.isClosing() || conn.OutboundBuffered() != 0 {
+		t.Fatalf("blocked UDP write closed or retained bytes: closing=%v pending=%d", conn.isClosing(), conn.OutboundBuffered())
+	}
+}
+
+// An external UDP write is sent before it returns, so a Close after it never
+// overtakes it, and a write after the connection is released fails.
+func TestExternalUDPWriteAndCloseOrdering(t *testing.T) {
+	for _, closeFirst := range []bool{false, true} {
+		name := "write_before_close"
+		if closeFirst {
+			name = "write_after_release"
+		}
+		t.Run(name, func(t *testing.T) {
+			fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unix.Close(fds[1])
+			events := &Events{MaxBufferSize: 64}
+			loop, err := newEventLoop(events)
+			if err != nil {
+				_ = unix.Close(fds[0])
+				t.Fatal(err)
+			}
+			defer func() {
+				_ = loop.poller.Close(nil)
+				loop.ioPool.stop()
+			}()
+			conn := &fdConn{fd: int32(fds[0]), udp: &unixUDPState{}}
+			conn.events, conn.loop = events, loop
+			defer func() {
+				if !conn.isReleased() {
+					_ = unix.Close(fds[0])
+				}
+			}()
+			if closeFirst {
+				if _, ok := conn.teardown(nil); !ok {
+					t.Fatal("connection was not released")
+				}
+				if n, err := conn.Write([]byte("packet")); n != 0 || !errors.Is(err, net.ErrClosed) {
+					t.Fatalf("write after release = %d, %v", n, err)
+				}
+				return
+			}
+			if n, err := conn.Write([]byte("packet")); n != len("packet") || err != nil {
+				t.Fatalf("write before close = %d, %v", n, err)
+			}
+			if err := conn.CloseWith(nil); err != nil {
+				t.Fatal(err)
+			}
+			if got := string(readPeer(t, fds[1], len("packet"))); got != "packet" {
+				t.Fatalf("datagram before close = %q", got)
+			}
+			if got := conn.OutboundBuffered(); got != 0 {
+				t.Fatalf("pending bytes after close = %d", got)
+			}
+		})
 	}
 }

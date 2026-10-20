@@ -704,3 +704,74 @@ func TestLoopWaitModeFollowsTheMeasuredRange(t *testing.T) {
 		}
 	}
 }
+
+func TestIOAdmissionRaceWithShutdown(t *testing.T) {
+	for range 1000 {
+		loop := &eventLoop{ioIdle: make(chan struct{}), ioPool: &ioTaskPool{}}
+		conn := &fdConn{commonConn: commonConn{events: &Events{}, loop: loop}}
+		start := make(chan struct{})
+		producerDone := make(chan struct{})
+		stopDone := make(chan struct{})
+		go func() {
+			<-start
+			if conn.noteIO(ioEventRead) {
+				conn.taskState.And(^taskScheduledBit)
+				loop.releaseIO()
+			}
+			close(producerDone)
+		}()
+		go func() {
+			<-start
+			loop.stopIO()
+			close(stopDone)
+		}()
+		close(start)
+		select {
+		case <-producerDone:
+		case <-time.After(time.Second):
+			t.Fatal("I/O producer did not finish during shutdown")
+		}
+		select {
+		case <-stopDone:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown lost an in-flight I/O reservation")
+		}
+		if conn.taskState.Load()&taskScheduledBit != 0 {
+			t.Fatal("shutdown left a connection scheduled without an owner")
+		}
+	}
+}
+
+// testLoopStops makes stopTestLoop idempotent per loop.
+var testLoopStops sync.Map // *eventLoop -> *testLoopStop
+
+type testLoopStop struct {
+	once sync.Once
+	done chan struct{}
+}
+
+// startTestLoop runs one waiter on loop, which a test publishes as the only
+// loop of its Events, so a white-box test drives a loop the way Serve does.
+func startTestLoop(events *Events, loop *eventLoop) {
+	events.loops = []*eventLoop{loop}
+	loop.start(1, waitBlock, false)
+}
+
+// stopTestLoop shuts loop down in the order Events does and returns a channel
+// closed once it has. Later calls return the same channel.
+func stopTestLoop(loop *eventLoop, err error) <-chan struct{} {
+	value, _ := testLoopStops.LoadOrStore(loop, &testLoopStop{done: make(chan struct{})})
+	stop := value.(*testLoopStop)
+	stop.once.Do(func() {
+		go func() {
+			loop.stopping.Store(true)
+			loop.closePoller(err)
+			loop.shutdown(err)
+			if loop.ioPool != nil && !loop.ioPoolOwner {
+				loop.waitIODrained()
+			}
+			close(stop.done)
+		}()
+	})
+	return stop.done
+}
