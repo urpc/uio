@@ -762,6 +762,9 @@ func (c *Conn) deliverOutbound(n int) {
 		observer.OnOutbound(c, n)
 		return
 	}
+	if testHookDeferredOutboundPending != nil {
+		testHookDeferredOutboundPending(c)
+	}
 	for {
 		old := c.writes.close.deferredOutbound.Load()
 		next := old + uint32(n)
@@ -769,8 +772,18 @@ func (c *Conn) deliverOutbound(n int) {
 			next = ^uint32(0)
 		}
 		if c.writes.close.deferredOutbound.CompareAndSwap(old, next) {
-			return
+			break
 		}
+	}
+	// The holder may have released and swapped between the failed probe and
+	// the publish above: its Swap then found nothing, and if the lock is free
+	// now nobody will look again. Whoever sees the lock free after publishing
+	// delivers. (The other half of the handshake: unlockWrite swaps only
+	// after releasing, so a Swap that follows a failed probe here is ordered
+	// after this publish and sees it.)
+	if c.writes.mu.TryLock() {
+		c.writes.mu.Unlock()
+		c.deliverDeferredOutbound()
 	}
 }
 

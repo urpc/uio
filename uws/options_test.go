@@ -302,3 +302,44 @@ func TestTrafficObserverSendUnderOutboundLimit(t *testing.T) {
 		t.Fatal("the observer's send never reached the peer")
 	}
 }
+
+// countingObserver adds up every byte OnOutbound reports.
+type countingObserver struct{ total atomic.Int64 }
+
+func (*countingObserver) OnOpen(*Conn)              {}
+func (*countingObserver) OnMessage(*Conn, Message)  {}
+func (*countingObserver) OnClose(*Conn, CloseEvent) {}
+func (*countingObserver) OnInbound(*Conn, int)      {}
+func (h *countingObserver) OnOutbound(_ *Conn, n int) {
+	h.total.Add(int64(n))
+}
+
+// A report deferred while the lock was held must be delivered even when the
+// holder released and swapped before the count was published: the publisher
+// re-checks and takes the delivery over.
+func TestTrafficObserverDeferredReportHandsOff(t *testing.T) {
+	raw := &limitedWire{limit: 1 << 20}
+	conn := newLimitedConn(raw, time.Hour)
+	h := &countingObserver{}
+	conn.handler = h
+
+	conn.writes.mu.Lock()
+	inWindow := make(chan struct{})
+	release := make(chan struct{})
+	testHookDeferredOutboundPending = func(*Conn) { close(inWindow); <-release }
+	t.Cleanup(func() { testHookDeferredOutboundPending = nil })
+	done := make(chan struct{})
+	go func() {
+		conn.deliverOutbound(123)
+		close(done)
+	}()
+	<-inWindow
+	// The holder releases and swaps before the count is published, so its
+	// swap finds nothing and only the publisher is left to deliver.
+	conn.unlockWrite()
+	close(release)
+	<-done
+	if got := h.total.Load(); got != 123 {
+		t.Fatalf("deferred report stranded: delivered %d of 123", got)
+	}
+}
