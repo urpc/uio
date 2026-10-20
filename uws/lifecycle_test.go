@@ -274,31 +274,17 @@ func startLifecycleTestServer(t *testing.T, handler Handler) (*Server, string, <
 
 func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure func(*Server)) (*Server, string, <-chan struct{}) {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
-	server := NewServer(Options{}, handler)
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	if configure != nil {
-		configure(server)
-	}
-	started := make(chan struct{})
-	server.startHook = func() { close(started) }
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		if configure != nil {
+			configure(s)
+		}
+		return s
+	})
 	done := make(chan struct{})
-	go func() {
-		_ = server.Serve(addr)
-		close(done)
-	}()
-	select {
-	case <-started:
-	case <-time.After(lifecycleTestTimeout()):
-		t.Fatal("server did not start")
-	}
+	go func() { _ = <-serveDone; close(done) }()
 	t.Cleanup(func() {
 		_ = server.Close(nil)
 		select {

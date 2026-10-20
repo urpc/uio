@@ -334,13 +334,6 @@ func readEchoFrame(reader *bufio.Reader) ([]byte, error) {
 // connection's reads once the outbound watermark is crossed. Reading again
 // drains the queue, the pause lifts, and every message is echoed exactly once.
 func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	const (
 		// Enough traffic that kernel socket buffers cannot absorb it: the
 		// server must reach its watermark and stop reading.
@@ -348,24 +341,18 @@ func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
 		payloadSize = 8 << 10
 		high        = 32 << 10
 	)
-	server := NewServer(Options{
-		Pollers:               1,
-		ReadBufferSize:        4 << 10,
-		OutboundHighWatermark: high,
-		OutboundLowWatermark:  high / 4,
-	}, echoAllHandler{})
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{
+			Pollers:               1,
+			ReadBufferSize:        4 << 10,
+			OutboundHighWatermark: high,
+			OutboundLowWatermark:  high / 4,
+		}, echoAllHandler{})
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	var conn net.Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); conn == nil && time.Now().Before(deadline); {
 		conn, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err != nil {

@@ -308,29 +308,16 @@ func (h *nativeRequestHandler) OnClose(*Conn, CloseEvent) {}
 // startNativeTestServer starts a native Serve server on a loopback address.
 func startNativeTestServer(t *testing.T, handler Handler, configure func(*Server)) string {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
-	server := NewServer(Options{}, handler)
-	if configure != nil {
-		configure(server)
-	}
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		if configure != nil {
+			configure(s)
 		}
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 	return addr
 }
 

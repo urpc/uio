@@ -367,24 +367,7 @@ func (h *captureEchoHandler) OnClose(*Conn, CloseEvent) {}
 // startEchoServer runs a server on an ephemeral port and returns its address.
 func startEchoServer(t *testing.T, handler Handler) string {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	server := NewServer(Options{Pollers: 1}, handler)
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
-	})
-	return addr
+	return startRobustServer(t, Options{Pollers: 1}, handler)
 }
 
 // dialTestWS opens a raw WebSocket client to addr and completes the upgrade.

@@ -186,28 +186,14 @@ func TestDialerNegotiatesAndUsesSmallDeflateWindow(t *testing.T) {
 }
 
 func TestDialerUsesUIOEventLoop(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(Options{}, serverHandler)
-	server.EnableCompression = true
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serverDone := make(chan error, 1)
-	go func() { serverDone <- server.Serve(addr) }()
-	for deadline := time.Now().Add(testIOTimeout()); time.Now().Before(deadline); {
-		probe, probeErr := net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if probeErr == nil {
-			_ = probe.Close()
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
+	server, addr, serverDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, serverHandler)
+		s.EnableCompression = true
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
+	})
 
 	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	dialer := NewDialer(Options{})
@@ -222,12 +208,7 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	t.Cleanup(func() {
 		_ = client.Close(1000, "")
 		_ = dialer.Close(nil)
-		_ = server.Close(nil)
-		select {
-		case <-serverDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+		stopTestServer(t, server, serverDone)
 	})
 
 	select {
@@ -781,24 +762,10 @@ func testAcceptKey(key string) string {
 // A Dialer heartbeat keeps pinging and the uws server answers Pong, so a
 // responsive connection stays open across several ping intervals.
 func TestDialerHeartbeatKeepsResponsivePeer(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
-	server := NewServer(Options{Pollers: 1}, newCloseWatcher())
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Pollers: 1}, newCloseWatcher())
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	dialer := NewDialer(Options{
 		Pollers:               1,
@@ -809,6 +776,7 @@ func TestDialerHeartbeatKeepsResponsivePeer(t *testing.T) {
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	watcher := newCloseWatcher()
 	var client *Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", watcher)
 		if err != nil {

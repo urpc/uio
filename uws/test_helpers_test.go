@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -397,4 +398,56 @@ func readServerFrame(reader *bufio.Reader) (first byte, payload []byte, fin bool
 	payload = make([]byte, int(length))
 	_, err = io.ReadFull(reader, payload)
 	return first, payload, fin, err
+}
+
+// startTestServer binds and starts the server built by newServer on a fresh
+// loopback port and returns it with its address and Serve's result. The
+// listeners are bound before it returns: ready is set at the start of OnStart,
+// after the bind. A port taken between the probe and the bind is retried on a
+// new one. The caller owns shutdown and must drain serveDone.
+func startTestServer(t *testing.T, newServer func() *Server) (*Server, string, <-chan error) {
+	t.Helper()
+	var lastErr error
+attempt:
+	for attempt := 0; attempt < 5; attempt++ {
+		probe, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := probe.Addr().String()
+		_ = probe.Close()
+		server := newServer()
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- server.Serve(addr) }()
+		deadline := time.Now().Add(testIOTimeout())
+		for {
+			select {
+			case lastErr = <-serveDone:
+				// Serve gave up before binding: another process most likely
+				// took the probed port. Try a fresh one.
+				continue attempt
+			default:
+			}
+			if server.ready.Load() {
+				return server, addr, serveDone
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("server did not bind %s: %v", addr, lastErr)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
+	t.Fatalf("could not bind an ephemeral port: %v", lastErr)
+	return nil, "", nil
+}
+
+// stopTestServer closes server and waits for Serve to return.
+func stopTestServer(t *testing.T, server *Server, serveDone <-chan error) {
+	t.Helper()
+	_ = server.Close(nil)
+	select {
+	case <-serveDone:
+	case <-time.After(testIOTimeout()):
+		t.Error("server did not stop")
+	}
 }

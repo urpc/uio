@@ -213,7 +213,10 @@ func TestRobustClientRejectsMaskedServerFrame(t *testing.T) {
 	dialer := NewDialer(Options{})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil {
+	// The violation can close the transport before Dial returns its flush;
+	// ErrClosed then means the same as a connection returned to close at once.
+	// What the peer observes is asserted below.
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil && !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -253,7 +256,10 @@ func TestRobustClientRejectsOversizedMessage(t *testing.T) {
 	dialer := NewDialer(Options{MaxMessageSize: 32})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil {
+	// The violation can close the transport before Dial returns its flush;
+	// ErrClosed then means the same as a connection returned to close at once.
+	// What the peer observes is asserted below.
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil && !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -486,24 +492,20 @@ func TestRobustConcurrentPings(t *testing.T) {
 // Closing the server while clients stream ends every connection without a
 // panic and Serve returns.
 func TestRobustServerCloseWhileClientsStream(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	server := NewServer(Options{}, robustEchoHandler{})
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{}, robustEchoHandler{})
+	})
 
 	const clients = 8
 	clientDone := make(chan struct{}, clients)
+	streaming := make(chan struct{}, clients)
 	for c := 0; c < clients; c++ {
 		go func() {
 			defer func() { clientDone <- struct{}{} }()
 			sock, reader := robustDial(t, addr)
 			_ = sock.SetReadDeadline(time.Now().Add(testIOTimeout()))
 			writeDataFrame(t, sock, frame.Binary, true, []byte("stream"))
+			streaming <- struct{}{}
 			for {
 				opcode, _, err := readFrameWithOpcode(reader)
 				if err != nil {
@@ -515,8 +517,16 @@ func TestRobustServerCloseWhileClientsStream(t *testing.T) {
 			}
 		}()
 	}
-	// Let the clients connect and start streaming.
-	time.Sleep(50 * time.Millisecond)
+	// Close once every client has streamed a frame. The point is to race the
+	// close against live connections; a handshake still in flight may be
+	// reset by the server, which the clients would rightly report as fatal.
+	for i := 0; i < clients; i++ {
+		select {
+		case <-streaming:
+		case <-time.After(testIOTimeout()):
+			t.Fatal("a client never started streaming")
+		}
+	}
 	_ = server.Close(nil)
 	select {
 	case <-serveDone:
@@ -807,15 +817,9 @@ func TestRobustConcurrentBackpressure(t *testing.T) {
 // Concurrent Dial storms while the server closes: dials fail cleanly or the
 // connections end, nothing panics, and the dialer shuts down.
 func TestRobustDialStormDuringServerClose(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	server := NewServer(Options{}, robustEchoHandler{})
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{}, robustEchoHandler{})
+	})
 
 	dialer := NewDialer(Options{})
 	const dials = 16
@@ -855,23 +859,10 @@ func TestRobustDialStormDuringServerClose(t *testing.T) {
 // Heartbeats and traffic share the connection under load: the peer stays up
 // and no ping or message is lost or duplicated.
 func TestRobustHeartbeatUnderLoad(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	server := NewServer(Options{HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond}, robustEchoHandler{})
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond}, robustEchoHandler{})
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	conn, reader := robustDial(t, addr)
 	if err := conn.SetReadDeadline(time.Now().Add(testIOTimeout())); err != nil {

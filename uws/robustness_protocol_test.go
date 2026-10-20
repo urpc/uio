@@ -49,23 +49,10 @@ func (robustEchoHandler) OnClose(*Conn, CloseEvent) {}
 // startRobustServer runs a server with opts on an ephemeral port.
 func startRobustServer(t *testing.T, opts Options, handler Handler) string {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	server := NewServer(opts, handler)
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(opts, handler)
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 	return addr
 }
 

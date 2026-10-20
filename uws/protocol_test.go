@@ -356,32 +356,20 @@ func (h *budgetIntegrationHandler) OnMessage(_ *Conn, message Message) {
 func (*budgetIntegrationHandler) OnClose(*Conn, CloseEvent) {}
 
 func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	const primaryFrames = minFramesPerDataEvent + 1
 	handler := &budgetIntegrationHandler{
 		opened:   make(chan struct{}, 2),
 		messages: make(chan Message, primaryFrames+1),
 	}
-	server := NewServer(Options{}, handler)
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
+	var err error
 	openClient := func() net.Conn {
 		var client net.Conn
 		for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
@@ -481,29 +469,17 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 }
 
 func TestServerHandshakeAndMaskedMessage(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(Options{}, handler)
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	var client net.Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = net.Dial("tcp", addr)
 		if err != nil {
@@ -740,30 +716,18 @@ func TestClientHandshakeAcceptsSplitResponse(t *testing.T) {
 }
 
 func TestServerPerMessageDeflate(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(Options{}, handler)
-	server.EnableCompression = true
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		s.EnableCompression = true
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	var client net.Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err != nil {

@@ -438,31 +438,19 @@ func TestServerServeRunsEventsOnCallerGoroutine(t *testing.T) {
 }
 
 func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	handler := &heartbeatHandler{closed: make(chan CloseEvent, 1)}
-	server := NewServer(Options{}, handler)
-	server.HeartbeatInterval = 10 * time.Millisecond
-	server.HeartbeatTimeout = 25 * time.Millisecond
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
-	t.Cleanup(func() {
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, handler)
+		s.HeartbeatInterval = 10 * time.Millisecond
+		s.HeartbeatTimeout = 25 * time.Millisecond
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
 	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
 	var client net.Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
 		if err != nil {
@@ -503,30 +491,25 @@ func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
 }
 
 func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server := NewServer(Options{}, serverHandler)
-	server.HeartbeatInterval = 10 * time.Millisecond
-	// The timeout must survive a starved CI runner: with 250ms a pong delayed
-	// by scheduling could close a client that responded promptly in program
-	// order, which is exactly what this test asserts cannot happen.
-	server.HeartbeatTimeout = 2 * time.Second
-	server.Options.Pollers = 1
-	server.Options.ReadBufferSize = 4 << 10
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- server.Serve(addr) }()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{}, serverHandler)
+		s.HeartbeatInterval = 10 * time.Millisecond
+		// The timeout must survive a starved CI runner: with 250ms a pong delayed
+		// by scheduling could close a client that responded promptly in program
+		// order, which is exactly what this test asserts cannot happen.
+		s.HeartbeatTimeout = 2 * time.Second
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
+	})
 
 	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	dialer := NewDialer(Options{})
 	dialer.Options.Pollers = 1
 	dialer.Options.ReadBufferSize = 4 << 10
 	var client *Conn
+	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
 		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
 		if err != nil {
@@ -540,12 +523,7 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	t.Cleanup(func() {
 		_ = client.Close(1000, "")
 		_ = dialer.Close(nil)
-		_ = server.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(testIOTimeout()):
-			t.Error("server did not stop")
-		}
+		stopTestServer(t, server, serveDone)
 	})
 	select {
 	case <-clientHandler.open:
