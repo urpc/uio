@@ -1567,3 +1567,44 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 		t.Fatal("OnData failed to return")
 	}
 }
+
+// A datagram the listener read just before its server closed is handled after
+// closeOnLoop set peers to nil: the lookup on the nil map misses, and the
+// insertion must be skipped rather than panic.
+func TestStdUDPListenerCloseDuringDatagramFlood(t *testing.T) {
+	for iter := 0; iter < 100; iter++ {
+		started := make(chan net.Addr, 1)
+		events := &Events{}
+		events.OnStart = func(ev *Events) {
+			for _, l := range ev.acceptor.listeners {
+				if l.udp != nil {
+					started <- l.udp.LocalAddr()
+					return
+				}
+			}
+		}
+		events.OnData = func(c Conn) error { return nil }
+		serveDone := make(chan error, 1)
+		go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
+		addr := <-started
+		var stop atomic.Bool
+		floodDone := make(chan struct{})
+		go func() {
+			defer close(floodDone)
+			client, err := net.Dial("udp", addr.String())
+			if err != nil {
+				return
+			}
+			defer client.Close()
+			for !stop.Load() {
+				_, _ = client.Write([]byte("x"))
+			}
+		}()
+		time.Sleep(2 * time.Millisecond)
+		_ = events.Close(nil)
+		<-serveDone
+		stop.Store(true)
+		<-floodDone
+	}
+}
+

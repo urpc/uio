@@ -59,19 +59,20 @@ type stdUDPState struct {
 
 type fdConn struct {
 	commonConn
-	conn       net.Conn
-	udp        *stdUDPState
-	writeSig   chan struct{} // coalesced "output exists" wake; see writeLoop
-	closed     int32
-	err        error
-	mux        sync.Mutex
-	outbound   bytebuf.CompositeBuffer
-	writeMu    sync.Mutex // keeps close cleanup from racing the detached write batch
-	writeBatch bytebuf.CompositeBuffer
-	writeBytes int
-	closing    atomic.Bool
-	callbackMu sync.Mutex // serializes OnOpen, OnData, Wake, and OnClose
-	internal   bool       // framework-owned endpoint, not a user connection
+	conn           net.Conn
+	udp            *stdUDPState
+	writeSig       chan struct{} // coalesced "output exists" wake; see writeLoop
+	closed         int32
+	closeDelivered int32
+	err            error
+	mux            sync.Mutex
+	outbound       bytebuf.CompositeBuffer
+	writeMu        sync.Mutex // keeps close cleanup from racing the detached write batch
+	writeBatch     bytebuf.CompositeBuffer
+	writeBytes     int
+	closing        atomic.Bool
+	callbackMu     sync.Mutex // serializes OnOpen, OnData, Wake, and OnClose
+	internal       bool       // framework-owned endpoint, not a user connection
 
 	// opened records that OnOpen has run, which a connection's read goroutine
 	// does first; only an opened connection gets OnClose. wakesAfterOpen
@@ -758,9 +759,9 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 		defer fc.events.callbackWG.Done()
 		fc.callbackMu.Lock()
 		defer fc.callbackMu.Unlock()
-		fc.inbound.Reset()
-		fc.inboundTail = nil
 		if callback := fc.events.OnClose; callback != nil && !fc.internal && fc.opened {
+			fc.inbound.Reset()
+			fc.inboundTail = nil
 			started := fc.beginInboundCallback()
 			callback(fc, err)
 			fc.endInboundCallback(started)
@@ -1229,7 +1230,9 @@ func (fc *fdConn) listenUDP() error {
 		// udp server
 		fc.mux.Lock()
 		udpConn, ok := fc.udp.peers[rAddr]
-		if !ok {
+		// A closed server leaves peers nil; a lookup on the nil map misses,
+		// and inserting would panic. The datagram is dropped instead.
+		if !ok && fc.udp.peers != nil {
 			udpConn = &fdConn{}
 			udpConn.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
 			udpConn.addr = fc.addr
@@ -1240,6 +1243,9 @@ func (fc *fdConn) listenUDP() error {
 			fc.udp.peers[rAddr] = udpConn
 		}
 		fc.mux.Unlock()
+		if udpConn == nil {
+			continue
+		}
 		if !ok {
 			// fire udp on-open event.
 			udpConn.callbackMu.Lock()

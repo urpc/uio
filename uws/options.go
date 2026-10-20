@@ -123,7 +123,8 @@ type Options struct {
 // wherever the transport finishes a send — a write turn, a writer goroutine,
 // or the goroutine closing the connection — and may overlap the connection's
 // Handler callbacks and OnInbound, so state it shares with them must be safe
-// for concurrent use. Neither may block.
+// for concurrent use. Neither may block. A Send made from OnOutbound is
+// allowed: it queues behind the traffic that triggered it.
 type TrafficObserver interface {
 	OnInbound(*Conn, int)
 	OnOutbound(*Conn, int)

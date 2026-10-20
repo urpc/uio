@@ -459,6 +459,9 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 			return written, err
 		}
 	}
+	if written == 0 && testHookDirectSendRefused != nil {
+		testHookDirectSendRefused(conn)
+	}
 	if written == len(data) {
 		conn.events.onSocketBytesWrite(conn, written)
 		return written, nil

@@ -787,12 +787,16 @@ func (conn *fdConn) afterRegister()                   {}
 //   - A write-only edge with nothing to send: registration arms every stream
 //     with one, and kqueue raises one each time an acknowledgement frees send
 //     space. Output is sent without an edge; only a write-blocked socket, or
-//     queued output whose sender may be waiting on an edge, needs it.
+//     queued output whose sender may be waiting on an edge, needs it. A sender
+//     holding the write claim may be between a refused send and publishing its
+//     bytes and writeBlocked; that edge is the only thing that will ever move
+//     them, so it passes while the claim is held too.
 func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
 		return conn.flags.Load()&(readStalledFlag|readHeldFlag|readEOFFlag) != 0
 	}
-	return events == poller.WriteEvents && conn.outboundEmpty() && !conn.writeBlocked()
+	return events == poller.WriteEvents && conn.outboundEmpty() &&
+		conn.writeState.Load()&(writeOwnerFlag|writeBlockedFlag) == 0
 }
 
 // Direct I/O belongs to this connection's active turn. A UDP child's turn is
@@ -890,6 +894,11 @@ var testHookTaskClaimed func(*fdConn)
 // decided to send its reply space straight to the socket. Tests use it to queue
 // another goroutine's write during that send; it is nil outside tests.
 var testHookScratchSend func(*fdConn)
+
+// testHookDirectSendRefused runs on the sender's goroutine right after a
+// direct send was refused by a full socket, before its bytes are published.
+// Tests use it to pin the writable-edge race window; it is nil outside tests.
+var testHookDirectSendRefused func(*fdConn)
 
 // watchTags generates registration tags. Zero means untagged.
 var watchTags atomic.Uint32

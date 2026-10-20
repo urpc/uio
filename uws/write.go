@@ -732,10 +732,16 @@ func (c *Conn) flushBatchLocked() error {
 }
 
 // flushLocked hands any batched frames to the transport and then asks it to
-// send what it holds. It requires writes.mu; callers without it use flush.
+// send what it holds. It requires writes.mu; callers without it use flush. The
+// flush is left to the turn's end or a write turn while a TrafficObserver is
+// configured: the transport runs its OnOutbound inside the flush, and a Send
+// the observer makes must not wait for writes.mu this caller holds.
 func (c *Conn) flushLocked() error {
 	if err := c.flushBatchLocked(); err != nil {
 		return err
+	}
+	if c.config != nil && c.config.observeTraffic {
+		return nil
 	}
 	return c.flush()
 }

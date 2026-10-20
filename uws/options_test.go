@@ -20,8 +20,11 @@ import (
 	"errors"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/urpc/uio/uws/internal/frame"
 )
 
 func TestOptionsResolveDefaults(t *testing.T) {
@@ -201,5 +204,49 @@ func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
 	}
 	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 {
 		t.Fatal("dialer connection limits changed after startup")
+	}
+}
+
+// outboundSendObserver sends from OnOutbound once, to pin the observer
+// deadlock window: the transport runs OnOutbound inside its flush, which a
+// send from it must not wait behind.
+type outboundSendObserver struct {
+	armed atomic.Bool
+	fired atomic.Bool
+	ran   chan struct{}
+	sent  chan error
+}
+
+func (*outboundSendObserver) OnOpen(*Conn)              {}
+func (*outboundSendObserver) OnMessage(*Conn, Message)  {}
+func (*outboundSendObserver) OnClose(*Conn, CloseEvent) {}
+func (*outboundSendObserver) OnInbound(*Conn, int)      {}
+func (h *outboundSendObserver) OnOutbound(c *Conn, n int) {
+	if !h.armed.Load() || !h.fired.CompareAndSwap(false, true) {
+		return
+	}
+	close(h.ran)
+	h.sent <- c.SendText([]byte("drained"))
+}
+
+func TestTrafficObserverOnOutboundCanSend(t *testing.T) {
+	h := &outboundSendObserver{ran: make(chan struct{}), sent: make(chan error, 1)}
+	addr := startRobustServer(t, Options{Pollers: 1}, h)
+	conn, _ := robustDial(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(2 * testIOTimeout()))
+	h.armed.Store(true)
+	writeDataFrame(t, conn, frame.Ping, true, []byte("p"))
+	select {
+	case <-h.ran:
+	case <-time.After(testIOTimeout()):
+		t.Fatal("OnOutbound never ran")
+	}
+	select {
+	case err := <-h.sent:
+		if err != nil {
+			t.Fatalf("send from OnOutbound: %v", err)
+		}
+	case <-time.After(testIOTimeout()):
+		t.Fatal("a send from OnOutbound deadlocked")
 	}
 }

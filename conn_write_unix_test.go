@@ -505,6 +505,103 @@ func TestReservedRepliesBehindQueuedOutput(t *testing.T) {
 	}
 }
 
+// fillSocketUntilRefused writes to a non-blocking fd until it refuses even
+// one byte.
+func fillSocketUntilRefused(t *testing.T, fd int) int {
+	t.Helper()
+	total := 0
+	chunk := make([]byte, 64<<10)
+	for size := len(chunk); size > 0; size /= 2 {
+		for {
+			n, err := unix.Write(fd, chunk[:size])
+			if n > 0 {
+				total += n
+			}
+			if err != nil {
+				if errors.Is(err, unix.EAGAIN) {
+					break
+				}
+				t.Fatal(err)
+			}
+		}
+	}
+	return total
+}
+
+// drainPeerFully reads everything the peer's socket holds and reports how much.
+func drainPeerFully(fd int) int {
+	buf := make([]byte, 1<<20)
+	total := 0
+	for {
+		n, err := unix.Read(fd, buf)
+		if n > 0 {
+			total += n
+		}
+		if err != nil || n <= 0 {
+			return total
+		}
+	}
+}
+
+// A direct send a full socket refuses publishes its bytes and writeBlocked
+// only after the send returned. The writable edge the drain raises must not be
+// dropped in that window: it is the only thing that would ever move them.
+func TestRefusedDirectSendKeepsAWritableEdge(t *testing.T) {
+	payload := bytes.Repeat([]byte{'P'}, 100)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 8<<10); err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.SetNonblock(fds[0], true); err != nil {
+		t.Fatal(err)
+	}
+	fillSocketUntilRefused(t, fds[0])
+	var hooked atomic.Bool
+	testHookDirectSendRefused = func(conn *fdConn) {
+		if !hooked.CompareAndSwap(false, true) {
+			return
+		}
+		// The peer frees the socket right after the refused send, and the
+		// loop collects the writable edge before the turn publishes anything.
+		drainPeerFully(fds[1])
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Cleanup(func() { testHookDirectSendRefused = nil })
+	events := &Events{Pollers: 1}
+	events.OnOpen = func(conn Conn) {
+		if _, err := conn.Write(payload); err != nil {
+			t.Error(err)
+		}
+	}
+	testConn, registered := startTestConnectionOn(t, events, fds)
+	if err = <-registered; err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for !hooked.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !hooked.Load() {
+		t.Fatal("the direct send was never refused")
+	}
+	got := 0
+	buf := make([]byte, 4096)
+	for got < len(payload) && time.Now().Before(deadline) {
+		n, _ := unix.Read(testConn.peer, buf)
+		if n > 0 {
+			got += n
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got < len(payload) {
+		c := testConn.conn
+		t.Fatalf("stalled: peer got %d of %d bytes; pending=%d writeBlocked=%v", got, len(payload), c.pending.Load(), c.writeBlocked())
+	}
+}
+
 // fillTestRecord fills record with tag, seq and a trailer that ties them, so a
 // record cut by other bytes fails validTestRecord.
 func fillTestRecord(record []byte, tag byte, seq uint32) {
