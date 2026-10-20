@@ -249,7 +249,11 @@ func (s *Server) onOutbound(raw uio.Conn, n int) {
 			conn.tryCloseTransport()
 		}
 		conn.resumeReadsAfterDrain()
-		conn.deliverOutbound(n)
+		if conn.config != nil && conn.config.observeTraffic {
+			if observer, ok := conn.handler.(TrafficObserver); ok {
+				observer.OnOutbound(conn, n)
+			}
+		}
 	}
 }
 

@@ -80,20 +80,11 @@ type connWriteState struct {
 // Close frame can wait for outbound room while earlier bytes are still
 // retiring. transitionMu only protects short state transitions; it never
 // covers socket I/O or application work.
-// testHookDeferredOutboundPending runs on a delivery goroutine after its
-// lock probe failed and before it publishes the deferred count. Tests use it
-// to pin the hand-off window; it is nil outside tests.
-var testHookDeferredOutboundPending func(*Conn)
-
 type connCloseProgress struct {
 	pendingBytes  atomic.Int64
 	transitionMu  sync.Mutex
 	deferredClose *deferredCloseFrame // guarded by transitionMu
 	flags         atomic.Uint32
-	// deferredOutbound coalesces TrafficObserver byte counts delivered while
-	// writes.mu is held; it fills the struct's tail padding. See
-	// deliverOutbound.
-	deferredOutbound atomic.Uint32
 }
 
 // deferredCloseFrame owns the payload of a Close frame the outbound limit had

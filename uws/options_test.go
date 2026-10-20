@@ -17,15 +17,11 @@
 package uws
 
 import (
-	"bytes"
 	"errors"
 	"net/http"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/urpc/uio/uws/internal/frame"
 )
 
 func TestOptionsResolveDefaults(t *testing.T) {
@@ -205,141 +201,5 @@ func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
 	}
 	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 {
 		t.Fatal("dialer connection limits changed after startup")
-	}
-}
-
-// outboundSendObserver sends from OnOutbound once, to pin the observer
-// deadlock window: the transport runs OnOutbound inside its flush, which a
-// send from it must not wait behind.
-type outboundSendObserver struct {
-	armed atomic.Bool
-	fired atomic.Bool
-	ran   chan struct{}
-	sent  chan error
-}
-
-func (*outboundSendObserver) OnOpen(*Conn)              {}
-func (*outboundSendObserver) OnMessage(*Conn, Message)  {}
-func (*outboundSendObserver) OnClose(*Conn, CloseEvent) {}
-func (*outboundSendObserver) OnInbound(*Conn, int)      {}
-func (h *outboundSendObserver) OnOutbound(c *Conn, n int) {
-	if !h.armed.Load() || !h.fired.CompareAndSwap(false, true) {
-		return
-	}
-	close(h.ran)
-	h.sent <- c.SendText([]byte("drained"))
-}
-
-func TestTrafficObserverOnOutboundCanSend(t *testing.T) {
-	h := &outboundSendObserver{ran: make(chan struct{}), sent: make(chan error, 1)}
-	addr := startRobustServer(t, Options{Pollers: 1}, h)
-	conn, _ := robustDial(t, addr)
-	_ = conn.SetDeadline(time.Now().Add(2 * testIOTimeout()))
-	h.armed.Store(true)
-	writeDataFrame(t, conn, frame.Ping, true, []byte("p"))
-	select {
-	case <-h.ran:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("OnOutbound never ran")
-	}
-	select {
-	case err := <-h.sent:
-		if err != nil {
-			t.Fatalf("send from OnOutbound: %v", err)
-		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("a send from OnOutbound deadlocked")
-	}
-}
-
-// trafficPressureObserver sends from OnOutbound once, after OnMessage filled
-// the outbound limit: the second send's reservation flushes the first inline,
-// under writes.mu.
-type trafficPressureObserver struct {
-	armed atomic.Bool
-	fired atomic.Bool
-}
-
-func (*trafficPressureObserver) OnOpen(*Conn)              {}
-func (*trafficPressureObserver) OnClose(*Conn, CloseEvent) {}
-func (*trafficPressureObserver) OnInbound(*Conn, int)      {}
-func (h *trafficPressureObserver) OnMessage(c *Conn, m Message) {
-	h.armed.Store(true)
-	_ = c.SendBinary(bytes.Repeat([]byte{'a'}, 200))
-	_ = c.SendBinary(bytes.Repeat([]byte{'b'}, 100))
-}
-func (h *trafficPressureObserver) OnOutbound(c *Conn, n int) {
-	if h.armed.Load() && h.fired.CompareAndSwap(false, true) {
-		_ = c.SendText([]byte("observer"))
-	}
-}
-
-// An OnOutbound that sends must not deadlock even when the report comes from
-// a flush a send started under writes.mu to make room for itself.
-func TestTrafficObserverSendUnderOutboundLimit(t *testing.T) {
-	h := &trafficPressureObserver{}
-	addr := startRobustServer(t, Options{Pollers: 1, MaxOutboundBuffered: 256, OutboundHighWatermark: -1}, h)
-	conn, reader := robustDial(t, addr)
-	defer conn.Close()
-	_ = conn.SetDeadline(time.Now().Add(2 * testIOTimeout()))
-	writeDataFrame(t, conn, frame.Binary, true, []byte("go"))
-	// The std transport has no make-room flush, so the second send may be
-	// refused with backpressure; what must always hold is that the observer's
-	// own send goes through and the connection keeps answering.
-	deadline := time.Now().Add(2 * testIOTimeout())
-	sawObserver := false
-	for time.Now().Before(deadline) && !sawObserver {
-		if err := conn.SetReadDeadline(time.Now().Add(testIOTimeout())); err != nil {
-			t.Fatal(err)
-		}
-		_, payload, err := readFrameWithOpcode(reader)
-		if err != nil {
-			break
-		}
-		sawObserver = string(payload) == "observer"
-	}
-	if !sawObserver {
-		t.Fatal("the observer's send never reached the peer")
-	}
-}
-
-// countingObserver adds up every byte OnOutbound reports.
-type countingObserver struct{ total atomic.Int64 }
-
-func (*countingObserver) OnOpen(*Conn)              {}
-func (*countingObserver) OnMessage(*Conn, Message)  {}
-func (*countingObserver) OnClose(*Conn, CloseEvent) {}
-func (*countingObserver) OnInbound(*Conn, int)      {}
-func (h *countingObserver) OnOutbound(_ *Conn, n int) {
-	h.total.Add(int64(n))
-}
-
-// A report deferred while the lock was held must be delivered even when the
-// holder released and swapped before the count was published: the publisher
-// re-checks and takes the delivery over.
-func TestTrafficObserverDeferredReportHandsOff(t *testing.T) {
-	raw := &limitedWire{limit: 1 << 20}
-	conn := newLimitedConn(raw, time.Hour)
-	h := &countingObserver{}
-	conn.handler = h
-
-	conn.writes.mu.Lock()
-	inWindow := make(chan struct{})
-	release := make(chan struct{})
-	testHookDeferredOutboundPending = func(*Conn) { close(inWindow); <-release }
-	t.Cleanup(func() { testHookDeferredOutboundPending = nil })
-	done := make(chan struct{})
-	go func() {
-		conn.deliverOutbound(123)
-		close(done)
-	}()
-	<-inWindow
-	// The holder releases and swaps before the count is published, so its
-	// swap finds nothing and only the publisher is left to deliver.
-	conn.unlockWrite()
-	close(release)
-	<-done
-	if got := h.total.Load(); got != 123 {
-		t.Fatalf("deferred report stranded: delivered %d of 123", got)
 	}
 }

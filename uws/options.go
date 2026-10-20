@@ -122,15 +122,22 @@ type Options struct {
 }
 
 // TrafficObserver reports transport traffic. Implement it on the Handler to
-// receive both directions of every connection. OnInbound runs in the
-// connection's turn and never overlaps its Handler callbacks. OnOutbound runs
-// wherever the transport finishes a send — a write turn, a writer goroutine,
-// or the goroutine closing the connection — and may overlap the connection's
-// Handler callbacks and OnInbound, so state it shares with them must be safe
-// for concurrent use. Neither may block. A Send made from OnOutbound is
-// allowed: it never waits for a lock the send that triggered the report
-// holds, and the reports it delays this way are delivered coalesced, as one
-// call carrying the byte total.
+// receive both directions of every connection.
+//
+// Both callbacks are observation only. They must not call any method that
+// sends or closes on the connection (SendText, SendBinary, Send, Write, Ping,
+// Close, CloseWrite, ...): a report is the result of I/O that just happened,
+// and writing from it feeds the report it answers — it retires more bytes,
+// which reports again. In uws the report can also run while the write lock a
+// send holds is still held, so a write here deadlocks the connection. They
+// must not block either.
+//
+// OnInbound runs in the connection's turn and never overlaps its Handler
+// callbacks. OnOutbound runs wherever the transport finishes a send — a write
+// turn, a writer goroutine, or the goroutine closing the connection, possibly
+// with internal locks held — and may overlap the connection's Handler
+// callbacks and OnInbound, so state it shares with them must be safe for
+// concurrent use.
 type TrafficObserver interface {
 	OnInbound(*Conn, int)
 	OnOutbound(*Conn, int)

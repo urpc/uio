@@ -746,60 +746,6 @@ func (c *Conn) flushLocked() error {
 	return c.flush()
 }
 
-// deliverOutbound reports retired bytes to the connection's TrafficObserver.
-// A goroutine inside a send holds writes.mu across the transport calls, and a
-// flush those calls start runs OnOutbound inline — the observer may not run
-// there, for a Send it makes would wait for that very lock. The TryLock is a
-// probe, released at once; on contention the count coalesces into
-// deferredOutbound, and the holder's unlockWrite delivers the total.
-func (c *Conn) deliverOutbound(n int) {
-	observer, ok := c.handler.(TrafficObserver)
-	if !ok {
-		return
-	}
-	if c.writes.mu.TryLock() {
-		c.writes.mu.Unlock()
-		observer.OnOutbound(c, n)
-		return
-	}
-	if testHookDeferredOutboundPending != nil {
-		testHookDeferredOutboundPending(c)
-	}
-	for {
-		old := c.writes.close.deferredOutbound.Load()
-		next := old + uint32(n)
-		if next < old {
-			next = ^uint32(0)
-		}
-		if c.writes.close.deferredOutbound.CompareAndSwap(old, next) {
-			break
-		}
-	}
-	// The holder may have released and swapped between the failed probe and
-	// the publish above: its Swap then found nothing, and if the lock is free
-	// now nobody will look again. Whoever sees the lock free after publishing
-	// delivers. (The other half of the handshake: unlockWrite swaps only
-	// after releasing, so a Swap that follows a failed probe here is ordered
-	// after this publish and sees it.)
-	if c.writes.mu.TryLock() {
-		c.writes.mu.Unlock()
-		c.deliverDeferredOutbound()
-	}
-}
-
-// deliverDeferredOutbound delivers the TrafficObserver counts deferred while
-// writes.mu was held. It runs with no lock held, so a Send the observer makes
-// waits for nothing of ours.
-func (c *Conn) deliverDeferredOutbound() {
-	n := c.writes.close.deferredOutbound.Swap(0)
-	if n == 0 {
-		return
-	}
-	if observer, ok := c.handler.(TrafficObserver); ok {
-		observer.OnOutbound(c, int(n))
-	}
-}
-
 // beginWriteBatch makes the small frames sent from now on join the write
 // batch until the read round ends. Only the connection's own read path calls
 // it, so a plain load sees whether this round already did.
@@ -825,7 +771,6 @@ func (c *Conn) unlockWrite() {
 		_ = c.flushBatchLocked()
 	}
 	c.writes.mu.Unlock()
-	c.deliverDeferredOutbound()
 	if c.writes.close.closePending() {
 		_, _ = c.tryCloseTransport()
 	}

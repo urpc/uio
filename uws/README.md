@@ -125,9 +125,11 @@ if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", nil); err != nil {
 ```
 
 `Dial` returns once the upgrade request is sent and the handshake finishes in
-the background. `OnOpen` means the connection is ready; a failed handshake
-calls `OnClose` without `OnOpen`, with the cause in `CloseEvent.Err`. The
-context bounds the dial and the handshake, not the connection after it.
+the background. Its third argument is the connection's userdata, available as
+`Conn.Userdata` from `OnOpen` on, so one stateless handler serves every dial.
+`OnOpen` means the connection is ready; a failed handshake calls `OnClose`
+without `OnOpen`, with the cause in `CloseEvent.Err`. The context bounds the
+dial and the handshake, not the connection after it.
 
 ## Configuration
 
@@ -158,9 +160,11 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
 | `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
-A `Server` adds `CheckOrigin`; the `Handler` lives in `Options`, shared by every connection a server accepts or a dialer dials, with per-dial state passed as `Dial`'s userdata. The underlying transport is built
-from these options and is not otherwise exposed; `Executor` is the scheduling
-escape hatch. Invalid combinations, such as a low watermark not below the high
+A `Server` adds `CheckOrigin`; the `Handler` lives in `Options`, shared by
+every connection a server accepts or a dialer dials, with per-dial state
+passed as `Dial`'s userdata. The underlying transport is built from these
+options and is not otherwise exposed; `Executor` is the scheduling escape
+hatch. Invalid combinations, such as a low watermark not below the high
 one, a high watermark above `MaxOutboundBuffered`, or a compression level
 outside 1-9, make `Serve` and `Dial` return `ErrInvalidOptions`.
 
@@ -178,9 +182,14 @@ pause. Set `MaxOutboundBuffered` to bound it: past the limit `SendText`,
 drop, retry later or close.
 
 **Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
-transport bytes in both directions. `OnInbound` runs in the connection's turn
-like the other callbacks; `OnOutbound` runs wherever a send completes and may
-overlap them, so keep what it touches safe for concurrent use:
+transport bytes in both directions. Both callbacks are observation only: do
+not call anything that sends or closes on the connection from them, and do not
+block. A report is the result of I/O that just happened, and a send from it
+feeds the report it answers; `OnOutbound` can also run while the write lock a
+send holds is held, so a send there deadlocks the connection. `OnInbound` runs
+in the connection's turn like the other callbacks; `OnOutbound` runs wherever
+a send completes and may overlap them, so keep what it touches safe for
+concurrent use:
 
 ```go
 func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }
@@ -198,7 +207,8 @@ func (m metrics) OnOutbound(c *uws.Conn, n int) { m.written.Add(n) }
   return `ErrBackpressure`.
 - **State without locks.** The `Handler` callbacks of one connection never
   overlap, so state kept with `SetUserdata` needs no locking from them;
-  `TrafficObserver.OnOutbound` is the exception.
+  `TrafficObserver.OnOutbound` is the exception, and it must only observe —
+  never send, close or block.
 - **Closing.** `Conn.Close(code, reason)` sends its close frame after everything
   already accepted and waits for the peer, up to `CloseTimeout`. Protocol
   errors close with 1002, invalid UTF-8 with 1007, oversized messages with
