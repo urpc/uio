@@ -886,6 +886,11 @@ func (conn *fdConn) noteIO(events uint32) bool {
 // held. Tests use it to pin the shutdown race window; it is nil outside tests.
 var testHookTaskClaimed func(*fdConn)
 
+// testHookScratchSend runs on the connection's turn once a read round has
+// decided to send its reply space straight to the socket. Tests use it to queue
+// another goroutine's write during that send; it is nil outside tests.
+var testHookScratchSend func(*fdConn)
+
 // watchTags generates registration tags. Zero means untagged.
 var watchTags atomic.Uint32
 

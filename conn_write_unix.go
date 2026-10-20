@@ -217,7 +217,9 @@ func (conn *fdConn) handOverScratchSpace() {
 // the socket does not take, or everything when output is queued, the
 // connection is closing or the socket is full, is handed to outbound for the
 // turn's flush or the next writable edge. The turn holds the write claim,
-// which every reservation takes.
+// which every reservation takes, so nothing else is sent meanwhile: an unsent
+// rest goes to the head of outbound, ahead of whatever other goroutines queued
+// during the send.
 func (conn *fdConn) sendScratch(holder *readBuffer) error {
 	out := holder.out
 	// pending counts every accepted byte, the reply space's included, so
@@ -230,6 +232,9 @@ func (conn *fdConn) sendScratch(holder *readBuffer) error {
 		conn.submitMu.Unlock()
 		holder.out = nil
 		return nil
+	}
+	if testHookScratchSend != nil {
+		testHookScratchSend(conn)
 	}
 	var sendErr error
 	unsent := out.Bytes()
@@ -253,9 +258,9 @@ func (conn *fdConn) sendScratch(holder *readBuffer) error {
 			// Discard(0) would empty the buffer.
 			out.Discard(sent)
 		}
-		conn.submitMu.Lock()
-		conn.outbound.AppendOwned(out)
-		conn.submitMu.Unlock()
+		// Appended, the rest would follow a write queued during the send,
+		// which would then cut into the frame the socket took part of.
+		conn.queueDirectSuffix(out)
 		holder.out = nil
 	} else {
 		out.Reset()

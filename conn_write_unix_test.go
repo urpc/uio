@@ -326,6 +326,103 @@ func TestReserveOutboundIsNeverSentUnfilled(t *testing.T) {
 	t.Logf("reservations=%d fallbacks=%d", reserved.Load(), fallback.Load())
 }
 
+// A read round's replies go to the socket straight from its reply space, and
+// a full socket may take only part of them. A write another goroutine queues
+// while that send runs must follow the replies' unsent rest rather than cut
+// into it, or the peer reads a torn record.
+func TestPartialReplySendKeepsLaterWritesBehind(t *testing.T) {
+	const replies, recordSize = 16, 1000
+	events := &Events{Pollers: 1, MaxBufferSize: 16 << 10}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(conn.InboundBuffered())
+		for seq := range uint32(replies) {
+			dst, err := conn.ReserveOutbound(recordSize)
+			if err != nil {
+				return err
+			}
+			fillTestRecord(dst, 'R', seq)
+		}
+		return nil
+	}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The send buffer holds a fraction of the round's replies and the peer
+	// reads nothing yet, so the round's send is partial.
+	if err = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<10); err != nil {
+		t.Fatal(err)
+	}
+	var injected atomic.Bool
+	testHookScratchSend = func(conn *fdConn) {
+		if !injected.CompareAndSwap(false, true) {
+			return
+		}
+		// Another goroutine writes as the round starts its send: it finds the
+		// write claim taken and leaves its bytes queued.
+		done := make(chan error, 1)
+		go func() {
+			var record [recordSize]byte
+			fillTestRecord(record[:], 'W', 0)
+			_, err := conn.Write(record[:])
+			done <- err
+		}()
+		if err := <-done; err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { testHookScratchSend = nil })
+	testConn, registered := startTestConnectionOn(t, events, fds)
+	if err = <-registered; err != nil {
+		t.Fatal(err)
+	}
+
+	if err = writePeerAll(testConn.peer, []byte{1}, time.Now().Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	data := readPeerUntil(t, testConn.peer, (replies+1)*recordSize, 10*time.Second)
+	if !injected.Load() {
+		t.Fatal("the round never sent from its reply space")
+	}
+	for offset, seq := 0, uint32(0); offset < len(data); offset += recordSize {
+		record := data[offset : offset+recordSize]
+		if !validTestRecord(record) {
+			t.Fatalf("record at byte %d is torn: tag %q", offset, record[0])
+		}
+		if record[0] == 'R' {
+			if got := binary.LittleEndian.Uint32(record[1:]); got != seq {
+				t.Fatalf("reply %d arrived as reply %d", got, seq)
+			}
+			seq++
+		} else if offset != replies*recordSize {
+			t.Fatalf("the other goroutine's write landed at byte %d, inside the round's replies", offset)
+		}
+	}
+}
+
+// fillTestRecord fills record with tag, seq and a trailer that ties them, so a
+// record cut by other bytes fails validTestRecord.
+func fillTestRecord(record []byte, tag byte, seq uint32) {
+	for i := range record {
+		record[i] = tag
+	}
+	binary.LittleEndian.PutUint32(record[1:], seq)
+	record[len(record)-1] = tag ^ byte(seq)
+}
+
+func validTestRecord(record []byte) bool {
+	tag := record[0]
+	if tag != 'R' && tag != 'W' {
+		return false
+	}
+	for _, b := range record[5 : len(record)-1] {
+		if b != tag {
+			return false
+		}
+	}
+	return record[len(record)-1] == tag^byte(binary.LittleEndian.Uint32(record[1:]))
+}
+
 // With an outbound limit, reads pause while replies queued by another
 // goroutine pile up behind a slow peer, and resume once the blocked socket
 // drains.
