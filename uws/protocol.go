@@ -257,6 +257,12 @@ func (c *Conn) readRound() error {
 				}
 				return nil
 			}
+			if errors.Is(err, ErrClosed) {
+				// This end is closing or closed: stop consuming instead of
+				// treating it as a protocol error, which would close the
+				// transport before the peer completes the close handshake.
+				return nil
+			}
 			return c.protocolClose(err)
 		}
 		if consumed == 0 {
