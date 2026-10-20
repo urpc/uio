@@ -124,7 +124,9 @@ type Options struct {
 // or the goroutine closing the connection — and may overlap the connection's
 // Handler callbacks and OnInbound, so state it shares with them must be safe
 // for concurrent use. Neither may block. A Send made from OnOutbound is
-// allowed: it queues behind the traffic that triggered it.
+// allowed: it never waits for a lock the send that triggered the report
+// holds, and the reports it delays this way are delivered coalesced, as one
+// call carrying the byte total.
 type TrafficObserver interface {
 	OnInbound(*Conn, int)
 	OnOutbound(*Conn, int)

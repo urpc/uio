@@ -1658,3 +1658,44 @@ func TestStdUDPChildClosedBeforeOpenGetsOnClose(t *testing.T) {
 		t.Fatalf("UDP child got %d OnOpen and %d OnClose", opens.Load(), closes.Load())
 	}
 }
+
+// The close reason publishes before the closed flag, so a child that observes
+// itself closed delivers the reason, not a nil.
+func TestStdUDPChildCloseReasonPublished(t *testing.T) {
+	started := make(chan net.Addr, 1)
+	closed := make(chan error, 1)
+	events := &Events{}
+	events.OnStart = func(e *Events) {
+		for _, l := range e.acceptor.listeners {
+			if l.udp != nil {
+				started <- l.udp.LocalAddr()
+				return
+			}
+		}
+	}
+	events.OnOpen = func(c Conn) {
+		_ = c.CloseWith(errors.New("test-close"))
+		for !c.(*fdConn).IsClosed() {
+			runtime.Gosched()
+		}
+	}
+	events.OnClose = func(c Conn, err error) { closed <- err }
+	done := make(chan error, 1)
+	go func() { done <- events.Serve("udp://127.0.0.1:0") }()
+	client, err := net.Dial("udp", (<-started).String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, _ = client.Write([]byte("x"))
+	select {
+	case err := <-closed:
+		if err == nil || err.Error() != "test-close" {
+			t.Fatalf("close reason = %v, want test-close", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("close missing")
+	}
+	_ = events.Close(nil)
+	<-done
+}

@@ -364,9 +364,7 @@ func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 			conn.tryCloseTransport()
 		}
 		conn.resumeReadsAfterDrain()
-		if observer, ok := conn.handler.(TrafficObserver); ok {
-			observer.OnOutbound(conn, n)
-		}
+		conn.deliverOutbound(n)
 	}
 }
 

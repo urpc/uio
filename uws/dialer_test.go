@@ -862,3 +862,69 @@ func TestDialerHeartbeatClosesSilentPeer(t *testing.T) {
 		t.Fatal("dialer heartbeat did not close the silent peer")
 	}
 }
+
+// dialerObserverHandler sends from OnOutbound once armed, on the client's own
+// traffic: the Pong a server Ping draws is flushed under writes.mu.
+type dialerObserverHandler struct {
+	opened chan struct{}
+	armed  atomic.Bool
+	ping   atomic.Bool
+	sent   chan error
+}
+
+func (h *dialerObserverHandler) OnOpen(*Conn)            { close(h.opened) }
+func (*dialerObserverHandler) OnMessage(*Conn, Message)  {}
+func (*dialerObserverHandler) OnClose(*Conn, CloseEvent) {}
+func (h *dialerObserverHandler) OnInbound(*Conn, int) {
+	// The only inbound after arming is the server's Ping.
+	h.ping.Store(h.armed.Load())
+}
+func (h *dialerObserverHandler) OnOutbound(c *Conn, n int) {
+	// Fire on the Pong the Ping drew: its flush runs under writes.mu.
+	if h.ping.CompareAndSwap(true, false) {
+		h.sent <- c.SendText([]byte("observer"))
+	}
+}
+
+// A Dialer connection's observer gets the same protection as a server's: a
+// send from OnOutbound never waits for the lock its own flush holds.
+func TestDialerTrafficObserverOnOutboundCanSend(t *testing.T) {
+	addr := startRobustServer(t, Options{Pollers: 1}, pingAfterMessageHandler{})
+	dialer := NewDialer(Options{Pollers: 1})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	h := &dialerObserverHandler{opened: make(chan struct{}), sent: make(chan error, 1)}
+	conn, err := dialer.Dial(context.Background(), "ws://"+addr+"/", h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close(1000, "") })
+	select {
+	case <-h.opened:
+	case <-time.After(testIOTimeout()):
+		t.Fatal("client OnOpen never ran")
+	}
+	h.armed.Store(true)
+	if err := conn.SendText([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-h.sent:
+		if err != nil {
+			t.Fatalf("send from OnOutbound: %v", err)
+		}
+	case <-time.After(testIOTimeout()):
+		buf := make([]byte, 1<<20)
+		n := runtime.Stack(buf, true)
+		t.Fatalf("a send from dialer OnOutbound deadlocked\n%s", buf[:n])
+	}
+}
+
+// pingAfterMessageHandler answers one message with a Ping, so the client's
+// Pong flush runs OnOutbound under writes.mu.
+type pingAfterMessageHandler struct{}
+
+func (pingAfterMessageHandler) OnOpen(*Conn)              {}
+func (pingAfterMessageHandler) OnClose(*Conn, CloseEvent) {}
+func (pingAfterMessageHandler) OnMessage(c *Conn, m Message) {
+	_ = c.Ping([]byte("probe"))
+}

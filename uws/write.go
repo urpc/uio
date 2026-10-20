@@ -738,18 +738,53 @@ func (c *Conn) flushBatchLocked() error {
 }
 
 // flushLocked hands any batched frames to the transport and then asks it to
-// send what it holds. It requires writes.mu; callers without it use flush. The
-// flush is left to the turn's end or a write turn while a TrafficObserver is
-// configured: the transport runs its OnOutbound inside the flush, and a Send
-// the observer makes must not wait for writes.mu this caller holds.
+// send what it holds. It requires writes.mu; callers without it use flush.
 func (c *Conn) flushLocked() error {
 	if err := c.flushBatchLocked(); err != nil {
 		return err
 	}
-	if c.config != nil && c.config.observeTraffic {
-		return nil
-	}
 	return c.flush()
+}
+
+// deliverOutbound reports retired bytes to the connection's TrafficObserver.
+// A goroutine inside a send holds writes.mu across the transport calls, and a
+// flush those calls start runs OnOutbound inline — the observer may not run
+// there, for a Send it makes would wait for that very lock. The TryLock is a
+// probe, released at once; on contention the count coalesces into
+// deferredOutbound, and the holder's unlockWrite delivers the total.
+func (c *Conn) deliverOutbound(n int) {
+	observer, ok := c.handler.(TrafficObserver)
+	if !ok {
+		return
+	}
+	if c.writes.mu.TryLock() {
+		c.writes.mu.Unlock()
+		observer.OnOutbound(c, n)
+		return
+	}
+	for {
+		old := c.writes.close.deferredOutbound.Load()
+		next := old + uint32(n)
+		if next < old {
+			next = ^uint32(0)
+		}
+		if c.writes.close.deferredOutbound.CompareAndSwap(old, next) {
+			return
+		}
+	}
+}
+
+// deliverDeferredOutbound delivers the TrafficObserver counts deferred while
+// writes.mu was held. It runs with no lock held, so a Send the observer makes
+// waits for nothing of ours.
+func (c *Conn) deliverDeferredOutbound() {
+	n := c.writes.close.deferredOutbound.Swap(0)
+	if n == 0 {
+		return
+	}
+	if observer, ok := c.handler.(TrafficObserver); ok {
+		observer.OnOutbound(c, int(n))
+	}
 }
 
 // beginWriteBatch makes the small frames sent from now on join the write
@@ -777,6 +812,7 @@ func (c *Conn) unlockWrite() {
 		_ = c.flushBatchLocked()
 	}
 	c.writes.mu.Unlock()
+	c.deliverDeferredOutbound()
 	if c.writes.close.closePending() {
 		_, _ = c.tryCloseTransport()
 	}

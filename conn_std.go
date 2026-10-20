@@ -729,10 +729,12 @@ func (fc *fdConn) closeOnLoop(err error) {
 		fc.udp.svr.mux.Lock()
 		delete(fc.udp.svr.udp.peers, fc.remoteAddr.String())
 		fc.udp.svr.mux.Unlock()
+		// The reason publishes before the flag: a reader that sees closed
+		// observes err without further synchronization.
+		fc.err = err
 		if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
 			return
 		}
-		fc.err = err
 	} else {
 		if fc.udp != nil && fc.udp.peers != nil {
 			fc.mux.Lock()
@@ -784,12 +786,12 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 // socket first, then waits for the detached writer batch before recycling any
 // pooled blocks.
 func (fc *fdConn) fdClose(err error) bool {
+	// The reason publishes before the flag: a reader that sees closed
+	// observes err without further synchronization.
+	fc.err = err
 	if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
 		return false
 	}
-
-	// save close reason
-	fc.err = err
 
 	// Wake the writer so it observes the close and stops. A notification that
 	// is already pending is just as good a wake as this one, so a full channel

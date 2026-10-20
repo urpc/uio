@@ -82,9 +82,13 @@ type connWriteState struct {
 // covers socket I/O or application work.
 type connCloseProgress struct {
 	pendingBytes  atomic.Int64
-	flags         atomic.Uint32
 	transitionMu  sync.Mutex
 	deferredClose *deferredCloseFrame // guarded by transitionMu
+	flags         atomic.Uint32
+	// deferredOutbound coalesces TrafficObserver byte counts delivered while
+	// writes.mu is held; it fills the struct's tail padding. See
+	// deliverOutbound.
+	deferredOutbound atomic.Uint32
 }
 
 // deferredCloseFrame owns the payload of a Close frame the outbound limit had
