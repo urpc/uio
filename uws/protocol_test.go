@@ -1252,3 +1252,74 @@ func FuzzTextValidation(f *testing.F) {
 		checkTextDelivery(t, append(prefix, p...), "fuzzed")
 	})
 }
+
+// peerCloseBehindHandler closes on its first message, so a peer that answers
+// with more frames plus its Close in one segment exercises what a read round
+// does after this end started closing.
+type peerCloseBehindHandler struct {
+	closed chan CloseEvent
+}
+
+func (*peerCloseBehindHandler) OnOpen(*Conn) {}
+func (h *peerCloseBehindHandler) OnMessage(c *Conn, m Message) {
+	if string(m.Payload) == "first" {
+		_ = c.Close(1000, "bye")
+	}
+}
+func (h *peerCloseBehindHandler) OnClose(_ *Conn, info CloseEvent) { h.closed <- info }
+
+// peerCloseBehindRun sends first + middle + the peer's Close in one segment
+// and checks the server ends the connection once its close frame drains,
+// rather than sitting on the buffered frames until the close timer.
+func peerCloseBehindRun(t *testing.T, middle frame.Frame, closeTimeout time.Duration) {
+	t.Helper()
+	h := &peerCloseBehindHandler{closed: make(chan CloseEvent, 1)}
+	addr := startRobustServer(t, Options{Pollers: 1, CloseTimeout: closeTimeout}, h)
+	conn, reader := robustDial(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(4 * testIOTimeout()))
+	closePayload := make([]byte, 2)
+	binary.BigEndian.PutUint16(closePayload, 1000)
+	maskKey := [4]byte{1, 2, 3, 4}
+	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("first")}, maskKey)
+	wire = frame.Append(wire, middle, maskKey)
+	wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: frame.Close, Masked: true, Payload: closePayload}, maskKey)
+	start := time.Now()
+	if _, err := conn.Write(wire); err != nil {
+		t.Fatal(err)
+	}
+	if code := awaitClose(t, reader); code != 1000 {
+		t.Fatalf("server close code %d", code)
+	}
+	_, err := reader.ReadByte()
+	elapsed := time.Since(start)
+	var info CloseEvent
+	select {
+	case info = <-h.closed:
+	case <-time.After(testIOTimeout()):
+		t.Fatalf("OnClose never ran: TCP err %v after %v", err, elapsed)
+	}
+	if err != io.EOF || elapsed > time.Second {
+		t.Fatalf("peer Close not processed: TCP closed after %v (err %v), OnClose err %v", elapsed, err, info.Err)
+	}
+	if info.Err != nil && !errors.Is(info.Err, io.EOF) {
+		t.Fatalf("OnClose err = %v, want a clean close", info.Err)
+	}
+}
+
+// A peer's Close in the same segment as data sent after this end closed is
+// still answered, and the connection ends once the close frame drains.
+func TestPeerCloseBehindDataCompletesHandshake(t *testing.T) {
+	peerCloseBehindRun(t, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("second")}, 2*time.Second)
+}
+
+// The same with a Ping in between: it gets no Pong after the close began, but
+// the Close behind it still completes the handshake.
+func TestPeerCloseBehindPingCompletesHandshake(t *testing.T) {
+	peerCloseBehindRun(t, frame.Frame{Fin: true, Opcode: frame.Ping, Masked: true, Payload: []byte("p")}, 2*time.Second)
+}
+
+// Without a usable close timer the handshake must still complete: the peer's
+// buffered Close, not the timer, ends the connection.
+func TestPeerCloseBehindDataCompletesWithoutTimer(t *testing.T) {
+	peerCloseBehindRun(t, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("second")}, 24*time.Hour)
+}

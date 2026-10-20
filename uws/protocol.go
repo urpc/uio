@@ -258,9 +258,10 @@ func (c *Conn) readRound() error {
 				return nil
 			}
 			if errors.Is(err, ErrClosed) {
-				// This end is closing or closed: stop consuming instead of
-				// treating it as a protocol error, which would close the
-				// transport before the peer completes the close handshake.
+				// This end's transport is closing or closed: stop consuming
+				// instead of treating it as a protocol error, which would
+				// close the transport before the peer completes the close
+				// handshake.
 				return nil
 			}
 			return c.protocolClose(err)
@@ -352,8 +353,10 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 		return size, true, frame.ErrInvalidUTF8
 	}
 	// notifyMessage, inline: this runs for every frame of a pipelined round.
+	// A close in progress drops the data without a callback, so the round
+	// keeps consuming and the peer's Close still completes the handshake.
 	if c.closing.Load() {
-		return size, true, ErrClosed
+		return size, true, nil
 	}
 	if handler := c.handler; handler != nil {
 		handler.OnMessage(c, Message{Type: messageType(opcode), Payload: payload})
@@ -628,6 +631,12 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	c.notifyOpen()
 	if len(extra) > 0 {
 		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
+			if errors.Is(err, ErrClosed) {
+				// OnOpen closed this end: stop consuming rather than treat
+				// it as a protocol error, which would end the transport
+				// before the peer answers the close handshake.
+				return nil
+			}
 			return c.protocolClose(err)
 		}
 	}
@@ -876,6 +885,11 @@ func (c *Conn) acceptControl(f frame.Frame) error {
 			// The outbound limit is full: the Pong cannot be sent now and must
 			// not close the connection over it. Dropping it loses only this
 			// keepalive exchange; the peer's next Ping retries.
+			return nil
+		}
+		if errors.Is(err, ErrClosed) {
+			// A close in progress answers no Pings; the round goes on
+			// consuming so the peer's Close still completes the handshake.
 			return nil
 		}
 		return err

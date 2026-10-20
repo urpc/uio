@@ -1086,3 +1086,60 @@ func TestPeerCloseInARoundWaitsForTheBatchedReplies(t *testing.T) {
 		t.Fatalf("closes = %d, want 1", raw.closeCount())
 	}
 }
+
+// retireInWindowWire reports bytes the transport retired from inside
+// WriteOwned, before the submitting goroutine marks the frame sent: the exact
+// shape of a write turn sending a deferred Close while its submitter runs.
+type retireInWindowWire struct {
+	*limitedWire
+	conn   *Conn
+	armed  bool
+	report int
+}
+
+func (w *retireInWindowWire) WriteOwned(b *uio.Buffer) (int, error) {
+	isClose := b.Len() > 0 && b.Bytes()[0]&0x0f == byte(frame.Close)
+	n, err := w.limitedWire.WriteOwned(b)
+	if err == nil && isClose && w.armed {
+		w.armed = false
+		w.conn.releaseOutbound(w.report)
+		_, _ = w.conn.tryCloseTransport()
+		w.limitedWire.retire(w.conn, n)
+	}
+	return n, err
+}
+
+// A deferred Close whose bytes a writer retires before the submitter marks it
+// sent leaves the transport close unclaimed, unless the submitter re-checks.
+func TestDeferredCloseClaimedWhenRetirePrecedesMark(t *testing.T) {
+	inner := &limitedWire{limit: 64}
+	raw := &retireInWindowWire{limitedWire: inner}
+	conn := newLimitedConn(inner, time.Hour)
+	conn.raw = raw
+	raw.conn = conn
+	if err := conn.SendBinary(make([]byte, 60)); err != nil { // 62 wire bytes queued
+		t.Fatal(err)
+	}
+	conn.writes.mu.Lock()
+	deferred, err := conn.sendCloseFrameLocked([]byte{0x03, 0xe8})
+	conn.unlockWrite()
+	if err != nil || !deferred {
+		t.Fatalf("deferred=%v err=%v", deferred, err)
+	}
+	// The peer's Close crosses ours: the transport close is now pending.
+	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Close, Payload: []byte{0x03, 0xe8}}); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.writes.close.closePending() {
+		t.Fatal("transport close not pending")
+	}
+	// The writer sends the 62 bytes, which makes room; the retry runs.
+	inner.mu.Lock()
+	inner.queued -= 62
+	inner.mu.Unlock()
+	raw.report, raw.armed = 62, true
+	conn.sendDeferredClose()
+	if inner.closeCount() == 0 {
+		t.Fatal("every byte retired and both Close frames exchanged, but the transport close is never claimed")
+	}
+}

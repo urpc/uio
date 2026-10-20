@@ -28,8 +28,13 @@ func (c *Conn) notifyOpen() {
 }
 
 func (c *Conn) notifyMessage(message Message) error {
-	if c.closed.Load() || c.closing.Load() {
+	if c.closed.Load() {
 		return ErrClosed
+	}
+	if c.closing.Load() {
+		// A close in progress drops the message without a callback; the read
+		// round keeps consuming so the peer's Close completes the handshake.
+		return nil
 	}
 	if handler := c.handler; handler != nil {
 		handler.OnMessage(c, message)

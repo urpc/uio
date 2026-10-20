@@ -363,6 +363,12 @@ func (c *Conn) sendDeferredClose() {
 		err := c.writeFrameOwned(f, maskKey, wireSize)
 		if err == nil {
 			_ = c.flush()
+			// A writer may have retired these bytes while the deferred flag
+			// was still set, leaving the transport close unclaimed; see
+			// claimPendingTransportClose.
+			if c.writes.close.closePending() {
+				_, _ = c.tryCloseTransport()
+			}
 			return
 		}
 		if errors.Is(err, ErrClosed) {
