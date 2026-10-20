@@ -413,7 +413,15 @@ func (poller *Poller) mountPark(batch *Batch) {
 	batch.parkFile = file
 	batch.parkConn = conn
 	batch.parkEpfd = poller.epfd
-	batch.parkRead = batch.readParked
+	batch.parkRead = func(fd uintptr) bool {
+		// A concurrent epoll scan can make a zero-timeout probe report no
+		// events even while a close wake is still readable: Linux moves the
+		// ready list aside while it scans, so the two internal lists can be
+		// empty for a moment. After consuming the runtime notification, do
+		// not park again on a closed poller; restoring the inner ready list
+		// need not emit another outer edge.
+		return batch.readParked(fd) || poller.closed.Load()
+	}
 }
 
 // Wake interrupts Wait. The eventfd counter is coalesced by the event loop, so
