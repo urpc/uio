@@ -1680,7 +1680,14 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 	}
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
-	addr := <-started
+	var addr string
+	select {
+	case addr = <-started:
+	case err := <-serveDone:
+		t.Fatalf("Serve did not start: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not start")
+	}
 	client, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
