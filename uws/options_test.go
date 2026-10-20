@@ -18,6 +18,7 @@ package uws
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -107,5 +108,43 @@ func TestTrafficObserverReceivesBothDirections(t *testing.T) {
 	}
 	if pending := conn.writes.close.pendingBytes.Load(); pending != 0 {
 		t.Fatalf("pending = %d", pending)
+	}
+}
+
+// The watermarks keep their documented meaning through resolution: a negative
+// high watermark disables the read pause, and only zero selects the 64 KiB
+// default. The resolved values reach the transport and every connection
+// configuration unchanged.
+func TestOutboundWatermarkResolution(t *testing.T) {
+	disabled, err := Options{OutboundHighWatermark: -1}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if disabled.OutboundHighWatermark != 0 || disabled.OutboundLowWatermark != 0 {
+		t.Fatalf("negative high watermark resolved to %d/%d, want 0/0 (pause disabled)",
+			disabled.OutboundHighWatermark, disabled.OutboundLowWatermark)
+	}
+	if got := disabled.transportEvents().MaxInboundBuffered; got != 0 {
+		t.Fatalf("transport inbound bound = %d, want 0 (pause disabled)", got)
+	}
+	if cfg := newServerConnConfig(disabled, nil, nil, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
+		t.Fatalf("server connection high watermark = %d, want 0", cfg.outboundHigh)
+	}
+	if cfg := newDialerConnConfig(disabled, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
+		t.Fatalf("dialer connection high watermark = %d, want 0", cfg.outboundHigh)
+	}
+
+	fallback, err := Options{}.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fallback.OutboundHighWatermark != DefaultOutboundHighWatermark ||
+		fallback.OutboundLowWatermark != DefaultOutboundHighWatermark/4 {
+		t.Fatalf("zero high watermark resolved to %d/%d, want the %d/%d default",
+			fallback.OutboundHighWatermark, fallback.OutboundLowWatermark,
+			DefaultOutboundHighWatermark, DefaultOutboundHighWatermark/4)
+	}
+	if got := fallback.transportEvents().MaxInboundBuffered; got != DefaultOutboundHighWatermark {
+		t.Fatalf("transport inbound bound = %d, want the %d default", got, DefaultOutboundHighWatermark)
 	}
 }
