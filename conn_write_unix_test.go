@@ -400,6 +400,111 @@ func TestPartialReplySendKeepsLaterWritesBehind(t *testing.T) {
 	}
 }
 
+// writeFromOtherGoroutine writes data to conn from a goroutine of its own and
+// waits for the write to return, so it is queued before the caller goes on.
+func writeFromOtherGoroutine(t *testing.T, conn Conn, data []byte) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := conn.Write(data)
+		done <- err
+	}()
+	if err := <-done; err != nil {
+		t.Error(err)
+	}
+}
+
+// Bytes a round reserves are part of outbound when ReserveOutbound returns, so
+// a write another goroutine makes afterwards follows them on the wire, as does
+// everything the round writes or reserves after that write.
+func TestReservedRepliesPrecedeLaterWrites(t *testing.T) {
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(conn.InboundBuffered())
+		reserve := func(tag byte) error {
+			dst, err := conn.ReserveOutbound(1)
+			if err != nil {
+				return err
+			}
+			dst[0] = tag
+			return nil
+		}
+		if err := reserve('a'); err != nil {
+			return err
+		}
+		writeFromOtherGoroutine(t, conn, []byte{'B'})
+		// The round's own write hands its reply space over mid-round.
+		if _, err := conn.Write([]byte{'c'}); err != nil {
+			return err
+		}
+		if err := reserve('d'); err != nil {
+			return err
+		}
+		writeFromOtherGoroutine(t, conn, []byte{'E'})
+		return reserve('f')
+	}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testConn, registered := startTestConnectionOn(t, events, fds)
+	if err = <-registered; err != nil {
+		t.Fatal(err)
+	}
+	if err = writePeerAll(testConn.peer, []byte{1}, time.Now().Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPeerUntil(t, testConn.peer, 6, 5*time.Second); string(got) != "aBcdEf" {
+		t.Fatalf("wire order %q, want %q", got, "aBcdEf")
+	}
+}
+
+// With output already queued when the round reserves, the reservation goes
+// behind it, and a later write from another goroutine still follows the
+// reservation.
+func TestReservedRepliesBehindQueuedOutput(t *testing.T) {
+	const backlog = 256 << 10
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(conn.InboundBuffered())
+		// The peer reads nothing yet, so most of this stays queued.
+		writeFromOtherGoroutine(t, conn, bytes.Repeat([]byte{'Q'}, backlog))
+		dst, err := conn.ReserveOutbound(1)
+		if errors.Is(err, ErrReserveUnsupported) {
+			// A write turn holds the claim; the round writes instead.
+			_, err = conn.Write([]byte{'r'})
+		} else if err == nil {
+			dst[0] = 'r'
+		}
+		if err != nil {
+			return err
+		}
+		writeFromOtherGoroutine(t, conn, []byte{'W'})
+		return nil
+	}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = unix.SetsockoptInt(fds[0], unix.SOL_SOCKET, unix.SO_SNDBUF, 4<<10); err != nil {
+		t.Fatal(err)
+	}
+	testConn, registered := startTestConnectionOn(t, events, fds)
+	if err = <-registered; err != nil {
+		t.Fatal(err)
+	}
+	if err = writePeerAll(testConn.peer, []byte{1}, time.Now().Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	got := readPeerUntil(t, testConn.peer, backlog+2, 10*time.Second)
+	if i := bytes.IndexFunc(got[:backlog], func(r rune) bool { return r != 'Q' }); i >= 0 {
+		t.Fatalf("queued output interrupted at byte %d by %q", i, got[i])
+	}
+	if tail := string(got[backlog:]); tail != "rW" {
+		t.Fatalf("after the queued output: %q, want %q", tail, "rW")
+	}
+}
+
 // fillTestRecord fills record with tag, seq and a trailer that ties them, so a
 // record cut by other bytes fails validTestRecord.
 func fillTestRecord(record []byte, tag byte, seq uint32) {

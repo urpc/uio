@@ -174,16 +174,22 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	}
 	if holder := conn.scratch; holder != nil {
 		out := holder.out
-		if out == nil {
-			out = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
-			holder.out = out
+		// A reply space starts only when this reservation is all that is
+		// queued or in flight, so whatever other goroutines queue while it is
+		// in use came after its bytes; see handOverScratch. Otherwise the
+		// reservation joins the end of outbound, behind what is there.
+		if out != nil && out.Len() > 0 || conn.pending.Load() == int64(n) {
+			if out == nil {
+				out = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
+				holder.out = out
+			}
+			if out.Available() >= n {
+				buffer := out.AvailableBuffer()[:n:n]
+				out.CommitWrite(n)
+				return buffer, nil
+			}
+			conn.handOverScratch()
 		}
-		if out.Available() >= n {
-			buffer := out.AvailableBuffer()[:n:n]
-			out.CommitWrite(n)
-			return buffer, nil
-		}
-		conn.handOverScratch()
 	}
 	conn.submitMu.Lock()
 	buffer := conn.outbound.Reserve(n, conn.coalesceBlockSize())
@@ -192,9 +198,13 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 }
 
 // handOverScratch moves the reply space of the running read round, with the
-// reservations made in it, to the end of outbound, so whatever the turn
-// queues or sends next goes out behind them. The space moves rather than its
-// bytes: a caller may still be filling a reservation in it.
+// reservations made in it, to the head of outbound, so whatever the turn
+// queues or sends next goes out behind them. The space started with nothing
+// queued or in flight (see ReserveOutbound), and the turn has held the write
+// claim since, so nothing was sent meanwhile: outbound holds only whole writes
+// other goroutines queued after the space's reservations, which follow them.
+// The space moves rather than its bytes: a caller may still be filling a
+// reservation in it.
 func (conn *fdConn) handOverScratch() {
 	if conn.scratch != nil {
 		conn.handOverScratchSpace()
@@ -206,30 +216,23 @@ func (conn *fdConn) handOverScratchSpace() {
 	if holder.out == nil || holder.out.Len() == 0 {
 		return
 	}
-	conn.submitMu.Lock()
-	conn.outbound.AppendOwned(holder.out)
-	conn.submitMu.Unlock()
+	conn.queueDirectSuffix(holder.out)
 	holder.out = nil
 }
 
 // sendScratch sends the replies a read round reserved once it has ended,
-// straight from its reply space when nothing is queued ahead of them. What
-// the socket does not take, or everything when output is queued, the
-// connection is closing or the socket is full, is handed to outbound for the
-// turn's flush or the next writable edge. The turn holds the write claim,
-// which every reservation takes, so nothing else is sent meanwhile: an unsent
-// rest goes to the head of outbound, ahead of whatever other goroutines queued
-// during the send.
+// straight from its reply space when nothing else is queued. What the socket
+// does not take, or everything when other output is queued, the connection is
+// closing or the socket is full, goes to the head of outbound for the turn's
+// flush or the next writable edge: the turn holds the write claim, which
+// every reservation takes, so whatever other goroutines queued since the
+// space started follows it (see handOverScratch).
 func (conn *fdConn) sendScratch(holder *readBuffer) error {
 	out := holder.out
 	// pending counts every accepted byte, the reply space's included, so
-	// when it holds no more than that space nothing is queued or in flight
-	// ahead of it. A producer that reserves after this check is concurrent
-	// with the round, and its bytes follow.
+	// when it holds no more than that space nothing else is queued.
 	if conn.pending.Load() != int64(out.Len()) || conn.writeBlocked() || conn.isClosing() {
-		conn.submitMu.Lock()
-		conn.outbound.AppendOwned(out)
-		conn.submitMu.Unlock()
+		conn.queueDirectSuffix(out)
 		holder.out = nil
 		return nil
 	}
@@ -629,10 +632,11 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	return size, nil
 }
 
-// queueDirectSuffix queues what a direct send left unsent at the head of
-// outbound. The sender holds the write claim and started with nothing queued
-// or in flight, so bytes in outbound now came from producers that wrote during
-// the send; behind them, they would land inside this payload on the wire.
+// queueDirectSuffix queues owned at the head of outbound: what a direct send
+// left unsent, or a read round's reply space. Its holder has held the write
+// claim since it started with nothing queued or in flight, so bytes in
+// outbound now came from producers that wrote after it; behind them, they
+// would land inside a half-sent payload or ahead of replies accepted first.
 func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
 	conn.submitMu.Lock()
 	conn.outbound.PrependOwned(owned)
