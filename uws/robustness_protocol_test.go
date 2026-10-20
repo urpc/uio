@@ -50,7 +50,8 @@ func (robustEchoHandler) OnClose(*Conn, CloseEvent) {}
 func startRobustServer(t *testing.T, opts Options, handler Handler) string {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(opts, handler)
+		opts.Handler = handler
+		return NewServer(opts)
 	})
 	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 	return addr

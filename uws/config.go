@@ -78,7 +78,7 @@ type connConfig struct {
 
 // newServerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Server's connections share.
-func newServerConnConfig(opts Options, handler Handler, checkOrigin func(*http.Request) bool, connections *sync.Map, stats *statsCounters) *connConfig {
+func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, connections *sync.Map, stats *statsCounters) *connConfig {
 	config := &connConfig{
 		parser: frame.ParserConfig{
 			ExpectMask: true, AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
@@ -97,8 +97,8 @@ func newServerConnConfig(opts Options, handler Handler, checkOrigin func(*http.R
 		compressionContextTakeover: opts.KeepCompressionContext,
 		subprotocols:               opts.Subprotocols,
 		checkOrigin:                checkOrigin,
-		handler:                    handler,
-		observeTraffic:             implementsTrafficObserver(handler),
+		handler:                    opts.Handler,
+		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
 		outboundHigh:               opts.OutboundHighWatermark,
@@ -173,6 +173,8 @@ func newDialerConnConfig(opts Options, connections *sync.Map, stats *statsCounte
 		compressionLevel:           compressionLevel(opts),
 		compressionContextTakeover: opts.KeepCompressionContext,
 		subprotocols:               opts.Subprotocols,
+		handler:                    opts.Handler,
+		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
 		outboundHigh:               opts.OutboundHighWatermark,

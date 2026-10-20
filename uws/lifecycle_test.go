@@ -109,17 +109,29 @@ func (h *blockingCloseConnectionHandler) OnClose(conn *Conn, _ CloseEvent) {
 	<-h.release
 }
 
+// clientUserdataHandler forwards every callback to the dial's userdata, the
+// per-connection clientHandler a handler shared by a whole Dialer cannot be.
+type clientUserdataHandler struct{}
+
+func (clientUserdataHandler) OnOpen(c *Conn) { c.Userdata().(*clientHandler).OnOpen(c) }
+func (clientUserdataHandler) OnMessage(c *Conn, m Message) {
+	c.Userdata().(*clientHandler).OnMessage(c, m)
+}
+func (clientUserdataHandler) OnClose(c *Conn, e CloseEvent) {
+	c.Userdata().(*clientHandler).OnClose(c, e)
+}
+
 func TestUIOExecutorWritesFlushAutomatically(t *testing.T) {
 	_, addr, _ := startConfiguredLifecycleTestServer(t, lifecycleEchoHandler{}, func(server *Server) {
 		server.Options.Executor = goroutineExecutor{}
 	})
-	dialer := NewDialer(Options{})
 	handler := &clientHandler{
 		open:    make(chan struct{}),
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", handler)
+	dialer := NewDialer(Options{Handler: handler})
+	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +160,7 @@ func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
 	handler := &slowConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
 	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
 	})
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	newClient := func() (*Conn, *clientHandler) {
 		clientHandler := &clientHandler{
@@ -206,7 +218,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 	handler := &blockingCloseConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
 	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
 	})
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	newClient := func() (*Conn, *clientHandler) {
 		clientHandler := &clientHandler{
@@ -275,7 +287,7 @@ func startLifecycleTestServer(t *testing.T, handler Handler) (*Server, string, <
 func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure func(*Server)) (*Server, string, <-chan struct{}) {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.Options.Pollers = 1
 		s.Options.ReadBufferSize = 4 << 10
 		if configure != nil {
@@ -298,13 +310,13 @@ func startConfiguredLifecycleTestServer(t *testing.T, handler Handler, configure
 
 func TestDialerCloseIsReentrantFromOnClose(t *testing.T) {
 	_, addr, _ := startLifecycleTestServer(t, nil)
-	dialer := NewDialer(Options{})
 	handler := &reentrantCloseHandler{
 		open:   make(chan struct{}),
 		closed: make(chan struct{}),
 	}
+	dialer := NewDialer(Options{Handler: handler})
 	handler.setCloseFunc(func() { _ = dialer.Close(nil) })
-	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", handler); err != nil {
+	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
@@ -345,7 +357,7 @@ func TestServerCloseIsReentrantFromOnClose(t *testing.T) {
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
 	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 		t.Fatal(err)
 	}
@@ -381,7 +393,7 @@ func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
 		server.Options.Executor = executor
 	})
 	handler.setCloseFunc(func() { _ = server.Close(nil) })
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
 	clientHandler := &clientHandler{
 		open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
 	}
@@ -420,7 +432,7 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	server, addr, serveDone := startLifecycleTestServer(t, handler)
 	handler.setCloseFunc(func() error { return server.Close(errors.New("close from server callback")) })
 
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
 	clientHandler := &clientHandler{
 		open:    make(chan struct{}),
 		closed:  make(chan struct{}),
@@ -466,14 +478,14 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 
 func TestDialerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	_, addr, _ := startLifecycleTestServer(t, lifecycleEchoHandler{})
-	dialer := NewDialer(Options{})
 	handler := &closeFromMessageHandler{
 		open:        make(chan struct{}),
 		closed:      make(chan struct{}),
 		closeResult: make(chan error, 1),
 	}
+	dialer := NewDialer(Options{Handler: handler})
 	handler.setCloseFunc(func() error { return dialer.Close(errors.New("close from dialer callback")) })
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", handler)
+	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

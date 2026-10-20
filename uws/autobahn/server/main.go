@@ -45,10 +45,11 @@ func (echoHandler) OnClose(*uws.Conn, uws.CloseEvent) {}
 
 func main() {
 	server := uws.NewServer(uws.Options{
+		Handler:           echoHandler{},
 		Pollers:           4,
 		ReadBufferSize:    4 << 10,
 		EnableCompression: true,
-	}, echoHandler{})
+	})
 	if err := server.Serve(":19701"); err != nil {
 		log.Fatal(err)
 	}

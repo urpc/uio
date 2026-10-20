@@ -101,7 +101,7 @@ func (o *trafficObserver) OnOutbound(_ *Conn, n int) { o.outbound += n }
 // traffic; the internal accounting still runs first.
 func TestTrafficObserverReceivesBothDirections(t *testing.T) {
 	observer := &trafficObserver{}
-	server := NewServer(Options{OutboundHighWatermark: -1}, observer)
+	server := NewServer(Options{Handler: observer, OutboundHighWatermark: -1})
 	raw := newScriptedConn()
 	conn := &Conn{raw: raw, handler: observer, config: testServerConfig(server)}
 	raw.userdata = conn
@@ -132,7 +132,7 @@ func TestOutboundWatermarkResolution(t *testing.T) {
 	if got := disabled.transportEvents().MaxInboundBuffered; got != 0 {
 		t.Fatalf("transport inbound bound = %d, want 0 (pause disabled)", got)
 	}
-	if cfg := newServerConnConfig(disabled, nil, nil, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
+	if cfg := newServerConnConfig(disabled, nil, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
 		t.Fatalf("server connection high watermark = %d, want 0", cfg.outboundHigh)
 	}
 	if cfg := newDialerConnConfig(disabled, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
@@ -157,7 +157,7 @@ func TestOutboundWatermarkResolution(t *testing.T) {
 func TestServerConnectionsShareFrozenConfig(t *testing.T) {
 	handler := &recordingHandler{}
 	protocols := []string{"v1"}
-	server := &Server{Options: Options{Subprotocols: protocols, MaxHeaderBytes: 101, MaxFramePayload: 102, MaxMessageSize: 103, CloseTimeout: 105 * time.Millisecond, HandshakeTimeout: 106 * time.Millisecond, EnableCompression: true, CompressionLevel: 1, KeepCompressionContext: true}, Handler: handler, CheckOrigin: func(*http.Request) bool { return true }}
+	server := &Server{Options: Options{Handler: handler, Subprotocols: protocols, MaxHeaderBytes: 101, MaxFramePayload: 102, MaxMessageSize: 103, CloseTimeout: 105 * time.Millisecond, HandshakeTimeout: 106 * time.Millisecond, EnableCompression: true, CompressionLevel: 1, KeepCompressionContext: true}, CheckOrigin: func(*http.Request) bool { return true }}
 	server.config = testServerConfig(server)
 
 	protocols[0] = "mutated"

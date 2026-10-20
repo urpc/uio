@@ -30,7 +30,7 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 		echoHandler: baseHandler,
 		request:     make(chan *http.Request, 1),
 	}
-	server := NewServer(Options{}, serverHandler)
+	server := NewServer(Options{Handler: serverHandler})
 	server.Options.Pollers = 1
 	server.Subprotocols = []string{"chat"}
 	server.EnableCompression = true
@@ -42,11 +42,11 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientHandler})
 	dialer.Options.Pollers = 1
 	dialer.Subprotocols = []string{"chat"}
 	dialer.EnableCompression = true
-	client, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), clientHandler)
+	client, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +116,7 @@ func (h *httpEchoHandler) OnOpen(conn *Conn) {
 
 func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
 	opened := make(chan struct{}, 1)
-	server := NewServer(Options{}, handlerFuncs{onOpen: func(*Conn) { opened <- struct{}{} }})
+	server := NewServer(Options{Handler: handlerFuncs{onOpen: func(*Conn) { opened <- struct{}{} }}})
 	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	httpServer := httptest.NewServer(server)
@@ -164,7 +164,7 @@ func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
 }
 
 func TestServerHTTPRequiresServe(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.Pollers = 1
 	request := newHTTPUpgradeRequest()
 	recorder := httptest.NewRecorder()
@@ -176,7 +176,7 @@ func TestServerHTTPRequiresServe(t *testing.T) {
 }
 
 func TestServerHTTPRequiresHijacker(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	request := newHTTPUpgradeRequest()
@@ -186,7 +186,7 @@ func TestServerHTTPRequiresHijacker(t *testing.T) {
 }
 
 func TestServerHTTPAfterCloseDoesNotHijack(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	if err := server.Close(nil); err != nil {
@@ -309,7 +309,7 @@ func (h *nativeRequestHandler) OnClose(*Conn, CloseEvent) {}
 func startNativeTestServer(t *testing.T, handler Handler, configure func(*Server)) string {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		if configure != nil {
 			configure(s)
 		}

@@ -35,7 +35,7 @@ import (
 // newBackpressureConn pairs a probe transport with a server connection whose
 // watermarks are small enough to cross by hand.
 func newBackpressureConn(high, low int) (*limitedWire, *Conn, *Server) {
-	server := NewServer(Options{OutboundHighWatermark: high, OutboundLowWatermark: low}, &batchEchoHandler{})
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: high, OutboundLowWatermark: low})
 	raw := &limitedWire{}
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -198,7 +198,7 @@ func (w *drainingWire) OutboundBuffered() int {
 // the pause must not leave the connection paused with nothing left to wake
 // it: the round sees the drained queue and keeps reading.
 func TestPauseRacingADrainDoesNotStrandReads(t *testing.T) {
-	server := NewServer(Options{OutboundHighWatermark: 64, OutboundLowWatermark: 16}, &batchEchoHandler{})
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64, OutboundLowWatermark: 16})
 	inner := &limitedWire{}
 	raw := &drainingWire{limitedWire: inner, high: 64}
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
@@ -225,7 +225,7 @@ func TestPauseRacingADrainDoesNotStrandReads(t *testing.T) {
 func TestMaxOutboundBufferedBoundsBackgroundSends(t *testing.T) {
 	const limit = 64 << 10
 	raw := &limitedWire{limit: limit}
-	server := NewServer(Options{MaxOutboundBuffered: limit}, &batchEchoHandler{})
+	server := NewServer(Options{Handler: &batchEchoHandler{}, MaxOutboundBuffered: limit})
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	payload := make([]byte, 8<<10)
@@ -342,12 +342,12 @@ func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
 		high        = 32 << 10
 	)
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(Options{
+		return NewServer(Options{Handler: echoAllHandler{},
 			Pollers:               1,
 			ReadBufferSize:        4 << 10,
 			OutboundHighWatermark: high,
 			OutboundLowWatermark:  high / 4,
-		}, echoAllHandler{})
+		})
 	})
 	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 
@@ -520,7 +520,7 @@ func maskedFrames(payloads ...string) []byte {
 }
 
 func newBatchConn(raw uio.Conn, handler Handler) *Conn {
-	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(NewServer(Options{OutboundHighWatermark: -1}, nil))}
+	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(NewServer(Options{OutboundHighWatermark: -1}))}
 	conn.opened.Store(true)
 	return conn
 }
@@ -597,7 +597,7 @@ func TestBatchKeepsOrderWithOtherSenders(t *testing.T) {
 
 func TestBatchRespectsOutboundLimit(t *testing.T) {
 	raw := &batchProbeConn{outbound: 40}
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = 64
 	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
@@ -637,7 +637,7 @@ func (c *failingBatchConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 
 func TestFailedBatchHandoffAbortsTransport(t *testing.T) {
 	raw := &failingBatchConn{err: errors.New("transport broke")}
-	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}, nil))}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}))}
 	conn.opened.Store(true)
 	raw.inbound = maskedFrames("a", "b")
 	if err := conn.readAvailable(); err != nil {
@@ -656,7 +656,7 @@ func TestFailedBatchHandoffAbortsTransport(t *testing.T) {
 
 func TestClosedTransportBatchHandoffDoesNotAbortAgain(t *testing.T) {
 	raw := &failingBatchConn{err: net.ErrClosed}
-	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}, nil))}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(NewServer(Options{}))}
 	conn.opened.Store(true)
 	raw.inbound = maskedFrames("a", "b")
 	if err := conn.readAvailable(); err != nil {
@@ -795,7 +795,7 @@ func TestRefusedBatchHandoffAbortsInsteadOfDroppingFrames(t *testing.T) {
 func TestBatchUnderOutboundLimitIsNeverRefused(t *testing.T) {
 	raw := &limitedWire{limit: 500}
 	handler := &batchEchoHandler{}
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = raw.limit
 	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	conn := &Conn{raw: raw, handler: handler, config: testServerConfig(server)}

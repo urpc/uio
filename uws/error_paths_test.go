@@ -396,7 +396,7 @@ func TestControlAndMessageValidationErrors(t *testing.T) {
 
 func TestServerDisableUTF8CheckAllowsIncomingText(t *testing.T) {
 	handler := &recordingHandler{}
-	server := NewServer(Options{}, handler)
+	server := NewServer(Options{Handler: handler})
 	server.DisableUTF8Check = true
 	raw := newScriptedConn()
 	server.onOpen(raw)
@@ -487,7 +487,7 @@ func TestReadAvailableHandshakeAndParserErrors(t *testing.T) {
 	badHandshake := &bufferedProbeConn{inbound: []byte("not HTTP\r\n\r\n")}
 	serverConn := &Conn{
 		raw:    badHandshake,
-		config: testServerConfig(NewServer(Options{}, nil)),
+		config: testServerConfig(NewServer(Options{})),
 	}
 	if err := serverConn.readAvailable(); err == nil {
 		t.Fatal("malformed handshake was accepted")

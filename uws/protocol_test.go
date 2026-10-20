@@ -23,7 +23,7 @@ func TestFrameParserIsRetainedOnlyAcrossIncompleteInput(t *testing.T) {
 	newConn := func(handler Handler) *Conn {
 		conn := &Conn{
 			raw:     &writeProbeConn{},
-			config:  testServerConfig(NewServer(Options{}, nil)),
+			config:  testServerConfig(NewServer(Options{})),
 			handler: handler,
 		}
 		conn.opened.Store(true)
@@ -71,7 +71,7 @@ func TestAssemblerIsRetainedOnlyForFragmentedMessages(t *testing.T) {
 	handler := &assemblerStateHandler{}
 	conn := &Conn{
 		raw:     &writeProbeConn{},
-		config:  testServerConfig(NewServer(Options{}, nil)),
+		config:  testServerConfig(NewServer(Options{})),
 		handler: handler,
 	}
 	conn.opened.Store(true)
@@ -127,7 +127,7 @@ func TestAssemblerIsReleasedAfterErrorAndTransportClose(t *testing.T) {
 		t.Fatal("message callback error retained assembler state")
 	}
 
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	transport := newScriptedConn()
 	conn = &Conn{raw: transport, config: testServerConfig(server)}
 	conn.opened.Store(true)
@@ -142,7 +142,7 @@ func TestAssemblerIsReleasedAfterErrorAndTransportClose(t *testing.T) {
 }
 
 func TestReleaseParserDropsIncompleteState(t *testing.T) {
-	conn := &Conn{config: testServerConfig(NewServer(Options{}, nil))}
+	conn := &Conn{config: testServerConfig(NewServer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{
 		Fin: true, Opcode: frame.Binary, Masked: true, Payload: []byte("payload"),
 	}, [4]byte{1, 2, 3, 4})
@@ -177,7 +177,7 @@ func TestIncrementalParserReturnsToPoolAfterCallbackError(t *testing.T) {
 }
 
 func TestIncrementalParserReturnsToPoolAfterProtocolError(t *testing.T) {
-	conn := &Conn{config: testServerConfig(NewServer(Options{}, nil))}
+	conn := &Conn{config: testServerConfig(NewServer(Options{}))}
 	if _, err := conn.feedFrames([]byte{0x82}, func(frame.Frame) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
@@ -199,7 +199,7 @@ func TestReadAvailableParsesFrameAcrossInboundSegments(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
-		config:  testServerConfig(NewServer(Options{}, nil)),
+		config:  testServerConfig(NewServer(Options{})),
 	}
 	conn.opened.Store(true)
 
@@ -225,7 +225,7 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
 	raw := newSegmentedProbeConn(request[:1], request[1:17], request[17:])
 	handler := &recordingHandler{}
-	server := NewServer(Options{}, handler)
+	server := NewServer(Options{Handler: handler})
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
@@ -267,7 +267,7 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 }
 
 func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
-	config := testServerConfig(NewServer(Options{}, nil))
+	config := testServerConfig(NewServer(Options{}))
 	var wire []byte
 	for i := 0; i < config.maxFramesPerDataEvent+1; i++ {
 		wire = frame.Append(wire, frame.Frame{
@@ -286,7 +286,7 @@ func TestReadBudgetDoesNotReplayIncrementalFrame(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: handler,
-		config:  testServerConfig(NewServer(Options{}, nil)),
+		config:  testServerConfig(NewServer(Options{})),
 	}
 	conn.opened.Store(true)
 	if err := conn.readAvailable(); err != nil {
@@ -330,7 +330,7 @@ func TestReadBudgetWakeFailureIsReturned(t *testing.T) {
 	conn := &Conn{
 		raw:     raw,
 		handler: &recordingHandler{},
-		config:  testServerConfig(NewServer(Options{}, nil)),
+		config:  testServerConfig(NewServer(Options{})),
 	}
 	conn.opened.Store(true)
 
@@ -362,7 +362,7 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 		messages: make(chan Message, primaryFrames+1),
 	}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.Options.Pollers = 1
 		s.Options.ReadBufferSize = 4 << 10
 		return s
@@ -471,7 +471,7 @@ func TestReadBudgetSchedulesBufferedFramesAndDoesNotStarvePeer(t *testing.T) {
 func TestServerHandshakeAndMaskedMessage(t *testing.T) {
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.Options.Pollers = 1
 		s.Options.ReadBufferSize = 4 << 10
 		return s
@@ -623,7 +623,7 @@ func TestCloseTimeoutTerminatesUnresponsivePeer(t *testing.T) {
 
 func TestCloseDoesNotRecreateTimerAfterTransportClose(t *testing.T) {
 	raw := newScriptedConn()
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
 	raw.userdata = conn
@@ -718,7 +718,7 @@ func TestClientHandshakeAcceptsSplitResponse(t *testing.T) {
 func TestServerPerMessageDeflate(t *testing.T) {
 	handler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.EnableCompression = true
 		s.Options.Pollers = 1
 		s.Options.ReadBufferSize = 4 << 10
@@ -941,7 +941,7 @@ func TestHandshakeCopiesOnlyARequestSplitAcrossReads(t *testing.T) {
 		"Sec-WebSocket-Key: " + testKey + "\r\n\r\n")
 	newConn := func() (*Conn, *handshakeState) {
 		handler := &recordingHandler{}
-		conn := &Conn{raw: newSegmentedProbeConn(), handler: handler, config: testServerConfig(NewServer(Options{}, handler))}
+		conn := &Conn{raw: newSegmentedProbeConn(), handler: handler, config: testServerConfig(NewServer(Options{Handler: handler}))}
 		state := &handshakeState{}
 		conn.handshake.Store(state)
 		return conn, state
@@ -992,7 +992,7 @@ func TestOnDataPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
 			if tc.client {
 				conn.config = testDialerConfig(NewDialer(Options{}))
 			} else {
-				conn.config = testServerConfig(NewServer(Options{}, nil))
+				conn.config = testServerConfig(NewServer(Options{}))
 			}
 			conn.opened.Store(true)
 			seen := 0
@@ -1141,7 +1141,7 @@ var textPaths = []string{"frame", "split", "fragments", "compressed"}
 func deliverText(t testing.TB, payload []byte, path string) ([]Message, bool) {
 	t.Helper()
 	var got []Message
-	server := NewServer(Options{}, messageLog{&got})
+	server := NewServer(Options{Handler: messageLog{&got}})
 	server.config = testServerConfig(server)
 	raw := &echoPathConn{}
 	conn := server.newConnection(raw)

@@ -71,7 +71,7 @@ func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 // reports handshake success or Handler.OnClose reports a handshake failure.
 // The returned error covers setup, network dial, and upgrade-request write or
 // flush failures. A handshake response failure is reported through OnClose.
-func (d *Dialer) Dial(ctx context.Context, addr string, handler Handler) (*Conn, error) {
+func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -105,10 +105,10 @@ func (d *Dialer) Dial(ctx context.Context, addr string, handler Handler) (*Conn,
 		return nil, err
 	}
 	setup := &dialSetup{
-		Context: attemptCtx,
-		cleanup: cleanupAttempt,
-		handler: handler,
-		key:     key,
+		Context:  attemptCtx,
+		cleanup:  cleanupAttempt,
+		userdata: userdata,
+		key:      key,
 	}
 	setup.conn = d.newClientConn(nil, setup)
 	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup)
@@ -322,9 +322,10 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		config = newDialerConnConfig(opts, &d.connections, &d.stats)
 	}
 	conn := &Conn{
-		raw:     raw,
-		config:  config,
-		handler: setup.handler,
+		raw:      raw,
+		config:   config,
+		handler:  config.handler,
+		userData: setup.userdata,
 	}
 	if config.heartbeatConnections != nil {
 		conn.heartbeat = &heartbeatState{}
@@ -423,7 +424,7 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 type dialSetup struct {
 	context.Context
 	cleanup    func()
-	handler    Handler
+	userdata   any
 	key        string
 	conn       *Conn
 	attachOnce sync.Once

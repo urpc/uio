@@ -176,7 +176,7 @@ func TestBatchCannotInterruptFragmentedMessage(t *testing.T) {
 	}
 	c := newLimitedConn(&raw.limitedWire, time.Hour)
 	c.raw = raw
-	c.config = testServerConfig(NewServer(Options{MaxOutboundBuffered: 1 << 20, OutboundHighWatermark: -1, MaxFramePayload: 8, WriteCoalesce: 10}, nil))
+	c.config = testServerConfig(NewServer(Options{MaxOutboundBuffered: 1 << 20, OutboundHighWatermark: -1, MaxFramePayload: 8, WriteCoalesce: 10}))
 	entered, resume := make(chan struct{}), make(chan struct{})
 	first := true
 	handlerErr := make(chan error, 1)
@@ -237,7 +237,7 @@ func TestBatchCannotInterruptFragmentedMessage(t *testing.T) {
 func TestFragmentAdmissionRacesBatchMutation(t *testing.T) {
 	raw := &limitedWire{limit: 100 << 20}
 	c := newLimitedConn(raw, time.Hour)
-	c.config = testServerConfig(NewServer(Options{MaxOutboundBuffered: 100 << 20, OutboundHighWatermark: -1, MaxFramePayload: 8}, nil))
+	c.config = testServerConfig(NewServer(Options{MaxOutboundBuffered: 100 << 20, OutboundHighWatermark: -1, MaxFramePayload: 8}))
 	start := make(chan struct{})
 	c.handler = &batchEchoHandler{onMessage: func(c *Conn, _ Message) {
 		<-start
@@ -735,7 +735,7 @@ func (c *limitedWire) Discard(n int) (int, error) {
 }
 
 func newLimitedConn(raw *limitedWire, closeTimeout time.Duration) *Conn {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = raw.limit
 	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	server.CloseTimeout = closeTimeout
@@ -883,7 +883,7 @@ func (c *drainOnRefusalWire) WriteOwned(buffer *uio.Buffer) (int, error) {
 func TestDeferredCloseNoticesRoomFreedDuringRefusal(t *testing.T) {
 	limited := &limitedWire{limit: 64}
 	raw := &drainOnRefusalWire{limitedWire: limited}
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = limited.limit
 	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	server.CloseTimeout = time.Hour

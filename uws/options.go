@@ -38,6 +38,10 @@ var ErrInvalidOptions = errors.New("uws: invalid options")
 // Serve or Dial first starts its transport and never again: changing the
 // Options of a running Server or Dialer has no effect.
 type Options struct {
+	// Handler receives the connection callbacks of every connection the
+	// server or dialer makes. It may be nil, which leaves the protocol
+	// running without application callbacks.
+	Handler Handler
 	// Subprotocols lists supported protocols in server preference order,
 	// offered in the same order by a Dialer.
 	Subprotocols []string

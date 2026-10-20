@@ -63,7 +63,7 @@ func (echo) OnMessage(c *uws.Conn, m uws.Message) {
 }
 
 func main() {
-	server := uws.NewServer(uws.Options{EnableCompression: true}, echo{})
+	server := uws.NewServer(uws.Options{Handler: echo{}, EnableCompression: true})
 	log.Fatal(server.Serve(":8080"))
 }
 ```
@@ -94,7 +94,7 @@ finished.
 address), then mount it like any other handler:
 
 ```go
-server := uws.NewServer(uws.Options{}, echo{})
+server := uws.NewServer(uws.Options{Handler: echo{}})
 go func() { log.Fatal(server.Serve()) }()
 
 http.Handle("/ws", server)
@@ -118,8 +118,8 @@ func (client) OnClose(c *uws.Conn, e uws.CloseEvent) {
 	}
 }
 
-dialer := uws.NewDialer(uws.Options{})
-if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", client{}); err != nil {
+dialer := uws.NewDialer(uws.Options{Handler: client{}})
+if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", nil); err != nil {
 	log.Fatal(err)
 }
 ```
@@ -158,7 +158,7 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
 | `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
-A `Server` adds `Handler` and `CheckOrigin`. The underlying transport is built
+A `Server` adds `CheckOrigin`; the `Handler` lives in `Options`, shared by every connection a server accepts or a dialer dials, with per-dial state passed as `Dial`'s userdata. The underlying transport is built
 from these options and is not otherwise exposed; `Executor` is the scheduling
 escape hatch. Invalid combinations, such as a low watermark not below the high
 one, a high watermark above `MaxOutboundBuffered`, or a compression level

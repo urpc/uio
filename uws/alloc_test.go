@@ -79,7 +79,7 @@ func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
 		Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, 1024),
 	}, [4]byte{1, 2, 3, 4})
 	raw := &bufferedProbeConn{}
-	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}, nil))}
+	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}))}
 	conn.opened.Store(true)
 	read := func() {
 		raw.inbound = wire

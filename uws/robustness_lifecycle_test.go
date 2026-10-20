@@ -210,13 +210,13 @@ func TestRobustClientRejectsMaskedServerFrame(t *testing.T) {
 		}
 	})
 	events := newClientEvents()
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	// The violation can close the transport before Dial returns its flush;
 	// ErrClosed then means the same as a connection returned to close at once.
 	// What the peer observes is asserted below.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil && !errors.Is(err, ErrClosed) {
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil && !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -253,13 +253,13 @@ func TestRobustClientRejectsOversizedMessage(t *testing.T) {
 		}
 	})
 	events := newClientEvents()
-	dialer := NewDialer(Options{MaxMessageSize: 32})
+	dialer := NewDialer(Options{Handler: events, MaxMessageSize: 32})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	// The violation can close the transport before Dial returns its flush;
 	// ErrClosed then means the same as a connection returned to close at once.
 	// What the peer observes is asserted below.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil && !errors.Is(err, ErrClosed) {
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil && !errors.Is(err, ErrClosed) {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -281,10 +281,10 @@ func TestRobustClientAssemblesServerFragments(t *testing.T) {
 		_, _, _ = readClientFrame(br) // hold the connection until the test ends
 	})
 	events := newClientEvents()
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil {
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -326,10 +326,10 @@ func TestRobustClientAnswersServerPing(t *testing.T) {
 		}
 	})
 	events := newClientEvents()
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", events); err != nil {
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -493,7 +493,7 @@ func TestRobustConcurrentPings(t *testing.T) {
 // panic and Serve returns.
 func TestRobustServerCloseWhileClientsStream(t *testing.T) {
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(Options{}, robustEchoHandler{})
+		return NewServer(Options{Handler: robustEchoHandler{}})
 	})
 
 	const clients = 8
@@ -586,6 +586,18 @@ type echoClientHandler struct {
 	errs   chan error
 }
 
+// dialUserdataHandler forwards every callback to the dial's userdata, which
+// carries the per-connection state a handler shared by a whole Dialer cannot.
+type dialUserdataHandler struct{}
+
+func (dialUserdataHandler) OnOpen(c *Conn) { c.Userdata().(*echoClientHandler).OnOpen(c) }
+func (dialUserdataHandler) OnMessage(c *Conn, m Message) {
+	c.Userdata().(*echoClientHandler).OnMessage(c, m)
+}
+func (dialUserdataHandler) OnClose(c *Conn, e CloseEvent) {
+	c.Userdata().(*echoClientHandler).OnClose(c, e)
+}
+
 func newEchoClientHandler() *echoClientHandler {
 	return &echoClientHandler{
 		opened: make(chan struct{}),
@@ -625,7 +637,7 @@ func TestRobustConcurrentDials(t *testing.T) {
 	warm, _ := robustDial(t, addr)
 	_ = warm.Close()
 	const clients, each = 24, 50
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: dialUserdataHandler{}})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 
 	var wg sync.WaitGroup
@@ -776,7 +788,7 @@ func TestRobustSendsAndPingsRacingClose(t *testing.T) {
 // or a clean ErrBackpressure, never a broken stream or a stall.
 func TestRobustConcurrentBackpressure(t *testing.T) {
 	raw := &limitedWire{limit: 4 << 10}
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = raw.limit
 	server.Options.OutboundHighWatermark = -1
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
@@ -818,10 +830,10 @@ func TestRobustConcurrentBackpressure(t *testing.T) {
 // connections end, nothing panics, and the dialer shuts down.
 func TestRobustDialStormDuringServerClose(t *testing.T) {
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(Options{}, robustEchoHandler{})
+		return NewServer(Options{Handler: robustEchoHandler{}})
 	})
 
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: dialUserdataHandler{}})
 	const dials = 16
 	var wg sync.WaitGroup
 	for i := 0; i < dials; i++ {
@@ -860,7 +872,7 @@ func TestRobustDialStormDuringServerClose(t *testing.T) {
 // and no ping or message is lost or duplicated.
 func TestRobustHeartbeatUnderLoad(t *testing.T) {
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(Options{HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond}, robustEchoHandler{})
+		return NewServer(Options{Handler: robustEchoHandler{}, HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond})
 	})
 	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 

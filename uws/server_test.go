@@ -71,7 +71,7 @@ func TestResolveWriteCoalesce(t *testing.T) {
 }
 
 func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.Pollers = 1
 	server.startHook = func() { _ = server.Close(nil) }
 	if err := server.Serve("127.0.0.1:0", "127.0.0.1:0"); err != nil {
@@ -95,7 +95,7 @@ func TestHeartbeatCanBeRestarted(t *testing.T) {
 }
 
 func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 5 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -138,7 +138,7 @@ func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
 }
 
 func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -169,7 +169,7 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 }
 
 func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
 	raw := newScriptedConn()
@@ -211,7 +211,7 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 }
 
 func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	raw := newScriptedConn()
 	raw.writeErr = uio.ErrOutboundOverflow
@@ -242,7 +242,7 @@ func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
 }
 
 func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	failure := errors.New("heartbeat write failed")
 	raw := newScriptedConn()
 	raw.writeErr = failure
@@ -259,7 +259,7 @@ func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
 }
 
 func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 20 * time.Millisecond
 	server.CloseTimeout = 5 * time.Millisecond
@@ -330,7 +330,7 @@ func TestHeartbeatSendPaths(t *testing.T) {
 	raw := newScriptedConn()
 	conn := &Conn{
 		raw:       raw,
-		config:    testServerConfig(NewServer(Options{}, nil)),
+		config:    testServerConfig(NewServer(Options{})),
 		heartbeat: &heartbeatState{},
 	}
 	conn.opened.Store(true)
@@ -344,7 +344,7 @@ func TestHeartbeatSendPaths(t *testing.T) {
 	writeErr := errors.New("heartbeat close write failed")
 	failedRaw := newScriptedConn()
 	failedRaw.writeErr = writeErr
-	failed := &Conn{raw: failedRaw, config: testServerConfig(NewServer(Options{}, nil))}
+	failed := &Conn{raw: failedRaw, config: testServerConfig(NewServer(Options{}))}
 	failed.opened.Store(true)
 	failed.sendHeartbeatClose(1001, "timeout")
 	if !failed.closing.Load() || failedRaw.closes != 1 {
@@ -400,7 +400,7 @@ func TestServerCloseStopsHeartbeatBeforeEvents(t *testing.T) {
 }
 
 func TestServerServeRunsEventsOnCallerGoroutine(t *testing.T) {
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.Pollers = 1
 	caller := make(chan int64, 1)
 	onStart := make(chan int64, 1)
@@ -440,7 +440,7 @@ func TestServerServeRunsEventsOnCallerGoroutine(t *testing.T) {
 func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
 	handler := &heartbeatHandler{closed: make(chan CloseEvent, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.HeartbeatInterval = 10 * time.Millisecond
 		s.HeartbeatTimeout = 25 * time.Millisecond
 		s.Options.Pollers = 1
@@ -493,7 +493,7 @@ func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
 func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, serverHandler)
+		s := NewServer(Options{Handler: serverHandler})
 		s.HeartbeatInterval = 10 * time.Millisecond
 		// The timeout must survive a starved CI runner: with 250ms a pong delayed
 		// by scheduling could close a client that responded promptly in program
@@ -505,13 +505,13 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	})
 
 	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	dialer := NewDialer(Options{})
+	dialer := NewDialer(Options{Handler: clientHandler})
 	dialer.Options.Pollers = 1
 	dialer.Options.ReadBufferSize = 4 << 10
 	var client *Conn
 	var err error
 	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
-		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
+		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
 		if err != nil {
 			time.Sleep(time.Millisecond)
 		}
@@ -598,7 +598,7 @@ func TestServerLifecycleEdges(t *testing.T) {
 // the Ping's own retirement starts the Pong timeout.
 func TestHeartbeatPingPositionFollowsEarlierPong(t *testing.T) {
 	raw := newScriptedConn()
-	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}, nil)), heartbeat: &heartbeatState{}}
+	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{})), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
 	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte{1}}); err != nil {
 		t.Fatal(err)

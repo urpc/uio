@@ -29,10 +29,9 @@ import (
 // Server accepts WebSocket connections over a UIO transport. Configure its
 // fields before calling Serve; Serve freezes the connection configuration.
 type Server struct {
-	// Options configures the protocol, the transport and backpressure.
+	// Options configures the protocol, the transport and backpressure, and
+	// carries the Handler every connection reports to.
 	Options
-	// Handler receives connection lifecycle and message callbacks. It may be nil.
-	Handler Handler
 	// CheckOrigin accepts an upgrade request. Nil accepts every origin.
 	CheckOrigin func(*http.Request) bool
 
@@ -54,8 +53,8 @@ type Server struct {
 
 // NewServer returns a Server using opts. http.Server-style: the exported
 // fields are the configuration, this constructor only fills them in.
-func NewServer(opts Options, handler Handler) *Server {
-	return &Server{Options: opts, Handler: handler}
+func NewServer(opts Options) *Server {
+	return &Server{Options: opts}
 }
 
 // Stats reports the read pausing of this server's connections.
@@ -78,7 +77,7 @@ func (s *Server) Serve(addrs ...string) error {
 		return ErrServerStarted
 	}
 	s.opts = opts
-	s.config = newServerConnConfig(opts, s.Handler, s.CheckOrigin, &s.connections, &s.stats)
+	s.config = newServerConnConfig(opts, s.CheckOrigin, &s.connections, &s.stats)
 	events := opts.transportEvents()
 	s.events = events
 	events.OnStart = func(*uio.Events) {
@@ -206,7 +205,7 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 	config := s.config
 	if config == nil {
 		opts, _ := s.Options.resolve()
-		config = newServerConnConfig(opts, s.Handler, s.CheckOrigin, &s.connections, &s.stats)
+		config = newServerConnConfig(opts, s.CheckOrigin, &s.connections, &s.stats)
 	}
 	conn := &Conn{
 		raw:     raw,

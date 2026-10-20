@@ -157,7 +157,7 @@ func TestFragmentRefusedPartWayAbortsConnection(t *testing.T) {
 // of them fit the outbound limit: nothing is queued otherwise.
 func TestFragmentedMessageAdmittedWholeOrNotAtAll(t *testing.T) {
 	raw := &limitedWire{limit: 20}
-	server := NewServer(Options{}, nil)
+	server := NewServer(Options{})
 	server.Options.MaxOutboundBuffered = raw.limit
 	server.Options.OutboundHighWatermark = -1 // refusal paths, not the read pause
 	server.MaxFramePayload = 4
@@ -260,7 +260,7 @@ func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 func TestCompressedMessageFragmentsAfterEncoding(t *testing.T) {
 	handler := &compressedMessageHandler{ready: make(chan error, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.EnableCompression = true
 		s.MaxFramePayload = 8
 		s.Options.Pollers = 1
@@ -353,7 +353,7 @@ func TestCompressedMessageFragmentsAfterEncoding(t *testing.T) {
 func TestMessageFragmentsByFrameLimit(t *testing.T) {
 	handler := &fragmentedMessageHandler{ready: make(chan error, 1)}
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{}, handler)
+		s := NewServer(Options{Handler: handler})
 		s.MaxFramePayload = 3
 		s.Options.Pollers = 1
 		s.Options.ReadBufferSize = 4 << 10
@@ -433,7 +433,7 @@ func TestMessageFragmentsByFrameLimit(t *testing.T) {
 // message limits falls back to it and is refused there.
 func TestShortPathCoversSixteenBitLengths(t *testing.T) {
 	for _, size := range []int{0, 1, 125, 126, 127, 1024, 4096, 65535} {
-		server := NewServer(Options{}, echoPathHandler{})
+		server := NewServer(Options{Handler: echoPathHandler{}})
 		server.config = testServerConfig(server)
 		raw := &echoPathConn{}
 		conn := server.newConnection(raw)
@@ -462,7 +462,7 @@ func TestShortPathCoversSixteenBitLengths(t *testing.T) {
 // path: it falls to the generic parser, which refuses it, and the round fails
 // exactly as it did before the fused path learned the width.
 func TestShortPathSixteenBitLengthHonorsFrameLimit(t *testing.T) {
-	server := NewServer(Options{}, echoPathHandler{})
+	server := NewServer(Options{Handler: echoPathHandler{}})
 	server.config = testServerConfig(server)
 	server.config.parser.MaxFramePayload = 2048
 	raw := &echoPathConn{}
@@ -496,7 +496,7 @@ func TestShortPathSixteenBitLengthHonorsFrameLimit(t *testing.T) {
 // across the seven-bit/sixteen-bit boundary.
 func TestSingleFrameRoundRepliesThroughTheShortPath(t *testing.T) {
 	for _, size := range []int{125, 126, 1024} {
-		server := NewServer(Options{}, echoPathHandler{})
+		server := NewServer(Options{Handler: echoPathHandler{}})
 		server.config = testServerConfig(server)
 		raw := &echoPathConn{}
 		conn := server.newConnection(raw)
@@ -532,7 +532,7 @@ func (c *echoPathConn) Writev(buffers [][]byte) (int, error) {
 // such a frame to the generic parser, which closes the connection with a
 // protocol error, rather than deliver it.
 func TestShortPathRefusesNonCanonicalSixteenBitLength(t *testing.T) {
-	server := NewServer(Options{}, echoPathHandler{})
+	server := NewServer(Options{Handler: echoPathHandler{}})
 	server.config = testServerConfig(server)
 	raw := &echoPathConn{}
 	conn := server.newConnection(raw)
@@ -598,7 +598,7 @@ func TestShortSendLimitsFollowTheThreshold(t *testing.T) {
 		{128, 125, 125}, {130, 125, 125}, {131, 125, 126},
 		{4096, 125, 4091}, {1 << 20, 125, 0xFFFF},
 	} {
-		server := NewServer(Options{}, echoPathHandler{})
+		server := NewServer(Options{Handler: echoPathHandler{}})
 		server.Options.WriteCoalesce = tc.threshold
 		config := testServerConfig(server)
 		if config.shortSendLimit != tc.send || config.shortSendDirect != tc.direct {
@@ -613,7 +613,7 @@ func TestShortSendLimitsFollowTheThreshold(t *testing.T) {
 	}
 
 	// The frame and message limits cap them too.
-	server := NewServer(Options{}, echoPathHandler{})
+	server := NewServer(Options{Handler: echoPathHandler{}})
 	server.Options.WriteCoalesce = 1 << 20
 	server.MaxFramePayload, server.MaxMessageSize = 2048, 1000
 	if config := testServerConfig(server); config.shortSendDirect != 1000 || config.shortReadLimit != 125 {
@@ -622,7 +622,7 @@ func TestShortSendLimitsFollowTheThreshold(t *testing.T) {
 
 	// A large message under a tiny threshold leaves one intact frame.
 	for _, threshold := range []int{1, 2} {
-		server := NewServer(Options{}, echoPathHandler{})
+		server := NewServer(Options{Handler: echoPathHandler{}})
 		server.Options.WriteCoalesce = threshold
 		server.config = testServerConfig(server)
 		raw := &echoPathConn{}
@@ -683,7 +683,7 @@ func TestReadsSplitInsideFramesDeliverEveryMessage(t *testing.T) {
 
 	for _, readSize := range []int{1, 2, 3, 5, 8, 13, 64, 127, 128, 262, 263, 264, 265, 700, 1024, 4096, len(wire)} {
 		var got []Message
-		server := NewServer(Options{}, messageLog{&got})
+		server := NewServer(Options{Handler: messageLog{&got}})
 		server.config = testServerConfig(server)
 		raw := &echoPathConn{}
 		conn := server.newConnection(raw)
@@ -718,7 +718,7 @@ func TestReadsSplitInsideFramesDeliverEveryMessage(t *testing.T) {
 // invalid UTF-8 there fails the round as it does anywhere else.
 func TestShortPathAfterASplitFrameValidatesText(t *testing.T) {
 	var got []Message
-	server := NewServer(Options{}, messageLog{&got})
+	server := NewServer(Options{Handler: messageLog{&got}})
 	server.config = testServerConfig(server)
 	raw := &echoPathConn{}
 	conn := server.newConnection(raw)
@@ -749,7 +749,7 @@ func TestShortPathAfterASplitFrameValidatesText(t *testing.T) {
 // comes out byte for byte as the generic encoder writes it.
 func TestBatchedRepliesEncodeEveryLengthAsTheGenericEncoder(t *testing.T) {
 	sizes := []int{0, 1, 125, 126, 127, 4096, 65535, 65536, 70000}
-	server := NewServer(Options{}, echoPathHandler{})
+	server := NewServer(Options{Handler: echoPathHandler{}})
 	server.config = testServerConfig(server)
 	server.config.writeBufferedThreshold = 1 << 20
 	server.config.maxOutbound = 0
@@ -820,7 +820,7 @@ func TestShortPathTextFramesValidateAcrossTheVectorThreshold(t *testing.T) {
 	bad := [][]byte{{0xff}, {0xc0, 0xaf}, {0xed, 0xa0, 0x80}, {0xe2, 0x82}, {0x80}}
 	run := func(payload []byte) ([]Message, error, bool) {
 		var got []Message
-		server := NewServer(Options{}, messageLog{&got})
+		server := NewServer(Options{Handler: messageLog{&got}})
 		server.config = testServerConfig(server)
 		raw := &echoPathConn{}
 		conn := server.newConnection(raw)

@@ -38,7 +38,7 @@ func (echoHandler) OnMessage(conn *uws.Conn, message uws.Message) {
 func (echoHandler) OnClose(*uws.Conn, uws.CloseEvent) {}
 
 func main() {
-	server := uws.NewServer(uws.Options{Pollers: 4, ReadBufferSize: 4 << 10}, echoHandler{})
+	server := uws.NewServer(uws.Options{Handler: echoHandler{}, Pollers: 4, ReadBufferSize: 4 << 10})
 	if err := server.Serve(":19701"); err != nil {
 		log.Fatal(err)
 	}

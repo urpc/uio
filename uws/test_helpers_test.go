@@ -16,13 +16,13 @@ const testKey = "dGhlIHNhbXBsZSBub25jZQ=="
 
 func testServerConfig(server *Server) *connConfig {
 	if server == nil {
-		server = NewServer(Options{}, nil)
+		server = NewServer(Options{})
 	}
 	opts, err := server.Options.resolve()
 	if err != nil {
 		panic(err)
 	}
-	return newServerConnConfig(opts, server.Handler, server.CheckOrigin, &server.connections, &server.stats)
+	return newServerConnConfig(opts, server.CheckOrigin, &server.connections, &server.stats)
 }
 
 func testDialerConfig(dialer *Dialer) *connConfig {

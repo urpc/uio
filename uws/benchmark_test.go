@@ -73,7 +73,7 @@ func BenchmarkServerEchoPath(b *testing.B) {
 	for _, frames := range []int{1, 100} {
 		for _, size := range []int{128, 1024} {
 			b.Run(fmt.Sprintf("frames=%d/payload=%d", frames, size), func(b *testing.B) {
-				server := NewServer(Options{}, echoPathHandler{})
+				server := NewServer(Options{Handler: echoPathHandler{}})
 				server.config = testServerConfig(server)
 				raw := &echoPathConn{}
 				conn := server.newConnection(raw)
@@ -120,7 +120,7 @@ func BenchmarkServerEchoPathSplitReads(b *testing.B) {
 	const readSize = 16 << 10
 	for _, size := range []int{64, 256, 1024} {
 		b.Run(fmt.Sprintf("payload=%d", size), func(b *testing.B) {
-			server := NewServer(Options{}, echoPathHandler{})
+			server := NewServer(Options{Handler: echoPathHandler{}})
 			server.config = testServerConfig(server)
 			raw := &echoPathConn{}
 			conn := server.newConnection(raw)
@@ -179,7 +179,7 @@ func BenchmarkServerEchoPathText(b *testing.B) {
 	for _, multibyte := range []bool{false, true} {
 		for _, size := range []int{128, 1024, 4000} {
 			b.Run(fmt.Sprintf("multibyte=%v/payload=%d", multibyte, size), func(b *testing.B) {
-				server := NewServer(Options{}, echoTextHandler{})
+				server := NewServer(Options{Handler: echoTextHandler{}})
 				server.config = testServerConfig(server)
 				raw := &echoPathConn{}
 				conn := server.newConnection(raw)
