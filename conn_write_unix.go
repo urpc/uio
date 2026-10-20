@@ -142,8 +142,10 @@ func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
 }
 
 // ReserveOutbound is the task-owner encoding path: the reserved bytes are part
-// of outbound as soon as it returns, and the caller fills them after submitMu
-// is released. No other sender may take outbound meanwhile, so the turn keeps
+// of outbound as soon as it returns. The caller fills them before it calls
+// anything else on the connection — the task's own writes and reservations
+// may flush outbound, and a Flush before the bytes are filled sends whatever
+// they hold. No other sender may take outbound meanwhile, so the turn keeps
 // the write claim until it ends; while another sender holds the claim the
 // reservation is refused and the caller writes another way.
 func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
@@ -174,11 +176,16 @@ func (conn *fdConn) ReserveOutbound(n int) ([]byte, error) {
 	}
 	if holder := conn.scratch; holder != nil {
 		out := holder.out
-		// A reply space starts only when this reservation is all that is
-		// queued or in flight, so whatever other goroutines queue while it is
-		// in use came after its bytes; see handOverScratch. Otherwise the
-		// reservation joins the end of outbound, behind what is there.
-		if out != nil && out.Len() > 0 || conn.pending.Load() == int64(n) {
+		// The reply space holds every accepted byte or it is stale: another
+		// goroutine queued something after it started, and a reservation now
+		// belongs behind that, not inside it (see handOverScratch). Fresh
+		// space starts only when this reservation is all that is queued or
+		// in flight.
+		used := 0
+		if out != nil {
+			used = out.Len()
+		}
+		if conn.pending.Load() == int64(used+n) {
 			if out == nil {
 				out = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
 				holder.out = out

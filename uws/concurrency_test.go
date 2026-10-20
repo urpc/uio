@@ -1143,3 +1143,48 @@ func TestDeferredCloseClaimedWhenRetirePrecedesMark(t *testing.T) {
 		t.Fatal("every byte retired and both Close frames exchanged, but the transport close is never claimed")
 	}
 }
+
+// closeOvertakeHandler drives the interleaving: the round replies A, another
+// goroutine's X is accepted, then the round itself closes.
+type closeOvertakeHandler struct{ accepted chan error }
+
+func (*closeOvertakeHandler) OnOpen(*Conn) {}
+func (h *closeOvertakeHandler) OnMessage(c *Conn, m Message) {
+	if string(m.Payload) != "go" {
+		return
+	}
+	_ = c.SendText([]byte("A"))
+	done := make(chan error, 1)
+	go func() { done <- c.SendText([]byte("X")) }()
+	h.accepted <- <-done
+	_ = c.Close(1000, "")
+}
+func (*closeOvertakeHandler) OnClose(*Conn, CloseEvent) {}
+
+// A Close from the round follows a message another goroutine sent before it,
+// which that send was told was accepted.
+func TestCloseFollowsAcceptedMessageFromAnotherGoroutine(t *testing.T) {
+	h := &closeOvertakeHandler{accepted: make(chan error, 1)}
+	addr := startRobustServer(t, Options{Pollers: 1}, h)
+	conn, reader := robustDial(t, addr)
+	_ = conn.SetDeadline(time.Now().Add(2 * testIOTimeout()))
+	writeDataFrame(t, conn, frame.Text, true, []byte("go"))
+	if err := <-h.accepted; err != nil {
+		t.Fatalf("X was not accepted: %v", err)
+	}
+	var got []string
+	for len(got) < 3 {
+		op, payload, err := readFrameWithOpcode(reader)
+		if err != nil {
+			break
+		}
+		if op == frame.Close {
+			got = append(got, "CLOSE")
+		} else {
+			got = append(got, string(payload))
+		}
+	}
+	if len(got) != 3 || got[0] != "A" || got[1] != "X" || got[2] != "CLOSE" {
+		t.Fatalf("wire order %v, want [A X CLOSE]: the Close overtook an accepted message", got)
+	}
+}

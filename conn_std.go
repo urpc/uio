@@ -753,6 +753,11 @@ func (fc *fdConn) closeOnLoop(err error) {
 	fc.scheduleCloseCallback(err)
 }
 
+// testHookUDPChildCreated runs on the listener goroutine after a UDP child
+// was created and published, before its OnOpen. Tests use it to pin the
+// close-while-opening race; it is nil outside tests.
+var testHookUDPChildCreated func(*fdConn)
+
 func (fc *fdConn) scheduleCloseCallback(err error) {
 	fc.events.callbackWG.Add(1)
 	go func() {
@@ -760,6 +765,12 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 		fc.callbackMu.Lock()
 		defer fc.callbackMu.Unlock()
 		if callback := fc.events.OnClose; callback != nil && !fc.internal && fc.opened {
+			// A child whose OnOpen had not run when its server closed is
+			// opened afterwards by the listener; whichever of the two close
+			// callbacks finds it opened delivers it, exactly once.
+			if !atomic.CompareAndSwapInt32(&fc.closeDelivered, 0, 1) {
+				return
+			}
 			fc.inbound.Reset()
 			fc.inboundTail = nil
 			started := fc.beginInboundCallback()
@@ -1247,6 +1258,9 @@ func (fc *fdConn) listenUDP() error {
 			continue
 		}
 		if !ok {
+			if testHookUDPChildCreated != nil {
+				testHookUDPChildCreated(udpConn)
+			}
 			// fire udp on-open event.
 			udpConn.callbackMu.Lock()
 			if onOpen := fc.events.OnOpen; nil != onOpen {
@@ -1255,6 +1269,11 @@ func (fc *fdConn) listenUDP() error {
 				udpConn.endInboundCallback(started)
 			}
 			udpConn.opened = true
+			if atomic.LoadInt32(&udpConn.closed) == 1 {
+				// The server closed this child before its OnOpen ran, and the
+				// close callback skipped it as unopened; deliver it now.
+				udpConn.scheduleCloseCallback(udpConn.err)
+			}
 			udpConn.callbackMu.Unlock()
 		}
 		if udpConn.isClosing() {

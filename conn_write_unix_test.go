@@ -602,6 +602,43 @@ func TestRefusedDirectSendKeepsAWritableEdge(t *testing.T) {
 	}
 }
 
+// A reply space that other goroutines have written behind continues only
+// while it still holds every accepted byte: a reservation made after those
+// writes belongs behind them, not inside the space.
+func TestReserveAfterExternalWriteKeepsOrder(t *testing.T) {
+	events := &Events{Pollers: 1}
+	events.OnData = func(conn Conn) error {
+		_, _ = conn.Discard(conn.InboundBuffered())
+		reserve := func(tag byte) error {
+			dst, err := conn.ReserveOutbound(1)
+			if err != nil {
+				return err
+			}
+			dst[0] = tag
+			return nil
+		}
+		if err := reserve('a'); err != nil {
+			return err
+		}
+		writeFromOtherGoroutine(t, conn, []byte{'B'})
+		return reserve('c')
+	}
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	testConn, registered := startTestConnectionOn(t, events, fds)
+	if err = <-registered; err != nil {
+		t.Fatal(err)
+	}
+	if err = writePeerAll(testConn.peer, []byte{1}, time.Now().Add(5*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := readPeerUntil(t, testConn.peer, 3, 5*time.Second); string(got) != "aBc" {
+		t.Fatalf("wire order %q, want %q", got, "aBc")
+	}
+}
+
 // fillTestRecord fills record with tag, seq and a trailer that ties them, so a
 // record cut by other bytes fails validTestRecord.
 func fillTestRecord(record []byte, tag byte, seq uint32) {

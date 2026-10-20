@@ -1323,3 +1323,56 @@ func TestPeerCloseBehindPingCompletesHandshake(t *testing.T) {
 func TestPeerCloseBehindDataCompletesWithoutTimer(t *testing.T) {
 	peerCloseBehindRun(t, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("second")}, 24*time.Hour)
 }
+
+// closeInOpenHandler closes from OnOpen, so a frame that arrived with the
+// upgrade request is delivered after this end already started closing.
+type closeInOpenHandler struct{ closed chan CloseEvent }
+
+func (*closeInOpenHandler) OnOpen(c *Conn)                     { _ = c.Close(4000, "no") }
+func (*closeInOpenHandler) OnMessage(*Conn, Message)           {}
+func (h *closeInOpenHandler) OnClose(_ *Conn, info CloseEvent) { h.closed <- info }
+
+// A frame in the upgrade segment behind a close started in OnOpen is a stop,
+// not a protocol error: the transport stays up until the peer answers the
+// close handshake instead of dropping the connection at once.
+func TestEarlyFrameAfterCloseInOnOpenWaitsForPeerClose(t *testing.T) {
+	h := &closeInOpenHandler{closed: make(chan CloseEvent, 1)}
+	addr := startRobustServer(t, Options{Pollers: 1, CloseTimeout: 3 * time.Second}, h)
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	request := "GET / HTTP/1.1\r\nHost: " + addr + "\r\n" +
+		"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
+	wire := append([]byte(request), frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("early")}, [4]byte{1, 2, 3, 4})...)
+	if _, err := conn.Write(wire); err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(conn)
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	_ = conn.SetDeadline(time.Now().Add(2 * testIOTimeout()))
+	if code := awaitClose(t, reader); code != 4000 {
+		t.Fatalf("close code %d", code)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	_, readErr := reader.ReadByte()
+	var info CloseEvent
+	select {
+	case info = <-h.closed:
+	case <-time.After(testIOTimeout()):
+		t.Fatal("OnClose never ran")
+	}
+	if readErr == io.EOF {
+		t.Fatalf("server closed TCP without waiting for the peer's Close reply (OnClose err %v)", info.Err)
+	}
+}

@@ -1608,3 +1608,53 @@ func TestStdUDPListenerCloseDuringDatagramFlood(t *testing.T) {
 	}
 }
 
+// A UDP child published while its server was still live but opened after the
+// server closed gets its OnClose: the listener re-checks instead of leaving
+// the child opened and undelivered.
+func TestStdUDPChildClosedBeforeOpenGetsOnClose(t *testing.T) {
+	started := make(chan net.Addr, 1)
+	created := make(chan *fdConn, 1)
+	release := make(chan struct{})
+	testHookUDPChildCreated = func(c *fdConn) {
+		created <- c
+		<-release
+	}
+	defer func() { testHookUDPChildCreated = nil }()
+	var opens, closes atomic.Int32
+	events := &Events{}
+	events.OnStart = func(ev *Events) {
+		for _, l := range ev.acceptor.listeners {
+			if l.udp != nil {
+				started <- l.udp.LocalAddr()
+				return
+			}
+		}
+	}
+	events.OnOpen = func(c Conn) { opens.Add(1) }
+	events.OnClose = func(c Conn, err error) { closes.Add(1) }
+	events.OnData = func(c Conn) error { return nil }
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
+	addr := <-started
+	client, err := net.Dial("udp", addr.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	_, _ = client.Write([]byte("x"))
+	child := <-created
+	_ = events.Close(nil)
+	for !child.IsClosed() {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond) // let the OnClose goroutine pass on the child
+	close(release)
+	select {
+	case <-serveDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+	if opens.Load() != closes.Load() {
+		t.Fatalf("UDP child got %d OnOpen and %d OnClose", opens.Load(), closes.Load())
+	}
+}
