@@ -75,7 +75,7 @@ type fdConn struct {
 	internal       bool       // framework-owned endpoint, not a user connection
 
 	// opened records that OnOpen has run, which a connection's read goroutine
-	// does first; only an opened connection gets OnClose. wakesAfterOpen
+	// does first, closing or not; only an opened connection gets OnClose. wakesAfterOpen
 	// counts the Wakes that arrived before OnOpen, for the read goroutine to
 	// deliver right after it, one OnData each. Both are guarded by callbackMu.
 	opened         bool
@@ -133,16 +133,19 @@ func (fc *fdConn) afterRegister() {
 // openOnReader runs OnOpen on the connection's read goroutine before its
 // first read, then starts the writer, so output written in OnOpen leaves after
 // it returns, as it did when OnOpen ran on the loop. Wakes that came first are
-// delivered right after, one OnData each. It reports whether the connection is still open; a
-// connection closed before its OnOpen gets neither OnOpen nor OnClose.
+// delivered right after, one OnData each. It reports whether the connection is
+// still open. A connection closed before this goroutine ran still gets OnOpen
+// and then OnClose, as on the native backend: a Dial that returned it has
+// handed its caller a connection whose end only OnClose reports.
 func (fc *fdConn) openOnReader() bool {
 	fc.callbackMu.Lock()
-	if fc.isClosing() {
-		fc.callbackMu.Unlock()
-		return false
-	}
 	fc.fireOnOpen()
 	fc.opened = true
+	if atomic.LoadInt32(&fc.closed) == 1 {
+		// Torn down before OnOpen ran, so the close callback may have skipped
+		// it as unopened; deliver it now. closeDelivered keeps it to once.
+		fc.scheduleCloseCallback(fc.err)
+	}
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
 		started := fc.beginInboundCallback()
 		err := fc.events.onData(fc)

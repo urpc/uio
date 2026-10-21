@@ -96,6 +96,8 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // or establishing the connection. The connection is registered on the calling
 // goroutine, so calling it from a connection callback waits for nothing but
 // the dial itself.
+// A connection it returns gets OnOpen and, at its end, OnClose, even if it is
+// closed first; after an error no callback runs for it.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed

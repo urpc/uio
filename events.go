@@ -155,8 +155,10 @@ type Events struct {
 	AllowHalfOpen bool
 
 	// OnOpen fires first for every connection, in the connection's first
-	// turn. On Unix a stream connection's first turn reads whatever its peer
-	// already sent right after OnOpen returns, in the same turn. Lifecycle and
+	// turn, also for one closed before that turn ran: OnClose follows, and
+	// writes from OnOpen return net.ErrClosed. On Unix a stream connection's
+	// first turn reads whatever its peer already sent right after OnOpen
+	// returns, in the same turn. Lifecycle and
 	// data callbacks are serialized per connection, while callbacks for
 	// different connections may run concurrently.
 	OnOpen func(c Conn)

@@ -90,6 +90,8 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // DialContext connects synchronously and allows cancellation while resolving
 // or establishing the network connection. Calling it from a connection
 // callback blocks that callback until dialing completes.
+// A connection it returns gets OnOpen and, at its end, OnClose, even if it is
+// closed first; after an error no callback runs for it.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed

@@ -115,7 +115,7 @@ Everything is optional; the zero `Events` is ready to use.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `Pollers` | one per 4 Ps, 1–8 | Number of event loops, never more than `GOMAXPROCS`. |
+| `Pollers` | one per 4 Ps: 1–8 native, at least 2 on stdio | Number of event loops, never more than `GOMAXPROCS`. |
 | `Executor` | built-in sharded pool | Your own scheduler for connection and write turns (native backend). |
 | `MaxBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnData` are batched either way. |

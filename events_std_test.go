@@ -254,8 +254,8 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 
 // A burst of registrations cut short by shutdown: every registration
 // returns, no connection starts I/O before its OnOpen returns, and OnOpen and
-// OnClose stay paired. OnOpen runs on each connection's read goroutine, so a
-// connection that shutdown closes before that goroutine ran gets neither.
+// OnClose stay paired, for connections that shutdown closed before their read
+// goroutine ran too.
 func TestStdRegisterBurstAndClose(t *testing.T) {
 	const desiredTotal = 2048
 	total := min(desiredTotal, stdTestFDLimit())
@@ -1501,6 +1501,81 @@ func TestStdWakesBeforeOnOpenEachRunOnData(t *testing.T) {
 	want := []string{"open", "data", "data", "data"}
 	if fmt.Sprint(seq) != fmt.Sprint(want) {
 		t.Fatalf("callbacks ran as %v, want %v", seq, want)
+	}
+}
+
+// A connection torn down before its read goroutine ran, as a Dial racing a
+// close leaves it, still gets OnOpen and then OnClose once, as on the native
+// backend: the caller holding it learns of its end only through OnClose.
+func TestStdCloseBeforeReaderStillOpensAndCloses(t *testing.T) {
+	var seq []string
+	cause := errors.New("closed before the reader ran")
+	events := &Events{
+		OnOpen:  func(Conn) { seq = append(seq, "open") },
+		OnClose: func(_ Conn, err error) { seq = append(seq, "close: "+err.Error()) },
+	}
+	conn := &fdConn{}
+	conn.events = events
+	conn.closing.Store(true)
+	conn.err = cause
+	atomic.StoreInt32(&conn.closed, 1)
+	conn.scheduleCloseCallback(cause)
+	events.callbackWG.Wait()
+	if len(seq) != 0 {
+		t.Fatalf("callbacks ran before the reader: %v", seq)
+	}
+	if conn.openOnReader() {
+		t.Fatal("a closed connection went on to read")
+	}
+	conn.scheduleCloseCallback(cause) // a late duplicate is dropped
+	events.callbackWG.Wait()
+	want := []string{"open", "close: " + cause.Error()}
+	if fmt.Sprint(seq) != fmt.Sprint(want) {
+		t.Fatalf("callbacks ran as %v, want %v", seq, want)
+	}
+}
+
+// A DialContext canceled while the loop registers its connection returns the
+// cause, and the connection it gave up gets neither OnOpen nor OnClose: the
+// caller never had it.
+func TestStdDialCanceledDuringRegistrationGetsNoCallbacks(t *testing.T) {
+	target, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer target.Close()
+	go func() {
+		for {
+			c, err := target.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c); _ = c.Close() }()
+		}
+	}()
+	var opens, closes atomic.Int32
+	events := &Events{
+		Pollers: 1,
+		OnOpen:  func(Conn) { opens.Add(1) },
+		OnClose: func(Conn, error) { closes.Add(1) },
+	}
+	serveDone := startStdTestEvents(t, events)
+	cause := errors.New("dial canceled while registering")
+	ctx, cancel := context.WithCancelCause(context.Background())
+	returned := make(chan struct{})
+	registeredForTest = func(*fdConn) {
+		cancel(cause)
+		<-returned
+	}
+	t.Cleanup(func() { registeredForTest = nil })
+	conn, err := events.DialContext(ctx, "tcp://"+target.Addr().String(), nil)
+	close(returned)
+	if conn != nil || !errors.Is(err, cause) {
+		t.Fatalf("DialContext = %v, %v; want nil, %v", conn, err, cause)
+	}
+	stopStdTestEvents(t, events, serveDone, errors.New("test done"))
+	if o, c := opens.Load(), closes.Load(); o != 0 || c != 0 {
+		t.Fatalf("the abandoned connection got %d OnOpen and %d OnClose, want none", o, c)
 	}
 }
 

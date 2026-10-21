@@ -263,11 +263,16 @@ func (loop *eventLoop) runRegisterTask(t *task) error {
 		t.conn.closeUnregistered()
 		return request.cause()
 	}
-	result := loop.registerConn(t.conn)
+	result := loop.watchConn(t.conn)
 	if request.state.CompareAndSwap(registerPending, registerCompleted) {
+		if result == nil {
+			t.conn.afterRegister()
+		}
 		return result
 	}
-	// The caller returned after canceling while registration was in progress.
+	// The caller returned after canceling while registration was in progress,
+	// so the connection is not theirs: it closes before its read goroutine
+	// starts, without OnOpen or OnClose.
 	if result == nil {
 		t.conn.closeOnLoop(request.cause())
 	}
@@ -417,9 +422,20 @@ func (loop *eventLoop) delConn(conn *fdConn) {
 // is added to its poller and before the loop schedules its open event.
 var registeredForTest func(*fdConn)
 
-// registerConn publishes the fd before poller registration so every delivered
-// event can resolve it. Failure unwinds both publications before closing the fd.
+// registerConn watches conn and starts its read goroutine, which runs OnOpen
+// first, so a connection it registers gets OnOpen and OnClose even when it is
+// closed meanwhile.
 func (loop *eventLoop) registerConn(conn *fdConn) error {
+	if err := loop.watchConn(conn); err != nil {
+		return err
+	}
+	conn.afterRegister()
+	return nil
+}
+
+// watchConn publishes the fd before poller registration so every delivered
+// event can resolve it. Failure unwinds both publications before closing the fd.
+func (loop *eventLoop) watchConn(conn *fdConn) error {
 	// Publish before Watch so every delivered event can resolve the fd.
 	fd := conn.Fd()
 	watcher := conn.watcher()
@@ -441,11 +457,6 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	}
 	if registeredForTest != nil {
 		registeredForTest(conn)
-	}
-	// The connection's read goroutine runs OnOpen before its first read, so
-	// no callback runs on the loop.
-	if !conn.isClosing() {
-		conn.afterRegister()
 	}
 	return nil
 }

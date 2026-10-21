@@ -76,6 +76,9 @@ func main() {
 		}
 		up.Userdata().(*leg).peer.Store(c)
 		client.peer.Store(up)
+		// The upstream may have spoken first and found no peer yet; its bytes
+		// wait unconsumed, so have them forwarded now.
+		_ = up.Wake()
 	}
 
 	events.OnData = func(c uio.Conn) error {
