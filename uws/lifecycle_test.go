@@ -22,6 +22,7 @@ func lifecycleTestTimeout() time.Duration {
 }
 
 type closeFromMessageHandler struct {
+	conn        *Conn // set by OnOpen before open closes
 	open        chan struct{}
 	closed      chan struct{}
 	closeResult chan error
@@ -133,8 +134,7 @@ func TestUIOExecutorWritesFlushAutomatically(t *testing.T) {
 		message: make(chan Message, 1),
 	}
 	dialer := NewDialer(Options{Handler: handler})
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
-	if err != nil {
+	if err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
@@ -145,7 +145,7 @@ func TestUIOExecutorWritesFlushAutomatically(t *testing.T) {
 	}
 
 	payload := []byte("uio executor auto flush")
-	if err = client.SendBinary(payload); err != nil {
+	if err := handler.conn.SendBinary(payload); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -168,8 +168,7 @@ func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
 		clientHandler := &clientHandler{
 			open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
 		}
-		client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
-		if err != nil {
+		if err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 			t.Fatal(err)
 		}
 		select {
@@ -177,7 +176,7 @@ func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
 		case <-time.After(lifecycleTestTimeout()):
 			t.Fatal("client did not open")
 		}
-		return client, clientHandler
+		return clientHandler.conn, clientHandler
 	}
 	slow, slowClientHandler := newClient()
 	fast, fastClientHandler := newClient()
@@ -234,8 +233,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 		clientHandler := &clientHandler{
 			open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
 		}
-		client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
-		if err != nil {
+		if err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 			t.Fatal(err)
 		}
 		select {
@@ -243,7 +241,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 		case <-time.After(lifecycleTestTimeout()):
 			t.Fatal("client did not open")
 		}
-		return client, clientHandler
+		return clientHandler.conn, clientHandler
 	}
 	slow, _ := newClient()
 	// The server answers the upgrade before its OnOpen runs, so the client's
@@ -277,7 +275,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 	release()
 }
 
-func (h *closeFromMessageHandler) OnOpen(*Conn) { close(h.open) }
+func (h *closeFromMessageHandler) OnOpen(c *Conn) { h.conn = c; close(h.open) }
 
 func (h *closeFromMessageHandler) OnMessage(*Conn, Message) {
 	h.messageOnce.Do(func() {
@@ -334,7 +332,7 @@ func TestDialerCloseIsReentrantFromOnClose(t *testing.T) {
 	}
 	dialer := NewDialer(Options{Handler: handler})
 	handler.setCloseFunc(func() { _ = dialer.Close(nil) })
-	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil); err != nil {
+	if err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
@@ -376,7 +374,7 @@ func TestServerCloseIsReentrantFromOnClose(t *testing.T) {
 		message: make(chan Message, 1),
 	}
 	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
-	if _, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
+	if err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
@@ -415,8 +413,7 @@ func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
 	clientHandler := &clientHandler{
 		open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1),
 	}
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
-	if err != nil {
+	if err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
@@ -425,8 +422,13 @@ func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
 	case <-time.After(lifecycleTestTimeout()):
 		t.Fatal("server connection did not open")
 	}
+	select {
+	case <-clientHandler.open:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("client connection did not open")
+	}
 	executor.reject.Store(true)
-	if err := client.raw.CloseWith(io.EOF); err != nil {
+	if err := clientHandler.conn.raw.CloseWith(io.EOF); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -456,7 +458,7 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 		closed:  make(chan struct{}),
 		message: make(chan Message, 1),
 	}
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
+	err := dialer.Dial(context.Background(), "ws://"+addr+"/", clientHandler)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +473,7 @@ func TestServerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	case <-time.After(lifecycleTestTimeout()):
 		t.Fatal("client connection did not open")
 	}
-	if err = client.SendBinary([]byte("close")); err != nil {
+	if err = clientHandler.conn.SendBinary([]byte("close")); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -503,7 +505,7 @@ func TestDialerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	}
 	dialer := NewDialer(Options{Handler: handler})
 	handler.setCloseFunc(func() error { return dialer.Close(errors.New("close from dialer callback")) })
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
+	err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -513,7 +515,7 @@ func TestDialerCloseReturnsFromSynchronousOnMessage(t *testing.T) {
 	case <-time.After(lifecycleTestTimeout()):
 		t.Fatal("client did not open")
 	}
-	if err = client.SendBinary([]byte("echo")); err != nil {
+	if err = handler.conn.SendBinary([]byte("echo")); err != nil {
 		t.Fatal(err)
 	}
 	select {

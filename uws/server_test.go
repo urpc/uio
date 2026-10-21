@@ -508,20 +508,12 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	dialer := NewDialer(Options{Handler: clientHandler})
 	dialer.Options.Pollers = 1
 	dialer.Options.ReadBufferSize = 4 << 10
-	var client *Conn
-	var err error
-	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
-		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
-		if err != nil {
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if client == nil {
+	err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
+	if err != nil {
 		_ = server.Close(nil)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = client.Close(1000, "")
 		_ = dialer.Close(nil)
 		stopTestServer(t, server, serveDone)
 	})
@@ -530,6 +522,7 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("client OnOpen was not called")
 	}
+	client := clientHandler.conn
 
 	time.Sleep(600 * time.Millisecond)
 	select {

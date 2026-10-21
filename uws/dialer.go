@@ -68,45 +68,46 @@ func NewDialer(opts Options) *Dialer {
 // Stats reports the read pausing of this dialer's connections.
 func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 
-// Dial starts a WebSocket connection. The supplied context bounds the TCP
-// connection and WebSocket handshake; it no longer affects the connection
-// after OnOpen. The returned connection remains pending until Handler.OnOpen
-// reports handshake success or Handler.OnClose reports a handshake failure.
-// The returned error covers setup, network dial, and upgrade-request write or
-// flush failures. A connection closed before Dial returns, and a handshake
-// response failure, are reported through OnClose.
-func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, error) {
+// Dial starts a WebSocket connection and returns once the upgrade request is
+// on its way; the Handler reports the rest. An error means no connection was
+// made and no callback follows. After a nil error, OnOpen reports a completed
+// handshake, and OnClose always reports how the connection ended, a failed
+// handshake or upgrade request included; the one exception is a custom
+// Executor that refuses the connection's first turn. userdata is the
+// connection's Userdata in every callback. ctx bounds the TCP connection and
+// the handshake, not the connection after OnOpen.
+func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return err
 	}
 	if err := d.closedCause(); err != nil {
-		return nil, err
+		return err
 	}
 	target, err := url.Parse(addr)
 	if err != nil || target.Scheme != "ws" || target.Host == "" {
-		return nil, fmt.Errorf("uws: only ws:// targets are supported: %w", ErrProtocol)
+		return fmt.Errorf("uws: only ws:// targets are supported: %w", ErrProtocol)
 	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
-		return nil, err
+		return err
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
 	attemptCtx, cleanupAttempt, err := d.newAttemptContext(ctx)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err = d.start(attemptCtx); err != nil {
 		cleanupAttempt()
-		return nil, err
+		return err
 	}
 	config := d.config
 	request, err := handshake.BuildClientRequest(target, key, config.subprotocols, config.clientExtensions())
 	if err != nil {
 		cleanupAttempt()
-		return nil, err
+		return err
 	}
 	setup := &dialSetup{
 		Context:  attemptCtx,
@@ -123,9 +124,9 @@ func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, er
 		}
 		cleanupAttempt()
 		if cause != nil {
-			return nil, cause
+			return cause
 		}
-		return nil, err
+		return err
 	}
 	setup.attach(raw)
 	conn := setup.conn
@@ -142,16 +143,12 @@ func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, er
 	} else {
 		err = raw.Flush()
 	}
-	if errors.Is(err, net.ErrClosed) {
-		// Something else already closed the connection, possibly after the
-		// whole handshake ran; its OnClose reports the outcome.
-		return conn, nil
-	}
-	if err != nil {
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		// A connection already closed, possibly after the whole handshake
+		// ran, reports its own cause.
 		_ = raw.CloseWith(err)
-		return nil, err
 	}
-	return conn, nil
+	return nil
 }
 
 // Close permanently stops the dialer, cancels in-flight connection attempts,

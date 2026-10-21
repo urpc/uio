@@ -119,17 +119,21 @@ func (client) OnClose(c *uws.Conn, e uws.CloseEvent) {
 }
 
 dialer := uws.NewDialer(uws.Options{Handler: client{}})
-if _, err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", nil); err != nil {
+if err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", nil); err != nil {
 	log.Fatal(err)
 }
 ```
 
 `Dial` returns once the upgrade request is sent and the handshake finishes in
-the background. Its third argument is the connection's userdata, available as
-`Conn.Userdata` from `OnOpen` on, so one stateless handler serves every dial.
-`OnOpen` means the connection is ready; a failed handshake calls `OnClose`
-without `OnOpen`, with the cause in `CloseEvent.Err`. The context bounds the
-dial and the handshake, not the connection after it.
+the background; the connection reaches the application only through the
+handler. Its third argument is the connection's userdata, available as
+`Conn.Userdata` in every callback, so one stateless handler serves every dial.
+An error from `Dial` means no connection was made and no callback follows.
+After a nil error, `OnOpen` means the connection is ready, and `OnClose`
+always follows, with the cause in `CloseEvent.Err`; a failed handshake calls
+it without `OnOpen`. The one exception is a custom `Executor` that refuses the
+connection's first turn. The context bounds the dial and the handshake, not
+the connection after it.
 
 ## Configuration
 

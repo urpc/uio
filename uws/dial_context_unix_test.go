@@ -22,7 +22,7 @@ func TestDialContextBoundsTCPConnect(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	_, err := dialer.Dial(ctx, "ws://"+addr+"/", nil)
+	err := dialer.Dial(ctx, "ws://"+addr+"/", nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Dial() error = %v, want %v", err, context.DeadlineExceeded)
 	}
@@ -46,7 +46,7 @@ func TestConcurrentDialCancelAndDialerCloseReturn(t *testing.T) {
 		go func() {
 			ready.Done()
 			<-start
-			_, err := dialer.Dial(ctx, "ws://"+addr+"/", nil)
+			err := dialer.Dial(ctx, "ws://"+addr+"/", nil)
 			errs <- err
 		}()
 	}
@@ -69,7 +69,7 @@ func TestConcurrentDialCancelAndDialerCloseReturn(t *testing.T) {
 		select {
 		case err := <-errs:
 			if err == nil {
-				t.Fatal("Dial() returned a connection after cancellation")
+				t.Fatal("Dial() succeeded after cancellation")
 			}
 		case <-deadline:
 			t.Fatalf("only %d/%d Dial calls returned", index, attempts)

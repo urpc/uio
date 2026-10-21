@@ -54,6 +54,7 @@ type echoHandler struct {
 }
 
 type clientHandler struct {
+	conn    *Conn // set by OnOpen before open closes
 	open    chan struct{}
 	closed  chan struct{}
 	message chan Message
@@ -348,7 +349,7 @@ func (h *compressedMessageHandler) OnOpen(conn *Conn) {
 func (*compressedMessageHandler) OnMessage(*Conn, Message)  {}
 func (*compressedMessageHandler) OnClose(*Conn, CloseEvent) {}
 
-func (h *clientHandler) OnOpen(*Conn) { close(h.open) }
+func (h *clientHandler) OnOpen(c *Conn) { h.conn = c; close(h.open) }
 
 func (h *clientHandler) OnMessage(_ *Conn, message Message) { h.message <- message.Clone() }
 

@@ -214,8 +214,8 @@ func TestRobustClientRejectsMaskedServerFrame(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	// The violation can close the transport before Dial returns; Dial still
-	// returns the connection and leaves the close to OnClose.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
+	// succeeds and leaves the close to OnClose.
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -256,8 +256,8 @@ func TestRobustClientRejectsOversizedMessage(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	// The violation can close the transport before Dial returns; Dial still
-	// returns the connection and leaves the close to OnClose.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
+	// succeeds and leaves the close to OnClose.
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -282,7 +282,7 @@ func TestRobustClientAssemblesServerFragments(t *testing.T) {
 	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -327,7 +327,7 @@ func TestRobustClientAnswersServerPing(t *testing.T) {
 	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -647,13 +647,13 @@ func TestRobustConcurrentDials(t *testing.T) {
 			handler := newEchoClientHandler()
 			ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 			defer cancel()
-			conn, err := dialer.Dial(ctx, "ws://"+addr+"/", handler)
-			if err != nil {
+			if err := dialer.Dial(ctx, "ws://"+addr+"/", handler); err != nil {
 				fail <- fmt.Errorf("dial %d: %w", c, err)
 				return
 			}
+			var conn *Conn
 			select {
-			case <-handler.opened:
+			case conn = <-handler.conn:
 			case <-time.After(testIOTimeout()):
 				fail <- fmt.Errorf("dial %d: no OnOpen", c)
 				return
@@ -841,7 +841,7 @@ func TestRobustDialStormDuringServerClose(t *testing.T) {
 			handler := newEchoClientHandler()
 			ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 			defer cancel()
-			_, _ = dialer.Dial(ctx, "ws://"+addr+"/", handler)
+			_ = dialer.Dial(ctx, "ws://"+addr+"/", handler)
 		}()
 	}
 	time.Sleep(20 * time.Millisecond)
@@ -857,7 +857,7 @@ func TestRobustDialStormDuringServerClose(t *testing.T) {
 	handler := newEchoClientHandler()
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", handler); err == nil {
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", handler); err == nil {
 		select {
 		case <-handler.closed:
 		case <-time.After(testIOTimeout()):

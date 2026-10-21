@@ -46,18 +46,18 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 	dialer.Options.Pollers = 1
 	dialer.Subprotocols = []string{"chat"}
 	dialer.EnableCompression = true
-	client, err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil)
+	err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = client.Close(1000, "")
 		_ = dialer.Close(nil)
 		httpServer.Close()
 	})
 
 	waitForSignal(t, serverHandler.open, "server OnOpen")
 	waitForSignal(t, clientHandler.open, "client OnOpen")
+	client := clientHandler.conn
 	serverConn := <-serverHandler.conn
 	if serverConn.raw.Userdata() != serverConn {
 		t.Fatal("transport userdata changed meaning during HTTP adoption")

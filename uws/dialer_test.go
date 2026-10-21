@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -127,14 +128,11 @@ func TestDialerNegotiatesAndUsesSmallDeflateWindow(t *testing.T) {
 	dialer.EnableCompression = true
 	dialer.Options.Pollers = 1
 	dialer.Options.ReadBufferSize = 4 << 10
-	client, err := dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil)
+	err = dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		_ = client.Close(1000, "")
-		_ = dialer.Close(nil)
-	})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
 	select {
 	case <-handler.open:
 	case err = <-serverErr:
@@ -142,6 +140,7 @@ func TestDialerNegotiatesAndUsesSmallDeflateWindow(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("small-window handshake did not call OnOpen")
 	}
+	client := handler.conn
 	select {
 	case message := <-handler.message:
 		if !bytes.Equal(message.Payload, serverPayload) {
@@ -200,13 +199,12 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	dialer.EnableCompression = true
 	dialer.Options.Pollers = 1
 	dialer.Options.ReadBufferSize = 4 << 10
-	client, err := dialer.Dial(context.Background(), "ws://"+addr+"/chat", nil)
+	err := dialer.Dial(context.Background(), "ws://"+addr+"/chat", nil)
 	if err != nil {
 		_ = server.Close(nil)
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		_ = client.Close(1000, "")
 		_ = dialer.Close(nil)
 		stopTestServer(t, server, serverDone)
 	})
@@ -216,6 +214,7 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("client OnOpen was not called")
 	}
+	client := clientHandler.conn
 	deadline := time.Now().Add(testIOTimeout())
 	for client.handshake.Load() != nil && time.Now().Before(deadline) {
 		runtime.Gosched()
@@ -256,13 +255,13 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 func TestDialerValidationAndConnectionFailure(t *testing.T) {
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := new(Dialer).Dial(canceled, "ws://127.0.0.1:1", nil); !errors.Is(err, context.Canceled) {
+	if err := new(Dialer).Dial(canceled, "ws://127.0.0.1:1", nil); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Dial() = %v", err)
 	}
 
 	dialer := NewDialer(Options{})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
-	if _, err := dialer.Dial(nil, "http://example.test", nil); !errors.Is(err, ErrProtocol) {
+	if err := dialer.Dial(nil, "http://example.test", nil); !errors.Is(err, ErrProtocol) {
 		t.Fatalf("invalid scheme Dial() = %v", err)
 	}
 	if dialer.started != nil {
@@ -270,7 +269,7 @@ func TestDialerValidationAndConnectionFailure(t *testing.T) {
 	}
 	// A released ephemeral port can be bound again by any process running
 	// tests meanwhile; nothing unprivileged can listen on port 1.
-	if _, err := dialer.Dial(context.Background(), "ws://127.0.0.1:1", nil); err == nil {
+	if err := dialer.Dial(context.Background(), "ws://127.0.0.1:1", nil); err == nil {
 		t.Fatal("connection failure Dial() returned nil")
 	}
 	if err := (&Dialer{}).Close(nil); err != nil {
@@ -282,7 +281,7 @@ func TestDialerValidationAndConnectionFailure(t *testing.T) {
 	if err := closedDialer.Close(closeErr); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := closedDialer.Dial(context.Background(), "ws://127.0.0.1:1", nil); !errors.Is(err, closeErr) {
+	if err := closedDialer.Dial(context.Background(), "ws://127.0.0.1:1", nil); !errors.Is(err, closeErr) {
 		t.Fatalf("Dial() after Close error = %v, want %v", err, closeErr)
 	}
 }
@@ -397,7 +396,7 @@ func TestDialContextCancelsDuringDialerStartup(t *testing.T) {
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		_, err := dialer.Dial(ctx, "ws://127.0.0.1:1/", nil)
+		err := dialer.Dial(ctx, "ws://127.0.0.1:1/", nil)
 		result <- err
 	}()
 	select {
@@ -594,7 +593,7 @@ func TestDialerHandshakeFailureCallsOnCloseSynchronously(t *testing.T) {
 
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
 	dialer := NewDialer(Options{Handler: handler})
-	_, err = dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil)
+	err = dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -659,7 +658,7 @@ func TestDialerDeadlineClosesRealPendingHandshake(t *testing.T) {
 	defer cancel(ErrClosed)
 	handler := &dialLifecycleHandler{opened: make(chan struct{}, 1), closed: make(chan CloseEvent, 1)}
 	dialer := NewDialer(Options{Handler: handler})
-	_, err = dialer.Dial(dialCtx, "ws://"+listener.Addr().String()+"/", nil)
+	err = dialer.Dial(dialCtx, "ws://"+listener.Addr().String()+"/", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -771,15 +770,7 @@ func TestDialerHeartbeatKeepsResponsivePeer(t *testing.T) {
 		OutboundHighWatermark: -1,
 	})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
-	var client *Conn
-	var err error
-	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
-		client, err = dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
-		if err != nil {
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if client == nil {
+	if err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil); err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	select {
@@ -794,7 +785,6 @@ func TestDialerHeartbeatKeepsResponsivePeer(t *testing.T) {
 		t.Fatalf("a responsive peer was closed: %+v", event)
 	default:
 	}
-	_ = client.Close(1000, "")
 }
 
 // A peer that accepts the upgrade and then never answers a Ping is closed by
@@ -840,11 +830,9 @@ func TestDialerHeartbeatClosesSilentPeer(t *testing.T) {
 		OutboundHighWatermark: -1,
 	})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
-	client, err := dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil)
-	if err != nil {
+	if err := dialer.Dial(context.Background(), "ws://"+listener.Addr().String()+"/", nil); err != nil {
 		t.Fatal(err)
 	}
-	_ = client
 	select {
 	case <-watcher.open:
 	case <-time.After(testIOTimeout()):
@@ -857,5 +845,102 @@ func TestDialerHeartbeatClosesSilentPeer(t *testing.T) {
 		}
 	case <-time.After(testIOTimeout()):
 		t.Fatal("dialer heartbeat did not close the silent peer")
+	}
+}
+
+// closeCountingHandler counts OnClose per dial, told apart by the *int each
+// dial passes as its userdata.
+type closeCountingHandler struct {
+	mu     sync.Mutex
+	closed map[*int]int
+}
+
+func (*closeCountingHandler) OnOpen(*Conn)             {}
+func (*closeCountingHandler) OnMessage(*Conn, Message) {}
+func (h *closeCountingHandler) OnClose(c *Conn, _ CloseEvent) {
+	h.mu.Lock()
+	h.closed[c.Userdata().(*int)]++
+	h.mu.Unlock()
+}
+
+// Every Dial that returns nil ends in exactly one OnClose, also when the
+// Dialer closes while the dials are still sending their requests.
+func TestDialRacingDialerCloseReportsEveryConnectionClosed(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(io.Discard, c); _ = c.Close() }()
+		}
+	}()
+	addr := "ws://" + ln.Addr().String() + "/"
+	rounds := 100
+	if testing.Short() {
+		rounds = 20
+	}
+	for round := range rounds {
+		handler := &closeCountingHandler{closed: map[*int]int{}}
+		dialer := NewDialer(Options{Handler: handler})
+		var mu sync.Mutex
+		var dialed, refused []*int
+		dial := func() {
+			token := new(int)
+			err := dialer.Dial(context.Background(), addr, token)
+			mu.Lock()
+			if err == nil {
+				dialed = append(dialed, token)
+			} else {
+				refused = append(refused, token)
+			}
+			mu.Unlock()
+		}
+		dial()
+		if len(dialed) != 1 {
+			t.Fatal("the first Dial failed")
+		}
+		var wg sync.WaitGroup
+		for range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				dial()
+			}()
+		}
+		time.Sleep(time.Duration(round%7) * 50 * time.Microsecond)
+		_ = dialer.Close(nil)
+		wg.Wait()
+		for deadline := time.Now().Add(testIOTimeout()); ; time.Sleep(time.Millisecond) {
+			handler.mu.Lock()
+			missing, twice, stray := 0, 0, 0
+			for _, token := range dialed {
+				switch handler.closed[token] {
+				case 0:
+					missing++
+				case 1:
+				default:
+					twice++
+				}
+			}
+			for _, token := range refused {
+				stray += handler.closed[token]
+			}
+			handler.mu.Unlock()
+			if twice > 0 || stray > 0 {
+				t.Fatalf("round %d: %d connections got OnClose more than once, %d failed dials got one", round, twice, stray)
+			}
+			if missing == 0 {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("round %d: %d of %d dialed connections never got OnClose", round, missing, len(dialed))
+			}
+		}
 	}
 }
