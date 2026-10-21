@@ -547,15 +547,16 @@ func TestConnectionTaskHandoffPublishesNewOwnerAfterPreviousTask(t *testing.T) {
 }
 
 // A refused open turn closes the connection before OnOpen ever ran, so it
-// gets no OnClose either: the two always come as a pair.
+// gets no OnClose either — the two always come as a pair — and registration
+// reports the refusal.
 func TestConnectionTaskExecutorRejectionClosesConnection(t *testing.T) {
 	var opened, closed atomic.Int32
 	events := &Events{Pollers: 1, Executor: rejectingNativeExecutor{}}
 	events.OnOpen = func(Conn) { opened.Add(1) }
 	events.OnClose = func(Conn, error) { closed.Add(1) }
 	testConn, registered := startTestConnection(t, events)
-	if err := <-registered; err != nil {
-		t.Fatal(err)
+	if err := <-registered; !errors.Is(err, ErrFirstTurnRefused) {
+		t.Fatalf("registration error = %v, want %v", err, ErrFirstTurnRefused)
 	}
 	conn := testConn.conn
 	for deadline := time.Now().Add(time.Second); conn.close.phase.Load() != closeCallbackDelivered ||

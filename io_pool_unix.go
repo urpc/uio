@@ -140,6 +140,12 @@ func (pool *ioTaskPool) submit(conn *fdConn) bool {
 		accepted = pool.executor.Submit(conn)
 	}
 	if !accepted {
+		if conn.taskState.Load()&ioEventOpen != 0 {
+			// The connection's first turn: it never opened, so no callback
+			// will ever report its end. Registration reports the refusal and
+			// tears the connection down itself instead of queueing a close.
+			return false
+		}
 		pool.rejectBatch([]IOTask{conn})
 	}
 	return true

@@ -558,7 +558,11 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 		registeredForTest(conn)
 	}
 	if !loop.ioPool.submit(conn) {
+		// The first turn never ran, so the connection has no callbacks to
+		// deliver and none ever will: report the refusal rather than hand
+		// the caller a connection whose end nothing will tell.
 		conn.handleIOSubmitFailure(net.ErrClosed)
+		return ErrFirstTurnRefused
 	}
 	return nil
 }

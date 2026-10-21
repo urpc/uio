@@ -226,10 +226,14 @@ type Conn interface {
 var errUnsupported = fmt.Errorf("unsupported method")
 
 var (
-	ErrOutboundOverflow   = errors.New("uio: outbound buffer limit exceeded")
-	ErrInboundOverflow    = errors.New("uio: inbound buffer limit exceeded")
-	ErrUnflushedData      = errors.New("uio: connection closed with unflushed data")
-	ErrDialOnEventLoop    = errors.New("uio: Dial cannot run on an event loop")
+	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
+	ErrInboundOverflow  = errors.New("uio: inbound buffer limit exceeded")
+	ErrUnflushedData    = errors.New("uio: connection closed with unflushed data")
+	ErrDialOnEventLoop  = errors.New("uio: Dial cannot run on an event loop")
+	// ErrFirstTurnRefused reports an Executor that declined to run a dialed
+	// or adopted connection's first turn, so the connection closed without
+	// ever calling back.
+	ErrFirstTurnRefused   = errors.New("uio: the executor refused the connection's first turn")
 	ErrReserveUnsupported = errors.New("uio: outbound reservation needs the connection's own callback")
 )
 
