@@ -20,7 +20,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"sync"
 	"time"
@@ -70,7 +73,8 @@ func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 // after OnOpen. The returned connection remains pending until Handler.OnOpen
 // reports handshake success or Handler.OnClose reports a handshake failure.
 // The returned error covers setup, network dial, and upgrade-request write or
-// flush failures. A handshake response failure is reported through OnClose.
+// flush failures. A connection closed before Dial returns, and a handshake
+// response failure, are reported through OnClose.
 func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -125,11 +129,25 @@ func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) (*Conn, er
 	}
 	setup.attach(raw)
 	conn := setup.conn
-	if _, err = raw.Write(request); err != nil {
-		_ = raw.CloseWith(err)
-		return nil, err
+	// The request's OnOutbound retires pending bytes like any frame's, so it
+	// must be counted, or it would retire the bytes of a later Close frame
+	// and let the graceful close drop that frame.
+	conn.trackOutbound(len(request))
+	n, err := raw.Write(request)
+	if err == nil && n != len(request) {
+		err = io.ErrShortWrite
 	}
-	if err = raw.Flush(); err != nil {
+	if err != nil {
+		conn.rollbackOutbound(len(request) - n)
+	} else {
+		err = raw.Flush()
+	}
+	if errors.Is(err, net.ErrClosed) {
+		// Something else already closed the connection, possibly after the
+		// whole handshake ran; its OnClose reports the outcome.
+		return conn, nil
+	}
+	if err != nil {
 		_ = raw.CloseWith(err)
 		return nil, err
 	}

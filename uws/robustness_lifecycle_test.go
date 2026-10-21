@@ -213,10 +213,9 @@ func TestRobustClientRejectsMaskedServerFrame(t *testing.T) {
 	dialer := NewDialer(Options{Handler: events})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	// The violation can close the transport before Dial returns its flush;
-	// ErrClosed then means the same as a connection returned to close at once.
-	// What the peer observes is asserted below.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil && !errors.Is(err, ErrClosed) {
+	// The violation can close the transport before Dial returns; Dial still
+	// returns the connection and leaves the close to OnClose.
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
@@ -256,10 +255,9 @@ func TestRobustClientRejectsOversizedMessage(t *testing.T) {
 	dialer := NewDialer(Options{Handler: events, MaxMessageSize: 32})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	// The violation can close the transport before Dial returns its flush;
-	// ErrClosed then means the same as a connection returned to close at once.
-	// What the peer observes is asserted below.
-	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil && !errors.Is(err, ErrClosed) {
+	// The violation can close the transport before Dial returns; Dial still
+	// returns the connection and leaves the close to OnClose.
+	if _, err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = dialer.Close(nil) }()
