@@ -70,13 +70,20 @@ func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 
 // Dial starts a WebSocket connection and returns once the upgrade request is
 // on its way; the Handler reports the rest. An error means no connection was
-// made and no callback follows. After a nil error, OnOpen reports a completed
-// handshake, and OnClose always reports how the connection ended, a failed
-// handshake or upgrade request included; the one exception is a custom
-// Executor that refuses the connection's first turn. userdata is the
-// connection's Userdata in every callback. ctx bounds the TCP connection and
-// the handshake, not the connection after OnOpen.
+// made and no callback follows — uio.ErrFirstTurnRefused when a custom
+// Executor declined the connection's first turn. After a nil error, OnOpen
+// reports a completed handshake, and OnClose always reports how the
+// connection ended, a failed handshake or upgrade request included. userdata
+// is the connection's Userdata in every callback. ctx bounds the TCP
+// connection and the handshake, not the connection after OnOpen.
 func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) error {
+	return d.dialWithHandler(ctx, addr, userdata, nil)
+}
+
+// dialWithHandler runs Dial's setup; a non-nil handler replaces the dialer's
+// frozen one on this connection only, which is how DialClient installs its
+// internal callbacks.
+func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any, handler Handler) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -113,6 +120,7 @@ func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) error {
 		Context:  attemptCtx,
 		cleanup:  cleanupAttempt,
 		userdata: userdata,
+		handler:  handler,
 		key:      key,
 	}
 	setup.conn = d.newClientConn(nil, setup)
@@ -336,10 +344,14 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		opts, _ := d.Options.resolve()
 		config = newDialerConnConfig(opts, &d.connections, &d.stats)
 	}
+	handler := config.handler
+	if setup.handler != nil {
+		handler = setup.handler
+	}
 	conn := &Conn{
 		raw:      raw,
 		config:   config,
-		handler:  config.handler,
+		handler:  handler,
 		userData: setup.userdata,
 	}
 	if config.heartbeatConnections != nil {
@@ -444,6 +456,7 @@ type dialSetup struct {
 	context.Context
 	cleanup    func()
 	userdata   any
+	handler    Handler // overrides the dialer's Handler when non-nil
 	key        string
 	conn       *Conn
 	attachOnce sync.Once

@@ -107,6 +107,38 @@ A request that arrives before `Serve` has started gets HTTP 500.
 
 ## Client
 
+The callback form above suits one handler serving many connections. For a
+single connection used from one place, the pull form returns a ready client
+after the handshake:
+
+```go
+client, err := uws.Dial(ctx, "ws://127.0.0.1:8080/")
+if err != nil {
+	log.Fatal(err)
+}
+defer client.Close(1000, "")
+
+_ = client.SendText([]byte("hello"))
+for {
+	message, err := client.ReadMessage(ctx)
+	if err != nil {
+		break // a *uws.CloseError once the queued messages ran out
+	}
+	log.Printf("%s", message.Payload)
+}
+```
+
+`uws.Dial` uses `uws.DefaultDialer`, a default-options dialer that lives as
+long as the process. `Dialer.DialClient` is the same with a configured
+dialer, whose `Options.Handler` must be nil because the client owns the
+callbacks. A full message queue pauses the connection's reads — TCP flow
+control then slows the peer — so a client must either keep reading or be
+closed; `Client.Close` works either way. `ReadMessage` reports a
+`*uws.CloseError` after the connection ended and every message received
+before that was returned.
+
+The callback form, for one handler serving every connection a dialer makes:
+
 ```go
 type client struct{}
 
@@ -128,12 +160,12 @@ if err := dialer.Dial(ctx, "ws://127.0.0.1:8080/", nil); err != nil {
 the background; the connection reaches the application only through the
 handler. Its third argument is the connection's userdata, available as
 `Conn.Userdata` in every callback, so one stateless handler serves every dial.
-An error from `Dial` means no connection was made and no callback follows.
-After a nil error, `OnOpen` means the connection is ready, and `OnClose`
-always follows, with the cause in `CloseEvent.Err`; a failed handshake calls
-it without `OnOpen`. The one exception is a custom `Executor` that refuses the
-connection's first turn. The context bounds the dial and the handshake, not
-the connection after it.
+An error from `Dial` means no connection was made and no callback follows,
+`uio.ErrFirstTurnRefused` when a custom `Executor` declines the connection's
+first turn. After a nil error, `OnOpen` means the connection is ready, and
+`OnClose` always follows, with the cause in `CloseEvent.Err`; a failed
+handshake calls it without `OnOpen`. The context bounds the dial and the
+handshake, not the connection after it.
 
 ## Configuration
 

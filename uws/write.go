@@ -271,14 +271,8 @@ func (c *Conn) Close(code uint16, reason string) error {
 	if !c.opened.Load() {
 		return c.raw.CloseWith(io.EOF)
 	}
-	if len(reason) > 123 || !utf8.ValidString(reason) {
-		return frame.ErrInvalidUTF8
-	}
-	payload := make([]byte, 2+len(reason))
-	payload[0] = byte(code >> 8)
-	payload[1] = byte(code)
-	copy(payload[2:], reason)
-	if err := frame.ValidateClosePayload(payload); err != nil {
+	payload, err := c.closePayload(code, reason)
+	if err != nil {
 		return err
 	}
 	if c.closing.Load() {
@@ -307,6 +301,23 @@ func (c *Conn) Close(code uint16, reason string) error {
 	}
 	c.startCloseTimer()
 	return nil
+}
+
+// closePayload builds and checks the Close frame payload for code and reason.
+// A Close that fails it changes nothing on the connection, which is what lets
+// Client.Close run it before committing to end reading.
+func (c *Conn) closePayload(code uint16, reason string) ([]byte, error) {
+	if len(reason) > 123 || !utf8.ValidString(reason) {
+		return nil, frame.ErrInvalidUTF8
+	}
+	payload := make([]byte, 2+len(reason))
+	payload[0] = byte(code >> 8)
+	payload[1] = byte(code)
+	copy(payload[2:], reason)
+	if err := frame.ValidateClosePayload(payload); err != nil {
+		return nil, err
+	}
+	return payload, nil
 }
 
 // sendCloseFrame queues a protocol Close frame; see sendCloseFrameLocked.

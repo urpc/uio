@@ -40,7 +40,8 @@ var ErrInvalidOptions = errors.New("uws: invalid options")
 type Options struct {
 	// Handler receives the connection callbacks of every connection the
 	// server or dialer makes. It may be nil, which leaves the protocol
-	// running without application callbacks.
+	// running without application callbacks; a Dialer whose Handler is set
+	// refuses DialClient, which installs its own.
 	Handler Handler
 	// Subprotocols lists supported protocols in server preference order,
 	// offered in the same order by a Dialer.
