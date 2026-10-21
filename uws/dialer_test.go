@@ -268,13 +268,9 @@ func TestDialerValidationAndConnectionFailure(t *testing.T) {
 	if dialer.started != nil {
 		t.Fatal("invalid target started the Dialer event loop")
 	}
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	address := probe.Addr().String()
-	_ = probe.Close()
-	if _, err := dialer.Dial(context.Background(), "ws://"+address, nil); err == nil {
+	// A released ephemeral port can be bound again by any process running
+	// tests meanwhile; nothing unprivileged can listen on port 1.
+	if _, err := dialer.Dial(context.Background(), "ws://127.0.0.1:1", nil); err == nil {
 		t.Fatal("connection failure Dial() returned nil")
 	}
 	if err := (&Dialer{}).Close(nil); err != nil {

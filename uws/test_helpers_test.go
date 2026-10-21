@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"math/rand/v2"
 	"net"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -403,19 +405,19 @@ func readServerFrame(reader *bufio.Reader) (first byte, payload []byte, fin bool
 // startTestServer binds and starts the server built by newServer on a fresh
 // loopback port and returns it with its address and Serve's result. The
 // listeners are bound before it returns: ready is set at the start of OnStart,
-// after the bind. A port taken between the probe and the bind is retried on a
-// new one. The caller owns shutdown and must drain serveDone.
+// after the bind. The caller owns shutdown and must drain serveDone.
+//
+// The port is picked below the ephemeral ranges (32768 up on Linux, 49152 up
+// on macOS and Windows). A port probed from those ranges and released is
+// handed to the next outgoing connection of any process on the host, and
+// processes running tests side by side dial thousands. Below them only an
+// explicit bind can take a port, and a taken one is retried.
 func startTestServer(t *testing.T, newServer func() *Server) (*Server, string, <-chan error) {
 	t.Helper()
 	var lastErr error
 attempt:
-	for attempt := 0; attempt < 5; attempt++ {
-		probe, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
-		}
-		addr := probe.Addr().String()
-		_ = probe.Close()
+	for attempt := 0; attempt < 20; attempt++ {
+		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(20000+rand.IntN(12000)))
 		server := newServer()
 		serveDone := make(chan error, 1)
 		go func() { serveDone <- server.Serve(addr) }()
@@ -423,8 +425,7 @@ attempt:
 		for {
 			select {
 			case lastErr = <-serveDone:
-				// Serve gave up before binding: another process most likely
-				// took the probed port. Try a fresh one.
+				// Serve gave up before binding: the port is in use.
 				continue attempt
 			default:
 			}
@@ -437,7 +438,7 @@ attempt:
 			time.Sleep(time.Millisecond)
 		}
 	}
-	t.Fatalf("could not bind an ephemeral port: %v", lastErr)
+	t.Fatalf("could not bind a loopback port: %v", lastErr)
 	return nil, "", nil
 }
 

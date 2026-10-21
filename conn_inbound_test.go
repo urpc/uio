@@ -15,17 +15,39 @@ import (
 	"time"
 )
 
+// serveLoopback serves events on a loopback port Serve picks itself, and
+// returns that address once OnStart has run. A port probed and released
+// beforehand could be bound by any process in between.
+func serveLoopback(tb testing.TB, events *Events) (string, <-chan error) {
+	tb.Helper()
+	addrs := make(chan string, 1)
+	onStart := events.OnStart
+	events.OnStart = func(ev *Events) {
+		if onStart != nil {
+			onStart(ev)
+		}
+		for _, l := range ev.acceptor.listeners {
+			addrs <- l.ln.Addr().String()
+			return
+		}
+	}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve("tcp://127.0.0.1:0") }()
+	select {
+	case addr := <-addrs:
+		return addr, done
+	case err := <-done:
+		tb.Fatalf("Serve: %v", err)
+	case <-time.After(5 * time.Second):
+		tb.Fatal("server did not start")
+	}
+	return "", nil
+}
+
 // serveInboundTest serves events on a fresh loopback port and returns a
 // connected client, with the server's view of it once OnOpen has run.
 func serveInboundTest(t *testing.T, events *Events) (net.Conn, Conn) {
 	t.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-
 	opened := make(chan Conn, 1)
 	onOpen := events.OnOpen
 	events.OnOpen = func(c Conn) {
@@ -37,15 +59,7 @@ func serveInboundTest(t *testing.T, events *Events) (net.Conn, Conn) {
 		default:
 		}
 	}
-	started := make(chan struct{})
-	events.OnStart = func(*Events) { close(started) }
-	done := make(chan error, 1)
-	go func() { done <- events.Serve("tcp://" + addr) }()
-	select {
-	case <-started:
-	case err := <-done:
-		t.Fatalf("Serve: %v", err)
-	}
+	addr, done := serveLoopback(t, events)
 	client, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
@@ -728,26 +742,12 @@ func (d *packetDecoder) onData(conn Conn) error {
 // buffers and returns a client connection to it.
 func startPacketServer(tb testing.TB, decoder *packetDecoder) net.Conn {
 	tb.Helper()
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		tb.Fatal(err)
-	}
-	addr := probe.Addr().String()
-	_ = probe.Close()
-	started := make(chan struct{})
 	server := &Events{
 		Pollers:       1,
 		MaxBufferSize: 64 << 10,
-		OnStart:       func(*Events) { close(started) },
 		OnData:        decoder.onData,
 	}
-	done := make(chan error, 1)
-	go func() { done <- server.Serve("tcp://" + addr) }()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		tb.Fatal("server did not start")
-	}
+	addr, done := serveLoopback(tb, server)
 	client, err := net.Dial("tcp", addr)
 	if err != nil {
 		tb.Fatal(err)

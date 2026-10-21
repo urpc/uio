@@ -25,6 +25,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -391,6 +392,7 @@ func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
 
 	// Write requests without reading a single reply.
 	writeDone := make(chan error, 1)
+	var sent atomic.Int64
 	go func() {
 		maskKey := [4]byte{9, 8, 7, 6}
 		var wire []byte
@@ -404,6 +406,7 @@ func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
 				writeDone <- err
 				return
 			}
+			sent.Add(1)
 		}
 		writeDone <- nil
 	}()
@@ -423,13 +426,26 @@ func TestSlowPeerBackpressureKeepsEveryMessage(t *testing.T) {
 	}
 
 	// Drain the replies: the pause lifts and every request is answered once.
-	if err := conn.SetReadDeadline(time.Now().Add(testIOTimeout())); err != nil {
-		t.Fatal(err)
-	}
+	// The deadline bounds each frame, not the whole transfer: a loaded runner
+	// can take longer than one timeout to move 64 MiB while making progress,
+	// and a stalled stream still fails within one timeout. The overall cap
+	// keeps a trickle from holding the test forever.
+	start := time.Now()
+	overall := start.Add(10 * testIOTimeout())
 	for i := 0; i < messages; i++ {
+		if err := conn.SetReadDeadline(time.Now().Add(testIOTimeout())); err != nil {
+			t.Fatal(err)
+		}
 		payload, err := readEchoFrame(reader)
 		if err != nil {
-			t.Fatalf("reply %d: %v", i, err)
+			stats := server.Stats()
+			t.Fatalf("reply %d after %v (sent %d/%d, reads paused %d resumed %d): %v",
+				i, time.Since(start), sent.Load(), messages, stats.ReadsPaused, stats.ReadsResumed, err)
+		}
+		if time.Now().After(overall) {
+			stats := server.Stats()
+			t.Fatalf("transfer exceeded %v at reply %d (sent %d/%d, reads paused %d resumed %d)",
+				10*testIOTimeout(), i, sent.Load(), messages, stats.ReadsPaused, stats.ReadsResumed)
 		}
 		if len(payload) != payloadSize {
 			t.Fatalf("reply %d length = %d, want %d", i, len(payload), payloadSize)

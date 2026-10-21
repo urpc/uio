@@ -185,18 +185,11 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 			},
 		}
 	}
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := "tcp://" + probe.Addr().String()
-	_ = probe.Close()
-
 	serverStarted, clientStarted := make(chan struct{}), make(chan struct{})
 	server := newEvents(&serverReceived, serverStarted)
 	client := newEvents(&clientReceived, clientStarted)
-	serverDone, clientDone := make(chan error, 1), make(chan error, 1)
-	go func() { serverDone <- server.Serve(addr) }()
+	addr, serverDone := serveLoopback(t, server)
+	clientDone := make(chan error, 1)
 	go func() { clientDone <- client.Serve() }()
 	t.Cleanup(func() {
 		_ = client.Close(nil)
@@ -204,14 +197,14 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 		<-clientDone
 		<-serverDone
 	})
-	for _, started := range []chan struct{}{serverStarted, clientStarted} {
-		select {
-		case <-started:
-		case <-time.After(5 * time.Second):
-			t.Fatal("event loops did not start")
-		}
+	select {
+	case <-clientStarted:
+	case err := <-clientDone:
+		t.Fatalf("client Serve: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("event loops did not start")
 	}
-	if _, err = client.Dial(addr, nil); err != nil {
+	if _, err := client.Dial("tcp://"+addr, nil); err != nil {
 		t.Fatal(err)
 	}
 
@@ -220,7 +213,7 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 	last, lastMoved := int64(-1), time.Now()
 	for {
 		select {
-		case err = <-writeErrs:
+		case err := <-writeErrs:
 			t.Fatalf("write failed: %v", err)
 		default:
 		}

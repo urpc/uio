@@ -293,13 +293,13 @@ func TestDialContextCancellationBeforeNetworkDial(t *testing.T) {
 		_ = events.Close(nil)
 		select {
 		case <-serveDone:
-		case <-time.After(time.Second):
+		case <-time.After(5 * time.Second):
 			t.Error("Events.Serve did not stop")
 		}
 	}()
 	select {
 	case <-started:
-	case <-time.After(time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("Events.Serve did not start")
 	}
 
@@ -398,25 +398,33 @@ func TestServeAcceptsConnectionsOnAllAddresses(t *testing.T) {
 }
 
 func TestServeRollsBackListenersWhenLaterAddressFails(t *testing.T) {
-	reserved, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := reserved.Addr().String()
-	if err = reserved.Close(); err != nil {
-		t.Fatal(err)
-	}
+	// The port is free between the probe and Serve and again after the
+	// rollback, so another process may bind it meanwhile; a listener the
+	// rollback leaked fails every attempt.
+	for attempt := 1; ; attempt++ {
+		reserved, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		addr := reserved.Addr().String()
+		if err = reserved.Close(); err != nil {
+			t.Fatal(err)
+		}
 
-	events := &Events{Pollers: 1}
-	if err = events.Serve(addr, "unsupported://address"); err == nil {
-		t.Fatal("Serve accepted an unsupported second address")
+		events := &Events{Pollers: 1}
+		if err = events.Serve(addr, "unsupported://address"); err == nil {
+			t.Fatal("Serve accepted an unsupported second address")
+		}
+		if events.ready.Load() || !events.closing.Load() {
+			t.Fatal("failed Serve left event loops serving")
+		}
+		listener, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = listener.Close()
+			return
+		}
+		if attempt == 5 {
+			t.Fatalf("first listener was not released: %v", err)
+		}
 	}
-	if events.ready.Load() || !events.closing.Load() {
-		t.Fatal("failed Serve left event loops serving")
-	}
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		t.Fatalf("first listener was not released: %v", err)
-	}
-	_ = listener.Close()
 }

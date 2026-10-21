@@ -168,10 +168,11 @@ func TestWriteTurnReleaseLosesNoWrite(t *testing.T) {
 // A direct send takes the write claim like every other sender, so it neither
 // overlaps a write turn's send nor gives away a claim it does not hold: both
 // producers' records arrive whole, once, and in order. A goroutine stands in
-// for the connection's own uncorked callback. The socket buffers hold every
-// record, so a send blocks only on the kernel's page-granular accounting, and
-// the write edges it raises are flushed by real turns beside the writers: the
-// claim serializes the sends, and the records arrive whole. That needs TCP: a
+// for the connection's own uncorked callback, holding the connection's turn
+// as a real one would: turns are exclusive, so the writable edges its sends
+// raise wait for it and are flushed by the turn that follows, while write
+// turns send beside it. The socket buffers hold every record, so a send
+// blocks only on the kernel's page-granular accounting. That needs TCP: a
 // Unix socket's per-send charge fills Linux's default limit after 555 such
 // records.
 func TestDirectSendSharesTheWriteClaim(t *testing.T) {
@@ -212,9 +213,17 @@ func TestDirectSendSharesTheWriteClaim(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		// This goroutine stands in for the idle connection's own callback,
-		// whose uncorked writes take the direct path.
+		// whose uncorked writes take the direct path. It claims the turn
+		// the way a producer does, so no real turn runs beside it.
+		for !conn.noteIO(0) {
+			runtime.Gosched()
+		}
 		conn.ioOwner.Store(currentGoroutineID())
-		defer conn.ioOwner.Store(0)
+		defer func() {
+			conn.ioOwner.Store(0)
+			// Edges noted meanwhile resubmit the turn.
+			conn.finishIOTask()
+		}()
 		for seq := uint32(0); seq < records; seq++ {
 			if _, err := conn.Write(record('D', seq)); err != nil {
 				t.Error(err)
@@ -954,7 +963,11 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 			events.OnOutbound = func(c Conn, _ int) {
 				if armed.CompareAndSwap(true, false) {
 					conn := c.(*fdConn)
-					blockedAtPanic.Store(conn.writeBlocked())
+					// A writable edge may clear the blocked flag once the
+					// peer acknowledges, before this callback looks; with the
+					// claim held, the edge leaves writeEdgeFlag behind.
+					state := conn.writeState.Load()
+					blockedAtPanic.Store(state&(writeBlockedFlag|writeEdgeFlag) != 0)
 					ownerAtPanic.Store(conn.directOwner())
 					panic("OnOutbound panics once")
 				}

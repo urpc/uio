@@ -39,9 +39,10 @@ type slowConnectionHandler struct {
 }
 
 type blockingCloseConnectionHandler struct {
-	opens   atomic.Int32
-	started chan struct{}
-	release chan struct{}
+	opens      atomic.Int32
+	slowOpened chan struct{} // closed once the first connection is marked slow
+	started    chan struct{}
+	release    chan struct{}
 }
 
 type goroutineExecutor struct{}
@@ -96,6 +97,7 @@ func (*slowConnectionHandler) OnClose(*Conn, CloseEvent) {}
 func (h *blockingCloseConnectionHandler) OnOpen(conn *Conn) {
 	if h.opens.Add(1) == 1 {
 		conn.SetUserdata("slow")
+		close(h.slowOpened)
 	}
 }
 func (*blockingCloseConnectionHandler) OnMessage(conn *Conn, message Message) {
@@ -215,7 +217,15 @@ func TestSlowConnectionDoesNotBlockOtherWebSocket(t *testing.T) {
 }
 
 func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
-	handler := &blockingCloseConnectionHandler{started: make(chan struct{}), release: make(chan struct{})}
+	handler := &blockingCloseConnectionHandler{
+		slowOpened: make(chan struct{}),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	// Every exit path must release the blocking OnClose, or shutdown waits
+	// on a callback this test leaked.
+	release := sync.OnceFunc(func() { close(handler.release) })
+	defer release()
 	_, addr, _ := startConfiguredLifecycleTestServer(t, handler, func(server *Server) {
 	})
 	dialer := NewDialer(Options{Handler: clientUserdataHandler{}})
@@ -236,6 +246,14 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 		return client, clientHandler
 	}
 	slow, _ := newClient()
+	// The server answers the upgrade before its OnOpen runs, so the client's
+	// OnOpen says nothing about which connection OnOpen marks slow. Wait for
+	// the mark before dialing the second one.
+	select {
+	case <-handler.slowOpened:
+	case <-time.After(lifecycleTestTimeout()):
+		t.Fatal("server OnOpen never marked a connection slow")
+	}
 	fast, fastHandler := newClient()
 	if err := slow.raw.CloseWith(io.EOF); err != nil {
 		t.Fatal(err)
@@ -256,7 +274,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 	case <-time.After(lifecycleTestTimeout()):
 		t.Fatal("blocking OnClose stopped the other connection")
 	}
-	close(handler.release)
+	release()
 }
 
 func (h *closeFromMessageHandler) OnOpen(*Conn) { close(h.open) }
