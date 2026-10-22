@@ -1579,6 +1579,57 @@ func TestStdDialCanceledDuringRegistrationGetsNoCallbacks(t *testing.T) {
 	}
 }
 
+// The acceptor hands each connection to its worker loop without waiting for
+// the registration: a worker loop held up registering one connection does not
+// stop connections bound for another loop from being accepted and opened.
+func TestStdAcceptDoesNotWaitForRegistration(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 3 {
+		t.Skip("needs three worker loops, and Pollers is capped at GOMAXPROCS")
+	}
+	release := make(chan struct{})
+	var held atomic.Pointer[eventLoop]
+	registeredForTest = func(conn *fdConn) {
+		if held.CompareAndSwap(nil, conn.loop) {
+			<-release
+		}
+	}
+	releaseOnce := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(func() {
+		releaseOnce()
+		registeredForTest = nil
+	})
+	opened := make(chan struct{}, 16)
+	// Three loops: the client sockets dialed here take descriptors too, so
+	// the accepted ones step by two, which a pair of loops would map to one.
+	events := &Events{Pollers: 3, OnOpen: func(Conn) { opened <- struct{}{} }}
+	addr, done := serveLoopback(t, events)
+	t.Cleanup(func() {
+		releaseOnce()
+		_ = events.Close(nil)
+		<-done
+	})
+	var clients []net.Conn
+	defer func() {
+		for _, c := range clients {
+			_ = c.Close()
+		}
+	}()
+	// The first registration blocks its loop; the rest of the dials reach
+	// the other loops too, since loops are picked by descriptor number.
+	for range 6 {
+		c, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		clients = append(clients, c)
+	}
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no connection opened while one worker loop was registering")
+	}
+}
+
 // stdioBackend tells cross-backend tests which backend they run on.
 const stdioBackend = true
 

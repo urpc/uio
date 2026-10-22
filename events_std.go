@@ -373,12 +373,14 @@ func (ev *Events) closeConn(fdc *fdConn, err error) {
 	fdc.requestClose(err)
 }
 
+// submitAccepted hands an accepted connection to its worker loop for
+// registration and returns at once. A task the loop accepted runs before the
+// loop stops, so the connection is registered or closed either way.
 func (ev *Events) submitAccepted(fdc *fdConn, tcp bool) bool {
 	if fdc.loop == nil || ev.closing.Load() {
 		fdc.closeUnregistered()
 		return false
 	}
-	// The listener loop never waits for a worker's OnOpen callback.
 	t := acquireTask(registerTask, fdc)
 	t.acceptedTCP = tcp
 	if !fdc.loop.submitTask(t) {

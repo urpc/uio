@@ -126,7 +126,9 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			fdc.writeSig = make(chan struct{}, 1)
 			fdc.readResume = make(chan struct{}, 1)
 
-			_ = ld.events.addConn(fdc)
+			// Registration runs on the worker loop; waiting for it here would
+			// hold every later accept behind that loop's queue.
+			ld.events.submitAccepted(fdc, true)
 		}
 	}()
 
