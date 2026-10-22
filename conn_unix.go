@@ -2027,13 +2027,6 @@ func (conn *fdConn) handleTimeout(kind deadlineKind, generation uint64) {
 	conn.requestClose(fmt.Errorf("uio: %s deadline: %w", deadlineName(kind), os.ErrDeadlineExceeded))
 }
 
-func deadlineName(kind deadlineKind) string {
-	if kind == deadlineRead {
-		return "read"
-	}
-	return "write"
-}
-
 func (conn *fdConn) stopDeadlines() {
 	conn.submitMu.Lock()
 	defer conn.submitMu.Unlock()

@@ -20,6 +20,7 @@ package uio
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -49,6 +50,11 @@ type stdUDPState struct {
 	sock  *net.UDPConn
 	svr   *fdConn
 	peers map[string]*fdConn
+
+	// deadlines are a server child's own: the socket it shares with its
+	// server and every other peer must not carry them. Allocated by the
+	// first nonzero deadline; see applyChildDeadline.
+	deadlines *childDeadlines
 
 	// Datagrams are sent on whichever goroutine writes them, and the bytes
 	// they report wait in outboundPending for whoever holds outboundClaim; see
@@ -317,6 +323,9 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	if fc.isClosing() {
 		return net.ErrClosed
 	}
+	if fc.udp != nil && fc.udp.svr != nil {
+		return fc.applyChildDeadline(kind, deadline)
+	}
 	var target net.Conn
 	if fc.conn != nil {
 		target = fc.conn
@@ -353,6 +362,89 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	default:
 	}
 	return nil
+}
+
+// childDeadlines times a UDP server child's deadlines, under the child's
+// deadlineMu. The child reads no socket of its own — its server's listener
+// reads the shared one for every peer — so a deadline there would end the
+// server and all its peers. As on the native backend, a deadline that passes
+// closes only this child, with an error that wraps os.ErrDeadlineExceeded.
+type childDeadlines struct {
+	stopped bool
+	read    childDeadline
+	write   childDeadline
+}
+
+type childDeadline struct {
+	at         time.Time
+	generation uint64
+	timer      *time.Timer
+}
+
+func (fc *fdConn) applyChildDeadline(kind deadlineKind, deadline time.Time) error {
+	fc.deadlineMu.Lock()
+	defer fc.deadlineMu.Unlock()
+	state := fc.udp.deadlines
+	if state == nil {
+		if deadline.IsZero() {
+			return nil
+		}
+		state = &childDeadlines{}
+		fc.udp.deadlines = state
+	}
+	if state.stopped || fc.isClosing() {
+		return net.ErrClosed
+	}
+	if kind == deadlineBoth || kind == deadlineRead {
+		fc.armChildDeadline(&state.read, deadlineRead, deadline)
+	}
+	if kind == deadlineBoth || kind == deadlineWrite {
+		fc.armChildDeadline(&state.write, deadlineWrite, deadline)
+	}
+	return nil
+}
+
+// armChildDeadline replaces one deadline; it requires deadlineMu. The
+// generation makes a timer that already fired for the old deadline harmless.
+func (fc *fdConn) armChildDeadline(slot *childDeadline, kind deadlineKind, deadline time.Time) {
+	slot.generation++
+	slot.at = deadline
+	if slot.timer != nil {
+		slot.timer.Stop()
+	}
+	if deadline.IsZero() {
+		return
+	}
+	generation := slot.generation
+	slot.timer = time.AfterFunc(max(time.Until(deadline), 0), func() {
+		fc.expireChildDeadline(slot, kind, generation)
+	})
+}
+
+func (fc *fdConn) expireChildDeadline(slot *childDeadline, kind deadlineKind, generation uint64) {
+	fc.deadlineMu.Lock()
+	expired := !fc.udp.deadlines.stopped && slot.generation == generation &&
+		!slot.at.IsZero() && !time.Now().Before(slot.at)
+	fc.deadlineMu.Unlock()
+	if expired {
+		fc.requestClose(fmt.Errorf("uio: %s deadline: %w", deadlineName(kind), os.ErrDeadlineExceeded))
+	}
+}
+
+// stopChildDeadlines cancels a closing child's timers and refuses new ones.
+func (fc *fdConn) stopChildDeadlines() {
+	fc.deadlineMu.Lock()
+	defer fc.deadlineMu.Unlock()
+	state := fc.udp.deadlines
+	if state == nil {
+		return
+	}
+	state.stopped = true
+	for _, slot := range []*childDeadline{&state.read, &state.write} {
+		if slot.timer != nil {
+			slot.timer.Stop()
+		}
+	}
 }
 
 func (fc *fdConn) applySocketOption(socketOptionKind, int) error { return errUnsupported }
@@ -729,6 +821,7 @@ func (fc *fdConn) closeOnLoop(err error) {
 	}
 	fc.closing.Store(true)
 	if fc.udp != nil && fc.udp.svr != nil {
+		fc.stopChildDeadlines()
 		fc.udp.svr.mux.Lock()
 		delete(fc.udp.svr.udp.peers, fc.remoteAddr.String())
 		fc.udp.svr.mux.Unlock()

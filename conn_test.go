@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -446,6 +447,99 @@ func TestCloseBeforeOnOpenSkipsOnClose(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	if n := orphans.Load(); n != 0 {
 		t.Fatalf("%d of %d closes reached a connection that never got OnOpen", n, closes.Load())
+	}
+}
+
+// A read deadline on one UDP server child ends that child alone: the server
+// and its other peers keep running. The children share their server's
+// socket, so a deadline that reached the socket would end them all.
+func TestUDPChildReadDeadlineClosesOnlyThatChild(t *testing.T) {
+	probe, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.LocalAddr().String()
+	_ = probe.Close()
+	type closeEvent struct {
+		peer string
+		err  error
+	}
+	closed := make(chan closeEvent, 4)
+	started := make(chan struct{})
+	events := &Events{
+		Pollers: 1,
+		OnStart: func(*Events) { close(started) },
+		OnData: func(c Conn) error {
+			payload := c.Peek(make([]byte, c.InboundBuffered()))
+			if string(payload) == "expire" {
+				if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+					return err
+				}
+			}
+			_, err := c.WriteTo(c)
+			return err
+		},
+		OnClose: func(c Conn, err error) { closed <- closeEvent{c.RemoteAddr().String(), err} },
+	}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve("udp://" + addr) }()
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("Serve: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("server did not start")
+	}
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-done
+	})
+	echo := func(c net.Conn, payload string) {
+		t.Helper()
+		if _, err := c.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 64)
+		n, err := c.Read(buf)
+		if err != nil || string(buf[:n]) != payload {
+			t.Fatalf("echo of %q = %q, %v", payload, buf[:n], err)
+		}
+	}
+	expiring, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer expiring.Close()
+	staying, err := net.Dial("udp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer staying.Close()
+	echo(staying, "hello")
+	echo(expiring, "expire")
+	select {
+	case event := <-closed:
+		if event.peer != expiring.LocalAddr().String() {
+			t.Fatalf("the deadline closed %s, want only %s", event.peer, expiring.LocalAddr())
+		}
+		if !errors.Is(event.err, os.ErrDeadlineExceeded) {
+			t.Fatalf("OnClose error = %v, want a deadline", event.err)
+		}
+	case err := <-done:
+		t.Fatalf("a child's read deadline stopped the server: %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the read deadline never closed its child")
+	}
+	// The other peer and the server outlive it.
+	time.Sleep(100 * time.Millisecond)
+	echo(staying, "still here")
+	select {
+	case event := <-closed:
+		t.Fatalf("another connection closed too: %s: %v", event.peer, event.err)
+	case err := <-done:
+		t.Fatalf("the server stopped: %v", err)
+	default:
 	}
 }
 

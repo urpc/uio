@@ -25,6 +25,13 @@ const (
 	deadlineWrite
 )
 
+func deadlineName(kind deadlineKind) string {
+	if kind == deadlineRead {
+		return "read"
+	}
+	return "write"
+}
+
 // socketOptionKind selects the socket option a setter applies.
 type socketOptionKind uint8
 
