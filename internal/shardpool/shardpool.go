@@ -474,7 +474,9 @@ func (s *shard[T]) wakeIdle(target *shard[T]) bool {
 }
 
 // start starts a worker of s to serve target, unless s has its maximum or the
-// pool stopped.
+// pool stopped. The worker is counted under s.mu, with the stopped check:
+// Stop takes every shard's mu after publishing stopped, so a start that saw
+// the pool running has counted its worker before Stop waits for the workers.
 func (s *shard[T]) start(target *shard[T]) bool {
 	pool := s.owner
 	s.mu.Lock()
@@ -484,12 +486,12 @@ func (s *shard[T]) start(target *shard[T]) bool {
 	}
 	s.live++
 	grown := s.live > 1
+	pool.workers.Add(1)
 	s.mu.Unlock()
 	if grown {
 		pool.janitor.Do(func() { go pool.retireIdleWorkers() })
 	}
 	w := &worker[T]{home: s, wake: make(chan *shard[T], 1)}
-	pool.workers.Add(1)
 	go w.run(target)
 	return true
 }

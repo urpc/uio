@@ -239,15 +239,6 @@ func (pool *ioTaskPool) stop() {
 	})
 }
 
-// connTasks boxes refused connections for rejectBatch.
-func connTasks(conns []*fdConn) []IOTask {
-	tasks := make([]IOTask, len(conns))
-	for index, conn := range conns {
-		tasks[index] = conn
-	}
-	return tasks
-}
-
 // rejectQueue runs refused turns' failure handling on at most
 // ioRejectWorkers goroutines, started while the queue has work and gone once
 // it is empty.

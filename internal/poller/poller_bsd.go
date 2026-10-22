@@ -359,7 +359,13 @@ func (poller *Poller) mountPark(batch *Batch) {
 	}
 	poller.mu.Lock()
 	batch.parkFile, batch.parkConn = file, conn
-	batch.parkKq, batch.parkRead = poller.kqfd, batch.readParked
+	batch.parkKq = poller.kqfd
+	batch.parkRead = func(fd uintptr) bool {
+		// As on Linux, an empty probe must not park again on a closed
+		// poller: the runtime watches the kqueue edge-triggered, and a close
+		// wake already pending raises no further edge for this waiter.
+		return batch.readParked(fd) || poller.closed.Load()
+	}
 	poller.parked = append(poller.parked, batch)
 	poller.mu.Unlock()
 }

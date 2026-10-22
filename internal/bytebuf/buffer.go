@@ -72,7 +72,8 @@ func (b *Buffer) CommitWrite(n int) {
 	b.buf = b.buf[:len(b.buf)+n]
 }
 
-// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
+// Discard drops the next n unread bytes. n <= 0 drops all of them, Discard(0)
+// included, so a caller that may have nothing to drop must check for it.
 func (b *Buffer) Discard(n int) {
 	if n <= 0 {
 		b.Reset()
