@@ -27,6 +27,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/libp2p/go-reuseport"
@@ -49,6 +50,42 @@ type listener struct {
 	udp     net.PacketConn // udp endpoint
 	udpSvr  *fdConn        // udp server
 	loop    *eventLoop     // the loop that accepts on a stream listener
+
+	// userdata is every accepted connection's initial Userdata.
+	userdata any
+	started  bool // registered with its loop; guarded by acceptor.mux
+	// use counts the waiters accepting on the listener, below its closed
+	// bit; see enter and retire.
+	use atomic.Int64
+}
+
+// listenerClosed is the bit of listener.use a closing listener sets.
+const listenerClosed = 1 << 62
+
+// enter reports whether a waiter may accept on l, and counts it until leave.
+func (l *listener) enter() bool {
+	for {
+		use := l.use.Load()
+		if use&listenerClosed != 0 {
+			return false
+		}
+		if l.use.CompareAndSwap(use, use+1) {
+			return true
+		}
+	}
+}
+
+func (l *listener) leave() { l.use.Add(-1) }
+
+// retire stops new accepts on l and waits for the ones in progress. A waiter
+// may have looked l up just before it left its loop, so its descriptor is
+// closed only after this returns: closed earlier, the number could be reused
+// by another socket that waiter would then accept on.
+func (l *listener) retire() {
+	l.use.Or(listenerClosed)
+	for l.use.Load() != listenerClosed {
+		runtime.Gosched()
+	}
 }
 
 // acceptor owns the listeners. Stream listeners are spread over the event
@@ -58,7 +95,9 @@ type acceptor struct {
 	mux       sync.Mutex
 	listeners map[int]*listener
 	events    *Events
-	next      int // the loop the next stream listener goes to
+	next      int  // the loop the next stream listener goes to
+	accepting bool // startAccepting has run: a new listener starts at once
+	closed    bool // close has run: Listen adds nothing more
 }
 
 // listenersOverride fixes the number of ReusePort listeners per address in
@@ -83,22 +122,40 @@ func reusePortListeners(procs int) int {
 // to a loop. Nothing is accepted until startAccepting, which Serve calls once
 // OnStart has returned; until then arriving connections wait in the
 // listener backlogs.
-func (ld *acceptor) addListen(addr string) (err error) {
+func (ld *acceptor) addListen(addr string) error {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
+	_, err := ld.addGroupLocked(addr, nil)
+	return err
+}
 
+// addGroupLocked creates and records the listeners for addr: one, or a
+// ReusePort group of them, every accepted connection starting with userdata.
+// It requires ld.mux. On error nothing it created stays open.
+func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener, err error) {
 	if nil == ld.listeners {
 		ld.listeners = make(map[int]*listener)
 	}
+	defer func() {
+		if err != nil {
+			for _, l := range group {
+				delete(ld.listeners, l.fd)
+				ld.closeListener(l)
+			}
+			group = nil
+		}
+	}()
 
-	var l *listener
-	if l, err = ld.listen(addr, ld.events.ReusePort); nil != err {
-		if nil != l {
+	l, err := ld.listen(addr, ld.events.ReusePort)
+	if err != nil {
+		if l != nil {
 			ld.closeListener(l)
 		}
-		return err
+		return nil, err
 	}
+	l.userdata = userdata
 	ld.listeners[l.fd] = l
+	group = append(group, l)
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
@@ -113,7 +170,9 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
 		l.udpSvr.addr = l.pair
-		return nil
+		// The server is internal; its userdata is what its peers start with.
+		l.udpSvr.userdata = userdata
+		return group, nil
 	}
 
 	count := 1
@@ -132,12 +191,92 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			if next != nil {
 				ld.closeListener(next)
 			}
-			return err
+			return group, err
 		}
+		next.userdata = userdata
 		ld.listeners[next.fd] = next
+		group = append(group, next)
 		ld.assignLoop(next)
 	}
-	return nil
+	return group, nil
+}
+
+// listenGroup adds addr while Serve runs: it records its listeners and starts
+// accepting on them at once.
+func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, error) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	if ld.closed {
+		return nil, net.ErrClosed
+	}
+	group, err := ld.addGroupLocked(addr, userdata)
+	if err != nil {
+		return nil, err
+	}
+	// Added during OnStart, the listeners start with the rest once it has
+	// returned; see startAccepting.
+	for i, l := range group {
+		if !ld.accepting {
+			break
+		}
+		if err = ld.startLocked(l); err != nil {
+			for _, started := range group[:i] {
+				ld.stopLocked(started)
+			}
+			for _, l := range group[i:] {
+				delete(ld.listeners, l.fd)
+				ld.closeListener(l)
+			}
+			return nil, err
+		}
+	}
+	return &listenerGroup{ld: ld, members: group, addr: group[0].pair.local}, nil
+}
+
+// startLocked registers l with its loop; it requires ld.mux.
+func (ld *acceptor) startLocked(l *listener) error {
+	var err error
+	if l.udpSvr != nil {
+		err = l.udpSvr.loop.registerListener(l.udpSvr)
+	} else {
+		err = l.loop.addListener(l)
+	}
+	l.started = err == nil
+	return err
+}
+
+// stopLocked takes l out of the registry and releases it while Serve runs;
+// it requires ld.mux. A stream listener leaves its loop first, and its
+// descriptor closes only once no waiter accepts on it any more. A UDP
+// listener's server connection closes in its own turn, and its peers with it.
+func (ld *acceptor) stopLocked(l *listener) {
+	delete(ld.listeners, l.fd)
+	if !l.started {
+		// Nothing watches it yet; release it as shutdown would.
+		ld.closeListener(l)
+		return
+	}
+	if l.udpSvr != nil {
+		_ = l.udpSvr.CloseWith(net.ErrClosed)
+		if l.udp != nil {
+			_ = l.udp.Close()
+		}
+		return
+	}
+	l.loop.removeListener(l)
+	l.retire()
+	ld.closeListener(l)
+}
+
+// closeGroup releases group unless shutdown already did.
+func (ld *acceptor) closeGroup(group []*listener) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	for _, l := range group {
+		if ld.listeners[l.fd] == l {
+			ld.stopLocked(l)
+		}
+	}
 }
 
 // assignLoop gives stream listeners to the loops in turn.
@@ -153,14 +292,9 @@ func (ld *acceptor) assignLoop(l *listener) {
 func (ld *acceptor) startAccepting() error {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
+	ld.accepting = true
 	for _, l := range ld.listeners {
-		if l.udpSvr != nil {
-			if err := l.udpSvr.loop.registerListener(l.udpSvr); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := l.loop.addListener(l); err != nil {
+		if err := ld.startLocked(l); err != nil {
 			return err
 		}
 	}
@@ -197,6 +331,7 @@ func (ld *acceptor) close() {
 	// listener-map lock before closing resources.
 	listeners := ld.listeners
 	ld.listeners = nil
+	ld.closed = true
 	ld.mux.Unlock()
 	for _, l := range listeners {
 		ld.closeListener(l)

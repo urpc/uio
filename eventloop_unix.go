@@ -483,7 +483,28 @@ func (loop *eventLoop) addListener(l *listener) error {
 	}
 	next = append(next, l)
 	loop.listeners.Store(&next)
-	return loop.poller.Add(l.fd, poller.Readable)
+	if err := loop.poller.Add(l.fd, poller.Readable); err != nil {
+		loop.removeListener(l)
+		return err
+	}
+	return nil
+}
+
+// removeListener stops accepting on l. Its descriptor is a duplicate of the
+// Go listener's, so the poller would keep watching the socket after it
+// closes; it is removed explicitly. Waiters that looked l up already are
+// waited out by listener.retire.
+func (loop *eventLoop) removeListener(l *listener) {
+	var next []*listener
+	if current := loop.listeners.Load(); current != nil {
+		for _, other := range *current {
+			if other != l {
+				next = append(next, other)
+			}
+		}
+	}
+	loop.listeners.Store(&next)
+	_ = loop.poller.Remove(l.fd, poller.Readable)
 }
 
 // accept takes a bounded batch of connections from l and queues each one's
@@ -492,6 +513,10 @@ func (loop *eventLoop) addListener(l *listener) error {
 // events of this loop for long; the level-triggered listener reports the rest
 // again.
 func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
+	if !l.enter() {
+		return nil // closing: its descriptor may close once nobody accepts
+	}
+	defer l.leave()
 	for range acceptBatchSize {
 		nfd, sa, err := socket.Accept(l.fd)
 		if err != nil {
@@ -506,6 +531,7 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 		conn.loop = loop.events.loopAt(waiter.accepted)
 		waiter.accepted++
 		conn.addr = l.pair
+		conn.userdata = l.userdata
 		if l.tcp {
 			conn.remoteAddr = socket.SockaddrToAddrPort(sa)
 		} else {

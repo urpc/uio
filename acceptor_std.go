@@ -34,10 +34,12 @@ import (
 
 // listener holds the blocking Go listener used by stdio and Windows builds.
 type listener struct {
-	addr   string
-	ln     net.Listener
-	udp    net.PacketConn
-	udpSvr *fdConn
+	addr     string
+	ln       net.Listener
+	udp      net.PacketConn
+	udpSvr   *fdConn
+	key      int // its key in acceptor.listeners
+	userdata any // every accepted connection's initial Userdata
 }
 
 // acceptor owns blocking listener goroutines. The logical event loop is used
@@ -47,6 +49,8 @@ type acceptor struct {
 	listeners map[int]*listener
 	loop      *eventLoop
 	events    *Events
+	next      int  // the key of the next listener
+	closed    bool // close has run: Listen adds nothing more
 }
 
 // OnEvent is unused because listener goroutines perform blocking accepts.
@@ -64,35 +68,83 @@ func (ld *acceptor) startMultiAcceptors() {}
 
 // addListen starts one blocking accept or UDP receive goroutine for addr.
 // Accepted streams are registered before their dedicated read/write loops run.
-func (ld *acceptor) addListen(addr string) (err error) {
+func (ld *acceptor) addListen(addr string) error {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
+	_, err := ld.addLocked(addr, nil)
+	return err
+}
 
+// listenGroup adds addr while Serve runs.
+func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, error) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	if ld.closed {
+		return nil, net.ErrClosed
+	}
+	l, err := ld.addLocked(addr, userdata)
+	if err != nil {
+		return nil, err
+	}
+	var local net.Addr
+	if l.udp != nil {
+		local = l.udp.LocalAddr()
+	} else {
+		local = l.ln.Addr()
+	}
+	return &listenerGroup{ld: ld, members: []*listener{l}, addr: local}, nil
+}
+
+// closeGroup releases group unless shutdown already did. Closing a stream
+// listener ends its accept goroutine; a UDP listener's server connection
+// closes its peers first.
+func (ld *acceptor) closeGroup(group []*listener) {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	for _, l := range group {
+		if ld.listeners[l.key] != l {
+			continue
+		}
+		delete(ld.listeners, l.key)
+		if l.udpSvr != nil {
+			_ = l.udpSvr.CloseWith(net.ErrClosed)
+			l.udpSvr = nil
+		}
+		ld.closeListener(l)
+	}
+}
+
+// addLocked creates the listener for addr and starts its goroutine; it
+// requires ld.mux.
+func (ld *acceptor) addLocked(addr string, userdata any) (*listener, error) {
 	if nil == ld.listeners {
 		ld.listeners = make(map[int]*listener)
 	}
 
-	var l *listener
-	if l, err = ld.listen(addr, ld.events.ReusePort); nil != err {
+	l, err := ld.listen(addr, ld.events.ReusePort)
+	if nil != err {
 		if nil != l {
 			ld.closeListener(l)
 		}
-		return err
+		return nil, err
 	}
-
+	l.userdata = userdata
 	// The requested address may be repeated with port 0; each bind is distinct.
-	ld.listeners[len(ld.listeners)] = l
+	l.key = ld.next
+	ld.next++
+	ld.listeners[l.key] = l
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
+		l.udpSvr.userdata = userdata // what its peers start with
 		l.udpSvr.udp = &stdUDPState{sock: l.udp.(*net.UDPConn), peers: make(map[string]*fdConn)}
 
 		ld.events.callbackWG.Add(1)
 		go l.udpSvr.listenUDP()
-		return nil
+		return l, nil
 	}
 
 	ld.events.callbackWG.Add(1)
@@ -121,6 +173,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 			fdc.conn = conn
 			fdc.events = ld.events
 			fdc.loop = ld.events.selectWorker(fdc.Fd())
+			fdc.userdata = l.userdata
 			fdc.setLocalAddr(conn.LocalAddr())
 			fdc.setRemoteAddr(conn.RemoteAddr())
 			fdc.writeSig = make(chan struct{}, 1)
@@ -132,7 +185,7 @@ func (ld *acceptor) addListen(addr string) (err error) {
 		}
 	}()
 
-	return nil
+	return l, nil
 }
 
 // listen parses UIO's address syntax and creates the corresponding blocking Go
@@ -201,6 +254,7 @@ func (ld *acceptor) close() {
 	ld.mux.Lock()
 	listeners := ld.listeners
 	ld.listeners = nil
+	ld.closed = true
 	ld.mux.Unlock()
 	for _, l := range listeners {
 		ld.closeListener(l)

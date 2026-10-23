@@ -1348,6 +1348,7 @@ func (fc *fdConn) listenUDP() error {
 			udpConn.setRemoteAddr(addr)
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
+			udpConn.userdata = fc.userdata // the listener's
 
 			fc.udp.peers[rAddr] = udpConn
 		}

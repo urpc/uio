@@ -80,8 +80,12 @@ func main() {
 `Serve` accepts several addresses at once, with an optional scheme:
 `":9527"`, `"tcp6://[::1]:9527"`, `"udp://:5353"`, `"unix:///tmp/app.sock"`.
 Once `Serve` is running (`Serve()` with no address for a dial-only client),
-the same `Events` can dial out with `Dial` or `DialContext`, or take over an
-established stream `net.Conn` with `Adopt`.
+the same `Events` can dial out with `Dial` or `DialContext`, take over an
+established stream `net.Conn` with `Adopt`, or add an address with
+`Listen(addr, userdata)`. Each connection a listener accepts starts with its
+userdata, and closing the returned `Listener` stops accepting there while the
+connections it accepted stay open (a UDP listener's peers share its socket and
+close with it).
 
 ## How it works
 

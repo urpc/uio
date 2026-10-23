@@ -1542,6 +1542,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 			}
 			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
 			packetConn.events, packetConn.loop = conn.events, conn.loop
+			packetConn.userdata = conn.userdata // the listener's
 			packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
 			conn.udp.peers[source] = packetConn
 			packetConn.fireOnOpen()
