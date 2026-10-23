@@ -47,8 +47,8 @@ func TestStaleEventDuringAdmissionFoldsIntoTheOpenTurn(t *testing.T) {
 	}
 	gotData := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(Conn) { enter("open"); inTurn.Add(-1) }
-	events.OnData = func(c Conn) error {
+	funcs(events).Open = func(Conn) { enter("open"); inTurn.Add(-1) }
+	funcs(events).Data = func(c Conn) error {
 		enter("data")
 		defer inTurn.Add(-1)
 		_, _ = c.Discard(-1)
@@ -110,7 +110,7 @@ func TestStaleEventDuringAdmissionFoldsIntoTheOpenTurn(t *testing.T) {
 func startRecoveringServer(t *testing.T, events *Events, network string) string {
 	t.Helper()
 	started := make(chan string, 1)
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
@@ -143,8 +143,8 @@ func TestRecoveredOnOpenPanicStillWatchesTheSocket(t *testing.T) {
 	gotData := make(chan struct{}, 1)
 	closed := make(chan struct{}, 1)
 	events := &Events{Pollers: 1, Executor: executor}
-	events.OnOpen = func(Conn) { panic("OnOpen panics") }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(Conn) { panic("OnOpen panics") }
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		select {
 		case gotData <- struct{}{}:
@@ -152,7 +152,7 @@ func TestRecoveredOnOpenPanicStillWatchesTheSocket(t *testing.T) {
 		}
 		return nil
 	}
-	events.OnClose = func(Conn, error) { closed <- struct{}{} }
+	funcs(events).Close = func(Conn, error) { closed <- struct{}{} }
 	addr := startRecoveringServer(t, events, "tcp")
 	client, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -186,9 +186,9 @@ func TestRecoveredOnOpenPanicStillWatchesTheSocket(t *testing.T) {
 func TestRecoveredOnClosePanicLetsServeReturn(t *testing.T) {
 	executor := &recoveringExecutor{}
 	events := &Events{Pollers: 1, Executor: executor}
-	events.OnClose = func(Conn, error) { panic("OnClose panics") }
+	funcs(events).Close = func(Conn, error) { panic("OnClose panics") }
 	started := make(chan string, 1)
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
@@ -222,7 +222,7 @@ func TestUDPSelfWakeDoesNotPinTheServerTurn(t *testing.T) {
 	firstData := make(chan struct{}, 1)
 	var callbacks atomic.Int32
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		if callbacks.Add(1) == 1 {
 			firstData <- struct{}{}
@@ -262,17 +262,17 @@ func TestUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	child := make(chan Conn, 1)
 	var in, overlap, calls atomic.Int32
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(c Conn) {
+	funcs(events).Open = func(c Conn) {
 		select {
 		case child <- c:
 		default:
 		}
 	}
-	events.OnData = func(c Conn) error {
+	funcs(events).Data = func(c Conn) error {
 		_, _ = c.Write([]byte("reply"))
 		return nil
 	}
-	events.OnOutbound = func(c Conn, n int) {
+	funcs(events).Outbound = func(c Conn, n int) {
 		if in.Add(1) > 1 {
 			overlap.Add(1)
 		}
@@ -339,8 +339,8 @@ func TestUDPOnOutboundCrossWritesDoNotDeadlock(t *testing.T) {
 	var mu sync.Mutex
 	other := map[Conn]Conn{}
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(c Conn) { opened <- c }
-	events.OnOutbound = func(c Conn, n int) {
+	funcs(events).Open = func(c Conn) { opened <- c }
+	funcs(events).Outbound = func(c Conn, n int) {
 		if n != 3 {
 			return
 		}
@@ -423,7 +423,7 @@ func testOnOpenRunsInThePoolTurn(t *testing.T, reusePort bool) {
 
 	var opens atomic.Int64
 	var notOwner atomic.Bool
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		fdc := conn.(*fdConn)
 		// runIOTask stamps the running worker; the open callback must see its
 		// own goroutine there, which is what "inside a worker" means.
@@ -434,7 +434,7 @@ func testOnOpenRunsInThePoolTurn(t *testing.T, reusePort bool) {
 	}
 
 	addrCh := make(chan string, 1)
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, l := range ev.acceptor.listeners {
 			addrCh <- l.ln.Addr().String()
 			return
@@ -503,11 +503,11 @@ func testAcceptShutdownRace(t *testing.T, reusePort bool) {
 	for round := 0; round < 15; round++ {
 		events := &Events{Pollers: 2, ReusePort: reusePort}
 		var opened, closed atomic.Int64
-		events.OnOpen = func(Conn) { opened.Add(1) }
-		events.OnClose = func(Conn, error) { closed.Add(1) }
+		funcs(events).Open = func(Conn) { opened.Add(1) }
+		funcs(events).Close = func(Conn, error) { closed.Add(1) }
 
 		addrCh := make(chan string, 1)
-		events.OnStart = func(ev *Events) {
+		funcs(events).Start = func(ev *Events) {
 			for _, l := range ev.acceptor.listeners {
 				addrCh <- l.ln.Addr().String()
 				return
@@ -577,12 +577,12 @@ func TestConnectedUDPCallbacksStayOnOwningLoop(t *testing.T) {
 	var callbacks atomic.Int32
 	started := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
-	events.OnStart = func(*Events) { started <- struct{}{} }
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Start = func(*Events) { started <- struct{}{} }
+	funcs(events).Open = func(conn Conn) {
 		openStarted <- conn.LocalAddr().(*net.UDPAddr)
 		<-releaseOpen
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		switch callbacks.Add(1) {
 		case 1:
 			close(dataStarted)
@@ -690,13 +690,13 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	tcpCallback := make(chan struct{}, 1)
 	udpWrite := make(chan error, 1)
 	events := &Events{Pollers: 1}
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		for _, listener := range events.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		fdc := conn.(*fdConn)
 		if fdc.isDatagram() {
 			udpOpened <- struct{}{}
@@ -704,7 +704,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 			tcpOpened <- fdc
 		}
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		if conn.(*fdConn).isDatagram() {
 			udpCallbackGoid.Store(currentGoroutineID())
 			_, err := target.Load().Write([]byte("cross"))
@@ -718,7 +718,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 		_, _ = conn.Discard(-1)
 		return nil
 	}
-	events.OnOutbound = func(conn Conn, written int) {
+	funcs(events).Outbound = func(conn Conn, written int) {
 		if fdc := conn.(*fdConn); fdc == target.Load() && written > 0 {
 			sender := currentGoroutineID()
 			if sender == udpCallbackGoid.Load() {
@@ -835,7 +835,7 @@ func TestStopRaceKeepsClaimReserved(t *testing.T) {
 
 	onClose := make(chan struct{})
 	events := &Events{}
-	events.OnClose = func(Conn, error) { close(onClose) }
+	funcs(events).Close = func(Conn, error) { close(onClose) }
 	// The final close callback is delivered as a pooled turn, so the loop
 	// needs a real pool.
 	pool := newIOTaskPool(nil)
@@ -921,9 +921,9 @@ func TestShutdownJoinsPendingWake(t *testing.T) {
 	started := make(chan struct{})
 	opened := make(chan *fdConn, 1)
 	closed := make(chan struct{})
-	ev.OnStart = func(*Events) { close(started) }
-	ev.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-	ev.OnClose = func(Conn, error) { close(closed) }
+	funcs(ev).Start = func(*Events) { close(started) }
+	funcs(ev).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(ev).Close = func(Conn, error) { close(closed) }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- ev.Serve() }()
 	<-started

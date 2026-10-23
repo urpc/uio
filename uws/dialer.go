@@ -218,26 +218,29 @@ func (d *Dialer) start(ctx context.Context) error {
 		d.config = newDialerConnConfig(opts, &d.connections, &d.stats)
 		events := opts.transportEvents()
 		d.events = events
-		events.OnStart = func(events *uio.Events) {
-			if err := d.closedCause(); err != nil {
-				d.publishStartResult(err)
-				_ = events.Close(err)
-				return
-			}
-			if hook := d.startHook; hook != nil {
-				hook()
-			}
-			if err := d.closedCause(); err != nil {
-				d.publishStartResult(err)
-				return
-			}
-			d.publishStartResult(nil)
+		handler := uio.FuncHandler{
+			Start: func(events *uio.Events) {
+				if err := d.closedCause(); err != nil {
+					d.publishStartResult(err)
+					_ = events.Close(err)
+					return
+				}
+				if hook := d.startHook; hook != nil {
+					hook()
+				}
+				if err := d.closedCause(); err != nil {
+					d.publishStartResult(err)
+					return
+				}
+				d.publishStartResult(nil)
+			},
+			Open:     d.onOpen,
+			Data:     d.onData,
+			Close:    d.onClose,
+			Outbound: d.onOutbound,
+			Inbound:  d.onInbound,
 		}
-		events.OnOpen = d.onOpen
-		events.OnData = d.onData
-		events.OnClose = d.onClose
-		events.OnOutbound = d.onOutbound
-		events.OnInbound = d.onInbound
+		events.Handler, events.Observer, events.Hooks = handler, handler, handler
 		d.startHeartbeat(d.config)
 		go func() {
 			err := events.Serve()

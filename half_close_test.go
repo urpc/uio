@@ -41,9 +41,10 @@ func TestCloseWriteFollowsQueuedOutput(t *testing.T) {
 	var mu sync.Mutex
 	var got bytes.Buffer
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnOpen: func(c Conn) {
+	}, FuncHandler{
+		Open: func(c Conn) {
 			if _, err := c.Write(want); err != nil {
 				t.Errorf("write: %v", err)
 			}
@@ -51,14 +52,14 @@ func TestCloseWriteFollowsQueuedOutput(t *testing.T) {
 				t.Errorf("CloseWrite: %v", err)
 			}
 		},
-		OnData: func(c Conn) error {
+		Data: func(c Conn) error {
 			mu.Lock()
 			defer mu.Unlock()
 			_, err := c.WriteTo(&got)
 			return err
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, _ := serveInboundTest(t, events)
 	time.Sleep(50 * time.Millisecond) // let the output back up behind the FIN
 	if got := readAllWithin(t, client, 10*time.Second); !bytes.Equal(got, want) {
@@ -95,9 +96,10 @@ func TestCloseWriteFollowsQueuedOutput(t *testing.T) {
 // goroutine, and a second CloseWrite does nothing.
 func TestWritesAfterCloseWriteAreRefused(t *testing.T) {
 	results := make(chan error, 8)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			if err := c.CloseWrite(); err != nil {
 				results <- err
@@ -121,7 +123,7 @@ func TestWritesAfterCloseWriteAreRefused(t *testing.T) {
 			results <- c.CloseWrite()
 			return nil
 		},
-	}
+	})
 	client, server := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("go")); err != nil {
 		t.Fatal(err)
@@ -151,10 +153,11 @@ func TestAllowHalfOpenKeepsWritingAfterPeerEOF(t *testing.T) {
 	reply := halfCloseTestData(1 << 20)
 	var request bytes.Buffer
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:       1,
 		AllowHalfOpen: true,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			buf := make([]byte, 4096)
 			for {
 				n, err := c.Read(buf)
@@ -170,8 +173,8 @@ func TestAllowHalfOpenKeepsWritingAfterPeerEOF(t *testing.T) {
 				}
 			}
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, _ := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("request")); err != nil {
 		t.Fatal(err)
@@ -200,16 +203,17 @@ func TestAllowHalfOpenKeepsWritingAfterPeerEOF(t *testing.T) {
 func TestPeerEOFClosesWithoutAllowHalfOpen(t *testing.T) {
 	var sawEOF atomic.Bool
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if _, err := c.Read(make([]byte, 64)); err == io.EOF {
 				sawEOF.Store(true)
 			}
 			return nil
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, _ := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("bye")); err != nil {
 		t.Fatal(err)
@@ -280,8 +284,8 @@ func TestHalfCloseThroughARelay(t *testing.T) {
 		}
 		return nil
 	}
-	events.OnData = forward
-	events.OnClose = func(Conn, error) { closes.Add(1) }
+	funcs(events).Data = forward
+	funcs(events).Close = func(Conn, error) { closes.Add(1) }
 	client, in := serveInboundTest(t, events)
 	inLeg := &leg{}
 	in.SetUserdata(inLeg)
@@ -321,17 +325,18 @@ func TestHalfCloseThroughARelay(t *testing.T) {
 func TestAllowHalfOpenNoticesAResetAfterEOF(t *testing.T) {
 	eof := make(chan struct{})
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:       1,
 		AllowHalfOpen: true,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if _, err := c.Read(make([]byte, 64)); err == io.EOF {
 				close(eof)
 			}
 			return nil
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	tcp := client.(*net.TCPConn)
 	_ = tcp.CloseWrite()
@@ -440,9 +445,10 @@ func TestCloseWriteRacingWritesKeepsTheStreamWhole(t *testing.T) {
 // stream.
 func TestCloseWriteAfterReserveOutbound(t *testing.T) {
 	want := halfCloseTestData(300)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			dst, err := c.ReserveOutbound(len(want))
 			if errors.Is(err, ErrReserveUnsupported) {
@@ -455,7 +461,7 @@ func TestCloseWriteAfterReserveOutbound(t *testing.T) {
 			}
 			return c.CloseWrite()
 		},
-	}
+	})
 	client, _ := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("go")); err != nil {
 		t.Fatal(err)
@@ -475,12 +481,13 @@ func TestAllowHalfOpenEOFBehindHeldReads(t *testing.T) {
 	sawEOF := make(chan struct{})
 	var once sync.Once
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 		AllowHalfOpen:      true,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if !consume.Load() {
 				return nil
 			}
@@ -497,8 +504,8 @@ func TestAllowHalfOpenEOFBehindHeldReads(t *testing.T) {
 				}
 			}
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	const total = 256 << 10
 	go func() {
@@ -539,15 +546,16 @@ func TestHalfOpenKeepsUnconsumedBytesAfterBothHalvesShut(t *testing.T) {
 			var request bytes.Buffer
 			sawEOF := make(chan struct{})
 			closed := make(chan error, 1)
-			events := &Events{
+			events := withFuncs(&Events{
 				Pollers:       1,
 				AllowHalfOpen: true,
-				OnOpen: func(c Conn) {
+			}, FuncHandler{
+				Open: func(c Conn) {
 					if closeWriteFirst {
 						_ = c.CloseWrite()
 					}
 				},
-				OnData: func(c Conn) error {
+				Data: func(c Conn) error {
 					if !consume.Load() {
 						return nil
 					}
@@ -564,8 +572,8 @@ func TestHalfOpenKeepsUnconsumedBytesAfterBothHalvesShut(t *testing.T) {
 						}
 					}
 				},
-				OnClose: func(_ Conn, err error) { closed <- err },
-			}
+				Close: func(_ Conn, err error) { closed <- err },
+			})
 			client, server := serveInboundTest(t, events)
 			if closeWriteFirst {
 				if got := readAllWithin(t, client, 2*time.Second); len(got) != 0 {
@@ -623,7 +631,7 @@ func TestCloseWriteUnsupportedOnUDP(t *testing.T) {
 	addr := probe.LocalAddr().String()
 	_ = probe.Close()
 	started := make(chan struct{})
-	events := &Events{Pollers: 1, OnStart: func(*Events) { close(started) }}
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { close(started) }})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	<-started

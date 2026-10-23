@@ -36,9 +36,9 @@ func TestAdoptTransfersTCPConnection(t *testing.T) {
 	started := make(chan struct{})
 	opened := make(chan Conn, 1)
 	received := make(chan string, 1)
-	events.OnStart = func(*Events) { close(started) }
-	events.OnOpen = func(conn Conn) { opened <- conn }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Start = func(*Events) { close(started) }
+	funcs(events).Open = func(conn Conn) { opened <- conn }
+	funcs(events).Data = func(conn Conn) error {
 		payload := make([]byte, conn.InboundBuffered())
 		_, err := conn.Read(payload)
 		if err == nil {
@@ -255,8 +255,8 @@ func TestWaitIncludesOnStop(t *testing.T) {
 	started := make(chan struct{})
 	stopStarted := make(chan struct{})
 	releaseStop := make(chan struct{})
-	events.OnStart = func(*Events) { close(started) }
-	events.OnStop = func(*Events) {
+	funcs(events).Start = func(*Events) { close(started) }
+	funcs(events).Stop = func(*Events) {
 		close(stopStarted)
 		<-releaseStop
 	}
@@ -286,7 +286,7 @@ func TestWaitIncludesOnStop(t *testing.T) {
 
 func TestDialContextCancellationBeforeNetworkDial(t *testing.T) {
 	started := make(chan struct{})
-	events := &Events{Pollers: 1, OnStart: func(*Events) { close(started) }}
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { close(started) }})
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve() }()
 	defer func() {
@@ -325,7 +325,7 @@ func TestServeInitializesListeners(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			events := &Events{Pollers: 1}
-			events.OnStart = func(events *Events) {
+			funcs(events).Start = func(events *Events) {
 				if got := len(events.acceptor.listeners); got != test.want {
 					t.Errorf("listeners = %d, want %d", got, test.want)
 				}
@@ -341,14 +341,14 @@ func TestServeInitializesListeners(t *testing.T) {
 func TestServeAcceptsConnectionsOnAllAddresses(t *testing.T) {
 	events := &Events{Pollers: 1}
 	started := make(chan []string, 1)
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		addrs := make([]string, 0, len(events.acceptor.listeners))
 		for _, listener := range events.acceptor.listeners {
 			addrs = append(addrs, listener.ln.Addr().String())
 		}
 		started <- addrs
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, err := conn.WriteTo(conn)
 		return err
 	}

@@ -78,7 +78,7 @@ func TestWriteTurnSendsBesideBlockedCallback(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		select {
 		case entered <- struct{}{}:
 		default:
@@ -258,7 +258,7 @@ func TestReserveOutboundIsNeverSentUnfilled(t *testing.T) {
 	var reserved, fallback atomic.Int64
 	var replySeq uint32
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		n := conn.InboundBuffered()
 		_, _ = conn.Discard(n)
 		for range n {
@@ -342,7 +342,7 @@ func TestReserveOutboundIsNeverSentUnfilled(t *testing.T) {
 func TestPartialReplySendKeepsLaterWritesBehind(t *testing.T) {
 	const replies, recordSize = 16, 1000
 	events := &Events{Pollers: 1, MaxBufferSize: 16 << 10}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		for seq := range uint32(replies) {
 			dst, err := conn.ReserveOutbound(recordSize)
@@ -428,7 +428,7 @@ func writeFromOtherGoroutine(t *testing.T, conn Conn, data []byte) {
 // everything the round writes or reserves after that write.
 func TestReservedRepliesPrecedeLaterWrites(t *testing.T) {
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		reserve := func(tag byte) error {
 			dst, err := conn.ReserveOutbound(1)
@@ -474,7 +474,7 @@ func TestReservedRepliesPrecedeLaterWrites(t *testing.T) {
 func TestReservedRepliesBehindQueuedOutput(t *testing.T) {
 	const backlog = 256 << 10
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		// The peer reads nothing yet, so most of this stays queued.
 		writeFromOtherGoroutine(t, conn, bytes.Repeat([]byte{'Q'}, backlog))
@@ -580,7 +580,7 @@ func TestRefusedDirectSendKeepsAWritableEdge(t *testing.T) {
 	}
 	t.Cleanup(func() { testHookDirectSendRefused = nil })
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		if _, err := conn.Write(payload); err != nil {
 			t.Error(err)
 		}
@@ -616,7 +616,7 @@ func TestRefusedDirectSendKeepsAWritableEdge(t *testing.T) {
 // writes belongs behind them, not inside the space.
 func TestReserveAfterExternalWriteKeepsOrder(t *testing.T) {
 	events := &Events{Pollers: 1}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		reserve := func(tag byte) error {
 			dst, err := conn.ReserveOutbound(1)
@@ -678,7 +678,7 @@ func TestWriteTurnResumesReadsAfterBlockedSend(t *testing.T) {
 	const total = 1 << 20
 	replies := make(chan []byte, 1024)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 16 << 10, MaxBufferSize: 4 << 10}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		replies <- buf
@@ -733,14 +733,14 @@ func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 	started := make(chan string, 1)
 	opened := make(chan Conn, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 8 << 10}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(conn Conn) { opened <- conn }
+	funcs(events).Data = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		replies <- buf
@@ -859,19 +859,19 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 			started := make(chan string, 1)
 			var armed atomic.Bool
 			events := &Events{Pollers: 1, Executor: executor}
-			events.OnStart = func(ev *Events) {
+			funcs(events).Start = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
 					started <- listener.pair.local.String()
 					return
 				}
 			}
-			events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-			events.OnData = func(conn Conn) error {
+			funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+			funcs(events).Data = func(conn Conn) error {
 				_, _ = conn.Discard(-1)
 				_, err := conn.Write([]byte("r"))
 				return err
 			}
-			events.OnOutbound = func(Conn, int) {
+			funcs(events).Outbound = func(Conn, int) {
 				if armed.CompareAndSwap(true, false) {
 					panic("OnOutbound panics once")
 				}
@@ -948,19 +948,19 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 			var armed atomic.Bool
 			var blockedAtPanic, ownerAtPanic atomic.Bool
 			events := &Events{Pollers: 1, Executor: executor}
-			events.OnStart = func(ev *Events) {
+			funcs(events).Start = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
 					started <- listener.pair.local.String()
 					return
 				}
 			}
-			events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-			events.OnData = func(conn Conn) error {
+			funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+			funcs(events).Data = func(conn Conn) error {
 				_, _ = conn.Discard(-1)
 				_, err := conn.Write(payload)
 				return err
 			}
-			events.OnOutbound = func(c Conn, _ int) {
+			funcs(events).Outbound = func(c Conn, _ int) {
 				if armed.CompareAndSwap(true, false) {
 					conn := c.(*fdConn)
 					// A writable edge may clear the blocked flag once the
@@ -1050,14 +1050,14 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	started := make(chan string, 1)
 	var armed, stalledAtPanic atomic.Bool
 	events := &Events{Pollers: 1, Executor: executor, MaxBufferSize: 1}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(events).Data = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		if _, err := conn.Write(buf); err != nil {
@@ -1065,7 +1065,7 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 		}
 		return conn.YieldRead()
 	}
-	events.OnOutbound = func(c Conn, _ int) {
+	funcs(events).Outbound = func(c Conn, _ int) {
 		if armed.CompareAndSwap(true, false) {
 			stalledAtPanic.Store(c.(*fdConn).readStalled())
 			panic("OnOutbound panics once")
@@ -1131,7 +1131,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 			var depth, maxDepth, count atomic.Int32
 			var mu sync.Mutex
 			events := &Events{Pollers: 1}
-			events.OnData = func(c Conn) error {
+			funcs(events).Data = func(c Conn) error {
 				_, _ = c.Discard(-1)
 				if reserve {
 					dst, err := c.ReserveOutbound(1)
@@ -1143,7 +1143,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 				_, err := c.Write([]byte("a"))
 				return err
 			}
-			events.OnOutbound = func(c Conn, n int) {
+			funcs(events).Outbound = func(c Conn, n int) {
 				mu.Lock() // deadlocks if the callback re-enters itself
 				defer mu.Unlock()
 				if d := depth.Add(1); d > maxDepth.Load() {
@@ -1186,7 +1186,7 @@ func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
 	var depth, maxDepth, count atomic.Int32
 	opened := make(chan struct{})
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(c Conn) {
+	funcs(events).Open = func(c Conn) {
 		defer close(opened)
 		dst, err := c.ReserveOutbound(1)
 		if err != nil {
@@ -1202,7 +1202,7 @@ func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	events.OnOutbound = func(c Conn, n int) {
+	funcs(events).Outbound = func(c Conn, n int) {
 		if !armed.Load() {
 			return
 		}
@@ -1237,13 +1237,13 @@ func TestOutputAfterRecoveredOnOpenPanic(t *testing.T) {
 	opened := make(chan Conn, 1)
 	started := make(chan string, 1)
 	events := &Events{Pollers: 1, Executor: executor}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		written := make(chan error, 1)
 		go func() {
 			_, err := conn.Write([]byte("early"))
@@ -1353,7 +1353,7 @@ func TestDirectSendSuffixStaysWhole(t *testing.T) {
 		opened := make(chan struct{}, 1)
 		producerDone := make(chan error, 1)
 		events := &Events{Pollers: 1}
-		events.OnOpen = func(c Conn) {
+		funcs(events).Open = func(c Conn) {
 			fc := c.(*fdConn)
 			go func() {
 				// The direct sender takes the claim just before its send.
@@ -1444,14 +1444,14 @@ func TestRefusedWriteTurnClosesTheConnection(t *testing.T) {
 	closed := make(chan error, 1)
 	started := make(chan string, 1)
 	events := &Events{Pollers: 1, Executor: executor}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-	events.OnClose = func(_ Conn, err error) { closed <- err }
+	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(events).Close = func(_ Conn, err error) { closed <- err }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
 	t.Cleanup(func() {
@@ -1489,7 +1489,7 @@ func TestRefusedWriteTurnClosesTheConnection(t *testing.T) {
 func TestRefusedReservationReleasesTheWriteClaim(t *testing.T) {
 	result := make(chan error, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 1024}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		_, err := conn.ReserveOutbound(4096)
 		if fdc := conn.(*fdConn); err == nil || fdc.writeClaimed() {
@@ -1526,19 +1526,19 @@ func TestCloseNeverWritesReusedDescriptor(t *testing.T) {
 	started := make(chan string, 1)
 	var strayInbound atomic.Int64
 	events := &Events{Pollers: 1}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(events).Data = func(conn Conn) error {
 		n, _ := conn.Discard(-1)
 		strayInbound.Add(int64(n))
 		return nil
 	}
-	events.OnClose = func(conn Conn, _ error) { closed <- conn.(*fdConn) }
+	funcs(events).Close = func(conn Conn, _ error) { closed <- conn.(*fdConn) }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
 	t.Cleanup(func() {
@@ -1627,12 +1627,12 @@ func TestWriteBeforeOpenWaitsForOnOpen(t *testing.T) {
 	var openReturned, earlySend atomic.Bool
 	started := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
-	events.OnStart = func(*Events) { started <- struct{}{} }
-	events.OnOpen = func(Conn) {
+	funcs(events).Start = func(*Events) { started <- struct{}{} }
+	funcs(events).Open = func(Conn) {
 		time.Sleep(50 * time.Millisecond)
 		openReturned.Store(true)
 	}
-	events.OnOutbound = func(Conn, int) {
+	funcs(events).Outbound = func(Conn, int) {
 		if !openReturned.Load() {
 			earlySend.Store(true)
 		}
@@ -1679,14 +1679,14 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 	var stopped atomic.Bool
 	var lateOutbound atomic.Int64
 	events := &Events{Pollers: 1}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn }
-	events.OnOutbound = func(Conn, int) {
+	funcs(events).Open = func(conn Conn) { opened <- conn }
+	funcs(events).Outbound = func(Conn, int) {
 		if stopped.Load() {
 			lateOutbound.Add(1)
 		}
@@ -1758,18 +1758,18 @@ func TestWritevTakesVectorsLongerThanOneSyscall(t *testing.T) {
 				}
 				result <- err
 			}
-			events.OnStart = func(ev *Events) {
+			funcs(events).Start = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
 					started <- listener.pair.local.String()
 					return
 				}
 			}
-			events.OnOpen = func(conn Conn) {
+			funcs(events).Open = func(conn Conn) {
 				if callback == "OnOpen" {
 					writev(conn)
 				}
 			}
-			events.OnData = func(conn Conn) error {
+			funcs(events).Data = func(conn Conn) error {
 				_, _ = conn.Discard(conn.InboundBuffered())
 				if callback == "OnData" {
 					writev(conn)
@@ -1831,7 +1831,7 @@ func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
 			events := &Events{Pollers: 1, WriteBufferedThreshold: tt.threshold}
 			started := make(chan string, 1)
 			measured := make(chan buffered, 8)
-			events.OnStart = func(ev *Events) {
+			funcs(events).Start = func(ev *Events) {
 				for _, listener := range ev.acceptor.listeners {
 					started <- listener.pair.local.String()
 					return
@@ -1844,7 +1844,7 @@ func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
 				_, err := conn.WriteOwned(owned)
 				return err
 			}
-			events.OnData = func(conn Conn) error {
+			funcs(events).Data = func(conn Conn) error {
 				_, _ = conn.Discard(conn.InboundBuffered())
 				if err := ownedWrite(conn, "one"); err != nil {
 					return err
@@ -1941,14 +1941,14 @@ func runBidirectionalLimitTransfer(t *testing.T, raw [2]net.Conn, limit int) {
 		started := make(chan struct{})
 		opened := make(chan Conn, 1)
 		ev := &Events{Pollers: 1, MaxOutboundBuffered: limit, MaxBufferSize: 16 << 10}
-		ev.OnStart = func(*Events) { close(started) }
-		ev.OnOpen = func(conn Conn) {
+		funcs(ev).Start = func(*Events) { close(started) }
+		funcs(ev).Open = func(conn Conn) {
 			opened <- conn
 			// Hold the open until both sides have their output queued, so
 			// neither reads while the other is still filling.
 			<-releaseOpen
 		}
-		ev.OnData = func(conn Conn) error {
+		funcs(ev).Data = func(conn Conn) error {
 			n, _ := conn.Discard(conn.InboundBuffered())
 			received[i].Add(int64(n))
 			return nil
@@ -2073,17 +2073,18 @@ func TestCloseWriteWaitsForAFullSocketWithoutSpinning(t *testing.T) {
 		want[i] = byte(i * 13)
 	}
 	queued := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:  1,
 		Executor: executor,
-		OnOpen: func(c Conn) {
+	}, FuncHandler{
+		Open: func(c Conn) {
 			_, err := c.Write(want)
 			if err == nil {
 				err = c.CloseWrite()
 			}
 			queued <- err
 		},
-	}
+	})
 	client, _ := serveInboundTest(t, events)
 	if err := <-queued; err != nil {
 		t.Fatal(err)
@@ -2107,7 +2108,7 @@ func TestHalfOpenCloseTakesNoExtraTurn(t *testing.T) {
 		executor := &countingExecutor{}
 		closed := make(chan struct{})
 		events := &Events{Pollers: 1, Executor: executor, AllowHalfOpen: halfOpen}
-		events.OnData = func(c Conn) error {
+		funcs(events).Data = func(c Conn) error {
 			if _, err := c.WriteTo(c); err != nil {
 				return err
 			}
@@ -2116,7 +2117,7 @@ func TestHalfOpenCloseTakesNoExtraTurn(t *testing.T) {
 			}
 			return nil
 		}
-		events.OnClose = func(Conn, error) { close(closed) }
+		funcs(events).Close = func(Conn, error) { close(closed) }
 		client, _ := serveInboundTest(t, events)
 		if _, err := client.Write(make([]byte, 100)); err != nil {
 			t.Fatal(err)
@@ -2144,7 +2145,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 	peer := make(chan Conn, 1)
 	closed := make(chan struct{}, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 8}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		ev.acceptor.mux.Lock()
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
@@ -2152,7 +2153,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 		}
 		ev.acceptor.mux.Unlock()
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		select {
 		case peer <- conn:
@@ -2160,7 +2161,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 		}
 		return nil
 	}
-	events.OnClose = func(Conn, error) { closed <- struct{}{} }
+	funcs(events).Close = func(Conn, error) { closed <- struct{}{} }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
 	defer func() {
@@ -2247,7 +2248,7 @@ func TestExternalConnectedUDPWrites(t *testing.T) {
 	}
 	defer receiver.Close()
 	started := make(chan struct{}, 1)
-	events := &Events{Pollers: 1, OnStart: func(*Events) { started <- struct{}{} }}
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { started <- struct{}{} }})
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve() }()
 	defer func() {

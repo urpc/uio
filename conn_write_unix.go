@@ -711,7 +711,7 @@ func (conn *fdConn) finishDatagram(data []byte, written int, err error) (int, er
 // inside OnOutbound is reported once that call returns. Nobody waits for the
 // claim, so OnOutbound callbacks that write to each other cannot deadlock.
 func (conn *fdConn) reportOutbound(n int) {
-	if n <= 0 || conn.events.OnOutbound == nil {
+	if n <= 0 || conn.events.cb.onOutbound == nil {
 		return
 	}
 	udp := conn.udp
@@ -736,7 +736,7 @@ func (conn *fdConn) drainOutbound() {
 		if pending == 0 {
 			return
 		}
-		conn.events.OnOutbound(conn, int(pending))
+		conn.events.cb.onOutbound(conn, int(pending))
 	}
 }
 

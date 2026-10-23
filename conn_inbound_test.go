@@ -21,8 +21,8 @@ import (
 func serveLoopback(tb testing.TB, events *Events) (string, <-chan error) {
 	tb.Helper()
 	addrs := make(chan string, 1)
-	onStart := events.OnStart
-	events.OnStart = func(ev *Events) {
+	onStart := funcs(events).Start
+	funcs(events).Start = func(ev *Events) {
 		if onStart != nil {
 			onStart(ev)
 		}
@@ -49,8 +49,8 @@ func serveLoopback(tb testing.TB, events *Events) (string, <-chan error) {
 func serveInboundTest(t *testing.T, events *Events) (net.Conn, Conn) {
 	t.Helper()
 	opened := make(chan Conn, 1)
-	onOpen := events.OnOpen
-	events.OnOpen = func(c Conn) {
+	onOpen := funcs(events).Open
+	funcs(events).Open = func(c Conn) {
 		if onOpen != nil {
 			onOpen(c)
 		}
@@ -116,16 +116,17 @@ func TestInboundLimitHoldsReadsInsteadOfClosing(t *testing.T) {
 	const limit = 64 << 10
 	var buffered atomic.Int64
 	var closed atomic.Bool
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			buffered.Store(int64(c.InboundBuffered()))
 			return nil
 		},
-		OnClose: func(Conn, error) { closed.Store(true) },
-	}
+		Close: func(Conn, error) { closed.Store(true) },
+	})
 	client, _ := serveInboundTest(t, events)
 
 	sent := writeUntilStalled(t, client, 64<<20)
@@ -151,11 +152,12 @@ func TestInboundLimitResumesAfterWakeConsumes(t *testing.T) {
 	var mu sync.Mutex
 	var got bytes.Buffer
 	consume := atomic.Bool{}
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if !consume.Load() {
 				return nil
 			}
@@ -164,7 +166,7 @@ func TestInboundLimitResumesAfterWakeConsumes(t *testing.T) {
 			mu.Unlock()
 			return err
 		},
-	}
+	})
 	client, server := serveInboundTest(t, events)
 
 	want := make([]byte, total)
@@ -236,7 +238,7 @@ func TestInboundLimitBoundsARelayToASlowReader(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}
-	events.OnData = func(c Conn) error {
+	funcs(events).Data = func(c Conn) error {
 		out, _ := relayOut.Load().(Conn)
 		if c.Userdata() != nil || out == nil {
 			return nil // the outbound leg's replies, or not dialed yet
@@ -249,7 +251,7 @@ func TestInboundLimitBoundsARelayToASlowReader(t *testing.T) {
 		note(&peakOutbound, out.OutboundBuffered())
 		return err
 	}
-	events.OnOutbound = func(c Conn, _ int) {
+	funcs(events).Outbound = func(c Conn, _ int) {
 		if c.Userdata() == nil || c.OutboundBuffered() >= limit/2 {
 			return
 		}
@@ -308,11 +310,12 @@ func TestInboundLimitWithReserveInbound(t *testing.T) {
 	var mu sync.Mutex
 	var packets []int
 	var reserveErr atomic.Value
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      1 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			var header [4]byte
 			for {
 				h := c.Peek(header[:])
@@ -333,7 +336,7 @@ func TestInboundLimitWithReserveInbound(t *testing.T) {
 				_, _ = c.Discard(total)
 			}
 		},
-	}
+	})
 	client, _ := serveInboundTest(t, events)
 	sizes := []int{0, 1, 1000, limit - 4, 3000, 7}
 	var wire []byte
@@ -384,13 +387,14 @@ func TestInboundLimitWithReserveInbound(t *testing.T) {
 func TestInboundLimitCloseWhileHeld(t *testing.T) {
 	const limit = 16 << 10
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData:             func(Conn) error { return nil },
-		OnClose:            func(_ Conn, err error) { closed <- err },
-	}
+	}, FuncHandler{
+		Data:  func(Conn) error { return nil },
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
 	if err := server.Close(); err != nil {
@@ -411,19 +415,20 @@ func TestInboundLimitHangupBehindHeldReads(t *testing.T) {
 	var consume atomic.Bool
 	var received atomic.Int64
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if consume.Load() {
 				n, _ := c.Discard(-1)
 				received.Add(int64(n))
 			}
 			return nil
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	const total = 256 << 10
 	go func() {
@@ -468,13 +473,14 @@ func TestInboundLimitDeadlineWhileHeld(t *testing.T) {
 			for _, when := range []string{"before hold", "during hold", "moved later", "cleared"} {
 				t.Run(when, func(t *testing.T) {
 					closed := make(chan error, 1)
-					events := &Events{
+					events := withFuncs(&Events{
 						Pollers:            1,
 						MaxBufferSize:      4 << 10,
 						MaxInboundBuffered: limit,
-						OnData:             func(Conn) error { return nil },
-						OnClose:            func(_ Conn, err error) { closed <- err },
-					}
+					}, FuncHandler{
+						Data:  func(Conn) error { return nil },
+						Close: func(_ Conn, err error) { closed <- err },
+					})
 					client, server := serveInboundTest(t, events)
 					if when == "before hold" {
 						if err := setDeadline(server, time.Now().Add(300*time.Millisecond)); err != nil {
@@ -531,15 +537,16 @@ func TestInboundLimitDeadlineWhileHeld(t *testing.T) {
 func TestInboundLimitDeadlineChangeKeepsReadsHeld(t *testing.T) {
 	const limit = 16 << 10
 	var buffered atomic.Int64
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			buffered.Store(int64(c.InboundBuffered()))
 			return nil
 		},
-	}
+	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
 	time.Sleep(50 * time.Millisecond)
@@ -575,13 +582,14 @@ func TestInboundLimitDeadlineEdgeValuesWhileHeld(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			closed := make(chan error, 1)
-			events := &Events{
+			events := withFuncs(&Events{
 				Pollers:            1,
 				MaxBufferSize:      4 << 10,
 				MaxInboundBuffered: limit,
-				OnData:             func(Conn) error { return nil },
-				OnClose:            func(_ Conn, err error) { closed <- err },
-			}
+			}, FuncHandler{
+				Data:  func(Conn) error { return nil },
+				Close: func(_ Conn, err error) { closed <- err },
+			})
 			client, server := serveInboundTest(t, events)
 			writeUntilStalled(t, client, 16<<20)
 			if err := server.SetReadDeadline(tc.deadline); err != nil {
@@ -742,11 +750,12 @@ func (d *packetDecoder) onData(conn Conn) error {
 // buffers and returns a client connection to it.
 func startPacketServer(tb testing.TB, decoder *packetDecoder) net.Conn {
 	tb.Helper()
-	server := &Events{
+	server := withFuncs(&Events{
 		Pollers:       1,
 		MaxBufferSize: 64 << 10,
-		OnData:        decoder.onData,
-	}
+	}, FuncHandler{
+		Data: decoder.onData,
+	})
 	addr, done := serveLoopback(tb, server)
 	client, err := net.Dial("tcp", addr)
 	if err != nil {

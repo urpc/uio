@@ -58,19 +58,19 @@ import (
 )
 
 func main() {
-	var events uio.Events
-
-	events.OnOpen = func(c uio.Conn) {
-		log.Println("hello", c.RemoteAddr())
-	}
-
-	events.OnData = func(c uio.Conn) error {
-		_, err := c.WriteTo(c) // echo everything that arrived
-		return err
-	}
-
-	events.OnClose = func(c uio.Conn, err error) {
-		log.Println("bye", c.RemoteAddr(), err)
+	events := &uio.Events{
+		Handler: uio.FuncHandler{
+			Open: func(c uio.Conn) {
+				log.Println("hello", c.RemoteAddr())
+			},
+			Data: func(c uio.Conn) error {
+				_, err := c.WriteTo(c) // echo everything that arrived
+				return err
+			},
+			Close: func(c uio.Conn, err error) {
+				log.Println("bye", c.RemoteAddr(), err)
+			},
+		},
 	}
 
 	log.Fatal(events.Serve(":9527"))
@@ -125,9 +125,18 @@ Everything is optional; the zero `Events` is ready to use.
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `LockOSThread` | off | Locks each event-loop goroutine to its own OS thread; callback workers are unaffected. |
 
-Besides the three main callbacks there are `OnInbound` and `OnOutbound`, which
-report bytes read and written, and `OnStart` and `OnStop` for the server's
-lifecycle.
+The callbacks are three interfaces, each its own field of `Events`:
+
+| Field | Interface | Methods |
+|---|---|---|
+| `Handler` | `Handler` | `OnOpen`, `OnData`, `OnClose`: every connection's lifecycle and data |
+| `Observer` | `TrafficObserver` | `OnInbound`, `OnOutbound`: bytes read and written |
+| `Hooks` | `ServeHooks` | `OnStart`, `OnStop`: around `Serve` |
+
+Any type implementing an interface fits its field. `FuncHandler` adapts plain
+functions to all three: set it as whichever fields its functions fill, and
+leave the rest unset. An unset field, or a nil `FuncHandler` function, costs
+nothing; the three are read once, when `Serve` starts.
 
 ## Backpressure
 
@@ -138,20 +147,22 @@ call, another peer — stop consuming once that destination is behind, and wake
 the source when it drains:
 
 ```go
-events := &uio.Events{MaxInboundBuffered: 256 << 10}
-events.OnData = func(c uio.Conn) error {
-	peer := peerOf(c) // the paired connection, e.g. from Userdata
-	if peer.OutboundBuffered() >= 256<<10 {
-		return nil // the far side is behind: leave the bytes unconsumed
-	}
-	_, err := c.WriteTo(peer)
-	return err
+relay := uio.FuncHandler{
+	Data: func(c uio.Conn) error {
+		peer := peerOf(c) // the paired connection, e.g. from Userdata
+		if peer.OutboundBuffered() >= 256<<10 {
+			return nil // the far side is behind: leave the bytes unconsumed
+		}
+		_, err := c.WriteTo(peer)
+		return err
+	},
+	Outbound: func(c uio.Conn, _ int) {
+		if c.OutboundBuffered() < 128<<10 {
+			_ = peerOf(c).Wake() // the far side drained: resume its held reads
+		}
+	},
 }
-events.OnOutbound = func(c uio.Conn, _ int) {
-	if c.OutboundBuffered() < 128<<10 {
-		_ = peerOf(c).Wake() // the far side drained: resume its held reads
-	}
-}
+events := &uio.Events{MaxInboundBuffered: 256 << 10, Handler: relay, Observer: relay}
 ```
 
 Once the unconsumed bytes reach the limit, that connection stops reading and
@@ -174,7 +185,7 @@ For a length-prefixed protocol, `ReserveInbound` gathers a packet that spans
 several reads into one chunk, so it can still be decoded in place:
 
 ```go
-events.OnData = func(c uio.Conn) error {
+func onData(c uio.Conn) error { // a Handler's OnData, or a FuncHandler's Data
 	var header [4]byte
 	for {
 		h := c.Peek(header[:]) // copies only if the header spans reads

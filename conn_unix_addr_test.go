@@ -38,7 +38,7 @@ func TestUnixConnectionAddressesAreKept(t *testing.T) {
 
 	clientEvents := &Events{Pollers: 1}
 	clientStarted := make(chan struct{}, 1)
-	clientEvents.OnStart = func(*Events) { clientStarted <- struct{}{} }
+	funcs(clientEvents).Start = func(*Events) { clientStarted <- struct{}{} }
 	clientDone := make(chan error, 1)
 	go func() { clientDone <- clientEvents.Serve() }()
 	t.Cleanup(func() {
@@ -61,9 +61,9 @@ func TestUnixConnectionAddressesAreKept(t *testing.T) {
 	servePath := filepath.Join(dir, "server.sock")
 	serverEvents := &Events{Pollers: 1}
 	serverStarted := make(chan struct{}, 1)
-	serverEvents.OnStart = func(*Events) { serverStarted <- struct{}{} }
+	funcs(serverEvents).Start = func(*Events) { serverStarted <- struct{}{} }
 	accepted := make(chan Conn, 1)
-	serverEvents.OnOpen = func(conn Conn) { accepted <- conn }
+	funcs(serverEvents).Open = func(conn Conn) { accepted <- conn }
 	serverDone := make(chan error, 1)
 	go func() { serverDone <- serverEvents.Serve("unix://" + servePath) }()
 	t.Cleanup(func() {

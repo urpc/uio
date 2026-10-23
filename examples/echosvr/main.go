@@ -28,17 +28,17 @@ func main() {
 
 	var events uio.Events
 
-	events.OnOpen = func(c uio.Conn) {
-		fmt.Println("connection opened:", c.RemoteAddr())
-	}
-
-	events.OnData = func(c uio.Conn) error {
-		_, err := c.WriteTo(c)
-		return err
-	}
-
-	events.OnClose = func(c uio.Conn, err error) {
-		fmt.Println("connection closed:", c.RemoteAddr())
+	events.Handler = uio.FuncHandler{
+		Open: func(c uio.Conn) {
+			fmt.Println("connection opened:", c.RemoteAddr())
+		},
+		Data: func(c uio.Conn) error {
+			_, err := c.WriteTo(c)
+			return err
+		},
+		Close: func(c uio.Conn, err error) {
+			fmt.Println("connection closed:", c.RemoteAddr())
+		},
 	}
 
 	go func() {

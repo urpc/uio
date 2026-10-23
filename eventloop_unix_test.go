@@ -20,14 +20,14 @@ import (
 func startEchoEvents(t *testing.T, events *Events) string {
 	t.Helper()
 	started := make(chan string, 1)
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		for _, listener := range events.acceptor.listeners {
 			started <- listener.ln.Addr().String()
 			return
 		}
 	}
-	if events.OnData == nil {
-		events.OnData = func(conn Conn) error {
+	if funcs(events).Data == nil {
+		funcs(events).Data = func(conn Conn) error {
 			_, err := conn.WriteTo(conn)
 			return err
 		}
@@ -128,7 +128,7 @@ func TestLoopIgnoresStaleTags(t *testing.T) {
 	}
 	events := &Events{Pollers: 1}
 	opened := make(chan *fdConn, 1)
-	events.OnOpen = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
 	addr := startEchoEvents(t, events)
 
 	client, err := net.DialTimeout("tcp", addr, time.Second)
@@ -206,10 +206,10 @@ func TestDialedConnectionRunsOpenBeforeRead(t *testing.T) {
 	t.Cleanup(func() { registeredForTest = nil })
 
 	started := make(chan struct{})
-	events := &Events{Pollers: 2, OnStart: func(*Events) { close(started) }}
-	events.OnOpen = func(conn Conn) { conn.SetUserdata(true) }
+	events := withFuncs(&Events{Pollers: 2}, FuncHandler{Start: func(*Events) { close(started) }})
+	funcs(events).Open = func(conn Conn) { conn.SetUserdata(true) }
 	gotData := make(chan struct{}, 32)
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		if conn.Userdata() == nil {
 			early.Add(1)
 		}
@@ -253,8 +253,8 @@ func TestAcceptedOpenTurnReadsAlreadySentBytes(t *testing.T) {
 	opened := make(chan int64, 1)
 	data := make(chan int64, 1)
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(Conn) { opened <- currentGoroutineID() }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(Conn) { opened <- currentGoroutineID() }
+	funcs(events).Data = func(conn Conn) error {
 		select {
 		case data <- currentGoroutineID():
 		default:
@@ -264,7 +264,7 @@ func TestAcceptedOpenTurnReadsAlreadySentBytes(t *testing.T) {
 	}
 	started := make(chan string, 1)
 	accepting := make(chan struct{})
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, l := range ev.acceptor.listeners {
 			started <- l.ln.Addr().String()
 		}
@@ -324,12 +324,12 @@ func TestCloseInOnOpenSendsQueuedOutput(t *testing.T) {
 	var openTurn, closeTurn atomic.Int64
 	closed := make(chan *fdConn, 1)
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		openTurn.Store(currentGoroutineID())
 		_, _ = conn.Write([]byte("bye"))
 		_ = conn.Close()
 	}
-	events.OnClose = func(conn Conn, _ error) {
+	funcs(events).Close = func(conn Conn, _ error) {
 		closeTurn.Store(currentGoroutineID())
 		if closes.Add(1) == 1 {
 			closed <- conn.(*fdConn)
@@ -374,11 +374,11 @@ func TestExternalCloseRacingTheOpenTurn(t *testing.T) {
 	release := make(chan struct{})
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		inOpen <- conn.(*fdConn)
 		<-release
 	}
-	events.OnClose = func(_ Conn, err error) { closed <- err }
+	funcs(events).Close = func(_ Conn, err error) { closed <- err }
 	addr := startEchoEvents(t, events)
 	client, err := net.DialTimeout("tcp", addr, time.Second)
 	if err != nil {
@@ -414,8 +414,8 @@ func TestSocketOptionsRaceClose(t *testing.T) {
 		opened := make(chan Conn, 1)
 		closed := make(chan struct{})
 		events := &Events{Pollers: 1}
-		events.OnOpen = func(conn Conn) { opened <- conn }
-		events.OnClose = func(Conn, error) { close(closed) }
+		funcs(events).Open = func(conn Conn) { opened <- conn }
+		funcs(events).Close = func(Conn, error) { close(closed) }
 		addr := startEchoEvents(t, events)
 		client, err := net.DialTimeout("tcp", addr, time.Second)
 		if err != nil {
@@ -459,7 +459,7 @@ func TestCloseStopsAllWaiters(t *testing.T) {
 	for i := 0; i < 50; i++ {
 		events := &Events{Pollers: 2}
 		started := make(chan struct{})
-		events.OnStart = func(*Events) { close(started) }
+		funcs(events).Start = func(*Events) { close(started) }
 		serveDone := make(chan error, 1)
 		go func() { serveDone <- events.Serve("") }()
 		select {
@@ -597,7 +597,7 @@ func TestAcceptedConnectionsGoRoundTheLoops(t *testing.T) {
 	const conns = 20
 	opened := make(chan *fdConn, conns)
 	events := &Events{Pollers: 2}
-	events.OnOpen = func(c Conn) { opened <- c.(*fdConn) }
+	funcs(events).Open = func(c Conn) { opened <- c.(*fdConn) }
 	addr := startEchoEvents(t, events)
 
 	perLoop := map[*eventLoop]int{}

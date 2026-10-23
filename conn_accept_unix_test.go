@@ -25,7 +25,7 @@ func TestReusePortListenersShareOnePort(t *testing.T) {
 
 	events := &Events{Pollers: 2, ReusePort: true}
 	addrCh := make(chan string, 1)
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		if len(ev.acceptor.listeners) != listeners {
 			t.Errorf("listeners = %d, want %d", len(ev.acceptor.listeners), listeners)
 		}
@@ -47,7 +47,7 @@ func TestReusePortListenersShareOnePort(t *testing.T) {
 
 	const dials = 16
 	var opened atomic.Int64
-	events.OnOpen = func(Conn) { opened.Add(1) }
+	funcs(events).Open = func(Conn) { opened.Add(1) }
 
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("tcp://127.0.0.1:0") }()
@@ -103,7 +103,7 @@ func TestCloseReleasesEveryListener(t *testing.T) {
 	var fds []int
 	var loops []*eventLoop
 	started := make(chan struct{})
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, l := range ev.acceptor.listeners {
 			fds = append(fds, l.fd)
 		}
@@ -146,7 +146,7 @@ func TestCloseReleasesEveryListener(t *testing.T) {
 func TestSingleListenerWithoutReusePort(t *testing.T) {
 	events := &Events{Pollers: 2}
 	checked := make(chan struct{})
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		if len(ev.acceptor.listeners) != 1 {
 			t.Errorf("listeners = %d, want 1", len(ev.acceptor.listeners))
 		}
@@ -190,15 +190,16 @@ func TestAcceptingWaitsForOnStart(t *testing.T) {
 
 			var opened atomic.Int64
 			var client net.Conn
-			events := &Events{
+			events := withFuncs(&Events{
 				Pollers:   2,
 				ReusePort: tc.reusePort,
-				OnOpen:    func(Conn) { opened.Add(1) },
-			}
+			}, FuncHandler{
+				Open: func(Conn) { opened.Add(1) },
+			})
 			// Dial while OnStart is still running: the connection then sits
 			// in the listener's backlog, and any OnOpen before OnStart
 			// returns is the race this test pins.
-			events.OnStart = func(ev *Events) {
+			funcs(events).Start = func(ev *Events) {
 				addr := ""
 				ev.acceptor.mux.Lock()
 				for _, l := range ev.acceptor.listeners {
@@ -330,14 +331,14 @@ func TestAcceptBurstAcrossListeners(t *testing.T) {
 	events := &Events{Pollers: 1}
 	started := make(chan []string, 1)
 	opened := make(chan acceptedOpen, want)
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		addrs := make([]string, 0, len(events.acceptor.listeners))
 		for _, listener := range events.acceptor.listeners {
 			addrs = append(addrs, listener.pair.local.String())
 		}
 		started <- addrs
 	}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		fd := conn.(*fdConn).fd
 		noDelay, err := syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, syscall.TCP_NODELAY)
 		var keepAlive int

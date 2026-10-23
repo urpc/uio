@@ -1335,7 +1335,7 @@ func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
 }
 
 func (conn *fdConn) fireOnOpen() {
-	if callback := conn.events.OnOpen; callback != nil {
+	if callback := conn.events.cb.onOpen; callback != nil {
 		started := conn.beginInboundCallback()
 		callback(conn)
 		conn.endInboundCallback(started)
@@ -1352,7 +1352,7 @@ func (conn *fdConn) fireOnOpen() {
 // are discarded by the datagram caller because packet lifetime is one turn.
 func (conn *fdConn) fireOnData() error {
 	var err error
-	if callback := conn.events.OnData; callback != nil {
+	if callback := conn.events.cb.onData; callback != nil {
 		started := conn.beginInboundCallback()
 		err = callback(conn)
 		conn.endInboundCallback(started)
@@ -1449,7 +1449,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		// inboundTail aliases the pooled read buffer. Unconsumed bytes are copied
 		// into inbound before the buffer is reused by the next syscall.
 		conn.inboundTail = buffer[:n]
-		if conn.events.OnInbound != nil {
+		if conn.events.cb.onInbound != nil {
 			conn.events.onSocketBytesRead(conn, n)
 		}
 		if conn.isClosing() {
@@ -1831,7 +1831,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 // owed, refused by the Executor, never got OnOpen, so it gets no OnClose
 // either.
 func (conn *fdConn) closeCallbackDue() bool {
-	return !conn.internal && conn.events.OnClose != nil && conn.taskState.Load()&ioEventOpen == 0
+	return !conn.internal && conn.events.cb.onClose != nil && conn.taskState.Load()&ioEventOpen == 0
 }
 
 // deliverClose runs OnClose for a released connection on the owner that
@@ -1911,7 +1911,7 @@ func (conn *fdConn) fireCloseCallback() {
 		return
 	}
 	err := conn.takeDeferredCloseCause()
-	if callback := conn.events.OnClose; callback != nil && !conn.internal {
+	if callback := conn.events.cb.onClose; callback != nil && !conn.internal {
 		started := conn.beginInboundCallback()
 		callback(conn, err)
 		conn.endInboundCallback(started)

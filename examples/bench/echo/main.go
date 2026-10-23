@@ -40,9 +40,11 @@ func main() {
 	events.LockOSThread = *lockOS
 	events.ReusePort = *reusePort
 
-	events.OnData = func(c uio.Conn) error {
-		_, err := c.WriteTo(c)
-		return err
+	events.Handler = uio.FuncHandler{
+		Data: func(c uio.Conn) error {
+			_, err := c.WriteTo(c)
+			return err
+		},
 	}
 
 	go func() {

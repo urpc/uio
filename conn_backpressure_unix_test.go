@@ -35,19 +35,19 @@ func startBackpressureServer(t *testing.T, onData func(conn Conn, n int) error) 
 	opened := make(chan *fdConn, 1)
 	started := make(chan string, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: backpressureLimit}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, listener := range ev.acceptor.listeners {
 			started <- listener.pair.local.String()
 			return
 		}
 	}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		// Kernels that grow buffers on their own would take the backlog the
 		// test means to keep in user space.
 		_ = unix.SetsockoptInt(int(conn.(*fdConn).fd), unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer)
 		opened <- conn.(*fdConn)
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		n, _ := conn.Discard(conn.InboundBuffered())
 		if n == 0 {
 			return nil
@@ -260,7 +260,7 @@ func TestRequestReplyRunsOneTurnPerRequest(t *testing.T) {
 	const rounds = 200
 	executor := &countingExecutor{}
 	events := &Events{Pollers: 1, Executor: executor}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		for conn.InboundBuffered() > 0 {
 			chunk := conn.PeekChunk()
 			if _, err := conn.Write(chunk); err != nil {

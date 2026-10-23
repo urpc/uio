@@ -80,24 +80,27 @@ func (s *Server) Serve(addrs ...string) error {
 	s.config = newServerConnConfig(opts, s.CheckOrigin, &s.connections, &s.stats)
 	events := opts.transportEvents()
 	s.events = events
-	events.OnStart = func(*uio.Events) {
-		s.closeMu.Lock()
-		if !s.closed {
-			s.ready.Store(true)
-		}
-		hook := s.startHook
-		s.closeMu.Unlock()
-		if hook != nil {
-			hook()
-		}
+	handler := uio.FuncHandler{
+		Start: func(*uio.Events) {
+			s.closeMu.Lock()
+			if !s.closed {
+				s.ready.Store(true)
+			}
+			hook := s.startHook
+			s.closeMu.Unlock()
+			if hook != nil {
+				hook()
+			}
+		},
+		Open:     s.onOpen,
+		Data:     s.onData,
+		Close:    s.onClose,
+		Outbound: s.onOutbound,
 	}
-	events.OnOpen = s.onOpen
-	events.OnData = s.onData
-	events.OnClose = s.onClose
-	events.OnOutbound = s.onOutbound
 	if s.config.observeTraffic {
-		events.OnInbound = s.onInbound
+		handler.Inbound = s.onInbound
 	}
+	events.Handler, events.Observer, events.Hooks = handler, handler, handler
 	s.startHeartbeat(s.config)
 	s.closeMu.Unlock()
 

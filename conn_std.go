@@ -170,7 +170,7 @@ func (fc *fdConn) openOnReader() bool {
 }
 
 func (fc *fdConn) fireOnOpen() {
-	if callback := fc.events.OnOpen; callback != nil {
+	if callback := fc.events.cb.onOpen; callback != nil {
 		started := fc.beginInboundCallback()
 		callback(fc)
 		fc.endInboundCallback(started)
@@ -532,7 +532,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 // reported once that call returns. Nobody waits for the claim, so OnOutbound
 // callbacks that write to each other cannot deadlock.
 func (fc *fdConn) reportOutbound(n int) {
-	if fc.events.OnOutbound == nil {
+	if fc.events.cb.onOutbound == nil {
 		return
 	}
 	udp := fc.udp
@@ -557,7 +557,7 @@ func (fc *fdConn) drainOutboundReports() {
 		if pending == 0 {
 			return
 		}
-		fc.events.OnOutbound(fc, int(pending))
+		fc.events.cb.onOutbound(fc, int(pending))
 	}
 }
 
@@ -862,7 +862,7 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 		defer fc.events.callbackWG.Done()
 		fc.callbackMu.Lock()
 		defer fc.callbackMu.Unlock()
-		if callback := fc.events.OnClose; callback != nil && !fc.internal && fc.opened {
+		if callback := fc.events.cb.onClose; callback != nil && !fc.internal && fc.opened {
 			// A child whose OnOpen had not run when its server closed is
 			// opened afterwards by the listener; whichever of the two close
 			// callbacks finds it opened delivers it, exactly once.
@@ -1361,7 +1361,7 @@ func (fc *fdConn) listenUDP() error {
 			}
 			// fire udp on-open event.
 			udpConn.callbackMu.Lock()
-			if onOpen := fc.events.OnOpen; nil != onOpen {
+			if onOpen := fc.events.cb.onOpen; nil != onOpen {
 				started := udpConn.beginInboundCallback()
 				onOpen(udpConn)
 				udpConn.endInboundCallback(started)

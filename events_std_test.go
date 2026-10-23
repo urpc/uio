@@ -121,7 +121,7 @@ func (fd stdRawConn) Write(callback func(uintptr) bool) error {
 func startStdTestEvents(t *testing.T, events *Events) <-chan error {
 	t.Helper()
 	started := make(chan struct{})
-	events.OnStart = func(*Events) { close(started) }
+	funcs(events).Start = func(*Events) { close(started) }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve() }()
 	select {
@@ -171,7 +171,7 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 	releaseOpen := make(chan struct{})
 	dataCalled := make(chan struct{}, 1)
 	callbackErr := make(chan error, 1)
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		raw := conn.(*fdConn).conn.(*stdRegistrationConn)
 		close(openEntered)
 		<-releaseOpen
@@ -180,7 +180,7 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 		}
 		raw.openReturned.Store(true)
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		raw := conn.(*fdConn).conn.(*stdRegistrationConn)
 		if !raw.openReturned.Load() {
 			raw.orderViolation.Store(true)
@@ -261,11 +261,11 @@ func TestStdRegisterBurstAndClose(t *testing.T) {
 	total := min(desiredTotal, stdTestFDLimit())
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
 	var opened, closed atomic.Int32
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		conn.(*fdConn).conn.(*stdRegistrationConn).openReturned.Store(true)
 		opened.Add(1)
 	}
-	events.OnClose = func(Conn, error) { closed.Add(1) }
+	funcs(events).Close = func(Conn, error) { closed.Add(1) }
 	serveDone := startStdTestEvents(t, events)
 
 	results := make([]chan error, total)
@@ -304,7 +304,7 @@ func TestStdRegisterBurstAndClose(t *testing.T) {
 
 func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
-	events.OnOpen = func(conn Conn) {
+	funcs(events).Open = func(conn Conn) {
 		conn.(*fdConn).conn.(*stdRegistrationConn).openReturned.Store(true)
 	}
 	serveDone := startStdTestEvents(t, events)
@@ -838,7 +838,7 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 	opened := make(chan Conn, 1)
 	dataCalls := make(chan struct{}, 2)
 	events := &Events{Pollers: 1, WriteBufferedThreshold: 1}
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {
 			started <- listener.ln.Addr().String()
@@ -846,8 +846,8 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 		}
 		events.acceptor.mux.Unlock()
 	}
-	events.OnOpen = func(conn Conn) { opened <- conn }
-	events.OnData = func(conn Conn) error {
+	funcs(events).Open = func(conn Conn) { opened <- conn }
+	funcs(events).Data = func(conn Conn) error {
 		dataCalls <- struct{}{}
 		_, err := conn.WriteTo(conn)
 		return err
@@ -909,7 +909,7 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 	closeReturned := make(chan struct{})
 	shutdownErr := errors.New("stdio callback shutdown")
 	events := &Events{Pollers: 1}
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		events.acceptor.mux.Lock()
 		for _, listener := range events.acceptor.listeners {
 			started <- listener.ln.Addr().String()
@@ -917,7 +917,7 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 		}
 		events.acceptor.mux.Unlock()
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		if err := events.Close(shutdownErr); err != nil {
 			return err
@@ -966,7 +966,7 @@ func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 	var callbackOnce sync.Once
 
 	events := &Events{Pollers: 1}
-	events.OnStart = func(events *Events) {
+	funcs(events).Start = func(events *Events) {
 		events.acceptor.mux.Lock()
 		defer events.acceptor.mux.Unlock()
 		for _, listener := range events.acceptor.listeners {
@@ -974,7 +974,7 @@ func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 			return
 		}
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		callbackOnce.Do(func() {
 			callbackEntered <- struct{}{}
 			<-releaseCallback
@@ -1042,7 +1042,7 @@ func TestStdReadLoopKeepsLifetimeUntilExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	callbackDone := make(chan struct{}, 1)
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		callbackDone <- struct{}{}
 		return nil
@@ -1103,7 +1103,7 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	received := make(chan string, 1)
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		chunk := append([]byte(nil), conn.PeekChunk()...)
 		_, _ = conn.Discard(-1)
 		received <- string(chunk)
@@ -1139,11 +1139,11 @@ func TestStdReadLoopRunsNoDataAfterOnClose(t *testing.T) {
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
 	closed := make(chan struct{})
 	var closedFlag, dataAfterClose atomic.Bool
-	events.OnClose = func(Conn, error) {
+	funcs(events).Close = func(Conn, error) {
 		closedFlag.Store(true)
 		close(closed)
 	}
-	events.OnData = func(conn Conn) error {
+	funcs(events).Data = func(conn Conn) error {
 		if closedFlag.Load() {
 			dataAfterClose.Store(true)
 		}
@@ -1212,7 +1212,7 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	events := &Events{}
-	events.OnOutbound = func(_ Conn, n int) {
+	funcs(events).Outbound = func(_ Conn, n int) {
 		if in.Add(1) > 1 {
 			overlap.Add(1)
 		}
@@ -1279,7 +1279,7 @@ func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
 	started := make(chan net.Addr, 1)
 	got := make(chan string, 1)
 	events := &Events{}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, l := range ev.acceptor.listeners {
 			if l.udp != nil {
 				started <- l.udp.LocalAddr()
@@ -1287,7 +1287,7 @@ func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
 			}
 		}
 	}
-	events.OnData = func(c Conn) error {
+	funcs(events).Data = func(c Conn) error {
 		buf := make([]byte, c.InboundBuffered())
 		n, err := c.Read(buf)
 		got <- string(buf[:n])
@@ -1332,18 +1332,19 @@ func TestStdHeldReadDeadlineAgreesWithTheSocket(t *testing.T) {
 	const limit = 16 << 10
 	var consume atomic.Bool
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Data: func(c Conn) error {
 			if consume.Load() {
 				_, _ = c.Discard(-1)
 			}
 			return nil
 		},
-		OnClose: func(_ Conn, err error) { closed <- err },
-	}
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
 
@@ -1402,13 +1403,14 @@ func TestStdHeldReadDeadlineAgreesWithTheSocket(t *testing.T) {
 func TestStdHeldDeadlineExpiryAndClearAreOrdered(t *testing.T) {
 	const limit = 16 << 10
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData:             func(Conn) error { return nil },
-		OnClose:            func(_ Conn, err error) { closed <- err },
-	}
+	}, FuncHandler{
+		Data:  func(Conn) error { return nil },
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
 
@@ -1452,13 +1454,14 @@ func TestStdHeldDeadlineExpiryAndClearAreOrdered(t *testing.T) {
 func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 	const limit = 16 << 10
 	closed := make(chan error, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers:            1,
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
-		OnData:             func(Conn) error { return nil },
-		OnClose:            func(_ Conn, err error) { closed <- err },
-	}
+	}, FuncHandler{
+		Data:  func(Conn) error { return nil },
+		Close: func(_ Conn, err error) { closed <- err },
+	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
 
@@ -1482,10 +1485,10 @@ func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 func TestStdWakesBeforeOnOpenEachRunOnData(t *testing.T) {
 	const wakes = 3
 	var seq []string
-	events := &Events{
-		OnOpen: func(Conn) { seq = append(seq, "open") },
-		OnData: func(Conn) error { seq = append(seq, "data"); return nil },
-	}
+	events := withFuncs(&Events{}, FuncHandler{
+		Open: func(Conn) { seq = append(seq, "open") },
+		Data: func(Conn) error { seq = append(seq, "data"); return nil },
+	})
 	conn := &fdConn{}
 	conn.events = events
 	for range wakes {
@@ -1510,10 +1513,10 @@ func TestStdWakesBeforeOnOpenEachRunOnData(t *testing.T) {
 func TestStdCloseBeforeReaderStillOpensAndCloses(t *testing.T) {
 	var seq []string
 	cause := errors.New("closed before the reader ran")
-	events := &Events{
-		OnOpen:  func(Conn) { seq = append(seq, "open") },
-		OnClose: func(_ Conn, err error) { seq = append(seq, "close: "+err.Error()) },
-	}
+	events := withFuncs(&Events{}, FuncHandler{
+		Open:  func(Conn) { seq = append(seq, "open") },
+		Close: func(_ Conn, err error) { seq = append(seq, "close: "+err.Error()) },
+	})
 	conn := &fdConn{}
 	conn.events = events
 	conn.closing.Store(true)
@@ -1554,11 +1557,12 @@ func TestStdDialCanceledDuringRegistrationGetsNoCallbacks(t *testing.T) {
 		}
 	}()
 	var opens, closes atomic.Int32
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnOpen:  func(Conn) { opens.Add(1) },
-		OnClose: func(Conn, error) { closes.Add(1) },
-	}
+	}, FuncHandler{
+		Open:  func(Conn) { opens.Add(1) },
+		Close: func(Conn, error) { closes.Add(1) },
+	})
 	serveDone := startStdTestEvents(t, events)
 	cause := errors.New("dial canceled while registering")
 	ctx, cancel := context.WithCancelCause(context.Background())
@@ -1601,7 +1605,7 @@ func TestStdAcceptDoesNotWaitForRegistration(t *testing.T) {
 	opened := make(chan struct{}, 16)
 	// Three loops: the client sockets dialed here take descriptors too, so
 	// the accepted ones step by two, which a pair of loops would map to one.
-	events := &Events{Pollers: 3, OnOpen: func(Conn) { opened <- struct{}{} }}
+	events := withFuncs(&Events{Pollers: 3}, FuncHandler{Open: func(Conn) { opened <- struct{}{} }})
 	addr, done := serveLoopback(t, events)
 	t.Cleanup(func() {
 		releaseOnce()
@@ -1658,8 +1662,8 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 	started := make(chan struct{})
 	result := make(chan error, 1)
 	var calls atomic.Int32
-	ev.OnStart = func(*Events) { close(started) }
-	ev.OnData = func(conn Conn) error {
+	funcs(ev).Start = func(*Events) { close(started) }
+	funcs(ev).Data = func(conn Conn) error {
 		if calls.Add(1) != 1 {
 			return nil
 		}
@@ -1717,7 +1721,7 @@ func TestStdUDPListenerCloseDuringDatagramFlood(t *testing.T) {
 	for iter := 0; iter < 100; iter++ {
 		started := make(chan net.Addr, 1)
 		events := &Events{}
-		events.OnStart = func(ev *Events) {
+		funcs(events).Start = func(ev *Events) {
 			for _, l := range ev.acceptor.listeners {
 				if l.udp != nil {
 					started <- l.udp.LocalAddr()
@@ -1725,7 +1729,7 @@ func TestStdUDPListenerCloseDuringDatagramFlood(t *testing.T) {
 				}
 			}
 		}
-		events.OnData = func(c Conn) error { return nil }
+		funcs(events).Data = func(c Conn) error { return nil }
 		serveDone := make(chan error, 1)
 		go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
 		addr := <-started
@@ -1764,7 +1768,7 @@ func TestStdUDPChildClosedBeforeOpenGetsOnClose(t *testing.T) {
 	defer func() { testHookUDPChildCreated = nil }()
 	var opens, closes atomic.Int32
 	events := &Events{}
-	events.OnStart = func(ev *Events) {
+	funcs(events).Start = func(ev *Events) {
 		for _, l := range ev.acceptor.listeners {
 			if l.udp != nil {
 				started <- l.udp.LocalAddr()
@@ -1772,9 +1776,9 @@ func TestStdUDPChildClosedBeforeOpenGetsOnClose(t *testing.T) {
 			}
 		}
 	}
-	events.OnOpen = func(c Conn) { opens.Add(1) }
-	events.OnClose = func(c Conn, err error) { closes.Add(1) }
-	events.OnData = func(c Conn) error { return nil }
+	funcs(events).Open = func(c Conn) { opens.Add(1) }
+	funcs(events).Close = func(c Conn, err error) { closes.Add(1) }
+	funcs(events).Data = func(c Conn) error { return nil }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
 	addr := <-started
@@ -1807,7 +1811,7 @@ func TestStdUDPChildCloseReasonPublished(t *testing.T) {
 	started := make(chan net.Addr, 1)
 	closed := make(chan error, 1)
 	events := &Events{}
-	events.OnStart = func(e *Events) {
+	funcs(events).Start = func(e *Events) {
 		for _, l := range e.acceptor.listeners {
 			if l.udp != nil {
 				started <- l.udp.LocalAddr()
@@ -1815,13 +1819,13 @@ func TestStdUDPChildCloseReasonPublished(t *testing.T) {
 			}
 		}
 	}
-	events.OnOpen = func(c Conn) {
+	funcs(events).Open = func(c Conn) {
 		_ = c.CloseWith(errors.New("test-close"))
 		for !c.(*fdConn).IsClosed() {
 			runtime.Gosched()
 		}
 	}
-	events.OnClose = func(c Conn, err error) { closed <- err }
+	funcs(events).Close = func(c Conn, err error) { closed <- err }
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("udp://127.0.0.1:0") }()
 	client, err := net.Dial("udp", (<-started).String())

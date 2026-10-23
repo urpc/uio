@@ -87,6 +87,7 @@ type Events struct {
 	ioPool         *ioTaskPool
 	readPool       plocal.Cache[*readBuffer] // read buffers, one kept per P
 	readBufferSize int
+	cb             callbacks // Handler, resolved when Serve starts
 
 	// Pollers is the number of event loops. On Unix each loop is one
 	// epoll or kqueue instance that a few goroutines wait on: they collect
@@ -154,47 +155,18 @@ type Events struct {
 	// the end of the peer's stream closes the connection with io.EOF.
 	AllowHalfOpen bool
 
-	// OnOpen fires first for every connection, in the connection's first
-	// turn, also for one closed before that turn ran: OnClose follows, and
-	// writes from OnOpen return net.ErrClosed. On Unix a stream connection's
-	// first turn reads whatever its peer already sent right after OnOpen
-	// returns, in the same turn. Lifecycle and
-	// data callbacks are serialized per connection, while callbacks for
-	// different connections may run concurrently.
-	OnOpen func(c Conn)
+	// Handler receives every connection's callbacks. A nil Handler leaves
+	// connections without callbacks, their input discarded.
+	Handler Handler
 
-	// OnData fires when inbound data is available. Inbound access methods are
-	// valid only for this callback invocation.
-	OnData func(c Conn) error
+	// Observer is told the bytes every connection reads and writes. Nil
+	// reports nothing.
+	Observer TrafficObserver
 
-	// OnClose is the final callback for a connection and never overlaps its
-	// OnOpen or OnData callback; only a connection that got OnOpen gets it.
-	// Close only requests the close: the connection is released, and OnClose
-	// runs, once the callback that closed it has returned.
-	OnClose func(c Conn, err error)
-
-	// OnInbound reports bytes read from the socket before OnData and shares its
-	// inbound-access scope.
-	OnInbound func(c Conn, readBytes int)
-
-	// OnOutbound reports bytes successfully written to the socket. It may run on
-	// a backend writer goroutine or a native write turn, concurrently with the
-	// connection's other callbacks, and does not grant inbound-buffer access.
-	// The final flush of a closing native connection reports from the goroutine
-	// that releases it, which during shutdown is the one returning from Serve.
-	// Calls for one connection never overlap each other: on the native backend
-	// a Write made inside OnOutbound is queued and sent after it returns. A UDP
-	// connection's datagrams leave on the goroutines that write them, and
-	// OnOutbound may report several of them, on any one of those goroutines,
-	// after its send.
-	OnOutbound func(c Conn, writeBytes int)
-
-	// OnStart runs synchronously after initialization and before listeners
-	// begin accepting connections.
-	OnStart func(ev *Events)
-
-	// OnStop runs once after Serve has stopped its loops and connection tasks.
-	OnStop func(ev *Events)
+	// Hooks runs around Serve. Nil runs nothing.
+	//
+	// Handler, Observer and Hooks are read once, when Serve starts.
+	Hooks ServeHooks
 }
 
 // Serve starts the event loops and listens on each supplied address. Calling
@@ -211,13 +183,13 @@ func (ev *Events) Serve(addrs ...string) (err error) {
 		return err
 	}
 
-	if ev.OnStart != nil {
-		ev.OnStart(ev)
+	if ev.cb.onStart != nil {
+		ev.cb.onStart(ev)
 	}
 
 	defer func() {
-		if ev.OnStop != nil {
-			ev.OnStop(ev)
+		if ev.cb.onStop != nil {
+			ev.cb.onStop(ev)
 		}
 		ev.finishLifecycle(err)
 	}()
@@ -322,6 +294,7 @@ func (ev *Events) finishLifecycle(err error) {
 }
 
 func (ev *Events) initConfig() error {
+	ev.cb = resolveCallbacks(ev.Handler, ev.Observer, ev.Hooks)
 
 	if ev.Pollers <= 0 {
 		ev.Pollers = defaultPollers(runtime.GOMAXPROCS(0))
@@ -341,11 +314,10 @@ func (ev *Events) initConfig() error {
 }
 
 func (ev *Events) onData(fdc *fdConn) error {
-	if nil != ev.OnData {
-		return ev.OnData(fdc)
+	if onData := ev.cb.onData; onData != nil {
+		return onData(fdc)
 	}
-	// discard all received bytes if not set OnData.
-	//
+	// Without a data callback the received bytes are discarded.
 	started := fdc.beginInboundCallback()
 	_, _ = fdc.Discard(-1)
 	fdc.endInboundCallback(started)
@@ -353,15 +325,15 @@ func (ev *Events) onData(fdc *fdConn) error {
 }
 
 func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
-	if readBytes > 0 && ev.OnInbound != nil {
+	if onInbound := ev.cb.onInbound; readBytes > 0 && onInbound != nil {
 		started := fdc.beginInboundCallback()
-		ev.OnInbound(fdc, readBytes)
+		onInbound(fdc, readBytes)
 		fdc.endInboundCallback(started)
 	}
 }
 
 func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
-	if writeBytes > 0 && ev.OnOutbound != nil {
-		ev.OnOutbound(fdc, writeBytes)
+	if onOutbound := ev.cb.onOutbound; writeBytes > 0 && onOutbound != nil {
+		onOutbound(fdc, writeBytes)
 	}
 }

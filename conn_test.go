@@ -165,11 +165,12 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 	writeErrs := make(chan error, 2)
 	payload := make([]byte, chunk)
 	newEvents := func(received *atomic.Int64, started chan<- struct{}) *Events {
-		return &Events{
+		return withFuncs(&Events{
 			Pollers:       1,
 			MaxBufferSize: chunk,
-			OnStart:       func(*Events) { close(started) },
-			OnOpen: func(conn Conn) {
+		}, FuncHandler{
+			Start: func(*Events) { close(started) },
+			Open: func(conn Conn) {
 				go func() {
 					for sent := 0; sent < total; sent += chunk {
 						if _, err := conn.Write(payload); err != nil {
@@ -179,12 +180,12 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 					}
 				}()
 			},
-			OnData: func(conn Conn) error {
+			Data: func(conn Conn) error {
 				n, _ := conn.Discard(conn.InboundBuffered())
 				received.Add(int64(n))
 				return nil
 			},
-		}
+		})
 	}
 	serverStarted, clientStarted := make(chan struct{}), make(chan struct{})
 	server := newEvents(&serverReceived, serverStarted)
@@ -274,7 +275,7 @@ func TestDialFromOnOpen(t *testing.T) {
 	}()
 	result := make(chan error, 1)
 	events := &Events{Pollers: 1}
-	events.OnOpen = func(c Conn) {
+	funcs(events).Open = func(c Conn) {
 		if c.Userdata() != nil {
 			return // the dialed connection's own OnOpen
 		}
@@ -300,18 +301,19 @@ func TestDialFromOnOpen(t *testing.T) {
 func TestSlowOnOpenDoesNotStallTheLoop(t *testing.T) {
 	release := make(chan struct{})
 	var accepted atomic.Int32
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnOpen: func(c Conn) {
+	}, FuncHandler{
+		Open: func(c Conn) {
 			if accepted.Add(1) == 2 {
 				<-release // the second accepted connection's OnOpen blocks
 			}
 		},
-		OnData: func(c Conn) error {
+		Data: func(c Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},
-	}
+	})
 	first, _ := serveInboundTest(t, events)
 	defer close(release)
 	addr := first.RemoteAddr().String()
@@ -349,15 +351,16 @@ func TestWakeBeforeOnOpenRunsAfterIt(t *testing.T) {
 		mu.Unlock()
 	}
 	woke := make(chan struct{}, 1)
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnOpen: func(c Conn) {
+	}, FuncHandler{
+		Open: func(c Conn) {
 			if c.Userdata() == "dialed" {
 				time.Sleep(50 * time.Millisecond)
 				note("open")
 			}
 		},
-		OnData: func(c Conn) error {
+		Data: func(c Conn) error {
 			if c.Userdata() == "dialed" {
 				note("data")
 				select {
@@ -367,7 +370,7 @@ func TestWakeBeforeOnOpenRunsAfterIt(t *testing.T) {
 			}
 			return nil
 		},
-	}
+	})
 	serveInboundTest(t, events)
 	target, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -420,14 +423,15 @@ func TestCloseBeforeOnOpenSkipsOnClose(t *testing.T) {
 	var mu sync.Mutex
 	opened := map[Conn]bool{}
 	var orphans, closes atomic.Int32
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnOpen: func(c Conn) {
+	}, FuncHandler{
+		Open: func(c Conn) {
 			mu.Lock()
 			opened[c] = true
 			mu.Unlock()
 		},
-		OnClose: func(c Conn, _ error) {
+		Close: func(c Conn, _ error) {
 			closes.Add(1)
 			mu.Lock()
 			if !opened[c] {
@@ -435,7 +439,7 @@ func TestCloseBeforeOnOpenSkipsOnClose(t *testing.T) {
 			}
 			mu.Unlock()
 		},
-	}
+	})
 	serveInboundTest(t, events)
 	for range 200 {
 		c, err := events.Dial("tcp://"+target.Addr().String(), "dialed")
@@ -466,10 +470,11 @@ func TestUDPChildReadDeadlineClosesOnlyThatChild(t *testing.T) {
 	}
 	closed := make(chan closeEvent, 4)
 	started := make(chan struct{})
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnStart: func(*Events) { close(started) },
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Start: func(*Events) { close(started) },
+		Data: func(c Conn) error {
 			payload := c.Peek(make([]byte, c.InboundBuffered()))
 			if string(payload) == "expire" {
 				if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
@@ -479,8 +484,8 @@ func TestUDPChildReadDeadlineClosesOnlyThatChild(t *testing.T) {
 			_, err := c.WriteTo(c)
 			return err
 		},
-		OnClose: func(c Conn, err error) { closed <- closeEvent{c.RemoteAddr().String(), err} },
-	}
+		Close: func(c Conn, err error) { closed <- closeEvent{c.RemoteAddr().String(), err} },
+	})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("udp://" + addr) }()
 	select {
@@ -555,16 +560,17 @@ func TestUDPChildGetsOnCloseAfterOnOpen(t *testing.T) {
 	opened := make(chan struct{}, 1)
 	closed := make(chan struct{}, 1)
 	started := make(chan struct{})
-	events := &Events{
+	events := withFuncs(&Events{
 		Pollers: 1,
-		OnStart: func(*Events) { close(started) },
-		OnOpen:  func(Conn) { opened <- struct{}{} },
-		OnData: func(c Conn) error {
+	}, FuncHandler{
+		Start: func(*Events) { close(started) },
+		Open:  func(Conn) { opened <- struct{}{} },
+		Data: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			return c.Close()
 		},
-		OnClose: func(Conn, error) { closed <- struct{}{} },
-	}
+		Close: func(Conn, error) { closed <- struct{}{} },
+	})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("udp://" + addr) }()
 	<-started

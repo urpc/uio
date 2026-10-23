@@ -27,18 +27,14 @@ func ListenAndServe(addr string, handler http.Handler) error {
 
 	var events uio.Events
 
-	events.OnOpen = func(c uio.Conn) {
-		//fmt.Println("connection opened:", c.RemoteAddr())
-		c.SetUserdata(NewHttpConn(c, handler))
-	}
-
-	events.OnData = func(c uio.Conn) error {
-		hConn := c.Userdata().(*HttpConn)
-		return hConn.ServeHTTP()
-	}
-
-	events.OnClose = func(c uio.Conn, err error) {
-		//fmt.Println("connection closed:", c.RemoteAddr(), err)
+	events.Handler = uio.FuncHandler{
+		Open: func(c uio.Conn) {
+			c.SetUserdata(NewHttpConn(c, handler))
+		},
+		Data: func(c uio.Conn) error {
+			hConn := c.Userdata().(*HttpConn)
+			return hConn.ServeHTTP()
+		},
 	}
 
 	if err := events.Serve(addr); nil != err {

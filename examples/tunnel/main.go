@@ -51,6 +51,7 @@ func main() {
 		MaxInboundBuffered: *inbound,
 		AllowHalfOpen:      true,
 	}
+	var handler uio.FuncHandler
 	peerOf := func(c uio.Conn) uio.Conn {
 		l, _ := c.Userdata().(*leg)
 		if l == nil {
@@ -60,7 +61,7 @@ func main() {
 		return p
 	}
 
-	events.OnOpen = func(c uio.Conn) {
+	handler.Open = func(c uio.Conn) {
 		if c.Userdata() != nil {
 			return // the upstream leg, paired by the client leg's OnOpen
 		}
@@ -81,7 +82,7 @@ func main() {
 		_ = up.Wake()
 	}
 
-	events.OnData = func(c uio.Conn) error {
+	handler.Data = func(c uio.Conn) error {
 		peer := peerOf(c)
 		if peer == nil {
 			return nil // the upstream is not up yet: hold
@@ -102,7 +103,7 @@ func main() {
 		return nil
 	}
 
-	events.OnOutbound = func(c uio.Conn, _ int) {
+	handler.Outbound = func(c uio.Conn, _ int) {
 		// The far leg may have stopped reading because this queue was full;
 		// wake it once enough of the queue has drained.
 		if c.OutboundBuffered() < *inbound/2 {
@@ -112,7 +113,7 @@ func main() {
 		}
 	}
 
-	events.OnClose = func(c uio.Conn, err error) {
+	handler.Close = func(c uio.Conn, err error) {
 		peer := peerOf(c)
 		if peer == nil || errors.Is(err, io.EOF) {
 			return // a graceful close: both halves already went on to the peer
@@ -121,6 +122,10 @@ func main() {
 		_ = peer.SetLinger(0)
 		_ = peer.Close()
 	}
+
+	// The relay observes its own writes, so one FuncHandler serves as both
+	// the Handler and the Observer.
+	events.Handler, events.Observer = handler, handler
 
 	go func() {
 		sig := make(chan os.Signal, 1)

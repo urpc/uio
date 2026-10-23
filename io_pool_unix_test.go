@@ -24,15 +24,17 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 			close(release)
 		}
 	}()
-	events := &Events{OnClose: func(Conn, error) {
-		if active.Add(1) > ioRejectWorkers {
-			exceeded.Store(true)
-		}
-		entered <- struct{}{}
-		<-release
-		active.Add(-1)
-		closed.Add(1)
-	}}
+	events := withFuncs(&Events{}, FuncHandler{
+		Close: func(Conn, error) {
+			if active.Add(1) > ioRejectWorkers {
+				exceeded.Store(true)
+			}
+			entered <- struct{}{}
+			<-release
+			active.Add(-1)
+			closed.Add(1)
+		},
+	})
 	pool := newIOTaskPool(rejectingNativeExecutor{})
 	tasks := make([]IOTask, connections)
 	for index := range tasks {
@@ -98,7 +100,7 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 // ends the turn and must release the connection itself, or it never closes.
 func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
 	closed := make(chan error, 1)
-	events := &Events{Pollers: 1, OnClose: func(_ Conn, err error) { closed <- err }}
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
 	testConn := newTestConnection(t, events)
 	conn := testConn.conn
 	for deadline := time.Now().Add(2 * time.Second); conn.taskState.Load()&taskScheduledBit != 0 || conn.ioOwner.Load() != 0; {
