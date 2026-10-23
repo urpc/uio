@@ -34,6 +34,15 @@ type Server struct {
 	Options
 	// CheckOrigin accepts an upgrade request. Nil accepts every origin.
 	CheckOrigin func(*http.Request) bool
+	// Authorize decides an upgrade request that passed validation and
+	// CheckOrigin, before the server answers it. A nil error accepts it, and
+	// userdata becomes the connection's Userdata from OnOpen on. An error
+	// refuses it: a *RejectError with the status, header and reason it names,
+	// any other error with 403. A refused connection never reaches the
+	// Handler. Authorize runs on the connection's turn, so a slow check holds
+	// up that connection only; it must not block for long all the same. Nil
+	// accepts every request.
+	Authorize func(r *http.Request) (userdata any, err error)
 
 	connections sync.Map
 	heartbeat   heartbeatRunner
@@ -77,7 +86,7 @@ func (s *Server) Serve(addrs ...string) error {
 		return ErrServerStarted
 	}
 	s.opts = opts
-	s.config = newServerConnConfig(opts, s.CheckOrigin, &s.connections, &s.stats)
+	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.connections, &s.stats)
 	events := opts.transportEvents()
 	s.events = events
 	handler := uio.FuncHandler{
@@ -208,7 +217,7 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 	config := s.config
 	if config == nil {
 		opts, _ := s.Options.resolve()
-		config = newServerConnConfig(opts, s.CheckOrigin, &s.connections, &s.stats)
+		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.connections, &s.stats)
 	}
 	conn := &Conn{
 		raw:     raw,

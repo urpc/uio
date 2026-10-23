@@ -239,8 +239,7 @@ func (c *Conn) readRound() error {
 			err := c.consumeHandshake(data)
 			if err != nil {
 				_, _ = c.raw.Discard(len(data))
-				c.rejectHandshake()
-				return err
+				return c.rejectHandshake(err)
 			}
 			_, _ = c.raw.Discard(len(data))
 			continue
@@ -591,6 +590,18 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		}
 		return err
 	}
+	if authorize := c.config.authorize; authorize != nil {
+		request, err := req.BuildHTTP()
+		if err != nil {
+			return err
+		}
+		req.HTTP = request
+		userdata, err := authorize(request)
+		if err != nil {
+			return &authorizeError{err}
+		}
+		c.userData = userdata
+	}
 	// Publish the request for Conn.Request during OnOpen; notifyOpen releases
 	// the state when the callback returns.
 	state.mu.Lock()
@@ -655,6 +666,12 @@ func (c *Conn) consumeClientHandshake() error {
 	}
 	consumed, protocol, extensions, err := handshake.ValidateClientResponse(state.data, state.clientKey, c.config.subprotocols, c.config.maxHeaderBytes)
 	if err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) {
+			return err
+		}
+		if refused := clientHandshakeError(err); refused != err {
+			return refused
+		}
 		return fmt.Errorf("uws: validate server handshake: %w", err)
 	}
 	params, err := extension.NegotiateClient(extensions, c.config.compressionEnabled)
@@ -685,16 +702,29 @@ func (c *Conn) consumeClientHandshake() error {
 	return nil
 }
 
-func (c *Conn) rejectHandshake() {
+// rejectHandshake ends a connection whose handshake failed with err. A
+// server answers with the refusal err calls for (see rejectResponse) and
+// closes once the answer has left: the response is counted like any frame,
+// so the graceful close waits for it instead of dropping it. The returned
+// error is the one the read round reports.
+func (c *Conn) rejectHandshake(err error) error {
 	if c.opened.Load() || c.closed.Load() {
-		return
+		return err
 	}
 	if c.isClient() {
-		_ = c.raw.Close()
-		return
+		_ = c.raw.CloseWith(err)
+		return err
 	}
-	const response = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
-	_, _ = c.raw.Write([]byte(response))
+	response := rejectResponse(err)
+	buffer := uio.AcquireBuffer(len(response))
+	_, _ = buffer.Write(response)
+	if writeErr := c.writeTransportOwned(buffer); writeErr != nil {
+		return err
+	}
+	if closeErr := c.closeTransport(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
+		return errors.Join(err, closeErr)
+	}
+	return &ownedProtocolClose{cause: err}
 }
 
 // closeTransport requests graceful transport shutdown. The raw connection

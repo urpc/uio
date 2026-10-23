@@ -225,7 +225,7 @@ func SelectSubprotocol(offered, supported []string) string {
 }
 
 // BuildClientRequest validates inputs and builds one HTTP/1.1 upgrade request.
-func BuildClientRequest(target *url.URL, key string, protocols []string, extensions string) ([]byte, error) {
+func BuildClientRequest(target *url.URL, key string, protocols []string, extensions string, header http.Header) ([]byte, error) {
 	if target == nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return nil, ErrBadRequest
 	}
@@ -262,6 +262,7 @@ func BuildClientRequest(target *url.URL, key string, protocols []string, extensi
 		b.WriteString(extensions)
 		b.WriteString("\r\n")
 	}
+	writeHeader(&b, header)
 	b.WriteString("\r\n")
 	return []byte(b.String()), nil
 }
@@ -286,9 +287,19 @@ func ValidateClientResponse(data []byte, key string, protocols []string, limits 
 	if err != nil {
 		return 0, "", nil, fmt.Errorf("%w: %v", ErrBadRequest, err)
 	}
+	if resp.StatusCode != http.StatusSwitchingProtocols {
+		refused := &ResponseError{StatusCode: resp.StatusCode, Header: resp.Header}
+		// A short body is the reason; wait for it rather than drop it.
+		if size := resp.ContentLength; size > 0 && size <= MaxRejectBody {
+			if len(data) < end+int(size) {
+				return 0, "", nil, io.ErrUnexpectedEOF
+			}
+			refused.Body = append([]byte(nil), data[end:end+int(size)]...)
+		}
+		return 0, "", nil, refused
+	}
 	acceptValues := resp.Header.Values("Sec-WebSocket-Accept")
 	if len(acceptValues) != 1 ||
-		resp.StatusCode != http.StatusSwitchingProtocols ||
 		!headerHasToken(resp.Header, "Upgrade", "websocket") ||
 		!headerHasToken(resp.Header, "Connection", "upgrade") ||
 		strings.TrimSpace(acceptValues[0]) != acceptKey(key) {

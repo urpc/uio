@@ -128,7 +128,7 @@ func TestOutboundWatermarkResolution(t *testing.T) {
 	if got := disabled.transportEvents().MaxInboundBuffered; got != 0 {
 		t.Fatalf("transport inbound bound = %d, want 0 (pause disabled)", got)
 	}
-	if cfg := newServerConnConfig(disabled, nil, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
+	if cfg := newServerConnConfig(disabled, nil, nil, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {
 		t.Fatalf("server connection high watermark = %d, want 0", cfg.outboundHigh)
 	}
 	if cfg := newDialerConnConfig(disabled, &sync.Map{}, &statsCounters{}); cfg.outboundHigh != 0 {

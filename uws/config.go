@@ -59,6 +59,7 @@ type connConfig struct {
 
 	subprotocols []string
 	checkOrigin  func(*http.Request) bool
+	authorize    func(*http.Request) (any, error)
 	handler      Handler
 	// observeTraffic is set when the handler implements TrafficObserver, so
 	// the transport only installs the inbound hook and the outbound observer
@@ -78,7 +79,7 @@ type connConfig struct {
 
 // newServerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Server's connections share.
-func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, connections *sync.Map, stats *statsCounters) *connConfig {
+func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, authorize func(*http.Request) (any, error), connections *sync.Map, stats *statsCounters) *connConfig {
 	config := &connConfig{
 		parser: frame.ParserConfig{
 			ExpectMask: true, AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
@@ -97,6 +98,7 @@ func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, con
 		compressionContextTakeover: opts.KeepCompressionContext,
 		subprotocols:               opts.Subprotocols,
 		checkOrigin:                checkOrigin,
+		authorize:                  authorize,
 		handler:                    opts.Handler,
 		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,

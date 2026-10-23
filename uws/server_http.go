@@ -18,6 +18,8 @@ package uws
 
 import (
 	"bufio"
+	"errors"
+	"io"
 	"net"
 	"net/http"
 	"strconv"
@@ -72,6 +74,13 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		writeHTTPError(writer, http.StatusBadRequest, httpErrorInvalidUpgrade)
 		return
 	}
+	var userdata any
+	if authorize := config.authorize; authorize != nil {
+		if userdata, err = authorize(request); err != nil {
+			writeRejection(writer, &authorizeError{err})
+			return
+		}
+	}
 	upgrade, err := prepareHTTPUpgrade(parsed, config)
 	if err != nil {
 		writeHTTPError(writer, http.StatusBadRequest, httpErrorInvalidUpgrade)
@@ -98,6 +107,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	}
 
 	wsConn := s.newConnection(nil)
+	wsConn.userData = userdata
 	wsConn.handshake.Store(&handshakeState{upgrade: upgrade})
 	_, err = s.events.Adopt(tcpConn, wsConn)
 	if err != nil {
@@ -158,6 +168,32 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 		conn.config.heartbeatConnections.Store(conn, conn)
 	}
 	conn.notifyOpen()
+}
+
+// writeRejection answers an upgrade Authorize refused, through net/http, with
+// the response rejectResponse would send.
+func writeRejection(writer http.ResponseWriter, err error) {
+	status, reason := http.StatusForbidden, ""
+	var reject *RejectError
+	if errors.As(err, &reject) {
+		status, reason = reject.status(), reject.Reason
+		if len(reason) > handshake.MaxRejectBody {
+			reason = reason[:handshake.MaxRejectBody]
+		}
+		if handshake.CheckRejectHeader(reject.Header) == nil {
+			for name, values := range reject.Header {
+				writer.Header()[http.CanonicalHeaderKey(name)] = values
+			}
+		}
+	}
+	header := writer.Header()
+	header.Set("Connection", "close")
+	if header.Get("Content-Type") == "" {
+		header.Set("Content-Type", "text/plain; charset=utf-8")
+	}
+	header.Set("Content-Length", strconv.Itoa(len(reason)))
+	writer.WriteHeader(status)
+	_, _ = io.WriteString(writer, reason)
 }
 
 func writeHTTPError(writer http.ResponseWriter, status int, message string) {

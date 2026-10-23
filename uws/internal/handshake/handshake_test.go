@@ -100,7 +100,7 @@ func TestBuildAndValidateClientHandshake(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := BuildClientRequest(target, testKey, []string{"chat"}, "permessage-deflate")
+	request, err := BuildClientRequest(target, testKey, []string{"chat"}, "permessage-deflate", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,18 +178,18 @@ func TestHandshakeRejectsOriginAndInvalidClientInputs(t *testing.T) {
 		t.Fatalf("malformed request error = %v", err)
 	}
 
-	if _, err := BuildClientRequest(nil, testKey, nil, ""); !errors.Is(err, ErrBadRequest) {
+	if _, err := BuildClientRequest(nil, testKey, nil, "", nil); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("nil target error = %v", err)
 	}
 	target, _ := url.Parse("http://example.test/socket")
-	if _, err := BuildClientRequest(target, testKey, nil, ""); !errors.Is(err, ErrBadRequest) {
+	if _, err := BuildClientRequest(target, testKey, nil, "", nil); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("invalid scheme error = %v", err)
 	}
 	target, _ = url.Parse("ws://example.test/socket")
-	if _, err := BuildClientRequest(target, "bad", nil, ""); !errors.Is(err, ErrBadRequest) {
+	if _, err := BuildClientRequest(target, "bad", nil, "", nil); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("invalid key error = %v", err)
 	}
-	if _, err := BuildClientRequest(target, testKey, []string{"bad token"}, ""); !errors.Is(err, ErrBadRequest) {
+	if _, err := BuildClientRequest(target, testKey, []string{"bad token"}, "", nil); !errors.Is(err, ErrBadRequest) {
 		t.Fatalf("invalid protocol error = %v", err)
 	}
 }

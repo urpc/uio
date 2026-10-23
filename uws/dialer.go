@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"sync"
 	"time"
@@ -38,6 +39,15 @@ import (
 type Dialer struct {
 	// Options configures the protocol, the transport and backpressure.
 	Options
+	// Header is added to every upgrade request, for credentials such as an
+	// Authorization token. The headers the handshake sets itself — Host,
+	// Upgrade, Connection, Sec-WebSocket-* and the body framing ones — are
+	// refused: the first Dial returns ErrInvalidOptions.
+	Header http.Header
+	// RequestHeader, when set, returns headers for one dial, given its
+	// userdata; they replace Header's values of the same name. A header the
+	// handshake sets itself fails that Dial with ErrInvalidOptions.
+	RequestHeader func(userdata any) http.Header
 
 	startOnce       sync.Once
 	closeMu         sync.Mutex
@@ -50,6 +60,7 @@ type Dialer struct {
 	startResultOnce sync.Once
 	config          *connConfig
 	opts            Options     // resolved snapshot, fixed at first Dial
+	header          http.Header // Header, canonical, fixed at first Dial
 	events          *uio.Events // private transport configuration
 	connections     sync.Map
 	heartbeat       heartbeatRunner
@@ -111,7 +122,12 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		return err
 	}
 	config := d.config
-	request, err := handshake.BuildClientRequest(target, key, config.subprotocols, config.clientExtensions())
+	header, err := d.requestHeader(userdata)
+	if err != nil {
+		cleanupAttempt()
+		return err
+	}
+	request, err := handshake.BuildClientRequest(target, key, config.subprotocols, config.clientExtensions(), header)
 	if err != nil {
 		cleanupAttempt()
 		return err
@@ -209,12 +225,18 @@ func (d *Dialer) start(ctx context.Context) error {
 			return
 		}
 		opts, err := d.Options.resolve()
+		if err == nil {
+			if err = handshake.CheckRequestHeader(d.Header); err != nil {
+				err = fmt.Errorf("%w: Header: %v", ErrInvalidOptions, err)
+			}
+		}
 		if err != nil {
 			d.closeMu.Unlock()
 			d.publishStartResult(err)
 			return
 		}
 		d.opts = opts
+		d.header = canonicalHeader(d.Header)
 		d.config = newDialerConnConfig(opts, &d.connections, &d.stats)
 		events := opts.transportEvents()
 		d.events = events
@@ -310,6 +332,43 @@ func (d *Dialer) newAttemptContext(parent context.Context) (context.Context, fun
 		})
 	}
 	return attemptCtx, cleanup, nil
+}
+
+// requestHeader returns the headers one dial adds to its upgrade request:
+// Header, frozen by the first Dial, with RequestHeader's on top.
+func (d *Dialer) requestHeader(userdata any) (http.Header, error) {
+	if d.RequestHeader == nil {
+		return d.header, nil
+	}
+	extra := d.RequestHeader(userdata)
+	if err := handshake.CheckRequestHeader(extra); err != nil {
+		return nil, fmt.Errorf("%w: RequestHeader: %v", ErrInvalidOptions, err)
+	}
+	if len(extra) == 0 {
+		return d.header, nil
+	}
+	header := d.header.Clone()
+	if header == nil {
+		header = make(http.Header, len(extra))
+	}
+	for name, values := range extra {
+		header[http.CanonicalHeaderKey(name)] = values
+	}
+	return header, nil
+}
+
+// canonicalHeader copies h with its names in canonical form, so a dial's
+// RequestHeader replaces a value whatever case either was written in.
+func canonicalHeader(h http.Header) http.Header {
+	if len(h) == 0 {
+		return nil
+	}
+	out := make(http.Header, len(h))
+	for name, values := range h {
+		key := http.CanonicalHeaderKey(name)
+		out[key] = append(out[key], values...)
+	}
+	return out
 }
 
 // startHeartbeat starts the scanner that pings this dialer's connections.

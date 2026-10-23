@@ -24,7 +24,7 @@ func testServerConfig(server *Server) *connConfig {
 	if err != nil {
 		panic(err)
 	}
-	return newServerConnConfig(opts, server.CheckOrigin, &server.connections, &server.stats)
+	return newServerConnConfig(opts, server.CheckOrigin, server.Authorize, &server.connections, &server.stats)
 }
 
 func testDialerConfig(dialer *Dialer) *connConfig {
@@ -54,6 +54,7 @@ type echoHandler struct {
 }
 
 type clientHandler struct {
+	name    string
 	conn    *Conn // set by OnOpen before open closes
 	open    chan struct{}
 	closed  chan struct{}

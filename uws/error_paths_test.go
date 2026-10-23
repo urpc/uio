@@ -302,16 +302,30 @@ func TestOversizedCompressedFragmentsCloseWith1009BeforeFIN(t *testing.T) {
 }
 
 func TestRejectHandshakeServerAndClientPaths(t *testing.T) {
+	cause := errors.New("bad upgrade")
 	serverRaw := newScriptedConn()
-	serverConn := &Conn{raw: serverRaw}
-	serverConn.rejectHandshake()
+	serverConn := &Conn{raw: serverRaw, config: testServerConfig(&Server{})}
+	err := serverConn.rejectHandshake(cause)
+	if !protocolCloseOwnsTransport(err) || !errors.Is(err, cause) {
+		t.Fatalf("server rejection = %v, want the cause with the close owned", err)
+	}
 	if len(serverRaw.written) != 1 || !strings.HasPrefix(string(serverRaw.written[0]), "HTTP/1.1 400 Bad Request") {
 		t.Fatalf("rejection response = %q", serverRaw.written)
+	}
+	// The response is counted, so the transport closes only once it left.
+	if serverRaw.closes != 0 {
+		t.Fatal("the transport closed before the rejection was sent")
+	}
+	completeTestOutbound(serverConn)
+	if serverRaw.closes != 1 {
+		t.Fatalf("server transport closes = %d after the rejection left, want 1", serverRaw.closes)
 	}
 
 	clientRaw := newScriptedConn()
 	clientConn := &Conn{raw: clientRaw, config: testDialerConfig(new(Dialer))}
-	clientConn.rejectHandshake()
+	if err := clientConn.rejectHandshake(cause); err != cause {
+		t.Fatalf("client rejection = %v, want %v", err, cause)
+	}
 	if clientRaw.closes != 1 {
 		t.Fatalf("client transport closes = %d, want 1", clientRaw.closes)
 	}
@@ -319,7 +333,9 @@ func TestRejectHandshakeServerAndClientPaths(t *testing.T) {
 	openedRaw := newScriptedConn()
 	openedConn := &Conn{raw: openedRaw}
 	openedConn.opened.Store(true)
-	openedConn.rejectHandshake()
+	if err := openedConn.rejectHandshake(cause); err != cause {
+		t.Fatalf("opened rejection = %v, want %v", err, cause)
+	}
 	if openedRaw.writes != 0 || openedRaw.closes != 0 {
 		t.Fatal("opened connection was rejected")
 	}

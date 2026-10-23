@@ -196,9 +196,10 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
 | `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
-A `Server` adds `CheckOrigin`; the `Handler` lives in `Options`, shared by
-every connection a server accepts or a dialer dials, with per-dial state
-passed as `Dial`'s userdata. The underlying transport is built from these
+A `Server` adds `CheckOrigin` and `Authorize`, and a `Dialer` adds `Header`
+and `RequestHeader` (see [Authentication](#authentication)). The `Handler`
+lives in `Options`, shared by every connection a server accepts or a dialer
+dials, with per-dial state passed as `Dial`'s userdata. The underlying transport is built from these
 options and is not otherwise exposed; `Executor` is the scheduling escape
 hatch. Invalid combinations, such as a low watermark not below the high
 one, a high watermark above `MaxOutboundBuffered`, or a compression level
@@ -231,6 +232,37 @@ concurrent use:
 func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }
 func (m metrics) OnOutbound(c *uws.Conn, n int) { m.written.Add(n) }
 ```
+
+## Authentication
+
+The upgrade request can carry credentials, and the server can refuse it before
+the WebSocket exists, so a rejected client costs no handshake and no callback:
+
+```go
+dialer := &uws.Dialer{
+	Header: http.Header{"Authorization": {"Bearer " + token}},
+}
+
+server := uws.NewServer(uws.Options{Handler: app{}})
+server.Authorize = func(r *http.Request) (any, error) {
+	user, err := verify(r.Header.Get("Authorization"))
+	if err != nil {
+		return nil, &uws.RejectError{Status: http.StatusUnauthorized, Reason: "bad token"}
+	}
+	return user, nil // the connection's Userdata from OnOpen on
+}
+```
+
+`Dialer.Header` goes with every dial; `Dialer.RequestHeader(userdata)` adds
+per-dial headers on top. Headers the handshake sets itself (Host, Upgrade,
+Connection, `Sec-WebSocket-*`) are refused with `ErrInvalidOptions`.
+`Authorize` runs after the request passed validation and `CheckOrigin`, on the
+native path and behind `net/http` alike. A `*RejectError` answers with its
+status, header and reason; any other error with 403. The answer is sent before
+the connection closes, and the client gets it as a `*HandshakeError` — in
+`CloseEvent.Err`, or from `DialClient` through `errors.As` — carrying the
+status, the header and the reason. Without TLS the credentials travel in clear
+text; terminate TLS in front of the server.
 
 ## Rules of the road
 
