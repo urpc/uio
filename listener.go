@@ -18,6 +18,7 @@ package uio
 
 import (
 	"net"
+	"net/netip"
 	"sync"
 )
 
@@ -32,6 +33,30 @@ type Listener interface {
 	// already accepted stay open. A UDP listener's peers share its socket, so
 	// they close with it, with net.ErrClosed. Closing again does nothing.
 	Close() error
+}
+
+// PacketListener is the Listener of a packet address. Assert it off the
+// Listener Listen returned: only a packet listener's carries it.
+type PacketListener interface {
+	Listener
+
+	// DialPeer adds a peer connection addressed at raddr, on the listener's
+	// own socket: what it sends leaves from the listener's address, and the
+	// datagrams raddr answers with are delivered to it — as they would be
+	// had raddr spoken first. It is the entry point for hole punching. The
+	// returned Conn is writable at once, before OnOpen, which runs once in a
+	// turn of its own and is always followed by OnClose. A peer that spoke
+	// first already has its connection: it is returned with ErrPeerExists,
+	// keeping the userdata it opened with. userdata is the new connection's
+	// initial Userdata. Before any datagram from raddr arrives, a closed
+	// child is replaced: a peer whose old connection is closing can be dialed
+	// again.
+	DialPeer(raddr netip.AddrPort, userdata any) (Conn, error)
+
+	// WriteTo sends one datagram to raddr from the listener's socket, from
+	// the listener's own address, without a connection. It reports the bytes
+	// sent, not their arrival.
+	WriteTo(b []byte, raddr netip.AddrPort) (int, error)
 }
 
 // Listen adds addr, in Serve's syntax, to a serving Events and accepts on it
@@ -62,4 +87,38 @@ func (g *listenerGroup) Addr() net.Addr { return g.addr }
 func (g *listenerGroup) Close() error {
 	g.once.Do(func() { g.ld.closeGroup(g.members) })
 	return nil
+}
+
+// dialPeerAt and writeToPeerAt reach the packet methods without giving
+// *listenerGroup the PacketListener method set: only packetListener has it,
+// so a stream listener's Listener asserts to no more than Listener.
+func (g *listenerGroup) dialPeerAt(raddr netip.AddrPort, userdata any) (Conn, error) {
+	return g.members[0].udpSvr.dialPeer(raddr, userdata)
+}
+
+func (g *listenerGroup) writeToPeerAt(b []byte, raddr netip.AddrPort) (int, error) {
+	return g.members[0].udpSvr.writeToPeer(b, raddr)
+}
+
+// packetListener is the PacketListener of a packet listener group; a stream
+// listener's Listener is the bare group, which asserts to no more.
+type packetListener struct{ group *listenerGroup }
+
+func (p packetListener) Addr() net.Addr { return p.group.Addr() }
+func (p packetListener) Close() error   { return p.group.Close() }
+func (p packetListener) DialPeer(raddr netip.AddrPort, userdata any) (Conn, error) {
+	return p.group.dialPeerAt(raddr, userdata)
+}
+
+func (p packetListener) WriteTo(b []byte, raddr netip.AddrPort) (int, error) {
+	return p.group.writeToPeerAt(b, raddr)
+}
+
+// asListener picks a group's Listener face: its PacketListener face for a
+// packet address, the bare Listener of the group for a stream one.
+func (g *listenerGroup) asListener() Listener {
+	if g.members[0].udpSvr != nil {
+		return packetListener{group: g}
+	}
+	return g
 }

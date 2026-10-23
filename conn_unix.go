@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"runtime"
 	"sync"
@@ -118,9 +119,19 @@ type unixUDPState struct {
 	peers  map[socket.UDPAddress]*fdConn
 	key    socket.UDPAddress
 
-	peerMu  sync.Mutex // server only: guards closing and waking
-	closing []*fdConn  // children whose close waits for the server's turn
-	waking  []*fdConn  // children whose Wake waits for the server's turn
+	family uint8 // server only: the socket's address family, 4 or 6
+
+	// peerMu guards a server's peers, which its turns read for every
+	// datagram and DialPeer adds to from any goroutine, and its queues.
+	peerMu  sync.Mutex
+	closing []*fdConn // children whose close waits for the server's turn
+	waking  []*fdConn // children whose Wake waits for the server's turn
+	opening []*fdConn // children DialPeer made, whose OnOpen is owed
+
+	// openOwed marks a child DialPeer made whose OnOpen has not run: the
+	// server's turn, a datagram from the peer, or its close runs it first,
+	// whichever claims it.
+	openOwed atomic.Bool
 
 	// readBuffer belongs to the socket's turns, which read one datagram at a
 	// time and lend it only for its callbacks. A child never reads.
@@ -1534,17 +1545,28 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 	packetConn := conn
 	if conn.udp.peers != nil {
 		// UDP children are logical connections that share the server fd.
-		packetConn = conn.udp.peers[source]
-		if packetConn == nil {
+		udp := conn.udp
+		udp.peerMu.Lock()
+		packetConn = udp.peers[source]
+		created := false
+		if packetConn == nil && udp.peers != nil {
 			sockaddr := source.Sockaddr()
 			if sockaddr == nil {
+				udp.peerMu.Unlock()
 				return
 			}
 			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
 			packetConn.events, packetConn.loop = conn.events, conn.loop
 			packetConn.userdata = conn.userdata // the listener's
 			packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
-			conn.udp.peers[source] = packetConn
+			udp.peers[source] = packetConn
+			created = true
+		}
+		udp.peerMu.Unlock()
+		if packetConn == nil {
+			return
+		}
+		if created || packetConn.udp.openOwed.CompareAndSwap(true, false) {
 			packetConn.fireOnOpen()
 		}
 	}
@@ -1579,6 +1601,56 @@ func (conn *fdConn) Wake() error {
 	return nil
 }
 
+// dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
+func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
+	udp := server.udp
+	key, err := socket.UDPAddressFor(udp.family, addr)
+	if err != nil {
+		return nil, err
+	}
+	sockaddr := key.Sockaddr()
+	udp.peerMu.Lock()
+	if udp.peers == nil || server.isClosing() || server.events.closing.Load() {
+		udp.peerMu.Unlock()
+		return nil, net.ErrClosed
+	}
+	if existing := udp.peers[key]; existing != nil && !existing.isClosing() {
+		udp.peerMu.Unlock()
+		return existing, ErrPeerExists
+	}
+	child := &fdConn{fd: server.fd, udp: &unixUDPState{remote: sockaddr, server: server, key: key}}
+	child.events, child.loop = server.events, server.loop
+	child.addr, child.remoteAddr = server.addr, key.NetAddr().AddrPort()
+	child.userdata = userdata
+	child.udp.openOwed.Store(true)
+	// A closing child still in the map is replaced: its release leaves the
+	// new one there.
+	udp.peers[key] = child
+	udp.opening = append(udp.opening, child)
+	udp.peerMu.Unlock()
+	server.scheduleIO(ioEventPeers)
+	return child, nil
+}
+
+// writeToPeer sends one datagram to addr from a UDP server's socket; see
+// Listener.WriteTo.
+func (server *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
+	key, err := socket.UDPAddressFor(server.udp.family, addr)
+	if err != nil {
+		return 0, err
+	}
+	sockaddr := key.Sockaddr()
+	server.submitMu.Lock()
+	defer server.submitMu.Unlock()
+	if server.isClosing() || server.close.isReleased() || server.events.closing.Load() {
+		return 0, net.ErrClosed
+	}
+	if err := syscall.Sendto(int(server.fd), b, 0, sockaddr); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
 // queuePeer hands a child's close or Wake to the server's turn, which owns
 // the children: wake selects which.
 func (server *fdConn) queuePeer(child *fdConn, wake bool) {
@@ -1609,7 +1681,14 @@ func (server *fdConn) settlePeers() {
 	// it.
 	udp.peerMu.Lock()
 	remaining := len(udp.closing) + len(udp.waking)
+	opening := udp.opening
+	udp.opening = nil
 	udp.peerMu.Unlock()
+	for _, child := range opening {
+		if child.udp.openOwed.CompareAndSwap(true, false) {
+			child.fireOnOpen()
+		}
+	}
 	for processed := 0; processed < remaining; processed++ {
 		udp.peerMu.Lock()
 		var child *fdConn
@@ -1642,7 +1721,7 @@ func (server *fdConn) settlePeers() {
 	// turn was running. finishIOTask will hand it to a fresh turn after the
 	// current one returns.
 	udp.peerMu.Lock()
-	if len(udp.closing)+len(udp.waking) == 0 {
+	if len(udp.closing)+len(udp.waking)+len(udp.opening) == 0 {
 		server.taskState.And(^ioEventPeers)
 	} else {
 		server.taskState.Or(ioEventPeers)
@@ -1799,11 +1878,20 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	conn.stopDeadlines()
 	if conn.udp != nil && conn.udp.server != nil {
 		// A child only leaves the peer map; its server owns the shared fd.
-		delete(conn.udp.server.udp.peers, conn.udp.key)
+		// DialPeer may have replaced it there already.
+		server := conn.udp.server.udp
+		server.peerMu.Lock()
+		if server.peers[conn.udp.key] == conn {
+			delete(server.peers, conn.udp.key)
+		}
+		server.peerMu.Unlock()
 	} else {
 		if conn.udp != nil && conn.udp.peers != nil {
+			conn.udp.peerMu.Lock()
 			children := conn.udp.peers
 			conn.udp.peers = nil
+			conn.udp.opening = nil
+			conn.udp.peerMu.Unlock()
 			for _, child := range children {
 				if childErr, ok := child.teardown(finalErr); ok {
 					child.scheduleCloseCallback(childErr)
@@ -1912,6 +2000,14 @@ func (conn *fdConn) fireCloseCallback() {
 		return
 	}
 	err := conn.takeDeferredCloseCause()
+	if conn.udp != nil && conn.udp.openOwed.CompareAndSwap(true, false) {
+		// A DialPeer child closed before its OnOpen ran gets it first.
+		if callback := conn.events.cb.onOpen; callback != nil {
+			started := conn.beginInboundCallback()
+			callback(conn)
+			conn.endInboundCallback(started)
+		}
+	}
 	if callback := conn.events.cb.onClose; callback != nil && !conn.internal {
 		started := conn.beginInboundCallback()
 		callback(conn, err)

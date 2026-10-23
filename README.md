@@ -85,7 +85,12 @@ established stream `net.Conn` with `Adopt`, or add an address with
 `Listen(addr, userdata)`. Each connection a listener accepts starts with its
 userdata, and closing the returned `Listener` stops accepting there while the
 connections it accepted stay open (a UDP listener's peers share its socket and
-close with it).
+close with it). A packet listener also dials: assert the returned
+`Listener` to a `PacketListener` and `DialPeer(raddr, userdata)` makes the
+peer's connection on the listener's own socket — what it sends leaves from
+the listener's address and the peer's answers reach that connection, as they
+would had the peer spoken first — which is the entry point for hole punching;
+`WriteTo` sends a single datagram the same way.
 
 ## How it works
 

@@ -235,6 +235,8 @@ var (
 	// ever calling back.
 	ErrFirstTurnRefused   = errors.New("uio: the executor refused the connection's first turn")
 	ErrReserveUnsupported = errors.New("uio: outbound reservation needs the connection's own callback")
+	// ErrPeerExists reports DialPeer finding the peer already connected.
+	ErrPeerExists = errors.New("uio: peer already connected")
 )
 
 // Deprecated: nothing returns ErrUDPWriteOnEventLoop any more; a UDP write

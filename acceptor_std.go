@@ -76,7 +76,7 @@ func (ld *acceptor) addListen(addr string) error {
 }
 
 // listenGroup adds addr while Serve runs.
-func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, error) {
+func (ld *acceptor) listenGroup(addr string, userdata any) (Listener, error) {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
 	if ld.closed {
@@ -92,7 +92,7 @@ func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, erro
 	} else {
 		local = l.ln.Addr()
 	}
-	return &listenerGroup{ld: ld, members: []*listener{l}, addr: local}, nil
+	return (&listenerGroup{ld: ld, members: []*listener{l}, addr: local}).asListener(), nil
 }
 
 // closeGroup releases group unless shutdown already did. Closing a stream
@@ -107,8 +107,9 @@ func (ld *acceptor) closeGroup(group []*listener) {
 		}
 		delete(ld.listeners, l.key)
 		if l.udpSvr != nil {
-			_ = l.udpSvr.CloseWith(net.ErrClosed)
-			l.udpSvr = nil
+			// Synchronously, with this cause: the queued form would lose the
+			// race with closeListener's own close and its default cause.
+			l.udpSvr.closeOnLoop(net.ErrClosed)
 		}
 		ld.closeListener(l)
 	}

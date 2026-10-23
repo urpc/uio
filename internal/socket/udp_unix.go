@@ -20,6 +20,7 @@ package socket
 
 import (
 	"net"
+	"net/netip"
 	"syscall"
 	"unsafe"
 
@@ -96,6 +97,56 @@ func (receive *UDPReceive) parse(addrLen uint32) error {
 func networkPort(port uint16) uint16 {
 	bytes := (*[2]byte)(unsafe.Pointer(&port))
 	return uint16(bytes[0])<<8 | uint16(bytes[1])
+}
+
+// UDPAddressFor returns the key a datagram from addr arrives with on a
+// socket of family (4 or 6): on an IPv6 socket an IPv4 peer is reported in
+// its IPv4-mapped form, and on an IPv4 socket only IPv4 peers exist.
+func UDPAddressFor(family uint8, addr netip.AddrPort) (UDPAddress, error) {
+	ip := addr.Addr()
+	if !ip.IsValid() {
+		return UDPAddress{}, unix.EINVAL
+	}
+	var key UDPAddress
+	key.Port = addr.Port()
+	switch family {
+	case 4:
+		ip = ip.Unmap()
+		if !ip.Is4() {
+			return UDPAddress{}, unix.EAFNOSUPPORT
+		}
+		key.Family = 4
+		v4 := ip.As4()
+		copy(key.Addr[:4], v4[:])
+	case 6:
+		key.Family = 6
+		key.Addr = ip.As16()
+		if zone := ip.Zone(); zone != "" {
+			iface, err := net.InterfaceByName(zone)
+			if err != nil {
+				return UDPAddress{}, err
+			}
+			key.Zone = uint32(iface.Index)
+		}
+	default:
+		return UDPAddress{}, unix.EAFNOSUPPORT
+	}
+	return key, nil
+}
+
+// SocketFamily reports whether fd is an IPv4 (4) or IPv6 (6) socket.
+func SocketFamily(fd int) (uint8, error) {
+	sa, err := unix.Getsockname(fd)
+	if err != nil {
+		return 0, err
+	}
+	switch sa.(type) {
+	case *unix.SockaddrInet4:
+		return 4, nil
+	case *unix.SockaddrInet6:
+		return 6, nil
+	}
+	return 0, unix.EAFNOSUPPORT
 }
 
 // Sockaddr allocates the persistent send address used only for a new peer.

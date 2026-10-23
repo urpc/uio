@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -812,6 +813,50 @@ func (fc *fdConn) enqueueClose(err error) error {
 
 func (fc *fdConn) requestClose(err error) { _ = fc.enqueueClose(err) }
 
+// dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
+// The child is published under the server's mutex, and its OnOpen runs on a
+// goroutine of its own serialized with the reader by the child's callback
+// mutex; a datagram from the peer that arrives first runs it there instead.
+func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
+	fc.mux.Lock()
+	if fc.udp == nil || fc.udp.peers == nil {
+		fc.mux.Unlock()
+		return nil, net.ErrClosed
+	}
+	rAddr := addr.String()
+	if existing := fc.udp.peers[rAddr]; existing != nil && !existing.isClosing() {
+		fc.mux.Unlock()
+		return existing, ErrPeerExists
+	}
+	child := &fdConn{}
+	child.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
+	child.addr = fc.addr
+	child.setRemoteAddr(net.UDPAddrFromAddrPort(addr))
+	child.loop = fc.loop
+	child.events = fc.events
+	child.userdata = userdata
+	fc.udp.peers[rAddr] = child
+	fc.mux.Unlock()
+	fc.events.callbackWG.Add(1)
+	go func() {
+		defer fc.events.callbackWG.Done()
+		child.openOnReader()
+	}()
+	return child, nil
+}
+
+// writeToPeer sends one datagram to addr from a UDP server's socket; see
+// Listener.WriteTo.
+func (fc *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
+	fc.mux.Lock()
+	peers := fc.udp.peers
+	fc.mux.Unlock()
+	if peers == nil {
+		return 0, net.ErrClosed
+	}
+	return fc.udp.sock.WriteTo(b, net.UDPAddrFromAddrPort(addr))
+}
+
 // closeOnLoop owns resource teardown and detaches UDP children. The user
 // callback is scheduled separately so a slow OnClose cannot block the logical
 // event loop or race an active OnData callback.
@@ -823,7 +868,10 @@ func (fc *fdConn) closeOnLoop(err error) {
 	if fc.udp != nil && fc.udp.svr != nil {
 		fc.stopChildDeadlines()
 		fc.udp.svr.mux.Lock()
-		delete(fc.udp.svr.udp.peers, fc.remoteAddr.String())
+		// DialPeer may have replaced this child in the map already.
+		if peers := fc.udp.svr.udp.peers; peers != nil && peers[fc.remoteAddr.String()] == fc {
+			delete(peers, fc.remoteAddr.String())
+		}
 		fc.udp.svr.mux.Unlock()
 		// The reason publishes before the flag: a reader that sees closed
 		// observes err without further synchronization.
@@ -1356,12 +1404,13 @@ func (fc *fdConn) listenUDP() error {
 		if udpConn == nil {
 			continue
 		}
-		if !ok {
-			if testHookUDPChildCreated != nil {
+		udpConn.callbackMu.Lock()
+		// fire udp on-open event: for a peer that just spoke first, and the
+		// one DialPeer still owes when the peer's datagram arrived before it.
+		if !udpConn.opened {
+			if !ok && testHookUDPChildCreated != nil {
 				testHookUDPChildCreated(udpConn)
 			}
-			// fire udp on-open event.
-			udpConn.callbackMu.Lock()
 			if onOpen := fc.events.cb.onOpen; nil != onOpen {
 				started := udpConn.beginInboundCallback()
 				onOpen(udpConn)
@@ -1373,13 +1422,7 @@ func (fc *fdConn) listenUDP() error {
 				// close callback skipped it as unopened; deliver it now.
 				udpConn.scheduleCloseCallback(udpConn.err)
 			}
-			udpConn.callbackMu.Unlock()
 		}
-		if udpConn.isClosing() {
-			continue
-		}
-
-		udpConn.callbackMu.Lock()
 		if udpConn.isClosing() {
 			// The peer closed while this packet waited for its callback
 			// mutex, and OnClose may already have run.

@@ -158,12 +158,17 @@ func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener
 	group = append(group, l)
 
 	if l.udp != nil {
+		family, err := socket.SocketFamily(l.fd)
+		if err != nil {
+			return group, err
+		}
 		l.udpSvr = &fdConn{}
 		l.udpSvr.fd = int32(l.fd)
 		// The logical UDP server takes ownership of the duplicated poller fd.
 		l.udpSvr.udp = &unixUDPState{
-			file:  l.file,
-			peers: make(map[socket.UDPAddress]*fdConn),
+			file:   l.file,
+			peers:  make(map[socket.UDPAddress]*fdConn),
+			family: family,
 		}
 		l.file = nil
 		l.udpSvr.loop = ld.events.selectLoop()
@@ -203,7 +208,7 @@ func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener
 
 // listenGroup adds addr while Serve runs: it records its listeners and starts
 // accepting on them at once.
-func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, error) {
+func (ld *acceptor) listenGroup(addr string, userdata any) (Listener, error) {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
 	if ld.closed {
@@ -230,7 +235,7 @@ func (ld *acceptor) listenGroup(addr string, userdata any) (*listenerGroup, erro
 			return nil, err
 		}
 	}
-	return &listenerGroup{ld: ld, members: group, addr: group[0].pair.local}, nil
+	return (&listenerGroup{ld: ld, members: group, addr: group[0].pair.local}).asListener(), nil
 }
 
 // startLocked registers l with its loop; it requires ld.mux.
