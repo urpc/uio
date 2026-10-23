@@ -79,6 +79,15 @@ type Conn interface {
 	// and sets period between TCP keep-alive probes.
 	SetKeepAlivePeriod(secs int) error
 
+	// Control runs fn with the connection's descriptor, for the socket
+	// options the dedicated setters do not carry — IP_TTL for a NAT probe,
+	// IP_TOS, SO_MARK. It returns after fn, and net.ErrClosed once the
+	// connection's close was requested. A datagram connection shares its
+	// descriptor with its listener and peers, so what it sets lands on the
+	// shared socket, which outlives one peer's close. The descriptor is valid
+	// only during fn; native external calls may use a temporary duplicate.
+	Control(fn func(fd uintptr)) error
+
 	// SetReadBuffer sets the size of the operating system's
 	// receive buffer associated with the connection.
 	SetReadBuffer(size int) error

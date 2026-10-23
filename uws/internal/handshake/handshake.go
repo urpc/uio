@@ -269,6 +269,8 @@ func BuildClientRequest(target *url.URL, key string, protocols []string, extensi
 
 // ValidateClientResponse parses and validates a server handshake response and
 // returns its consumed bytes, selected subprotocol, and extension headers.
+// The limit bounds the response's header; a refusal's short body, which the
+// client waits for to report its reason, is bounded by MaxRejectBody on top.
 func ValidateClientResponse(data []byte, key string, protocols []string, limits ...int) (int, string, []string, error) {
 	maxBytes := responseLimit(limits)
 	end := bytes.Index(data, []byte("\r\n\r\n"))

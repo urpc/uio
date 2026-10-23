@@ -80,7 +80,7 @@ type Events struct {
 	mux            sync.Mutex // serializes initialization and shutdown publication
 	closing        atomic.Bool
 	ready          atomic.Bool    // Dial is allowed only after full initialization
-	callbackWG     sync.WaitGroup // std I/O goroutines still able to enter callbacks
+	callbackWG     sync.WaitGroup // std connections, I/O goroutines, and callbacks
 	done           chan struct{}  // closed after OnStop and all owned work exits
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]

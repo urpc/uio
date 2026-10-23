@@ -19,6 +19,7 @@
 package uio
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -30,7 +31,6 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/libp2p/go-reuseport"
 	"github.com/urpc/uio/internal/socket"
 )
 
@@ -123,60 +123,37 @@ func reusePortListeners(procs int) int {
 // OnStart has returned; until then arriving connections wait in the
 // listener backlogs.
 func (ld *acceptor) addListen(addr string) error {
+	group, err := ld.bindGroup(addr, nil)
+	if err != nil {
+		return err
+	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	_, err := ld.addGroupLocked(addr, nil)
-	return err
+	return ld.addGroupLocked(group, nil)
 }
 
-// addGroupLocked creates and records the listeners for addr: one, or a
-// ReusePort group of them, every accepted connection starting with userdata.
-// It requires ld.mux. On error nothing it created stays open.
-func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener, err error) {
-	if nil == ld.listeners {
-		ld.listeners = make(map[int]*listener)
-	}
+// bindGroup creates sockets without holding a registry lock: a control may
+// close Events or another listener. Nothing is published until addGroupLocked.
+func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*listener, err error) {
 	defer func() {
 		if err != nil {
 			for _, l := range group {
-				delete(ld.listeners, l.fd)
 				ld.closeListener(l)
 			}
 			group = nil
 		}
 	}()
 
-	l, err := ld.listen(addr, ld.events.ReusePort)
+	l, err := ld.listen(addr, ld.events.ReusePort, control)
 	if err != nil {
 		if l != nil {
 			ld.closeListener(l)
 		}
 		return nil, err
 	}
-	l.userdata = userdata
-	ld.listeners[l.fd] = l
 	group = append(group, l)
 
 	if l.udp != nil {
-		family, err := socket.SocketFamily(l.fd)
-		if err != nil {
-			return group, err
-		}
-		l.udpSvr = &fdConn{}
-		l.udpSvr.fd = int32(l.fd)
-		// The logical UDP server takes ownership of the duplicated poller fd.
-		l.udpSvr.udp = &unixUDPState{
-			file:   l.file,
-			peers:  make(map[socket.UDPAddress]*fdConn),
-			family: family,
-		}
-		l.file = nil
-		l.udpSvr.loop = ld.events.selectLoop()
-		l.udpSvr.events = ld.events
-		l.udpSvr.internal = true
-		l.udpSvr.addr = l.pair
-		// The server is internal; its userdata is what its peers start with.
-		l.udpSvr.userdata = userdata
 		return group, nil
 	}
 
@@ -184,12 +161,11 @@ func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener
 	if ld.events.ReusePort && l.tcp {
 		count = reusePortListeners(runtime.GOMAXPROCS(0))
 	}
-	ld.assignLoop(l)
 	// The others bind the concrete address l resolved, so a port of zero
 	// still yields one shared port.
 	resolved := l.ln.Addr().String()
 	for range count - 1 {
-		next, err := ld.listen(resolved, true)
+		next, err := ld.listen(resolved, true, control)
 		if err != nil {
 			// listen can fail after creating the listener (SetNonblock); it
 			// is not in the registry yet, so release it here.
@@ -198,24 +174,72 @@ func (ld *acceptor) addGroupLocked(addr string, userdata any) (group []*listener
 			}
 			return group, err
 		}
-		next.userdata = userdata
-		ld.listeners[next.fd] = next
 		group = append(group, next)
-		ld.assignLoop(next)
 	}
 	return group, nil
 }
 
+// addGroupLocked admits a complete group against shutdown, gives every UDP
+// server a lifetime owner, and then publishes it. It requires ld.mux and
+// releases the entire group on error, including sockets not yet admitted.
+func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) {
+	defer func() {
+		if err != nil {
+			for _, l := range group {
+				delete(ld.listeners, l.fd)
+				ld.closeListener(l)
+			}
+		}
+	}()
+	if ld.closed || ld.events.closing.Load() {
+		return net.ErrClosed
+	}
+	if ld.listeners == nil {
+		ld.listeners = make(map[int]*listener)
+	}
+	for _, l := range group {
+		l.userdata = userdata
+		if l.udp != nil {
+			family, err := socket.SocketFamily(l.fd)
+			if err != nil {
+				return err
+			}
+			l.udpSvr = &fdConn{}
+			l.udpSvr.fd = int32(l.fd)
+			l.udpSvr.udp = &unixUDPState{
+				file:   l.file,
+				peers:  make(map[socket.UDPAddress]*fdConn),
+				family: family,
+			}
+			l.file = nil // The logical server owns the duplicated poller fd.
+			l.udpSvr.loop = ld.events.selectLoop()
+			l.udpSvr.events = ld.events
+			l.udpSvr.internal = true
+			l.udpSvr.addr = l.pair
+			l.udpSvr.userdata = userdata // What its peers start with.
+			// Ownership precedes publication and outlives listener removal,
+			// even when the listener closes before accepting starts.
+			if err := l.udpSvr.loop.trackListener(l.udpSvr); err != nil {
+				return err
+			}
+		} else {
+			ld.assignLoop(l)
+		}
+		ld.listeners[l.fd] = l
+	}
+	return nil
+}
+
 // listenGroup adds addr while Serve runs: it records its listeners and starts
 // accepting on them at once.
-func (ld *acceptor) listenGroup(addr string, userdata any) (Listener, error) {
+func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
+	group, err := ld.bindGroup(addr, listenConfigFor(opts).Control)
+	if err != nil {
+		return nil, err
+	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	if ld.closed {
-		return nil, net.ErrClosed
-	}
-	group, err := ld.addGroupLocked(addr, userdata)
-	if err != nil {
+	if err = ld.addGroupLocked(group, userdata); err != nil {
 		return nil, err
 	}
 	// Added during OnStart, the listeners start with the rest once it has
@@ -256,16 +280,20 @@ func (ld *acceptor) startLocked(l *listener) error {
 // listener's server connection closes in its own turn, and its peers with it.
 func (ld *acceptor) stopLocked(l *listener) {
 	delete(ld.listeners, l.fd)
-	if !l.started {
-		// Nothing watches it yet; release it as shutdown would.
-		ld.closeListener(l)
-		return
-	}
 	if l.udpSvr != nil {
-		_ = l.udpSvr.CloseWith(net.ErrClosed)
+		// Started or not, the release travels as the server's own turn, in
+		// line behind the opens DialPeer queued there: a peer's OnOpen runs
+		// and returns before its release, and the cause is the one Close
+		// promised.
+		l.udpSvr.requestClose(net.ErrClosed)
 		if l.udp != nil {
 			_ = l.udp.Close()
 		}
+		return
+	}
+	if !l.started {
+		// Nothing watches it yet; release it as shutdown would.
+		ld.closeListener(l)
 		return
 	}
 	l.loop.removeListener(l)
@@ -297,6 +325,9 @@ func (ld *acceptor) assignLoop(l *listener) {
 func (ld *acceptor) startAccepting() error {
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
+	if ld.closed || ld.events.closing.Load() {
+		return nil
+	}
 	ld.accepting = true
 	for _, l := range ld.listeners {
 		if err := ld.startLocked(l); err != nil {
@@ -307,10 +338,10 @@ func (ld *acceptor) startAccepting() error {
 }
 
 func (ld *acceptor) closeListener(l *listener) {
-	if l.udpSvr != nil && !l.udpSvr.isReleased() {
-		if err, ok := l.udpSvr.teardown(io.ErrUnexpectedEOF); ok {
-			l.udpSvr.scheduleCloseCallback(err)
-		}
+	if l.udpSvr != nil {
+		// The server remains owned by its loop until its own turn, or the
+		// shutdown pass after all turns ended, finishes releasing it.
+		l.udpSvr.requestClose(io.ErrUnexpectedEOF)
 	}
 	if l.file != nil && l.udpSvr == nil {
 		_ = l.file.Close()
@@ -346,7 +377,7 @@ func (ld *acceptor) close() {
 // listen parses UIO's scheme-prefixed address and duplicates the resulting Go
 // listener descriptor. The duplicate is switched to non-blocking mode and is
 // thereafter owned by the poller-facing listener record.
-func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
+func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (*listener, error) {
 
 	// default scheme is tcp protocol.
 	if !strings.Contains(addr, "://") {
@@ -360,26 +391,19 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 	}
 
 	var l listener
+	listenConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {
 	case "tcp", "tcp4", "tcp6":
 		l.addr = u.Host
-		if reusePort {
-			l.ln, err = reuseport.Listen(u.Scheme, u.Host)
-		} else {
-			l.ln, err = net.Listen(u.Scheme, u.Host)
-		}
+		l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Host)
 	case "udp", "udp4", "udp6":
 		l.addr = u.Host
-		if reusePort {
-			l.udp, err = reuseport.ListenPacket(u.Scheme, u.Host)
-		} else {
-			l.udp, err = net.ListenPacket(u.Scheme, u.Host)
-		}
+		l.udp, err = listenConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
 	case "unix", "unixgram", "unixpacket":
 		if err = os.RemoveAll(u.Path); nil == err || os.IsNotExist(err) {
 			l.addr = u.Path
-			l.ln, err = net.Listen(u.Scheme, u.Path)
+			l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", u.Scheme)

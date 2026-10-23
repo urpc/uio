@@ -661,9 +661,6 @@ func (c *Conn) consumeClientHandshake() error {
 	if state == nil {
 		return ErrClosed
 	}
-	if len(state.data) > c.config.maxHeaderBytes {
-		return handshake.ErrBadRequest
-	}
 	consumed, protocol, extensions, err := handshake.ValidateClientResponse(state.data, state.clientKey, c.config.subprotocols, c.config.maxHeaderBytes)
 	if err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {

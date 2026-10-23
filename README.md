@@ -92,6 +92,14 @@ the listener's address and the peer's answers reach that connection, as they
 would had the peer spoken first — which is the entry point for hole punching;
 `WriteTo` sends a single datagram the same way.
 
+For the socket options no setter carries, `Conn.Control(fn)` runs fn with the
+connection's descriptor — IP_TTL for a NAT probe, IP_TOS, SO_MARK — and the
+`SocketControl` options run before a socket connects or binds:
+`WithDialControl` on a dial, `WithLocalAddr` binds the dial's socket first,
+and `WithListenControl` runs on a `Listen`'s socket before it binds. `fd` is
+valid only for the call, and these are the hooks a hole punch needs; the
+punching itself is yours.
+
 ## How it works
 
 <p align="center">

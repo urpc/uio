@@ -64,6 +64,10 @@ const (
 	// the buffer is drained, and the connection closes once its own writing
 	// half is shut too. Only the connection's turn sets it.
 	readEOFFlag
+	// controlAliasFlag records an external Control alias. Teardown explicitly
+	// removes this socket's poller registration before closing its original
+	// descriptor, since an alias can keep the socket alive beyond that close.
+	controlAliasFlag
 )
 
 type fdConn struct {
@@ -1316,6 +1320,50 @@ func (conn *fdConn) setSocketOption(kind socketOptionKind, value int) error {
 	return conn.applySocketOption(kind, value)
 }
 
+// Control runs fn with the connection's descriptor, for the socket options
+// the dedicated setters do not carry; see Conn.Control. A UDP child's options
+// land on the socket it shares with its server.
+func (conn *fdConn) Control(fn func(fd uintptr)) error {
+	if conn.isClosing() {
+		return net.ErrClosed
+	}
+	if conn.directOwner() {
+		return conn.applyControl(fn)
+	}
+	owner := conn.descriptorOwner()
+	if owner.loop == nil || !owner.loop.acquireIO() {
+		return net.ErrClosed
+	}
+	defer owner.loop.releaseIO()
+	owner.submitMu.Lock()
+	if conn.isClosing() || owner.isClosing() {
+		owner.submitMu.Unlock()
+		return net.ErrClosed
+	}
+	// Keep the socket alive without holding a submission lock across user
+	// code: fn may close this connection or its listener. A temporary alias
+	// applies the same socket options and cannot be reused under the call.
+	fd, err := socket.Dup(int(owner.fd))
+	if err == nil {
+		owner.flags.Or(controlAliasFlag)
+	}
+	owner.submitMu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	fn(uintptr(fd))
+	return nil
+}
+
+func (conn *fdConn) applyControl(fn func(fd uintptr)) error {
+	if conn.close.isReleased() || conn.descriptorOwner().close.isReleased() {
+		return net.ErrClosed
+	}
+	fn(uintptr(conn.fd))
+	return nil
+}
+
 // descriptorOwner is the connection whose release closes this connection's
 // descriptor: a UDP child shares its server's.
 func (conn *fdConn) descriptorOwner() *fdConn {
@@ -1614,9 +1662,15 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 		udp.peerMu.Unlock()
 		return nil, net.ErrClosed
 	}
-	if existing := udp.peers[key]; existing != nil && !existing.isClosing() {
-		udp.peerMu.Unlock()
-		return existing, ErrPeerExists
+	if existing := udp.peers[key]; existing != nil {
+		if !existing.isClosing() {
+			udp.peerMu.Unlock()
+			return existing, ErrPeerExists
+		}
+		// Transfer ownership before replacing the address entry. The old
+		// closer may still be between marking closing and queuePeer, so the
+		// server must retain it even if shutdown wins before that hand-off.
+		udp.closing = append(udp.closing, existing)
 	}
 	child := &fdConn{fd: server.fd, udp: &unixUDPState{remote: sockaddr, server: server, key: key}}
 	child.events, child.loop = server.events, server.loop
@@ -1656,6 +1710,10 @@ func (server *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 func (server *fdConn) queuePeer(child *fdConn, wake bool) {
 	udp := server.udp
 	udp.peerMu.Lock()
+	if udp.peers == nil {
+		udp.peerMu.Unlock()
+		return // The release pass already owns every child and queued request.
+	}
 	if wake {
 		udp.waking = append(udp.waking, child)
 	} else {
@@ -1751,7 +1809,7 @@ func (conn *fdConn) CloseWith(err error) error {
 		return net.ErrClosed
 	}
 	conn.submitMu.Lock()
-	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.request() {
+	if conn.isClosing() || conn.descriptorOwner().isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.request() {
 		conn.submitMu.Unlock()
 		return net.ErrClosed
 	}
@@ -1889,12 +1947,25 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 		if conn.udp != nil && conn.udp.peers != nil {
 			conn.udp.peerMu.Lock()
 			children := conn.udp.peers
+			closing, opening, waking := conn.udp.closing, conn.udp.opening, conn.udp.waking
 			conn.udp.peers = nil
+			conn.udp.closing = nil
 			conn.udp.opening = nil
+			conn.udp.waking = nil
 			conn.udp.peerMu.Unlock()
 			for _, child := range children {
 				if childErr, ok := child.teardown(finalErr); ok {
 					child.scheduleCloseCallback(childErr)
+				}
+			}
+			// A replaced child may only remain in a hand-off queue. Teardown
+			// claims each child once, so overlapping entries need no set or
+			// extra allocation in this terminal path.
+			for _, queued := range [][]*fdConn{closing, opening, waking} {
+				for _, child := range queued {
+					if childErr, ok := child.teardown(finalErr); ok {
+						child.scheduleCloseCallback(childErr)
+					}
 				}
 			}
 		}

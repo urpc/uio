@@ -44,8 +44,8 @@ import (
 //	Dial("udp://[fe80::1%lo0]:53")
 //	Dial("tcp://:80")
 //	Dial("unix:///path/your/unix.sock")
-func (ev *Events) Dial(addr string, userdata any) (Conn, error) {
-	return ev.DialContext(context.Background(), addr, userdata)
+func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, error) {
+	return ev.DialContext(context.Background(), addr, userdata, opts...)
 }
 
 // Adopt transfers ownership of an established stream connection to ev. The
@@ -92,7 +92,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // callback blocks that callback until dialing completes.
 // A connection it returns gets OnOpen and, at its end, OnClose, even if it is
 // closed first; after an error no callback runs for it.
-func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
+func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}
@@ -114,7 +114,11 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		address = u.Path
 	}
 
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, u.Scheme, address)
+	dialer, err := netDialerFor(u.Scheme, dialConfigFor(opts))
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.DialContext(dialCtx, u.Scheme, address)
 	if nil != err {
 		return nil, err
 	}
@@ -179,9 +183,16 @@ func (ev *Events) stopLoopsLocked(err error) bool {
 // serveLoops serves the listener loop on Serve's goroutine and then joins
 // every loop, connection task and I/O goroutine.
 func (ev *Events) serveLoops() error {
+	// Listeners were bound before OnStart; accepting starts only now, once
+	// it has returned, so no callback runs while the application initializes.
+	startErr := ev.acceptor.startAccepting()
 	err := ev.master.Serve(ev.LockOSThread, ev.acceptor)
 	ev.waitGroup.Done()
 	ev.initiateClose(err)
+	if startErr != nil {
+		err = startErr
+		ev.recordCloseReason(err)
+	}
 	ev.waitGroup.Wait()
 	ev.stopIOPool()
 	ev.callbackWG.Wait()

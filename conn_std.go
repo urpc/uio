@@ -50,7 +50,7 @@ const stdWriteVecLimit = 16
 type stdUDPState struct {
 	sock  *net.UDPConn
 	svr   *fdConn
-	peers map[string]*fdConn
+	peers map[netip.AddrPort]*fdConn
 
 	// deadlines are a server child's own: the socket it shares with its
 	// server and every other peer must not carry them. Allocated by the
@@ -62,6 +62,11 @@ type stdUDPState struct {
 	// reportOutbound.
 	outboundPending atomic.Int64
 	outboundClaim   atomic.Bool
+
+	// A server's accepted close detaches the address table immediately so
+	// DialPeer and WriteTo refuse it; the counted close task owns it until
+	// physical release, even when the close queue has already stopped.
+	closingPeers map[netip.AddrPort]*fdConn
 }
 
 type fdConn struct {
@@ -112,6 +117,14 @@ type fdConn struct {
 	writeShutDone atomic.Bool
 	readEOF       atomic.Bool
 	readEnded     atomic.Bool
+
+	// A published user connection holds one lifecycle reservation until its
+	// terminal callback completes, including while a close has left the peer
+	// map but has not yet scheduled that callback. lifecycle is initialized
+	// before publication and cleared under callbackMu.
+	lifecycle      bool
+	closeReady     atomic.Bool // resource cleanup finished; OnClose may run
+	closeScheduled atomic.Bool // one close delivery, including duplicates from opening
 }
 
 func (fc *fdConn) IsClosed() bool { return atomic.LoadInt32(&fc.closed) != 0 }
@@ -134,7 +147,16 @@ func (fc *fdConn) isClosedOnLoop() bool             { return fc.IsClosed() }
 // then starts the writer; see openOnReader. OnOpen stays off the event loop,
 // so it may Dial and a slow one holds up no other connection.
 func (fc *fdConn) afterRegister() {
+	fc.retainLifecycle()
 	_ = fc.fireReadEvent()
+}
+
+// retainLifecycle runs before a connection is published, or on its registering
+// loop before the loop can stop. Readers and openers have their own counts:
+// this count covers the connection after it leaves those owners' tables.
+func (fc *fdConn) retainLifecycle() {
+	fc.events.callbackWG.Add(1)
+	fc.lifecycle = true
 }
 
 // openOnReader runs OnOpen on the connection's read goroutine before its
@@ -146,13 +168,7 @@ func (fc *fdConn) afterRegister() {
 // handed its caller a connection whose end only OnClose reports.
 func (fc *fdConn) openOnReader() bool {
 	fc.callbackMu.Lock()
-	fc.fireOnOpen()
-	fc.opened = true
-	if atomic.LoadInt32(&fc.closed) == 1 {
-		// Torn down before OnOpen ran, so the close callback may have skipped
-		// it as unopened; deliver it now. closeDelivered keeps it to once.
-		fc.scheduleCloseCallback(fc.err)
-	}
+	fc.ensureOpenLocked()
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
 		started := fc.beginInboundCallback()
 		err := fc.events.onData(fc)
@@ -168,6 +184,23 @@ func (fc *fdConn) openOnReader() bool {
 	}
 	_ = fc.fireWriteEvent()
 	return true
+}
+
+// ensureOpenLocked claims the connection's first open and runs OnOpen; it
+// requires callbackMu. Whichever of a connection's openers reaches it first —
+// its reader, the goroutine of a DialPeer, a close catching it unopened —
+// runs OnOpen, exactly once, before any OnData or OnClose of it.
+func (fc *fdConn) ensureOpenLocked() {
+	if fc.opened {
+		return
+	}
+	fc.fireOnOpen()
+	fc.opened = true
+	if fc.closeReady.Load() {
+		// Torn down before OnOpen ran, so the close callback may have skipped
+		// it as unopened; deliver it now. closeDelivered keeps it to once.
+		fc.scheduleCloseCallback(fc.err)
+	}
 }
 
 func (fc *fdConn) fireOnOpen() {
@@ -187,6 +220,38 @@ func (fc *fdConn) closeUnregistered() {
 	if fc.udp != nil {
 		_ = fc.udp.sock.Close()
 	}
+}
+
+// Control runs fn with the connection's descriptor, for the socket options
+// the dedicated setters do not carry; see Conn.Control. A UDP child's options
+// land on the socket it shares with its server.
+func (fc *fdConn) Control(fn func(fd uintptr)) error {
+	// A closed datagram peer shares a socket that stays open, but its own
+	// close refuses options all the same.
+	if fc.isClosing() {
+		return net.ErrClosed
+	}
+	var conn syscall.Conn
+	if fc.udp != nil {
+		if fc.udp.sock == nil {
+			return net.ErrClosed
+		}
+		conn = fc.udp.sock
+	} else {
+		if fc.conn == nil {
+			return net.ErrClosed
+		}
+		holder, ok := fc.conn.(syscall.Conn)
+		if !ok {
+			return errUnsupported
+		}
+		conn = holder
+	}
+	raw, err := conn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	return raw.Control(func(fd uintptr) { fn(fd) })
 }
 
 func (fc *fdConn) RemoteAddr() net.Addr {
@@ -798,48 +863,93 @@ func (fc *fdConn) CloseWith(err error) error {
 }
 
 func (fc *fdConn) enqueueClose(err error) error {
-	if !fc.closing.CompareAndSwap(false, true) {
+	fc.mux.Lock()
+	if fc.isClosing() || (fc.udp != nil && fc.udp.svr != nil && fc.udp.svr.isClosing()) {
+		fc.mux.Unlock()
 		return net.ErrClosed
 	}
-	// Resource release and OnClose still belong to the logical event loop.
+	// Publish the first request's cause together with closing. A listener's
+	// release may overtake the task, but must retain that requested cause.
+	fc.err = err
+	fc.closing.Store(true)
+	if fc.udp != nil && fc.internal {
+		fc.udp.closingPeers = fc.udp.peers
+		fc.udp.peers = nil
+	}
+	fc.mux.Unlock()
+	if hook := testHookStdCloseRequested.Load(); hook != nil {
+		(*hook)(fc)
+	}
+	// Prefer the loop's ordered close task for resource release and OnClose.
 	t := acquireTask(closeTask, fc)
 	t.err = err
-	if fc.loop == nil || !fc.loop.submitTask(t) {
-		releaseTask(t)
-		return net.ErrClosed
+	if fc.loop != nil && fc.loop.submitTask(t) {
+		return nil
 	}
+	releaseTask(t)
+	// A sealed queue transfers the close to a counted owner. Keep cleanup
+	// off the caller: it may hold a RawConn.Control descriptor reference, or
+	// another resource that closing the socket must wait for it to release.
+	fc.events.callbackWG.Add(1)
+	go func() {
+		defer fc.events.callbackWG.Done()
+		fc.closeOnLoop(err)
+	}()
 	return nil
 }
 
 func (fc *fdConn) requestClose(err error) { _ = fc.enqueueClose(err) }
+
+// peerKey is the canonical key of a UDP peer: an IPv4-mapped address
+// collapses to its IPv4 form, so the dialing and receiving sides of one
+// endpoint name it the same whatever form either was given.
+func peerKey(addr netip.AddrPort) netip.AddrPort {
+	return netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
+}
 
 // dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
 // The child is published under the server's mutex, and its OnOpen runs on a
 // goroutine of its own serialized with the reader by the child's callback
 // mutex; a datagram from the peer that arrives first runs it there instead.
 func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
+	// The open joins the lifecycle before the peer is visible to any cleanup,
+	// in one section with the shutdown publication: either the Events is
+	// closing and none of this runs, or the open is counted and Serve's join
+	// waits for it, so no callback slips past Serve's return.
+	events := fc.events
+	events.mux.Lock()
+	if events.closing.Load() {
+		events.mux.Unlock()
+		return nil, net.ErrClosed
+	}
+	events.callbackWG.Add(1)
+	events.mux.Unlock()
+
 	fc.mux.Lock()
 	if fc.udp == nil || fc.udp.peers == nil {
 		fc.mux.Unlock()
+		events.callbackWG.Done()
 		return nil, net.ErrClosed
 	}
-	rAddr := addr.String()
+	rAddr := peerKey(addr)
 	if existing := fc.udp.peers[rAddr]; existing != nil && !existing.isClosing() {
 		fc.mux.Unlock()
+		events.callbackWG.Done()
 		return existing, ErrPeerExists
 	}
+	// A closing peer's counted task owns its end even after replacement.
 	child := &fdConn{}
 	child.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
 	child.addr = fc.addr
-	child.setRemoteAddr(net.UDPAddrFromAddrPort(addr))
+	child.setRemoteAddr(net.UDPAddrFromAddrPort(rAddr))
 	child.loop = fc.loop
 	child.events = fc.events
 	child.userdata = userdata
+	child.retainLifecycle()
 	fc.udp.peers[rAddr] = child
 	fc.mux.Unlock()
-	fc.events.callbackWG.Add(1)
 	go func() {
-		defer fc.events.callbackWG.Done()
+		defer events.callbackWG.Done()
 		child.openOnReader()
 	}()
 	return child, nil
@@ -860,83 +970,79 @@ func (fc *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 // closeOnLoop owns resource teardown and detaches UDP children. The user
 // callback is scheduled separately so a slow OnClose cannot block the logical
 // event loop or race an active OnData callback.
+//
+// Closers arrive from several goroutines at once — a Listener.Close on its
+// caller's, Events.Close, a loop's close task — so fc.mux claims the close
+// exclusively: the first one in publishes the reason and tears down, and the
+// rest find the connection closed and return without touching anything. The
+// reason publishes before the closed flag: a reader that sees closed observes
+// err without further synchronization.
 func (fc *fdConn) closeOnLoop(err error) {
-	if fc.IsClosed() {
+	fc.mux.Lock()
+	if atomic.LoadInt32(&fc.closed) == 1 {
+		fc.mux.Unlock()
 		return
 	}
-	fc.closing.Store(true)
+	if fc.closing.Load() {
+		err = fc.err
+	} else {
+		fc.err = err
+		fc.closing.Store(true)
+	}
 	if fc.udp != nil && fc.udp.svr != nil {
 		fc.stopChildDeadlines()
+		// A child only leaves the peer map, under its server's lock; DialPeer
+		// may have replaced it there already. The child's own lock always
+		// comes before its server's.
 		fc.udp.svr.mux.Lock()
-		// DialPeer may have replaced this child in the map already.
-		if peers := fc.udp.svr.udp.peers; peers != nil && peers[fc.remoteAddr.String()] == fc {
-			delete(peers, fc.remoteAddr.String())
+		if peers := fc.udp.svr.udp.peers; peers != nil && peers[peerKey(fc.remoteAddr)] == fc {
+			delete(peers, peerKey(fc.remoteAddr))
 		}
 		fc.udp.svr.mux.Unlock()
-		// The reason publishes before the flag: a reader that sees closed
-		// observes err without further synchronization.
-		fc.err = err
-		if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
-			return
+		atomic.StoreInt32(&fc.closed, 1)
+		fc.mux.Unlock()
+		fc.finishClose(err)
+		return
+	}
+	var children []*fdConn
+	if fc.udp != nil && (fc.udp.peers != nil || fc.udp.closingPeers != nil) {
+		peers := fc.udp.peers
+		if peers == nil {
+			peers = fc.udp.closingPeers
 		}
-	} else {
-		if fc.udp != nil && fc.udp.peers != nil {
-			fc.mux.Lock()
-			children := make([]*fdConn, 0, len(fc.udp.peers))
-			for _, child := range fc.udp.peers {
-				children = append(children, child)
-			}
-			fc.udp.peers = nil
-			fc.mux.Unlock()
-			for _, child := range children {
-				child.closeOnLoop(err)
-			}
+		children = make([]*fdConn, 0, len(peers))
+		for _, child := range peers {
+			children = append(children, child)
 		}
-		if !fc.fdClose(err) {
-			return
-		}
+		fc.udp.peers = nil
+		fc.udp.closingPeers = nil
+	}
+	atomic.StoreInt32(&fc.closed, 1)
+	fc.mux.Unlock()
+	fc.closeDescriptor()
+	for _, child := range children {
+		child.closeOnLoop(err)
+	}
+	fc.finishClose(err)
+}
+
+// finishClose is the resource owner's terminal hand-off. Opening may only
+// arrange OnClose once this cleanup has finished, never just from closed.
+func (fc *fdConn) finishClose(err error) {
+	if hook := testHookStdCloseReleased.Load(); hook != nil {
+		(*hook)(fc)
 	}
 	fc.scheduleCloseCallback(err)
 }
 
-// testHookUDPChildCreated runs on the listener goroutine after a UDP child
-// was created and published, before its OnOpen. Tests use it to pin the
-// close-while-opening race; it is nil outside tests.
-var testHookUDPChildCreated func(*fdConn)
+// Tests pause the two ownership hand-offs without instrumenting I/O paths.
+var testHookStdCloseRequested atomic.Pointer[func(*fdConn)]
+var testHookStdCloseReleased atomic.Pointer[func(*fdConn)]
 
-func (fc *fdConn) scheduleCloseCallback(err error) {
-	fc.events.callbackWG.Add(1)
-	go func() {
-		defer fc.events.callbackWG.Done()
-		fc.callbackMu.Lock()
-		defer fc.callbackMu.Unlock()
-		if callback := fc.events.cb.onClose; callback != nil && !fc.internal && fc.opened {
-			// A child whose OnOpen had not run when its server closed is
-			// opened afterwards by the listener; whichever of the two close
-			// callbacks finds it opened delivers it, exactly once.
-			if !atomic.CompareAndSwapInt32(&fc.closeDelivered, 0, 1) {
-				return
-			}
-			fc.inbound.Reset()
-			fc.inboundTail = nil
-			started := fc.beginInboundCallback()
-			callback(fc, err)
-			fc.endInboundCallback(started)
-		}
-	}()
-}
-
-// fdClose wins physical teardown once, interrupts blocking I/O by closing the
-// socket first, then waits for the detached writer batch before recycling any
-// pooled blocks.
-func (fc *fdConn) fdClose(err error) bool {
-	// The reason publishes before the flag: a reader that sees closed
-	// observes err without further synchronization.
-	fc.err = err
-	if !atomic.CompareAndSwapInt32(&fc.closed, 0, 1) {
-		return false
-	}
-
+// closeDescriptor releases a claimed connection's descriptor and its queued
+// output. It runs once per connection, after closeOnLoop's exclusive claim,
+// with no lock held: the closed flag keeps every other closer out.
+func (fc *fdConn) closeDescriptor() {
 	// Wake the writer so it observes the close and stops. A notification that
 	// is already pending is just as good a wake as this one, so a full channel
 	// needs no second signal.
@@ -955,7 +1061,9 @@ func (fc *fdConn) fdClose(err error) bool {
 	}
 
 	// delete connection fd-mapping.
-	fc.loop.delConn(fc)
+	if fc.loop != nil {
+		fc.loop.delConn(fc)
+	}
 
 	// Close the socket before waiting on mux so blocked writes are interrupted.
 	switch {
@@ -973,8 +1081,53 @@ func (fc *fdConn) fdClose(err error) bool {
 	fc.writeBytes = 0
 	fc.mux.Unlock()
 	fc.writeMu.Unlock()
+}
 
-	return true
+// testHookUDPChildCreated runs on the listener goroutine after a UDP child
+// was created and published, before its OnOpen. Tests use it to pin the
+// close-while-opening race; it is nil outside tests.
+var testHookUDPChildCreated func(*fdConn)
+
+func (fc *fdConn) scheduleCloseCallback(err error) {
+	fc.closeReady.Store(true)
+	if !fc.closeScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	// The connection's lifecycle reservation, or its still-counted owner
+	// for an unregistered/internal connection, precedes this Add. Shutdown
+	// cannot finish between resource release and this hand-off.
+	fc.events.callbackWG.Add(1)
+	go func() {
+		defer fc.events.callbackWG.Done()
+		fc.deliverCloseCallback(err)
+	}()
+}
+
+// deliverCloseCallback runs one connection's OnClose under its callback
+// mutex, exactly once per connection.
+func (fc *fdConn) deliverCloseCallback(err error) {
+	fc.callbackMu.Lock()
+	defer fc.callbackMu.Unlock()
+	if !fc.internal && !fc.opened {
+		// Its counted opener still owes OnOpen. Give that opener the close
+		// delivery back, keeping the connection's lifecycle reservation.
+		fc.closeScheduled.Store(false)
+		return
+	}
+	if !atomic.CompareAndSwapInt32(&fc.closeDelivered, 0, 1) {
+		return
+	}
+	if fc.lifecycle {
+		fc.lifecycle = false
+		defer fc.events.callbackWG.Done()
+	}
+	if callback := fc.events.cb.onClose; callback != nil && !fc.internal {
+		fc.inbound.Reset()
+		fc.inboundTail = nil
+		started := fc.beginInboundCallback()
+		callback(fc, err)
+		fc.endInboundCallback(started)
+	}
 }
 
 func (fc *fdConn) Wake() error {
@@ -1381,8 +1534,8 @@ func (fc *fdConn) listenUDP() error {
 			return err
 		}
 
-		// remote address.
-		var rAddr = addr.String()
+		// remote address, in the one form every side of a peer agrees on.
+		rAddr := peerKey(remoteAddrFrom(addr))
 
 		// udp server
 		fc.mux.Lock()
@@ -1397,6 +1550,7 @@ func (fc *fdConn) listenUDP() error {
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
 			udpConn.userdata = fc.userdata // the listener's
+			udpConn.retainLifecycle()
 
 			fc.udp.peers[rAddr] = udpConn
 		}
@@ -1405,23 +1559,13 @@ func (fc *fdConn) listenUDP() error {
 			continue
 		}
 		udpConn.callbackMu.Lock()
-		// fire udp on-open event: for a peer that just spoke first, and the
-		// one DialPeer still owes when the peer's datagram arrived before it.
+		// The open a new peer owes — or the one DialPeer still owes, when the
+		// peer's datagram arrived before its opener — runs here, once.
 		if !udpConn.opened {
 			if !ok && testHookUDPChildCreated != nil {
 				testHookUDPChildCreated(udpConn)
 			}
-			if onOpen := fc.events.cb.onOpen; nil != onOpen {
-				started := udpConn.beginInboundCallback()
-				onOpen(udpConn)
-				udpConn.endInboundCallback(started)
-			}
-			udpConn.opened = true
-			if atomic.LoadInt32(&udpConn.closed) == 1 {
-				// The server closed this child before its OnOpen ran, and the
-				// close callback skipped it as unopened; deliver it now.
-				udpConn.scheduleCloseCallback(udpConn.err)
-			}
+			udpConn.ensureOpenLocked()
 		}
 		if udpConn.isClosing() {
 			// The peer closed while this packet waited for its callback

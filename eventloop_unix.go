@@ -178,6 +178,12 @@ type eventLoop struct {
 	// own counts as the only one.
 	index uint32
 	count uint32
+
+	// UDP lifetime ownership starts before poller registration. Keeping it
+	// separate from fdMap also keeps stale untagged kqueue events from
+	// reaching a listener before OnStart returns. Only create/close use it.
+	udpMu      sync.Mutex
+	udpServers map[*fdConn]struct{}
 }
 
 // loopWaiter is one waiter goroutine's private dispatch state.
@@ -597,9 +603,37 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 // added to its poller and before its claimed open turn is submitted.
 var registeredForTest func(*fdConn)
 
-// registerListener watches a UDP listener's server connection. It has no
-// OnOpen; its turns read every peer's datagrams.
+// trackListener owns a UDP server from its creation, before accepting starts
+// or DialPeer can publish children. The reservation joins a concurrent
+// shutdown, just as registration does for dialed connections.
+func (loop *eventLoop) trackListener(server *fdConn) error {
+	if !loop.acquireIO() {
+		server.closeUnregistered()
+		return net.ErrClosed
+	}
+	defer loop.releaseIO()
+	loop.udpMu.Lock()
+	defer loop.udpMu.Unlock()
+	if loop.stopping.Load() {
+		server.closeUnregistered()
+		return net.ErrClosed
+	}
+	if loop.udpServers == nil {
+		loop.udpServers = make(map[*fdConn]struct{})
+	}
+	loop.udpServers[server] = struct{}{}
+	return nil
+}
+
+// registerListener starts receiving for an already owned UDP server. Its
+// descriptor may have been closed by a turn during OnStart, so watching it
+// uses the same descriptor guard as socket options and teardown.
 func (loop *eventLoop) registerListener(server *fdConn) error {
+	server.submitMu.Lock()
+	defer server.submitMu.Unlock()
+	if server.isClosing() || loop.stopping.Load() {
+		return net.ErrClosed
+	}
 	if err := loop.fdMap.Put(int(server.fd), server); err != nil {
 		return err
 	}
@@ -611,16 +645,24 @@ func (loop *eventLoop) registerListener(server *fdConn) error {
 }
 
 // forget takes conn out of the fd table before its descriptor closes. A
-// stream's descriptor is the only reference to its socket — accepted, or
-// duplicated by Dial or Adopt, which close the original — so closing it takes
-// it out of the poller, and an explicit removal would only add a syscall per
-// connection. A UDP listener's descriptor shares its socket with the Go
+// stream's descriptor normally owns its socket alone, so closing it removes
+// it from the poller without an extra syscall. Connections used by external
+// Control calls need explicit removal, since an alias may still be open.
+// A UDP listener shares its socket with the Go
 // listener that is closed later, so it is removed explicitly.
 func (loop *eventLoop) forget(conn *fdConn) {
 	loop.fdMap.DeleteValue(conn.Fd(), conn)
 	if conn.isDatagram() {
 		_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
+		if conn.internal {
+			loop.udpMu.Lock()
+			delete(loop.udpServers, conn)
+			loop.udpMu.Unlock()
+		}
 	} else {
+		if conn.flags.Load()&controlAliasFlag != 0 {
+			_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
+		}
 		loop.ioPool.connClosed()
 	}
 }
@@ -630,6 +672,11 @@ func (loop *eventLoop) forget(conn *fdConn) {
 // waits for those turns, and then releases each connection itself; OnClose
 // is still delivered by a final turn.
 func (loop *eventLoop) shutdown(err error) {
+	loop.udpMu.Lock()
+	for server := range loop.udpServers {
+		server.beginShutdown()
+	}
+	loop.udpMu.Unlock()
 	for _, conn := range loop.fdMap.Range() {
 		if conn.loop == loop {
 			conn.beginShutdown()
@@ -641,6 +688,18 @@ func (loop *eventLoop) shutdown(err error) {
 			if finalErr, ok := conn.teardown(err); ok {
 				conn.scheduleCloseCallback(finalErr)
 			}
+		}
+	}
+	// Registered servers have already left this registry via forget. Take
+	// the unregistered ones after joining every turn, and release with no
+	// registry lock held: their callbacks may close another listener.
+	loop.udpMu.Lock()
+	servers := loop.udpServers
+	loop.udpServers = nil
+	loop.udpMu.Unlock()
+	for server := range servers {
+		if finalErr, ok := server.teardown(err); ok {
+			server.scheduleCloseCallback(finalErr)
 		}
 	}
 	if loop.ioPoolOwner {

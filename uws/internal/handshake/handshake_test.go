@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -293,4 +294,43 @@ func BenchmarkAppendServerResponse(b *testing.B) {
 			b.Fatal(len(dst))
 		}
 	}
+}
+
+// A refusal's body is not header: the limit bounds the header alone, the body
+// is waited for and bounded by MaxRejectBody, and a refusal split across
+// reads arrives whole.
+func TestValidateClientResponseRefusalBodyBounds(t *testing.T) {
+	const key = testKey
+	reason := strings.Repeat("r", MaxRejectBody)
+	response := "HTTP/1.1 401 Unauthorized\r\nContent-Length: " +
+		itoa(len(reason)) + "\r\nConnection: close\r\n\r\n" + reason
+	limit := len("HTTP/1.1 401 Unauthorized\r\nContent-Length: 4100\r\nConnection: close\r\n\r\n") // header alone
+	// Whole, with a header at the limit: the body rides on top of it.
+	consumed, _, _, err := ValidateClientResponse([]byte(response), key, nil, limit)
+	var refused *ResponseError
+	if !errors.As(err, &refused) || refused.StatusCode != 401 || string(refused.Body) != reason {
+		t.Fatalf("whole refusal = %v, want status 401 with its body", err)
+	}
+	if consumed != 0 {
+		// A refusal reports no consumed bytes: the connection ends with it.
+		t.Fatalf("consumed = %d, want 0", consumed)
+	}
+	// The header alone asks for the body; the rest arrives later.
+	if _, _, _, err := ValidateClientResponse([]byte(response[:limit]), key, nil, limit); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("header without body = %v, want %v", err, io.ErrUnexpectedEOF)
+	}
+	// A body past MaxRejectBody is not waited for; the refusal still reports.
+	huge := "HTTP/1.1 403 Forbidden\r\nContent-Length: 99999\r\n\r\npast"
+	if _, _, _, err := ValidateClientResponse([]byte(huge), key, nil, limit); !errors.As(err, &refused) || refused.StatusCode != 403 {
+		t.Fatalf("oversized body = %v, want the refusal without its body", err)
+	}
+	// A header past the limit is still refused.
+	oversized := "HTTP/1.1 401 Unauthorized\r\nX-Fill: " + strings.Repeat("a", limit) + "\r\n\r\n"
+	if _, _, _, err := ValidateClientResponse([]byte(oversized), key, nil, limit); !errors.Is(err, ErrBadRequest) {
+		t.Fatalf("oversized header = %v, want %v", err, ErrBadRequest)
+	}
+}
+
+func itoa(v int) string {
+	return strings.TrimSpace(strconv.Itoa(v))
 }

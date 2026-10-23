@@ -46,8 +46,8 @@ import (
 //	Dial("udp://[fe80::1%lo0]:53")
 //	Dial("tcp://:80")
 //	Dial("unix:///path/your/unix.sock")
-func (ev *Events) Dial(addr string, userdata any) (Conn, error) {
-	return ev.DialContext(context.Background(), addr, userdata)
+func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, error) {
+	return ev.DialContext(context.Background(), addr, userdata, opts...)
 }
 
 // Adopt transfers ownership of an established stream connection to ev. The
@@ -98,7 +98,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // the dial itself.
 // A connection it returns gets OnOpen and, at its end, OnClose, even if it is
 // closed first; after an error no callback runs for it.
-func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any) (Conn, error) {
+func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}
@@ -120,7 +120,11 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		address = u.Path
 	}
 
-	conn, err := (&net.Dialer{}).DialContext(dialCtx, u.Scheme, address)
+	dialer, err := netDialerFor(u.Scheme, dialConfigFor(opts))
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.DialContext(dialCtx, u.Scheme, address)
 	if nil != err {
 		return nil, err
 	}

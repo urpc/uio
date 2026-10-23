@@ -2445,7 +2445,7 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 func TestListenerAddressVariants(t *testing.T) {
 	ld := &acceptor{}
 	for _, address := range []string{"127.0.0.1:0", "udp://127.0.0.1:0"} {
-		listener, err := ld.listen(address, false)
+		listener, err := ld.listen(address, false, nil)
 		if err != nil {
 			t.Fatalf("listen %q: %v", address, err)
 		}
@@ -2453,7 +2453,7 @@ func TestListenerAddressVariants(t *testing.T) {
 	}
 
 	path := filepath.Join(t.TempDir(), "uio.sock")
-	listener, err := ld.listen("unix://"+path, false)
+	listener, err := ld.listen("unix://"+path, false, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2463,13 +2463,13 @@ func TestListenerAddressVariants(t *testing.T) {
 	}
 
 	for _, address := range []string{"unsupported://address", "tcp://%", "tcp://bad-address"} {
-		if listener, err := ld.listen(address, false); err == nil {
+		if listener, err := ld.listen(address, false, nil); err == nil {
 			ld.closeListener(listener)
 			t.Fatalf("listen %q unexpectedly succeeded", address)
 		}
 	}
 
-	listener, err = ld.listen("tcp://127.0.0.1:0", true)
+	listener, err = ld.listen("tcp://127.0.0.1:0", true, nil)
 	if err == nil {
 		ld.closeListener(listener)
 	}

@@ -19,16 +19,17 @@
 package uio
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/libp2p/go-reuseport"
 	"github.com/urpc/uio/internal/poller"
 )
 
@@ -38,8 +39,9 @@ type listener struct {
 	ln       net.Listener
 	udp      net.PacketConn
 	udpSvr   *fdConn
-	key      int // its key in acceptor.listeners
-	userdata any // every accepted connection's initial Userdata
+	key      int  // its key in acceptor.listeners
+	started  bool // its accept goroutine runs; guarded by acceptor.mux
+	userdata any  // every accepted connection's initial Userdata
 }
 
 // acceptor owns blocking listener goroutines. The logical event loop is used
@@ -50,6 +52,7 @@ type acceptor struct {
 	loop      *eventLoop
 	events    *Events
 	next      int  // the key of the next listener
+	accepting bool // startAccepting has run: a new listener starts at once
 	closed    bool // close has run: Listen adds nothing more
 }
 
@@ -62,28 +65,33 @@ func (ld *acceptor) OnClose(ep *poller.Poller, err error) {
 }
 
 // startMultiAcceptors exists for the shared Serve path. This backend has no
-// dedicated ReusePort acceptors: its blocking listener goroutines are created
-// together with the listeners themselves.
+// dedicated ReusePort acceptors.
 func (ld *acceptor) startMultiAcceptors() {}
 
-// addListen starts one blocking accept or UDP receive goroutine for addr.
-// Accepted streams are registered before their dedicated read/write loops run.
+// addListen binds addr for Serve. Nothing accepts on it until
+// startAccepting, once OnStart has returned — a connection must not reach a
+// callback while the application is still initializing.
 func (ld *acceptor) addListen(addr string) error {
+	l, err := ld.listen(addr, ld.events.ReusePort, nil)
+	if err != nil {
+		return err
+	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	_, err := ld.addLocked(addr, nil)
-	return err
+	return ld.addLocked(l, nil)
 }
 
 // listenGroup adds addr while Serve runs.
-func (ld *acceptor) listenGroup(addr string, userdata any) (Listener, error) {
+func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
+	// A socket control may close Events or another listener. Create the
+	// socket before taking the registry lock, then admit it against shutdown.
+	l, err := ld.listen(addr, ld.events.ReusePort, listenConfigFor(opts).Control)
+	if err != nil {
+		return nil, err
+	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	if ld.closed {
-		return nil, net.ErrClosed
-	}
-	l, err := ld.addLocked(addr, userdata)
-	if err != nil {
+	if err = ld.addLocked(l, userdata); err != nil {
 		return nil, err
 	}
 	var local net.Addr
@@ -93,6 +101,21 @@ func (ld *acceptor) listenGroup(addr string, userdata any) (Listener, error) {
 		local = l.ln.Addr()
 	}
 	return (&listenerGroup{ld: ld, members: []*listener{l}, addr: local}).asListener(), nil
+}
+
+// startAccepting starts every listener Serve bound, once OnStart has
+// returned; see addListen.
+func (ld *acceptor) startAccepting() error {
+	ld.mux.Lock()
+	defer ld.mux.Unlock()
+	if ld.closed || ld.events.closing.Load() {
+		return nil
+	}
+	ld.accepting = true
+	for _, l := range ld.listeners {
+		ld.startLocked(l)
+	}
+	return nil
 }
 
 // closeGroup releases group unless shutdown already did. Closing a stream
@@ -107,27 +130,27 @@ func (ld *acceptor) closeGroup(group []*listener) {
 		}
 		delete(ld.listeners, l.key)
 		if l.udpSvr != nil {
-			// Synchronously, with this cause: the queued form would lose the
-			// race with closeListener's own close and its default cause.
-			l.udpSvr.closeOnLoop(net.ErrClosed)
+			// Publish the cause and detach the peer table now; a counted task
+			// releases the socket. The caller may be inside a peer's Control,
+			// holding a descriptor reference that socket close must wait for.
+			l.udpSvr.requestClose(net.ErrClosed)
+			continue
 		}
 		ld.closeListener(l)
 	}
 }
 
-// addLocked creates the listener for addr and starts its goroutine; it
-// requires ld.mux.
-func (ld *acceptor) addLocked(addr string, userdata any) (*listener, error) {
+// addLocked admits and records a bound listener; it requires ld.mux. The same
+// lock excludes shutdown until every I/O goroutine is counted.
+// A listener added while Serve runs starts at once; one from Serve starts
+// with the rest in startAccepting.
+func (ld *acceptor) addLocked(l *listener, userdata any) error {
+	if ld.closed || ld.events.closing.Load() {
+		ld.closeListener(l)
+		return net.ErrClosed
+	}
 	if nil == ld.listeners {
 		ld.listeners = make(map[int]*listener)
-	}
-
-	l, err := ld.listen(addr, ld.events.ReusePort)
-	if nil != err {
-		if nil != l {
-			ld.closeListener(l)
-		}
-		return nil, err
 	}
 	l.userdata = userdata
 	// The requested address may be repeated with port 0; each bind is distinct.
@@ -141,11 +164,26 @@ func (ld *acceptor) addLocked(addr string, userdata any) (*listener, error) {
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
 		l.udpSvr.userdata = userdata // what its peers start with
-		l.udpSvr.udp = &stdUDPState{sock: l.udp.(*net.UDPConn), peers: make(map[string]*fdConn)}
+		l.udpSvr.udp = &stdUDPState{sock: l.udp.(*net.UDPConn), peers: make(map[netip.AddrPort]*fdConn)}
+	}
+	if ld.accepting {
+		ld.startLocked(l)
+	}
+	return nil
+}
 
+// startLocked starts l accepting: one blocking accept goroutine, or the UDP
+// receive goroutine of its server connection. It requires ld.mux and runs
+// each listener once.
+func (ld *acceptor) startLocked(l *listener) {
+	if l.started {
+		return
+	}
+	l.started = true
+	if l.udpSvr != nil {
 		ld.events.callbackWG.Add(1)
 		go l.udpSvr.listenUDP()
-		return l, nil
+		return
 	}
 
 	ld.events.callbackWG.Add(1)
@@ -185,13 +223,11 @@ func (ld *acceptor) addLocked(addr string, userdata any) (*listener, error) {
 			ld.events.submitAccepted(fdc, true)
 		}
 	}()
-
-	return l, nil
 }
 
 // listen parses UIO's address syntax and creates the corresponding blocking Go
 // listener. Unlike the native backend, no descriptor is duplicated.
-func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
+func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (*listener, error) {
 
 	// default scheme is tcp protocol.
 	if !strings.Contains(addr, "://") {
@@ -205,32 +241,29 @@ func (ld *acceptor) listen(addr string, reusePort bool) (*listener, error) {
 	}
 
 	var l listener
+	listenConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {
 	case "tcp", "tcp4", "tcp6":
 		l.addr = u.Host
-		if reusePort {
-			l.ln, err = reuseport.Listen(u.Scheme, u.Host)
-		} else {
-			l.ln, err = net.Listen(u.Scheme, u.Host)
-		}
+		l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Host)
 	case "udp", "udp4", "udp6":
 		l.addr = u.Host
-		if reusePort {
-			l.udp, err = reuseport.ListenPacket(u.Scheme, u.Host)
-		} else {
-			l.udp, err = net.ListenPacket(u.Scheme, u.Host)
-		}
+		l.udp, err = listenConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
 	case "unix", "unixgram", "unixpacket":
 		if err = os.RemoveAll(u.Path); nil == err || os.IsNotExist(err) {
 			l.addr = u.Path
-			l.ln, err = net.Listen(u.Scheme, u.Path)
+			l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", u.Scheme)
 	}
 
-	return &l, err
+	if err != nil {
+		ld.closeListener(&l)
+		return nil, err
+	}
+	return &l, nil
 }
 
 func (ld *acceptor) closeListener(l *listener) {
