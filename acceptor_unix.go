@@ -202,8 +202,14 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 		count = reusePortListeners(runtime.GOMAXPROCS(0))
 	}
 	// The others bind the concrete address l resolved, so a port of zero
-	// still yields one shared port.
-	resolved := l.ln.Addr().String()
+	// still yields one shared port. The scheme goes along: without it the
+	// address defaults to tcp, and a group requested as tcp4 or tcp6 would
+	// bind dual-stack sockets instead.
+	scheme := "tcp"
+	if mark := strings.Index(addr, "://"); mark >= 0 {
+		scheme = addr[:mark]
+	}
+	resolved := scheme + "://" + l.ln.Addr().String()
 	for range count - 1 {
 		next, err := ld.listen(resolved, true, control)
 		if err != nil {

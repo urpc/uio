@@ -175,9 +175,7 @@ func writeRejection(writer http.ResponseWriter, err error) {
 	status, reason := http.StatusForbidden, ""
 	if reject := asRejectError(err); reject != nil {
 		status, reason = reject.status(), reject.Reason
-		if len(reason) > handshake.MaxRejectBody {
-			reason = reason[:handshake.MaxRejectBody]
-		}
+		reason = handshake.LimitBody(reason)
 		if handshake.CheckRejectHeader(reject.Header) == nil {
 			for name, values := range reject.Header {
 				writer.Header()[http.CanonicalHeaderKey(name)] = values

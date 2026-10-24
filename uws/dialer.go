@@ -40,13 +40,15 @@ type Dialer struct {
 	// Options configures the protocol, the transport and backpressure.
 	Options
 	// Header is added to every upgrade request, for credentials such as an
-	// Authorization token. The headers the handshake sets itself — Host,
-	// Upgrade, Connection, Sec-WebSocket-* and the body framing ones — are
-	// refused: the first Dial returns ErrInvalidOptions.
+	// Authorization token. The headers the handshake sets itself are refused
+	// — Host, Upgrade, Connection, Content-Length, Transfer-Encoding, Expect,
+	// and Sec-WebSocket-Key, -Version, -Protocol, -Extensions and -Accept —
+	// the first Dial returns ErrInvalidOptions.
 	Header http.Header
 	// RequestHeader, when set, returns headers for one dial, given its
-	// userdata; they replace Header's values of the same name. A header the
-	// handshake sets itself fails that Dial with ErrInvalidOptions.
+	// userdata — nil for a DialClient, which dials without one; they replace
+	// Header's values of the same name. A header the handshake sets itself
+	// fails that Dial with ErrInvalidOptions.
 	RequestHeader func(userdata any) http.Header
 
 	startOnce       sync.Once

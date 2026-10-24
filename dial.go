@@ -38,8 +38,9 @@ type DialConfig struct {
 	// fails unless the option set on the socket allows the sharing.
 	LocalAddr string
 
-	// Control runs on the dialing socket's descriptor, after LocalAddr's
-	// bind and before the socket connects.
+	// Control runs on the dialing socket's descriptor, after the socket is
+	// created and before LocalAddr binds it or it connects — as net.Dialer's
+	// Control does, so a bind-time option such as SO_REUSEPORT can be set.
 	Control SocketControl
 }
 

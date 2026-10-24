@@ -3,6 +3,8 @@
 package uio
 
 import (
+	"fmt"
+	"github.com/urpc/uio/internal/socket"
 	"net"
 	"testing"
 	"time"
@@ -104,5 +106,51 @@ func TestPausedListenerCloseBeforeResume(t *testing.T) {
 		}
 		_ = c.Close()
 		_ = next.Close()
+	}
+}
+
+// A ReusePort group binds one socket family: what the address asked for, not
+// the dual-stack sockets a scheme-less rebind of the resolved address would
+// produce, so a tcp4 listener refuses IPv6 peers and a tcp6 one IPv4.
+func TestReusePortGroupKeepsAddressFamily(t *testing.T) {
+	hold := listenersOverride
+	listenersOverride = 3
+	defer func() { listenersOverride = hold }()
+	for _, tc := range []struct {
+		addr   string
+		family uint8
+		other  string
+	}{
+		{"tcp4://0.0.0.0:0", 4, "tcp6"},
+		{"tcp6://[::]:0", 6, "tcp4"},
+	} {
+		t.Run(tc.addr, func(t *testing.T) {
+			events := withFuncs(&Events{Pollers: 1, ReusePort: true}, FuncHandler{})
+			serveClosing(t, events)
+			ln, err := events.Listen(tc.addr, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			group := ln.(*listenerGroup)
+			if len(group.members) < 2 {
+				t.Fatalf("ReusePort group has %d members, want several", len(group.members))
+			}
+			for i, m := range group.members {
+				family, err := socket.SocketFamily(int(m.fd))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if family != tc.family {
+					t.Fatalf("member %d family = %d, want %d", i, family, tc.family)
+				}
+			}
+			port := ln.Addr().(*net.TCPAddr).Port
+			other := net.JoinHostPort(map[uint8]string{4: "[::1]", 6: "127.0.0.1"}[tc.family], fmt.Sprint(port))
+			conn, err := net.DialTimeout(tc.other, other, time.Second)
+			if err == nil {
+				_ = conn.Close()
+				t.Fatalf("a %s listener accepted a %s peer", tc.addr, tc.other)
+			}
+		})
 	}
 }

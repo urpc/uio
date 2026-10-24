@@ -595,6 +595,9 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		if err != nil {
 			return err
 		}
+		if request.RemoteAddr == "" {
+			request.RemoteAddr = c.raw.RemoteAddr().String()
+		}
 		req.HTTP = request
 		userdata, err := authorize(request)
 		if err != nil {

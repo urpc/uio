@@ -17,6 +17,8 @@
 package handshake
 
 import (
+	"unicode/utf8"
+
 	"fmt"
 	"net/http"
 	"net/textproto"
@@ -97,6 +99,17 @@ func checkHeader(h http.Header, reserved map[string]bool) error {
 }
 
 // writeHeader writes h in a stable order, one line per value.
+// headerHas reports a case-insensitive name, as http.Header.Get does but
+// over the keys as they are, without their canonical form.
+func headerHas(h http.Header, name string) bool {
+	for key := range h {
+		if strings.EqualFold(key, name) {
+			return true
+		}
+	}
+	return false
+}
+
 func writeHeader(b *strings.Builder, h http.Header) {
 	names := make([]string, 0, len(h))
 	for name := range h {
@@ -114,6 +127,19 @@ func writeHeader(b *strings.Builder, h http.Header) {
 	}
 }
 
+// LimitBody cuts reason to at most MaxRejectBody bytes, ending on a whole
+// UTF-8 character: a few bytes short rather than a broken one.
+func LimitBody(reason string) string {
+	if len(reason) <= MaxRejectBody {
+		return reason
+	}
+	cut := MaxRejectBody
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
+}
+
 // BuildRejectResponse returns a complete refusal of an upgrade: status,
 // header and reason as a plain-text body, the connection to be closed after.
 // The reason is cut to MaxRejectBody bytes; header must pass
@@ -123,9 +149,7 @@ func BuildRejectResponse(status int, header http.Header, reason string) []byte {
 	if text == "" {
 		text = "Status"
 	}
-	if len(reason) > MaxRejectBody {
-		reason = reason[:MaxRejectBody]
-	}
+	reason = LimitBody(reason)
 	var b strings.Builder
 	b.Grow(128 + len(reason))
 	b.WriteString("HTTP/1.1 ")
@@ -133,7 +157,7 @@ func BuildRejectResponse(status int, header http.Header, reason string) []byte {
 	b.WriteByte(' ')
 	b.WriteString(text)
 	b.WriteString("\r\nConnection: close\r\n")
-	if header.Get("Content-Type") == "" {
+	if !headerHas(header, "Content-Type") {
 		b.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
 	}
 	b.WriteString("Content-Length: ")

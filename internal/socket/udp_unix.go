@@ -21,6 +21,7 @@ package socket
 import (
 	"net"
 	"net/netip"
+	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -122,11 +123,15 @@ func UDPAddressFor(family uint8, addr netip.AddrPort) (UDPAddress, error) {
 		key.Family = 6
 		key.Addr = ip.As16()
 		if zone := ip.Zone(); zone != "" {
-			iface, err := net.InterfaceByName(zone)
-			if err != nil {
+			// A numeric zone is an interface index, as in fe80::1%2; a name
+			// is looked up, as in fe80::1%en0.
+			if index, err := strconv.Atoi(zone); err == nil {
+				key.Zone = uint32(index)
+			} else if iface, err := net.InterfaceByName(zone); err == nil {
+				key.Zone = uint32(iface.Index)
+			} else {
 				return UDPAddress{}, err
 			}
-			key.Zone = uint32(iface.Index)
 		}
 	default:
 		return UDPAddress{}, unix.EAFNOSUPPORT

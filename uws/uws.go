@@ -14,7 +14,8 @@
  * limitations under the License.
  */
 
-// Package uws provides an asynchronous WebSocket server built on UIO.
+// Package uws provides an asynchronous WebSocket server and client built on
+// UIO.
 package uws
 
 import (

@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -323,5 +324,48 @@ func TestListenerDialPeerConcurrent(t *testing.T) {
 	peers.Wait()
 	if dialed.Load() == 0 {
 		t.Fatal("no dial ever succeeded")
+	}
+}
+
+// A peer's address is checked before the child exists, on both backends: an
+// invalid one fails the Dial instead of yielding a connection whose every
+// send does.
+func TestDialPeerRefusesUnusableAddress(t *testing.T) {
+	f := startPacketFixture(t)
+	cases := []struct {
+		name string
+		addr netip.AddrPort
+	}{
+		{"zero", netip.AddrPort{}},
+		{"ipv6 on udp4", netip.MustParseAddrPort("[2001:db8::9]:53")},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			conn, err := f.packet.DialPeer(c.addr, nil)
+			if err == nil {
+				_ = conn.Close()
+				t.Fatalf("DialPeer(%v) = a connection, want an error", c.addr)
+			}
+			if !errors.Is(err, syscall.EINVAL) && !errors.Is(err, syscall.EAFNOSUPPORT) {
+				t.Fatalf("DialPeer(%v) = %v, want EINVAL or EAFNOSUPPORT", c.addr, err)
+			}
+		})
+	}
+}
+
+// A UDP child reports the listener's local address, on both backends.
+func TestUDPChildLocalAddr(t *testing.T) {
+	f := startPacketFixture(t)
+	conn, err := f.packet.DialPeer(f.peerAddr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = conn.Close() }()
+	local, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || local.IP == nil || local.Port == 0 {
+		t.Fatalf("child LocalAddr = %v, want the listener's address", conn.LocalAddr())
+	}
+	if want := f.ln.Addr().(*net.UDPAddr); local.Port != want.Port {
+		t.Fatalf("child LocalAddr = %v, want the listener's %v", local, want)
 	}
 }

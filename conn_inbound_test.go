@@ -31,6 +31,12 @@ func serveLoopback(tb testing.TB, events *Events) (string, <-chan error) {
 			return
 		}
 	}
+	// The events close with the test, so a suite run at a high count is not
+	// worn down by servers left running.
+	tb.Cleanup(func() {
+		_ = events.Close(nil)
+		_ = events.Wait()
+	})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("tcp://127.0.0.1:0") }()
 	select {

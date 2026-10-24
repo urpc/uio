@@ -10,6 +10,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"net/netip"
 )
 
 func TestRecvUDPIPv4(t *testing.T) {
@@ -76,5 +77,17 @@ func TestUDPReceiveParsesIPv6AndRejectsInvalidAddresses(t *testing.T) {
 	receive.raw.Addr.Family = unix.AF_UNSPEC
 	if err := receive.parse(unix.SizeofSockaddrAny); !errors.Is(err, unix.EAFNOSUPPORT) {
 		t.Fatalf("unsupported address error = %v", err)
+	}
+}
+
+// A numeric zone is an interface index; a name is looked up.
+func TestUDPAddressForNumericZone(t *testing.T) {
+	addr := netip.MustParseAddrPort("[fe80::1%2]:53")
+	key, err := UDPAddressFor(6, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key.Zone != 2 {
+		t.Fatalf("zone = %d, want the index 2", key.Zone)
 	}
 }

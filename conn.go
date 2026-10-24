@@ -86,6 +86,10 @@ type Conn interface {
 	// descriptor with its listener and peers, so what it sets lands on the
 	// shared socket, which outlives one peer's close. The descriptor is valid
 	// only during fn; native external calls may use a temporary duplicate.
+	// fn must not wait for what its own connection has to make happen: a
+	// callback, a Dial's registration, OnClose after a close — the descriptor
+	// reference Control holds, and on stdio the loop it may run in, can be
+	// part of what fn is waiting for.
 	Control(fn func(fd uintptr)) error
 
 	// SetReadBuffer sets the size of the operating system's

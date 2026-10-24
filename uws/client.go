@@ -45,11 +45,12 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 // write, and ReadMessage returns the next received message. The connection
 // must be read continuously: a Client whose messages are not being read
 // stops reading, so the peer's flow control slows it and its control frames,
-// Ping included, go unanswered. Client.Close always ends a Client, however
-// many messages are waiting, and so do the closes this end starts itself —
-// Dialer.Close, a deadline, a heartbeat timeout, a failed send: a message that
-// arrives once one has begun and finds the queue full is dropped rather than
-// holding the close up.
+// Ping included, go unanswered. Its own sends slow with it: one made while
+// the queue is full waits for reading to resume before it leaves. Client.Close
+// always ends a Client, however many messages are waiting, and so do the
+// closes this end starts itself — Dialer.Close, a deadline, a heartbeat
+// timeout, a failed send: a message that arrives once one has begun and finds
+// the queue full is dropped rather than holding the close up.
 type Client struct {
 	*Conn
 

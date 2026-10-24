@@ -1008,6 +1008,9 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	// in one section with the shutdown publication: either the Events is
 	// closing and none of this runs, or the open is counted and Serve's join
 	// waits for it, so no callback slips past Serve's return.
+	if err := fc.checkPeerAddr(addr); err != nil {
+		return nil, err
+	}
 	events := fc.events
 	events.mux.Lock()
 	if events.closing.Load() {
@@ -1045,6 +1048,22 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 		child.openOnReader()
 	}()
 	return child, nil
+}
+
+// checkPeerAddr reports whether addr can be a peer of this UDP socket: the
+// native backend's DialPeer refuses it in the address translation, and a
+// child for an unusable address would come back to life only to fail every
+// send.
+func (fc *fdConn) checkPeerAddr(addr netip.AddrPort) error {
+	ip := addr.Addr()
+	if !ip.IsValid() {
+		return fmt.Errorf("uio: dial peer %v: %w", addr, syscall.EINVAL)
+	}
+	local := fc.LocalAddr().(*net.UDPAddr)
+	if local.IP.To4() != nil && !ip.Unmap().Is4() {
+		return fmt.Errorf("uio: dial peer %v on udp4: %w", addr, syscall.EAFNOSUPPORT)
+	}
+	return nil
 }
 
 // writeToPeer sends one datagram to addr from a UDP server's socket; see

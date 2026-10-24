@@ -254,8 +254,10 @@ server.Authorize = func(r *http.Request) (any, error) {
 ```
 
 `Dialer.Header` goes with every dial; `Dialer.RequestHeader(userdata)` adds
-per-dial headers on top. Headers the handshake sets itself (Host, Upgrade,
-Connection, `Sec-WebSocket-*`) are refused with `ErrInvalidOptions`.
+per-dial headers on top. Headers the handshake sets itself are refused with
+`ErrInvalidOptions`: Host, Upgrade, Connection, Content-Length,
+Transfer-Encoding, Expect, and `Sec-WebSocket-Key`, `-Version`, `-Protocol`,
+`-Extensions` and `-Accept`.
 `Authorize` runs after the request passed validation and `CheckOrigin`, on the
 native path and behind `net/http` alike. A `*RejectError` answers with its
 status, header and reason; any other error with 403. The answer is sent before

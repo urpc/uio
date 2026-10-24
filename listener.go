@@ -69,9 +69,10 @@ type PacketListener interface {
 // connection accepted there starts with userdata as its Userdata, the way
 // Dial's userdata starts a dialed one. opts configure this listener's
 // sockets; see WithListenControl. With ReusePort, the address gets the group
-// of listeners Serve would give it. Before Serve has started, and once it is
-// closing, Listen returns net.ErrClosed. Events.Close closes the listeners
-// Listen added along with the others.
+// of listeners Serve would give it. A unix path is unlinked and bound
+// afresh, taking the socket file over from whoever held it. Before Serve has
+// started, and once it is closing, Listen returns net.ErrClosed. Events.Close
+// closes the listeners Listen added along with the others.
 func (ev *Events) Listen(addr string, userdata any, opts ...ListenOption) (Listener, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed

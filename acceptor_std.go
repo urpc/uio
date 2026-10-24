@@ -167,7 +167,8 @@ func (ld *acceptor) addLocked(l *listener, userdata any) error {
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
-		l.udpSvr.userdata = userdata // what its peers start with
+		l.udpSvr.setLocalAddr(l.udp.LocalAddr()) // what its peers report
+		l.udpSvr.userdata = userdata             // what its peers start with
 		l.udpSvr.udp = &stdUDPState{sock: l.udp.(*net.UDPConn), peers: make(map[netip.AddrPort]*fdConn)}
 	}
 	if ld.accepting {

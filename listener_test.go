@@ -31,7 +31,12 @@ func (h *listenEcho) events() *Events {
 			_, err := c.WriteTo(c)
 			return err
 		},
-		Close: func(_ Conn, err error) { h.closed <- err },
+		Close: func(_ Conn, err error) {
+			select {
+			case h.closed <- err:
+			default: // a test not counting closes leaves the rest here
+			}
+		},
 	})
 }
 

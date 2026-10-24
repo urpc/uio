@@ -279,3 +279,29 @@ func TestInvalidUpgradeAnswerArrivesBeforeClose(t *testing.T) {
 		}
 	}
 }
+
+// The request Authorize sees carries the peer's address on the native path
+// too, as behind net/http.
+func TestAuthorizeSeesRemoteAddr(t *testing.T) {
+	remote := make(chan string, 4)
+	addr := startAuthServer(t, newAuthRecorder(), func(r *http.Request) (any, error) {
+		remote <- r.RemoteAddr
+		return nil, nil
+	})
+	dialer := &Dialer{}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	client, err := dialAuth(t, dialer, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(1000, "") }()
+	local := client.LocalAddr().String()
+	select {
+	case got := <-remote:
+		if got != local {
+			t.Fatalf("Authorize RemoteAddr = %q, want the peer's %q", got, local)
+		}
+	case <-time.After(testIOTimeout()):
+		t.Fatal("Authorize did not run")
+	}
+}

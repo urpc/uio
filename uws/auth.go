@@ -26,8 +26,10 @@ import (
 
 // RejectError is what Server.Authorize returns to refuse an upgrade with a
 // response of its choosing. Status is the HTTP status, 403 when zero or not a
-// 4xx or 5xx code; Header is added to the response; Reason is its plain-text
-// body, cut to 4 KiB, which a uws client reports as HandshakeError.Reason.
+// 4xx or 5xx code; Header is added to the response — all of it or none: one
+// reserved or malformed name drops the whole header; Reason is its plain-text
+// body, cut to 4 KiB on a whole character, which a uws client reports as
+// HandshakeError.Reason.
 type RejectError struct {
 	Status int
 	Header http.Header
