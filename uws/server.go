@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/ulayer"
 )
 
 // Server accepts WebSocket connections over a UIO transport. Configure its
@@ -109,7 +110,10 @@ func (s *Server) Serve(addrs ...string) error {
 	if s.config.observeTraffic {
 		handler.Inbound = s.onInbound
 	}
-	events.Handler, events.Observer, events.Hooks = handler, handler, handler
+	// The layers wrap what the connections carry, not the traffic the
+	// observer reports or the hooks around Serve.
+	events.Handler = ulayer.Wrap(handler, opts.Layers...)
+	events.Observer, events.Hooks = handler, handler
 	s.startHeartbeat(s.config)
 	s.closeMu.Unlock()
 

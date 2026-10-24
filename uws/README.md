@@ -266,6 +266,31 @@ the connection closes, and the client gets it as a `*HandshakeError` — in
 status, the header and the reason. Without TLS the credentials travel in clear
 text; terminate TLS in front of the server.
 
+## Secure WebSockets (wss)
+
+A TLS layer under the WebSocket protocol makes a server a wss one and a
+dialer speak `wss://`, with no TLS of its own in UWS: configure a
+[`uio/utls`](../utls) layer, or any `uio/ulayer` stack, in `Options.Layers`
+— the last layer sits next to the wire:
+
+```go
+server := uws.NewServer(uws.Options{
+	Handler: handler,
+	Layers:  []ulayer.Layer{utls.Server(tlsConfig)},
+})
+
+dialer := uws.NewDialer(uws.Options{
+	Handler: handler,
+	Layers:  []ulayer.Layer{utls.Client(tlsConfig)}, // ServerName or InsecureSkipVerify
+})
+err := dialer.Dial(ctx, "wss://example.org/socket", nil)
+```
+
+The layers settle before the WebSocket handshake begins: a handshake that
+fails closes the connection with its cause, which the handler's `OnClose`
+reports. Behind `net/http`, `ServeHTTP` does not run the layers — an
+`http.Server`'s own TLS carries them instead.
+
 ## Rules of the road
 
 - **Payloads are borrowed.** `Message.Payload` is valid until `OnMessage`

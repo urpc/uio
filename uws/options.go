@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/ulayer"
 )
 
 // DefaultOutboundHighWatermark is the default queued-output level at which a
@@ -104,6 +105,17 @@ type Options struct {
 	// scheduler.
 	Executor uio.Executor
 
+	// Layers run under the WebSocket protocol, the last of them next to
+	// the wire: a TLS layer makes the server a wss one and a dialer speak
+	// wss, as
+	//
+	//	Layers: []ulayer.Layer{utls.Server(config)}
+	//
+	// does; see uio/ulayer for what a layer is and uio/utls for TLS. The
+	// layers settle before the WebSocket handshake begins: one whose
+	// handshake fails closes the connection with its cause. Serve's net/http
+	// path does not run them — an http.Server's TLS carries them instead.
+	Layers []ulayer.Layer
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the
 	// replies to its requests piling up. It paces only what the connection's
@@ -177,6 +189,9 @@ func (c *statsCounters) snapshot() Stats {
 // configured.
 func (o Options) resolve() (Options, error) {
 	r := o
+	if err := ulayer.Validate(r.Layers...); err != nil {
+		return r, fmt.Errorf("%w: %v", ErrInvalidOptions, err)
+	}
 	if r.MaxHeaderBytes == 0 {
 		r.MaxHeaderBytes = DefaultMaxHeaderBytes
 	}

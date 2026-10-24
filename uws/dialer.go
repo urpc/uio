@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/ulayer"
 	"github.com/urpc/uio/uws/internal/handshake"
 )
 
@@ -108,8 +109,11 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		return err
 	}
 	target, err := url.Parse(addr)
-	if err != nil || target.Scheme != "ws" || target.Host == "" {
-		return fmt.Errorf("uws: only ws:// targets are supported: %w", ErrProtocol)
+	if err != nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
+		return fmt.Errorf("uws: only ws:// and wss:// targets are supported: %w", ErrProtocol)
+	}
+	if target.Scheme == "wss" && len(d.Options.Layers) == 0 {
+		return fmt.Errorf("%w: wss:// needs a secure layer in Layers", ErrInvalidOptions)
 	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
@@ -143,6 +147,7 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		key:      key,
 	}
 	setup.conn = d.newClientConn(nil, setup)
+	setup.request = request
 	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup)
 	if err != nil {
 		cause := context.Cause(attemptCtx)
@@ -155,27 +160,38 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		}
 		return err
 	}
-	setup.attach(raw)
+	_ = raw
+	return nil
+}
+
+// sendRequest writes the upgrade request once the stack under it has
+// settled — with a TLS layer, its OnOpen runs after that layer's handshake,
+// and the request must not go out in the clear before it. The request's
+// OnOutbound retires pending bytes like any frame's, so it must be counted,
+// or it would retire the bytes of a later Close frame and let the graceful
+// close drop that frame.
+func (d *Dialer) sendRequest(raw uio.Conn, setup *dialSetup) {
 	conn := setup.conn
-	// The request's OnOutbound retires pending bytes like any frame's, so it
-	// must be counted, or it would retire the bytes of a later Close frame
-	// and let the graceful close drop that frame.
-	conn.trackOutbound(len(request))
-	n, err := raw.Write(request)
-	if err == nil && n != len(request) {
+	if conn == nil {
+		return
+	}
+	conn.trackOutbound(len(setup.request))
+	n, err := raw.Write(setup.request)
+	if err == nil && n != len(setup.request) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		conn.rollbackOutbound(len(request) - n)
-	} else {
-		err = raw.Flush()
+		conn.rollbackOutbound(len(setup.request) - n)
+		if !errors.Is(err, net.ErrClosed) {
+			// A connection already closed, possibly after the whole
+			// handshake ran, reports its own cause.
+			_ = raw.CloseWith(err)
+		}
+		return
 	}
-	if err != nil && !errors.Is(err, net.ErrClosed) {
-		// A connection already closed, possibly after the whole handshake
-		// ran, reports its own cause.
+	if err := raw.Flush(); err != nil && !errors.Is(err, net.ErrClosed) {
 		_ = raw.CloseWith(err)
 	}
-	return nil
 }
 
 // Close permanently stops the dialer, cancels in-flight connection attempts,
@@ -266,7 +282,10 @@ func (d *Dialer) start(ctx context.Context) error {
 			Outbound: d.onOutbound,
 			Inbound:  d.onInbound,
 		}
-		events.Handler, events.Observer, events.Hooks = handler, handler, handler
+		// The layers wrap what the connections carry, not the traffic the
+		// observer reports or the hooks around Serve.
+		events.Handler = ulayer.Wrap(handler, opts.Layers...)
+		events.Observer, events.Hooks = handler, handler
 		d.startHeartbeat(d.config)
 		go func() {
 			err := events.Serve()
@@ -402,6 +421,7 @@ func (d *Dialer) onOpen(raw uio.Conn) {
 	raw.SetUserdata(conn)
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 	conn.watchHandshakeContext(setup.Context)
+	d.sendRequest(raw, setup)
 }
 
 func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
@@ -526,6 +546,7 @@ type dialSetup struct {
 	key        string
 	conn       *Conn
 	attachOnce sync.Once
+	request    []byte // the upgrade request, sent once the layers settle
 }
 
 func (setup *dialSetup) attach(raw uio.Conn) {
