@@ -262,7 +262,7 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			l.udpSvr.events = ld.events
 			l.udpSvr.internal = true
 			l.udpSvr.addr = l.pair
-			l.udpSvr.userdata = userdata // What its peers start with.
+			l.udpSvr.SetUserdata(userdata) // What its peers start with.
 			// Ownership precedes publication and outlives listener removal,
 			// even when the listener closes before accepting starts.
 			if err := l.udpSvr.loop.trackListener(l.udpSvr); err != nil {

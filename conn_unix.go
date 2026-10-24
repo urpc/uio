@@ -1707,7 +1707,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 			}
 			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
 			packetConn.events, packetConn.loop = conn.events, conn.loop
-			packetConn.userdata = conn.userdata // the listener's
+			packetConn.SetUserdata(conn.Userdata()) // the listener's
 			packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
 			udp.peers[source] = packetConn
 			created = true
@@ -1777,7 +1777,7 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	child := &fdConn{fd: server.fd, udp: &unixUDPState{remote: sockaddr, server: server, key: key}}
 	child.events, child.loop = server.events, server.loop
 	child.addr, child.remoteAddr = server.addr, key.NetAddr().AddrPort()
-	child.userdata = userdata
+	child.SetUserdata(userdata)
 	child.udp.openOwed.Store(true)
 	// A closing child still in the map is replaced: its release leaves the
 	// new one there.

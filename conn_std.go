@@ -1039,7 +1039,7 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	child.setRemoteAddr(net.UDPAddrFromAddrPort(rAddr))
 	child.loop = fc.loop
 	child.events = fc.events
-	child.userdata = userdata
+	child.SetUserdata(userdata)
 	child.retainLifecycle()
 	fc.udp.peers[rAddr] = child
 	fc.mux.Unlock()
@@ -1660,7 +1660,7 @@ func (fc *fdConn) listenUDP() error {
 			udpConn.setRemoteAddr(addr)
 			udpConn.loop = fc.loop
 			udpConn.events = fc.events
-			udpConn.userdata = fc.userdata // the listener's
+			udpConn.SetUserdata(fc.Userdata()) // the listener's
 			udpConn.retainLifecycle()
 
 			fc.udp.peers[rAddr] = udpConn

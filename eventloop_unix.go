@@ -590,7 +590,7 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 		conn.loop = loop.events.loopAt(waiter.accepted)
 		waiter.accepted++
 		conn.addr = l.pair
-		conn.userdata = l.userdata
+		conn.SetUserdata(l.userdata)
 		if l.tcp {
 			conn.remoteAddr = socket.SockaddrToAddrPort(sa)
 		} else {

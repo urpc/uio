@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
+	"sync/atomic"
 )
 
 // Conn is a connection managed by Events. On native Unix, socket I/O and
@@ -42,13 +43,11 @@ type Conn interface {
 	// RemoteAddr is the connection's remote address.
 	RemoteAddr() net.Addr
 
-	// Userdata returns user-defined connection data. It may be called outside a
-	// callback, but callers must serialize it with SetUserdata. Native
-	// OnOutbound may run beside the connection's other callbacks.
+	// Userdata returns user-defined connection data. It may be read from any
+	// callback, OnOutbound included, and from other goroutines.
 	Userdata() any
 
-	// SetUserdata replaces user-defined connection data. It may be called outside
-	// a callback, but callers must serialize it with Userdata.
+	// SetUserdata replaces user-defined connection data, from any goroutine.
 	SetUserdata(value any)
 
 	// SetLinger sets the behavior of Close on a connection which still
@@ -277,7 +276,7 @@ type commonConn struct {
 	events *Events    // events
 	loop   *eventLoop // event loop
 	inboundScope
-	userdata    any                     // user-defined data; see Conn.SetUserdata
+	userdata    atomic.Pointer[any]     // user-defined data; see Conn.SetUserdata
 	inboundTail []byte                  // inbound tail buffer
 	inbound     bytebuf.CompositeBuffer // inbound buffer
 	// addr carries the address objects LocalAddr and RemoteAddr hand back.
@@ -343,13 +342,26 @@ func remoteAddrFrom(addr net.Addr) netip.AddrPort {
 	return netip.AddrPort{}
 }
 
-// Userdata is read on every data callback. Callers already serialize it with
-// SetUserdata, so it is a plain field: boxing it for atomic publication cost a
-// pointer chase, and a cache miss, per callback. Lifecycle and data callbacks
-// are ordered by the connection's turn, but native OnOutbound may run beside
-// them, so a value read there must not be replaced in those callbacks.
-func (fc *commonConn) Userdata() any         { return fc.userdata }
-func (fc *commonConn) SetUserdata(value any) { fc.userdata = value }
+// Userdata is published atomically: a layer under a protocol writes before
+// the protocol's callbacks map the connection — TLS handshake records retire
+// beside the WebSocket open that names its connection — so a value read by
+// OnOutbound may be replaced in those callbacks, and the swap is one pointer,
+// never a torn interface. The read is a pointer chase more than a field was;
+// SetUserdata boxes its value, once per set.
+func (fc *commonConn) Userdata() any {
+	if held := fc.userdata.Load(); held != nil {
+		return *held
+	}
+	return nil
+}
+
+func (fc *commonConn) SetUserdata(value any) {
+	if value == nil {
+		fc.userdata.Store(nil)
+		return
+	}
+	fc.userdata.Store(&value)
+}
 
 func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
 func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
