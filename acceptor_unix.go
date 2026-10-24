@@ -30,6 +30,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/urpc/uio/internal/socket"
 )
@@ -54,37 +55,76 @@ type listener struct {
 	// userdata is every accepted connection's initial Userdata.
 	userdata any
 	started  bool // registered with its loop; guarded by acceptor.mux
-	// use counts the waiters accepting on the listener, below its closed
-	// bit; see enter and retire.
+	// The gate counts the waiters accepting on the listener. A waiter may
+	// have looked l up just before it left its loop, so its descriptor is
+	// closed only after retire returns: closed earlier, the number could be
+	// reused by another socket that waiter would then accept on.
+	descriptorGate
+	// acceptPaused marks a stream listener taken out of its poller after an
+	// accept ran out of descriptors or memory, and acceptDelay is the pause
+	// that took, zero again once an accept succeeds; see pauseAccept.
+	acceptPaused atomic.Bool
+	acceptDelay  atomic.Int64
+}
+
+// descriptorGate counts the goroutines using a descriptor, below a closed
+// bit. retire closes it to new users and waits for those in progress, so the
+// descriptor can close without its number being reused under one of them.
+// Nothing a user does while counted may wait for the descriptor's closer.
+type descriptorGate struct {
 	use atomic.Int64
 }
 
-// listenerClosed is the bit of listener.use a closing listener sets.
-const listenerClosed = 1 << 62
+// gateClosed is the bit of descriptorGate.use that retire sets.
+const gateClosed = 1 << 62
 
-// enter reports whether a waiter may accept on l, and counts it until leave.
-func (l *listener) enter() bool {
+// enter reports whether the descriptor may still be used, and counts the
+// caller until leave.
+func (g *descriptorGate) enter() bool {
 	for {
-		use := l.use.Load()
-		if use&listenerClosed != 0 {
+		use := g.use.Load()
+		if use&gateClosed != 0 {
 			return false
 		}
-		if l.use.CompareAndSwap(use, use+1) {
+		if g.use.CompareAndSwap(use, use+1) {
 			return true
 		}
 	}
 }
 
-func (l *listener) leave() { l.use.Add(-1) }
+func (g *descriptorGate) leave() {
+	if g != nil {
+		g.use.Add(-1)
+	}
+}
 
-// retire stops new accepts on l and waits for the ones in progress. A waiter
-// may have looked l up just before it left its loop, so its descriptor is
-// closed only after this returns: closed earlier, the number could be reused
-// by another socket that waiter would then accept on.
-func (l *listener) retire() {
-	l.use.Or(listenerClosed)
-	for l.use.Load() != listenerClosed {
-		runtime.Gosched()
+// retire stops new users and waits for the ones in progress. They are
+// syscalls, which end at once, or a Control's fn, which may take its time.
+func (g *descriptorGate) retire() {
+	g.markClosed()
+	g.waitDrain(0)
+}
+
+// markClosed stops new users without waiting for the ones in progress.
+func (g *descriptorGate) markClosed() { g.use.Or(gateClosed) }
+
+// waitDrain waits for every user in progress to leave, at most as long as
+// within; a zero within waits without bound. It reports whether they all
+// left.
+func (g *descriptorGate) waitDrain(within time.Duration) bool {
+	deadline := time.Now().Add(within)
+	for spins := 0; ; spins++ {
+		if g.use.Load() == gateClosed {
+			return true
+		}
+		if within > 0 && time.Now().After(deadline) {
+			return false
+		}
+		if spins < 64 {
+			runtime.Gosched()
+		} else {
+			time.Sleep(50 * time.Microsecond)
+		}
 	}
 }
 
@@ -277,7 +317,8 @@ func (ld *acceptor) startLocked(l *listener) error {
 // stopLocked takes l out of the registry and releases it while Serve runs;
 // it requires ld.mux. A stream listener leaves its loop first, and its
 // descriptor closes only once no waiter accepts on it any more. A UDP
-// listener's server connection closes in its own turn, and its peers with it.
+// listener's server connection closes in its own turn, and its peers with it;
+// its socket may close sooner, see closeGroup.
 func (ld *acceptor) stopLocked(l *listener) {
 	delete(ld.listeners, l.fd)
 	if l.udpSvr != nil {
@@ -301,14 +342,24 @@ func (ld *acceptor) stopLocked(l *listener) {
 	ld.closeListener(l)
 }
 
-// closeGroup releases group unless shutdown already did.
+// closeGroup releases group unless shutdown already did. A UDP listener's
+// socket closes before it returns, so the address is free for the next bind,
+// once ld.mux is released: closing waits for a Control in progress on the
+// socket, whose fn may add or close listeners.
 func (ld *acceptor) closeGroup(group []*listener) {
 	ld.mux.Lock()
-	defer ld.mux.Unlock()
+	var servers []*fdConn
 	for _, l := range group {
 		if ld.listeners[l.fd] == l {
 			ld.stopLocked(l)
+			if l.udpSvr != nil {
+				servers = append(servers, l.udpSvr)
+			}
 		}
+	}
+	ld.mux.Unlock()
+	for _, server := range servers {
+		server.releaseSocketNow()
 	}
 }
 

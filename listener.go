@@ -29,9 +29,14 @@ type Listener interface {
 	// port the system chose.
 	Addr() net.Addr
 
-	// Close stops accepting on the address and frees it. Stream connections
-	// already accepted stay open. A UDP listener's peers share its socket, so
-	// they close with it, with net.ErrClosed. Closing again does nothing.
+	// Close stops accepting on the address and frees it: once Close returns,
+	// the address can be bound again. Stream connections already accepted
+	// stay open. A UDP listener's peers share its socket, so they close with
+	// it, with net.ErrClosed. Two cases free a UDP address only after Close
+	// returns: a Close from a callback of one of the listener's own peers or
+	// from inside a Control on its socket frees it once that returns, and a
+	// Control still running elsewhere holds it until it returns. Closing again
+	// does nothing.
 	Close() error
 }
 

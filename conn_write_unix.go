@@ -330,7 +330,13 @@ func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 		owner.submitMu.Unlock()
 		return 0, net.ErrClosed
 	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
 	written, err := conn.sendDatagram(data)
+	gate.leave()
 	owner.submitMu.Unlock()
 	return conn.finishDatagram(data, written, err)
 }
@@ -659,7 +665,13 @@ func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
 func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
 	owner := conn.descriptorOwner()
 	owner.submitMu.Lock()
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
 	written, err = conn.sendDatagram(data)
+	gate.leave()
 	owner.submitMu.Unlock()
 	return conn.finishDatagram(data, written, err)
 }

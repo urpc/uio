@@ -477,3 +477,9 @@ func (fc *commonConn) InboundBuffered() int {
 	fc.assertInboundAccess()
 	return fc.inbound.Len() + len(fc.inboundTail)
 }
+
+// socketCloseWait is how long a closing listener waits for syscalls and
+// Controls on its socket to end before Close returns without the address
+// freed; whatever holds it past that releases the socket itself, and the
+// close keeps retrying until then.
+const socketCloseWait = 50 * time.Millisecond

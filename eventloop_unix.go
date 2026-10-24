@@ -513,6 +513,49 @@ func (loop *eventLoop) removeListener(l *listener) {
 	_ = loop.poller.Remove(l.fd, poller.Readable)
 }
 
+// minAcceptPause and maxAcceptPause bound the pause after an accept that ran
+// out of descriptors or memory.
+const (
+	minAcceptPause = 5 * time.Millisecond
+	maxAcceptPause = time.Second
+)
+
+// pauseAccept stops watching l after an accept ran out of something the next
+// connection needs as well, descriptors or memory: the level-triggered
+// listener would report the waiting connection again at once and spin its
+// waiters. It watches l again after a pause that doubles while the shortage
+// lasts; the other listeners and connections carry on meanwhile.
+func (loop *eventLoop) pauseAccept(l *listener) {
+	if !l.acceptPaused.CompareAndSwap(false, true) {
+		return
+	}
+	delay := time.Duration(l.acceptDelay.Load())
+	if delay == 0 {
+		delay = minAcceptPause
+	} else {
+		delay = min(2*delay, maxAcceptPause)
+	}
+	l.acceptDelay.Store(int64(delay))
+	_ = loop.poller.Remove(l.fd, poller.Readable)
+	time.AfterFunc(delay, func() { loop.resumeAccept(l) })
+}
+
+// resumeAccept watches a paused listener again, unless it is closing or has
+// left the loop. A Listener.Close that overtakes this call removes l from the
+// poller after it, or closes the descriptor, which drops the registration
+// with the socket; and its retire waits for this call to leave.
+func (loop *eventLoop) resumeAccept(l *listener) {
+	if !l.enter() {
+		return
+	}
+	defer l.leave()
+	l.acceptPaused.Store(false)
+	if loop.listener(l.fd) != l {
+		return
+	}
+	_ = loop.poller.Add(l.fd, poller.Readable)
+}
+
 // accept takes a bounded batch of connections from l and queues each one's
 // first turn on the waiter, which hands them over with the readiness it
 // collected. The bound keeps a busy listener from holding up the other
@@ -529,7 +572,17 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 			if isWouldBlock(err) {
 				return nil
 			}
+			switch socket.ClassifyAcceptError(err) {
+			case socket.AcceptRetry:
+				continue
+			case socket.AcceptBackoff:
+				loop.pauseAccept(l)
+				return nil
+			}
 			return err
+		}
+		if l.acceptDelay.Load() != 0 {
+			l.acceptDelay.Store(0)
 		}
 		conn := &fdConn{}
 		conn.fd = int32(nfd)
@@ -634,6 +687,10 @@ func (loop *eventLoop) registerListener(server *fdConn) error {
 	if server.isClosing() || loop.stopping.Load() {
 		return net.ErrClosed
 	}
+	if !server.udp.gate.enter() {
+		return net.ErrClosed
+	}
+	defer server.udp.gate.leave()
 	if err := loop.fdMap.Put(int(server.fd), server); err != nil {
 		return err
 	}
@@ -648,17 +705,20 @@ func (loop *eventLoop) registerListener(server *fdConn) error {
 // stream's descriptor normally owns its socket alone, so closing it removes
 // it from the poller without an extra syscall. Connections used by external
 // Control calls need explicit removal, since an alias may still be open.
-// A UDP listener shares its socket with the Go
-// listener that is closed later, so it is removed explicitly.
+// A dialed UDP socket is removed explicitly too. A UDP listener's server
+// leaves both in releaseSocket, which may already have run on the
+// Listener.Close caller: its descriptor number may belong to another socket
+// by now, so here it only leaves the registry of servers.
 func (loop *eventLoop) forget(conn *fdConn) {
+	if conn.internal {
+		loop.udpMu.Lock()
+		delete(loop.udpServers, conn)
+		loop.udpMu.Unlock()
+		return
+	}
 	loop.fdMap.DeleteValue(conn.Fd(), conn)
 	if conn.isDatagram() {
 		_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())
-		if conn.internal {
-			loop.udpMu.Lock()
-			delete(loop.udpServers, conn)
-			loop.udpMu.Unlock()
-		}
 	} else {
 		if conn.flags.Load()&controlAliasFlag != 0 {
 			_ = loop.poller.Remove(conn.Fd(), conn.currentInterest())

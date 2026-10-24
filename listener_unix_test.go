@@ -69,3 +69,40 @@ func TestListenReusePortGroup(t *testing.T) {
 	_ = ln.Close()
 	waitRefused(t, addr)
 }
+
+// A listener closed while its accepting is paused stays out of the poller:
+// the pause's re-arm finds it closing and leaves it, and a listener that
+// takes over its descriptor number accepts as usual.
+func TestPausedListenerCloseBeforeResume(t *testing.T) {
+	opened := make(chan Conn, 4)
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Open: func(c Conn) { opened <- c }})
+	serveClosing(t, events)
+	for round := range 20 {
+		ln, err := events.Listen("tcp4://127.0.0.1:0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		group := ln.(*listenerGroup)
+		l := group.members[0]
+		l.loop.pauseAccept(l)
+		if err := ln.Close(); err != nil {
+			t.Fatal(err)
+		}
+		next, err := events.Listen("tcp4://127.0.0.1:0", nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * minAcceptPause) // the closed listener's re-arm has run
+		c, err := net.Dial("tcp4", next.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-opened:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("round %d: the listener after a paused one did not accept", round)
+		}
+		_ = c.Close()
+		_ = next.Close()
+	}
+}

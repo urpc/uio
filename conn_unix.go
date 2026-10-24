@@ -146,6 +146,16 @@ type unixUDPState struct {
 	// reportOutbound.
 	outboundPending atomic.Int64
 	outboundClaim   atomic.Bool
+
+	// A server's socket closes on whichever goroutine gets there first —
+	// Listener.Close's caller, so the address is free when it returns, or the
+	// release in the server's turn — so every syscall on it, from any
+	// goroutine, holds the gate; see releaseSocket.
+	gate descriptorGate
+	// closeMu and closed hold the socket close's single owner; see
+	// releaseSocket.
+	closeMu sync.Mutex
+	closed  chan struct{}
 }
 
 // deadlineState is guarded by submitMu except for its atomic timer generations.
@@ -1268,9 +1278,12 @@ func (conn *fdConn) RunTask() {
 
 func (conn *fdConn) closeUnregistered() {
 	if conn.close.abandon() {
-		if conn.udp != nil && conn.udp.file != nil {
+		switch {
+		case conn.internal:
+			conn.releaseSocket()
+		case conn.udp != nil && conn.udp.file != nil:
 			_ = conn.udp.file.Close()
-		} else {
+		default:
 			_ = syscall.Close(int(conn.fd))
 		}
 	}
@@ -1343,7 +1356,13 @@ func (conn *fdConn) Control(fn func(fd uintptr)) error {
 	// Keep the socket alive without holding a submission lock across user
 	// code: fn may close this connection or its listener. A temporary alias
 	// applies the same socket options and cannot be reused under the call.
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return net.ErrClosed
+	}
 	fd, err := socket.Dup(int(owner.fd))
+	gate.leave()
 	if err == nil {
 		owner.flags.Or(controlAliasFlag)
 	}
@@ -1356,12 +1375,85 @@ func (conn *fdConn) Control(fn func(fd uintptr)) error {
 	return nil
 }
 
+// applyControl runs fn on the turn that owns the descriptor. On a UDP
+// server's socket the gate stays held across fn: a Listener.Close elsewhere
+// waits for fn to return before closing the socket, and one from fn itself
+// leaves the close to this turn.
 func (conn *fdConn) applyControl(fn func(fd uintptr)) error {
 	if conn.close.isReleased() || conn.descriptorOwner().close.isReleased() {
 		return net.ErrClosed
 	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		return net.ErrClosed
+	}
+	defer gate.leave()
 	fn(uintptr(conn.fd))
 	return nil
+}
+
+// enterDescriptor counts a syscall on a UDP server's socket, which children
+// and Listener.Close reach from any goroutine, and reports false once that
+// socket is closing; see descriptorGate. Leave the returned gate when done; it
+// is nil for a connection whose descriptor is its own, which closes only in
+// its own turn.
+func (conn *fdConn) enterDescriptor() (*descriptorGate, bool) {
+	owner := conn.descriptorOwner()
+	if !owner.internal || owner.udp == nil {
+		return nil, true
+	}
+	gate := &owner.udp.gate
+	return gate, gate.enter()
+}
+
+// releaseSocket hands the socket close to its one owner, started by whoever
+// calls first, and returns a channel closed once the socket is closed: it
+// stops new syscalls on the socket, then — once those in progress have ended
+// — takes the descriptor out of the fd table and the poller, explicitly since
+// a Control alias may keep the socket open, and closes it. A Control that
+// outlasts socketCloseWait holds the close, which keeps retrying, so waiting
+// on the channel is waiting on a fn that may be waiting for the close itself:
+// bound the wait, and let the retry close once the fn returns.
+func (server *fdConn) releaseSocket() <-chan struct{} {
+	server.udp.closeMu.Lock()
+	if server.udp.closed != nil {
+		done := server.udp.closed
+		server.udp.closeMu.Unlock()
+		return done
+	}
+	done := make(chan struct{})
+	server.udp.closed = done
+	server.udp.closeMu.Unlock()
+	go func() {
+		defer close(done)
+		server.udp.gate.markClosed()
+		for !server.udp.gate.waitDrain(socketCloseWait) {
+			time.Sleep(socketCloseWait)
+		}
+		server.loop.fdMap.DeleteValue(int(server.fd), server)
+		_ = server.loop.poller.Remove(int(server.fd), server.currentInterest())
+		if server.udp.file != nil {
+			_ = server.udp.file.Close()
+		} else {
+			_ = syscall.Close(int(server.fd))
+		}
+	}()
+	return done
+}
+
+// releaseSocketNow closes a closing UDP server's socket on the caller, so the
+// address is free once Listener.Close returns — unless a Control on the
+// socket outlasts the wait. The server's own turn — a callback of one of its
+// peers — may hold the gate in a Control, so there the release at the end of
+// the turn closes it instead.
+func (server *fdConn) releaseSocketNow() {
+	if server.ioOwner.Load() == currentGoroutineID() {
+		return
+	}
+	select {
+	case <-server.releaseSocket():
+	case <-time.After(2 * socketCloseWait):
+	}
 }
 
 // descriptorOwner is the connection whose release closes this connection's
@@ -1377,6 +1469,11 @@ func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
 	if conn.close.isReleased() || conn.descriptorOwner().close.isReleased() {
 		return net.ErrClosed
 	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		return net.ErrClosed
+	}
+	defer gate.leave()
 	switch kind {
 	case optionLinger:
 		return socket.SetLinger(int(conn.fd), value)
@@ -1570,7 +1667,12 @@ func (conn *fdConn) onRecvUDP() error {
 	totalRead := 0
 	var receive socket.UDPReceive
 	for packets := 0; packets < 256 && totalRead < 1<<20; packets++ {
+		gate, open := conn.enterDescriptor()
+		if !open {
+			return nil // The listener closed its socket; the release follows.
+		}
 		n, err := socket.RecvUDP(int(conn.fd), buffer, &receive)
+		gate.leave()
 		if err != nil {
 			if isWouldBlock(err) {
 				return nil
@@ -1699,7 +1801,12 @@ func (server *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 	if server.isClosing() || server.close.isReleased() || server.events.closing.Load() {
 		return 0, net.ErrClosed
 	}
-	if err := syscall.Sendto(int(server.fd), b, 0, sockaddr); err != nil {
+	if !server.udp.gate.enter() {
+		return 0, net.ErrClosed
+	}
+	err = syscall.Sendto(int(server.fd), b, 0, sockaddr)
+	server.udp.gate.leave()
+	if err != nil {
 		return 0, err
 	}
 	return len(b), nil
@@ -1969,11 +2076,16 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 				}
 			}
 		}
-		conn.loop.forget(conn)
-		if conn.udp != nil && conn.udp.file != nil {
-			_ = conn.udp.file.Close()
+		if conn.internal {
+			conn.releaseSocket()
+			conn.loop.forget(conn)
 		} else {
-			_ = syscall.Close(int(conn.fd))
+			conn.loop.forget(conn)
+			if conn.udp != nil && conn.udp.file != nil {
+				_ = conn.udp.file.Close()
+			} else {
+				_ = syscall.Close(int(conn.fd))
+			}
 		}
 	}
 	conn.submitMu.Lock()

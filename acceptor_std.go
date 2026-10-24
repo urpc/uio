@@ -20,6 +20,7 @@ package uio
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -120,23 +121,26 @@ func (ld *acceptor) startAccepting() error {
 
 // closeGroup releases group unless shutdown already did. Closing a stream
 // listener ends its accept goroutine; a UDP listener's server connection
-// closes its peers first.
+// closes its peers first, and its socket before closeGroup returns — once
+// ld.mux is released, since it waits for Controls in progress on the socket,
+// whose fn may add or close listeners.
 func (ld *acceptor) closeGroup(group []*listener) {
 	ld.mux.Lock()
-	defer ld.mux.Unlock()
+	var servers []*fdConn
 	for _, l := range group {
 		if ld.listeners[l.key] != l {
 			continue
 		}
 		delete(ld.listeners, l.key)
 		if l.udpSvr != nil {
-			// Publish the cause and detach the peer table now; a counted task
-			// releases the socket. The caller may be inside a peer's Control,
-			// holding a descriptor reference that socket close must wait for.
-			l.udpSvr.requestClose(net.ErrClosed)
+			servers = append(servers, l.udpSvr)
 			continue
 		}
 		ld.closeListener(l)
+	}
+	ld.mux.Unlock()
+	for _, server := range servers {
+		server.closeListenerSocket(net.ErrClosed)
 	}
 }
 
@@ -193,20 +197,25 @@ func (ld *acceptor) startLocked(l *listener) {
 		for {
 			conn, err := l.ln.Accept()
 			if nil != err {
-				if ne, ok := err.(net.Error); ok && ne.Timeout() {
-					if tempDelay == 0 {
-						tempDelay = 5 * time.Millisecond
-					} else {
-						tempDelay *= 2
-					}
-					if maxDelay := 1 * time.Second; tempDelay > maxDelay {
-						tempDelay = maxDelay
-					}
-					time.Sleep(tempDelay)
-					continue
+				// Only closing the listener ends accepting. Anything else —
+				// out of descriptors or memory, a connection reset while it
+				// waited — is retried after a pause that doubles while the
+				// failures last.
+				if errors.Is(err, net.ErrClosed) {
+					return
 				}
-				return
+				if tempDelay == 0 {
+					tempDelay = 5 * time.Millisecond
+				} else {
+					tempDelay *= 2
+				}
+				if maxDelay := 1 * time.Second; tempDelay > maxDelay {
+					tempDelay = maxDelay
+				}
+				time.Sleep(tempDelay)
+				continue
 			}
+			tempDelay = 0
 
 			fdc := &fdConn{}
 			fdc.conn = conn

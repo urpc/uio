@@ -67,6 +67,13 @@ type stdUDPState struct {
 	// DialPeer and WriteTo refuse it; the counted close task owns it until
 	// physical release, even when the close queue has already stopped.
 	closingPeers map[netip.AddrPort]*fdConn
+
+	// controlling lists the goroutines inside a Control on a server's
+	// socket, its peers' included. Closing the socket waits for their
+	// descriptor references, so Listener.Close cannot close it on one of
+	// them; see closeListenerSocket.
+	controlMu   sync.Mutex
+	controlling []int64
 }
 
 type fdConn struct {
@@ -251,7 +258,92 @@ func (fc *fdConn) Control(fn func(fd uintptr)) error {
 	if err != nil {
 		return err
 	}
+	if fc.udp != nil {
+		server := fc
+		if fc.udp.svr != nil {
+			server = fc.udp.svr
+		}
+		defer server.udp.leaveControl(server.udp.enterControl())
+	}
 	return raw.Control(func(fd uintptr) { fn(fd) })
+}
+
+// enterControl records the calling goroutine as inside a Control on the
+// socket, until leaveControl.
+func (udp *stdUDPState) enterControl() int64 {
+	id := currentGoroutineID()
+	udp.controlMu.Lock()
+	udp.controlling = append(udp.controlling, id)
+	udp.controlMu.Unlock()
+	return id
+}
+
+func (udp *stdUDPState) leaveControl(id int64) {
+	udp.controlMu.Lock()
+	for i, held := range udp.controlling {
+		if held == id {
+			udp.controlling = append(udp.controlling[:i], udp.controlling[i+1:]...)
+			break
+		}
+	}
+	udp.controlMu.Unlock()
+}
+
+// controlsQuiet waits, bounded, for the Controls on the socket to end.
+func (udp *stdUDPState) controlsQuiet() bool {
+	deadline := time.Now().Add(socketCloseWait)
+	for {
+		udp.controlMu.Lock()
+		held := len(udp.controlling)
+		udp.controlMu.Unlock()
+		if held == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// inControl reports whether the calling goroutine is inside a Control on the
+// socket.
+func (udp *stdUDPState) inControl() bool {
+	id := currentGoroutineID()
+	udp.controlMu.Lock()
+	defer udp.controlMu.Unlock()
+	for _, held := range udp.controlling {
+		if held == id {
+			return true
+		}
+	}
+	return false
+}
+
+// closeListenerSocket closes a UDP listener's server connection on the
+// Listener.Close caller, so its address is free when Close returns. A Control
+// on the socket holds a descriptor reference the socket close waits for: one
+// by the caller itself would wait forever, and one that outlasts
+// socketCloseWait may be waiting for this very Close, so both fall back to
+// the counted close task, which closes the socket once the Control returns.
+func (fc *fdConn) closeListenerSocket(err error) {
+	events := fc.events
+	if fc.udp.inControl() || !fc.udp.controlsQuiet() {
+		fc.requestClose(err)
+		return
+	}
+	// Count the close as shutdown counts a close task: it may still deliver
+	// the peers' OnClose, which Serve's return must not precede.
+	events.mux.Lock()
+	if events.closing.Load() {
+		events.mux.Unlock()
+		fc.requestClose(err)
+		return
+	}
+	events.callbackWG.Add(1)
+	events.mux.Unlock()
+	defer events.callbackWG.Done()
+	fc.closeOnLoop(err)
 }
 
 func (fc *fdConn) RemoteAddr() net.Addr {
