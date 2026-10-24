@@ -6,20 +6,21 @@ kept outside the repository because the complete HTML and JSON output is large.
 
 ## Latest result
 
-The full suite was run on 2026-09-29 against UIO revision
-`d9e461b9724164bf9b93af0bf184dd9b3153c269`:
+The full suite was run on 2026-10-24 against UIO revision
+`f217e7b1ea83dae7ed5600f4f67caee67e90656c`,
+once on the native backend and once on the stdio backend:
 
-- 517 total cases
+- 517 total cases on each backend
 - 510 `OK`
 - 4 `NON-STRICT`: `6.4.1` through `6.4.4`
 - 3 `INFORMATIONAL`: `7.1.6`, `7.13.1`, and `7.13.2`
 - 0 `FAILED` or `UNIMPLEMENTED`
 - Compression enabled for all 216 RFC 7692 cases
 
-The run took 1080 seconds using Go 1.27.1 on Linux 6.8.0 x86-64, Docker
-28.3.3, and the pinned Autobahn image documented below. It validates the
-send path after the v1.5.0 write-lock rework with results identical to the
-2026-09-04 baseline.
+The two runs took about 1060 seconds together using Go 1.27.1 on Linux 6.8.0
+x86-64, Docker 28.3.3, and the pinned Autobahn image documented below. They
+validate the release review's listener, handshake and close fixes with
+results identical to every run since 2026-09-04.
 
 ## Run the suite
 
