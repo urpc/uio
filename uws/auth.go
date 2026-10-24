@@ -35,17 +35,29 @@ type RejectError struct {
 }
 
 func (e *RejectError) Error() string {
-	if e.Reason != "" {
+	if e != nil && e.Reason != "" {
 		return fmt.Sprintf("uws: upgrade rejected with %d: %s", e.status(), e.Reason)
 	}
 	return fmt.Sprintf("uws: upgrade rejected with %d", e.status())
 }
 
+// status is the response status; a nil *RejectError, still a non-nil error
+// when Authorize returns one, refuses with 403 like any other error.
 func (e *RejectError) status() int {
-	if e.Status < 400 || e.Status > 599 {
+	if e == nil || e.Status < 400 || e.Status > 599 {
 		return http.StatusForbidden
 	}
 	return e.Status
+}
+
+// asRejectError finds the RejectError in err, or nil when it carries none or
+// a nil one.
+func asRejectError(err error) *RejectError {
+	var reject *RejectError
+	if errors.As(err, &reject) {
+		return reject
+	}
+	return nil
 }
 
 // HandshakeError reports a server that refused the upgrade: it answered with
@@ -70,8 +82,7 @@ func (e *HandshakeError) Error() string {
 // what an Authorize RejectError asks for, 403 for any other Authorize error,
 // and 400 for a request that is not a valid upgrade.
 func rejectResponse(err error) []byte {
-	var reject *RejectError
-	if errors.As(err, &reject) {
+	if reject := asRejectError(err); reject != nil {
 		header := reject.Header
 		if handshake.CheckRejectHeader(header) != nil {
 			header = nil

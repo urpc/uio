@@ -18,7 +18,6 @@ package uws
 
 import (
 	"bufio"
-	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -174,8 +173,7 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 // the response rejectResponse would send.
 func writeRejection(writer http.ResponseWriter, err error) {
 	status, reason := http.StatusForbidden, ""
-	var reject *RejectError
-	if errors.As(err, &reject) {
+	if reject := asRejectError(err); reject != nil {
 		status, reason = reject.status(), reject.Reason
 		if len(reason) > handshake.MaxRejectBody {
 			reason = reason[:handshake.MaxRejectBody]

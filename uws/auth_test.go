@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -151,6 +152,51 @@ func TestAuthorizePlainErrorRefusesWith403(t *testing.T) {
 	var refused *HandshakeError
 	if !errors.As(err, &refused) || refused.StatusCode != http.StatusForbidden {
 		t.Fatalf("DialClient error = %v, want a 403 HandshakeError", err)
+	}
+}
+
+// A nil *RejectError is still a non-nil error: it refuses with 403 on both
+// server paths, bare or wrapped, and the server keeps serving.
+func TestAuthorizeNilRejectErrorRefusesWith403(t *testing.T) {
+	authorizers := map[string]func(*http.Request) (any, error){
+		"bare": func(*http.Request) (any, error) {
+			var reject *RejectError
+			return nil, reject
+		},
+		"wrapped": func(*http.Request) (any, error) {
+			var reject *RejectError
+			return nil, fmt.Errorf("denied: %w", reject)
+		},
+	}
+	for name, authorize := range authorizers {
+		for _, backendPath := range []string{"native", "net/http"} {
+			t.Run(name+"/"+backendPath, func(t *testing.T) {
+				recorder := newAuthRecorder()
+				var addr string
+				if backendPath == "native" {
+					addr = startAuthServer(t, recorder, authorize)
+				} else {
+					server := NewServer(Options{Handler: recorder})
+					server.Authorize = authorize
+					serveWithoutListener(t, server)
+					httpServer := httptest.NewServer(server)
+					t.Cleanup(httpServer.Close)
+					addr = strings.TrimPrefix(httpServer.URL, "http://")
+				}
+				dialer := &Dialer{}
+				t.Cleanup(func() { _ = dialer.Close(nil) })
+				for range 2 {
+					_, err := dialAuth(t, dialer, addr)
+					var refused *HandshakeError
+					if !errors.As(err, &refused) || refused.StatusCode != http.StatusForbidden {
+						t.Fatalf("DialClient error = %v, want a 403 HandshakeError", err)
+					}
+				}
+				if n := recorder.count(); n != 0 {
+					t.Fatalf("a refused connection made %d server callbacks", n)
+				}
+			})
+		}
 	}
 }
 
