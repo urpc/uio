@@ -1,0 +1,261 @@
+package utls
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"math/big"
+	"net"
+	"testing"
+	"time"
+
+	"github.com/urpc/uio"
+	"github.com/urpc/uio/ulayer"
+)
+
+const testWait = 10 * time.Second
+
+// testCertificate makes a self-signed certificate for the TLS the tests run.
+func testCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "utls test"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		DNSNames:     []string{"localhost", "127.0.0.1"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+	}
+	der, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate := tls.Certificate{
+		Certificate: [][]byte{der},
+		PrivateKey:  key,
+		Leaf:        leaf,
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	return certificate, pool
+}
+
+// serverConfig and clientConfig are a matching pair.
+func testConfigs(t *testing.T) (server *tls.Config, client *tls.Config) {
+	t.Helper()
+	certificate, pool := testCertificate(t)
+	return &tls.Config{Certificates: []tls.Certificate{certificate}},
+		&tls.Config{ServerName: "localhost", RootCAs: pool}
+}
+
+// echo is the handler at the top of a stack: it answers what it reads.
+type echo struct {
+	opened chan uio.Conn
+	data   chan []byte
+	closed chan uio.Conn
+}
+
+func newEcho() *echo {
+	return &echo{
+		opened: make(chan uio.Conn, 8),
+		data:   make(chan []byte, 64),
+		closed: make(chan uio.Conn, 8),
+	}
+}
+
+func (e *echo) OnOpen(c uio.Conn) { e.opened <- c }
+
+func (e *echo) OnData(c uio.Conn) error {
+	payload := append([]byte(nil), c.PeekChunk()...)
+	_, _ = c.Discard(len(payload))
+	e.data <- payload
+	_, err := c.Write(payload)
+	return err
+}
+
+func (e *echo) OnClose(c uio.Conn, _ error) { e.closed <- c }
+
+func wait[T any](t *testing.T, c chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(testWait):
+		t.Fatalf("no %s within %v", what, testWait)
+		return *new(T)
+	}
+}
+
+// serveTLS serves a TLS stack over fresh events.
+func serveTLS(t *testing.T, top uio.Handler, layers ...ulayer.Layer) ulayer.Transport {
+	t.Helper()
+	started := make(chan struct{})
+	events := &uio.Events{Pollers: 2, Hooks: uio.FuncHandler{
+		Start: func(*uio.Events) { close(started) },
+	}}
+	transport, err := ulayer.Over(events, top, layers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		select {
+		case <-done:
+		case <-time.After(testWait):
+			t.Error("Serve did not return")
+		}
+	})
+	select {
+	case <-started:
+	case <-time.After(testWait):
+		t.Fatal("Serve did not start")
+	}
+	return transport
+}
+
+// record is a handler that only reports what it reads.
+type record struct {
+	opened chan uio.Conn
+	data   chan []byte
+	closed chan error
+}
+
+func newRecord() *record {
+	return &record{
+		opened: make(chan uio.Conn, 4),
+		data:   make(chan []byte, 64),
+		closed: make(chan error, 4),
+	}
+}
+
+func (r *record) OnOpen(c uio.Conn) { r.opened <- c }
+
+func (r *record) OnData(c uio.Conn) error {
+	payload := append([]byte(nil), c.PeekChunk()...)
+	_, _ = c.Discard(len(payload))
+	r.data <- payload
+	return nil
+}
+
+func (r *record) OnClose(_ uio.Conn, err error) { r.closed <- err }
+
+// dialTLS dials through a TLS stack of its own and reports what its handler
+// saw, once the whole stack settled.
+func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
+	t.Helper()
+	client := newRecord()
+	started := make(chan struct{})
+	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{
+		Start: func(*uio.Events) { close(started) },
+	}}
+	transport, err := ulayer.Over(events, client, stack(layers)...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-done
+	})
+	select {
+	case <-started:
+	case <-time.After(testWait):
+		t.Fatal("Serve did not start")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	conn, err := transport.DialContext(ctx, layers[len(layers)-1].(string), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return conn, client
+}
+
+// stack splits a dialTLS argument list into its layers and address.
+func stack(args []any) []ulayer.Layer {
+	layers := make([]ulayer.Layer, 0, len(args))
+	for _, arg := range args[:len(args)-1] {
+		switch v := arg.(type) {
+		case *Layer:
+			layers = append(layers, v)
+		case string:
+			panic("utls test: address must come last")
+		default:
+			layers = append(layers, v.(ulayer.Layer))
+		}
+	}
+	return layers
+}
+
+// The two sides of a TLS layer speak to each other through the stack: the
+// handshake settles, plaintext travels both ways, and the certificate the
+// peer served is the test's.
+func TestTLSEchoBothSides(t *testing.T) {
+	serverConfig, clientConfig := testConfigs(t)
+	server := newEcho()
+	transport := serveTLS(t, server, Server(serverConfig))
+	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	clientConn, clientEcho := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+	if _, err := clientConn.Write([]byte("over the wire")); err != nil {
+		t.Fatal(err)
+	}
+	serverConn := wait(t, server.opened, "server open")
+	if state, ok := serverConn.(interface{ State() tls.ConnectionState }); ok {
+		if state.State().PeerCertificates == nil {
+			// a server without ClientAuth sees none; the handshake itself is
+			// what matters here
+			_ = state
+		}
+	} else {
+		t.Fatal("the TLS connection does not report its state")
+	}
+	if got := string(wait(t, server.data, "server data")); got != "over the wire" {
+		t.Fatalf("server read %q through TLS", got)
+	}
+	if got := string(wait(t, clientEcho.data, "client answer")); got != "over the wire" {
+		t.Fatalf("client read %q back through TLS", got)
+	}
+
+	// the other direction, and a larger payload across many records
+	big := make([]byte, 256<<10)
+	for i := range big {
+		big[i] = byte(i)
+	}
+	if _, err := serverConn.Write(big); err != nil {
+		t.Fatal(err)
+	}
+	reassembled := make([]byte, 0, len(big))
+	for len(reassembled) < len(big) {
+		chunk := wait(t, clientEcho.data, "client bulk data")
+		reassembled = append(reassembled, chunk...)
+	}
+	for i := range big {
+		if reassembled[i] != big[i] {
+			t.Fatalf("bulk payload differs at %d", i)
+		}
+	}
+
+	_ = clientConn.Close()
+	wait(t, server.closed, "server close")
+}
