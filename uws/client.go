@@ -19,8 +19,10 @@ package uws
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // DefaultDialer is the Dialer the package-level Dial uses. It runs with the
@@ -44,7 +46,10 @@ func Dial(ctx context.Context, addr string) (*Client, error) {
 // must be read continuously: a Client whose messages are not being read
 // stops reading, so the peer's flow control slows it and its control frames,
 // Ping included, go unanswered. Client.Close always ends a Client, however
-// many messages are waiting.
+// many messages are waiting, and so do the closes this end starts itself —
+// Dialer.Close, a deadline, a heartbeat timeout, a failed send: a message that
+// arrives once one has begun and finds the queue full is dropped rather than
+// holding the close up.
 type Client struct {
 	*Conn
 
@@ -57,6 +62,18 @@ type Client struct {
 	// queue, and ends ReadMessage once the queue has drained.
 	done     chan struct{}
 	doneOnce sync.Once
+	// stop is closed once this end starts closing the connection. It releases
+	// an OnMessage blocked on a full queue, which would otherwise keep the
+	// connection from ever closing, without ending reading.
+	stop     chan struct{}
+	stopOnce sync.Once
+	// readDeadline is the read deadline set through the Client's Conn. The
+	// client owns it — the connection's turn cannot observe the transport's
+	// own expiry while its OnMessage waits on a full queue — and its expiry
+	// closes the connection, which releases the queue; see setReadDeadline.
+	deadlineMu    sync.Mutex
+	readDeadline  time.Time
+	deadlineTimer *time.Timer
 	// ended is closed after the connection's OnClose stored its event, so a
 	// ReadMessage that drained the queue never reports an empty close.
 	ended chan struct{}
@@ -142,20 +159,96 @@ func (c *Client) finish() {
 	c.doneOnce.Do(func() { close(c.done) })
 }
 
+// release lets the connection close past a full queue; see stop.
+func (c *Client) release() {
+	c.stopOnce.Do(func() { close(c.stop) })
+}
+
+// setReadDeadline arms the client-owned read deadline; a zero time clears
+// it. An expiry the application pushed back since the timer was armed is
+// discarded here, and the timer the later deadline armed is already waiting.
+func (c *Client) setReadDeadline(deadline time.Time) {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	c.readDeadline = deadline
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+		c.deadlineTimer = nil
+	}
+	if c.readDeadline.IsZero() || c.closedConn() {
+		return
+	}
+	c.deadlineTimer = time.AfterFunc(time.Until(deadline), c.expireReadDeadline)
+}
+
+// expireReadDeadline closes the connection once its read deadline arrived.
+// Only the deadline decides: nothing else observes it while a full queue
+// holds the connection's turn, so this timer is its one owner.
+func (c *Client) expireReadDeadline() {
+	c.deadlineMu.Lock()
+	if c.readDeadline.IsZero() || c.readDeadline.After(time.Now()) {
+		c.deadlineMu.Unlock()
+		return
+	}
+	c.deadlineTimer = nil
+	c.deadlineMu.Unlock()
+	if conn := c.Conn; conn != nil {
+		conn.failStream(os.ErrDeadlineExceeded)
+	}
+}
+
+// stopDeadlines drops the deadline timer once the connection closed.
+func (c *Client) stopDeadlines() {
+	c.deadlineMu.Lock()
+	c.readDeadline = time.Time{}
+	if c.deadlineTimer != nil {
+		c.deadlineTimer.Stop()
+		c.deadlineTimer = nil
+	}
+	c.deadlineMu.Unlock()
+}
+
+// closedConn reports whether the connection's OnClose has run.
+func (c *Client) closedConn() bool {
+	select {
+	case <-c.ended:
+		return true
+	default:
+		return false
+	}
+}
+
 // newClient is the Client a DialClient wires its internal handler to.
 func newClient() *Client {
 	return &Client{
 		queue: make(chan Message, clientQueueMessages),
 		done:  make(chan struct{}),
+		stop:  make(chan struct{}),
 		ended: make(chan struct{}),
 	}
 }
 
-// enqueue offers a message to the reader, or gives up once intake ended.
+// enqueue offers a message to the reader. With the queue full it waits for
+// room, and gives up once intake ended or the connection started closing;
+// from then on every message gives up, queued or not, so a close under way
+// loses messages whole rather than leaving gaps between delivered ones.
 func (c *Client) enqueue(message Message) {
+	select {
+	case <-c.stop:
+		return
+	case <-c.done:
+		return
+	default:
+	}
+	select {
+	case c.queue <- message:
+		return
+	default:
+	}
 	select {
 	case c.queue <- message:
 	case <-c.done:
+	case <-c.stop:
 	}
 }
 
@@ -164,6 +257,7 @@ func (c *Client) enqueue(message Message) {
 // client's queue.
 type pullHandler struct {
 	client *Client
+	dialer *Dialer
 	// ready receives the handshake outcome: nil after OnOpen, the close
 	// otherwise. One receiver, so one buffer never blocks a callback.
 	ready chan error
@@ -171,6 +265,7 @@ type pullHandler struct {
 
 func (h *pullHandler) OnOpen(conn *Conn) {
 	h.client.Conn = conn
+	h.dialer.trackClient(h.client)
 	h.ready <- nil
 }
 
@@ -179,6 +274,8 @@ func (h *pullHandler) OnMessage(_ *Conn, message Message) {
 }
 
 func (h *pullHandler) OnClose(_ *Conn, event CloseEvent) {
+	h.dialer.clients.Delete(h.client)
+	h.client.stopDeadlines()
 	h.client.event.Store(&event)
 	h.client.finish()
 	close(h.client.ended)
@@ -199,7 +296,7 @@ func (d *Dialer) DialClient(ctx context.Context, addr string) (*Client, error) {
 		return nil, fmt.Errorf("%w: Handler is set: DialClient owns the callbacks", ErrInvalidOptions)
 	}
 	client := newClient()
-	handler := &pullHandler{client: client, ready: make(chan error, 1)}
+	handler := &pullHandler{client: client, dialer: d, ready: make(chan error, 1)}
 	if err := d.dialWithHandler(ctx, addr, nil, handler); err != nil {
 		// An error means no connection was made and no callback follows.
 		return nil, err
@@ -210,4 +307,29 @@ func (d *Dialer) DialClient(ctx context.Context, addr string) (*Client, error) {
 		return nil, err
 	}
 	return client, nil
+}
+
+// trackClient lets Dialer.Close release client. Registered first and checked
+// after, so a client either is seen by the Close or sees it.
+func (d *Dialer) trackClient(client *Client) {
+	d.clients.Store(client, struct{}{})
+	if d.closedCause() != nil {
+		client.release()
+	}
+}
+
+// releaseClients lets every pull client's connection close past its queue.
+func (d *Dialer) releaseClients() {
+	d.clients.Range(func(key, _ any) bool {
+		key.(*Client).release()
+		return true
+	})
+}
+
+// releasePullClient lets a pull Client's connection close past its full
+// queue once this end starts closing it.
+func (c *Conn) releasePullClient() {
+	if h, ok := c.handler.(*pullHandler); ok {
+		h.client.release()
+	}
 }

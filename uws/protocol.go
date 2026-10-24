@@ -728,7 +728,7 @@ func (c *Conn) rejectHandshake(err error) error {
 // closes once a deferred Close frame went out and every accepted byte retired,
 // bounded by the close timer.
 func (c *Conn) closeTransport() error {
-	c.closing.Store(true)
+	c.markClosing()
 	if !c.writes.close.requestTransportClose() {
 		return nil
 	}
@@ -814,7 +814,16 @@ func (c *Conn) abortTransport(err error) {
 		return
 	}
 	c.stopCloseTimer()
+	c.releasePullClient()
 	_ = c.raw.CloseWith(err)
+}
+
+// markClosing records that this end is closing the connection: messages
+// that arrive meanwhile are dropped, and a pull Client's full queue no longer
+// holds the close up.
+func (c *Conn) markClosing() {
+	c.closing.Store(true)
+	c.releasePullClient()
 }
 
 func (c *Conn) stopCloseTimer() {
@@ -972,7 +981,7 @@ func (c *Conn) protocolClose(err error) error {
 	}
 	payload := []byte{byte(code >> 8), byte(code)}
 	writeErr := c.sendCloseFrame(payload)
-	c.closing.Store(true)
+	c.markClosing()
 	if writeErr != nil {
 		c.abortTransport(errors.Join(err, writeErr))
 		return errors.Join(err, writeErr)

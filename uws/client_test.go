@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"testing"
 	"time"
 
@@ -403,5 +404,201 @@ func TestDialClientFirstTurnRefusalFailsDial(t *testing.T) {
 	// connection.
 	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); !errors.Is(err, uio.ErrFirstTurnRefused) {
 		t.Fatalf("Dial error = %v, want %v", err, uio.ErrFirstTurnRefused)
+	}
+}
+
+// floodClient dials a server that sends far more than a Client queues, with
+// dialer, and waits until the queue is full: OnMessage is blocked in the
+// connection's turn, nothing reading.
+func floodClient(t *testing.T, dialer *Dialer) *Client {
+	t.Helper()
+	addr := startClientTestServer(t, func(conn *Conn) {
+		go func() {
+			for range 10 * clientQueueMessages {
+				if err := conn.SendText([]byte("flood")); err != nil {
+					return
+				}
+			}
+		}()
+	})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	client, err := dialer.DialClient(ctx, "ws://"+addr+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(testIOTimeout())
+	for len(client.queue) < clientQueueMessages {
+		if time.Now().After(deadline) {
+			t.Fatalf("queue holds %d messages, want it full", len(client.queue))
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(20 * time.Millisecond) // OnMessage now waits on the full queue
+	return client
+}
+
+// drainToClose reads a Client until ReadMessage reports how it closed.
+func drainToClose(t *testing.T, client *Client) *CloseError {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	for {
+		_, err := client.ReadMessage(ctx)
+		if err == nil {
+			continue
+		}
+		var closeErr *CloseError
+		if !errors.As(err, &closeErr) {
+			t.Fatalf("ReadMessage error = %v, want a CloseError", err)
+		}
+		return closeErr
+	}
+}
+
+// waitClientClosed waits for the Client's connection to finish closing
+// without anything reading it.
+func waitClientClosed(t *testing.T, client *Client, what string) {
+	t.Helper()
+	select {
+	case <-client.ended:
+	case <-time.After(testIOTimeout()):
+		t.Fatalf("%s did not close a Client whose full queue nobody reads", what)
+	}
+}
+
+// Dialer.Close ends a Client nobody reads, whose OnMessage waits on a full
+// queue: its connection closes, the transport stops, and the queued messages
+// are still read before the close.
+func TestDialerCloseEndsUnreadClient(t *testing.T) {
+	dialer := &Dialer{}
+	client := floodClient(t, dialer)
+	if err := dialer.Close(nil); err != nil {
+		t.Fatal(err)
+	}
+	waitClientClosed(t, client, "Dialer.Close")
+	stopped := make(chan struct{})
+	go func() { _ = dialer.events.Wait(); close(stopped) }()
+	select {
+	case <-stopped:
+	case <-time.After(testIOTimeout()):
+		t.Fatal("the dialer's transport did not stop")
+	}
+	queued := len(client.queue)
+	if queued < clientQueueMessages {
+		t.Fatalf("%d queued messages left, want the full queue", queued)
+	}
+	drainToClose(t, client)
+}
+
+// The closes this end starts itself end an unread Client too: a transport
+// deadline set on its Conn, a close through the embedded Conn, and the
+// dialer's heartbeat timing out.
+func TestSelfInitiatedClosesEndUnreadClient(t *testing.T) {
+	t.Run("read deadline", func(t *testing.T) {
+		client := floodClient(t, &Dialer{})
+		if err := client.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		waitClientClosed(t, client, "an expired read deadline")
+		if closeErr := drainToClose(t, client); !errors.Is(closeErr, os.ErrDeadlineExceeded) {
+			t.Fatalf("closed with %v, want the deadline", closeErr.Err)
+		}
+	})
+	t.Run("deadline cleared in time", func(t *testing.T) {
+		client := floodClient(t, &Dialer{})
+		if err := client.SetDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SetDeadline(time.Time{}); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(60 * time.Millisecond)
+		select {
+		case <-client.ended:
+			t.Fatal("a cleared deadline closed the connection")
+		default:
+		}
+		// The connection still delivers everything once read.
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+		defer cancel()
+		for range 10 * clientQueueMessages {
+			if _, err := client.ReadMessage(ctx); err != nil {
+				t.Fatalf("ReadMessage: %v", err)
+			}
+		}
+	})
+	t.Run("embedded Conn.Close", func(t *testing.T) {
+		client := floodClient(t, &Dialer{})
+		done := make(chan error, 1)
+		go func() { done <- client.Conn.Close(1000, "bye") }()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(testIOTimeout()):
+			t.Fatal("Conn.Close did not return")
+		}
+		waitClientClosed(t, client, "Conn.Close")
+		drainToClose(t, client)
+	})
+	t.Run("heartbeat timeout", func(t *testing.T) {
+		client := floodClient(t, &Dialer{Options: Options{
+			HeartbeatInterval: 10 * time.Millisecond,
+			HeartbeatTimeout:  50 * time.Millisecond,
+		}})
+		waitClientClosed(t, client, "a heartbeat timeout")
+		drainToClose(t, client)
+	})
+}
+
+// A read deadline the application extends before it arrives never releases
+// the queue: every message still arrives in order, and the connection stays
+// open.
+func TestClientDeadlineExtendedKeepsDelivery(t *testing.T) {
+	const messages = 200
+	addr := startClientTestServer(t, func(conn *Conn) {
+		go func() {
+			for i := range messages {
+				if err := conn.SendText([]byte(fmt.Sprintf("m%d", i))); err != nil {
+					return
+				}
+			}
+		}()
+	})
+	dialer := &Dialer{}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	client, err := dialer.DialClient(ctx, "ws://"+addr+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = client.Close(1000, "") }()
+	for range 50 {
+		if err := client.SetReadDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
+			t.Fatal(err)
+		}
+		if err := client.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
+		select {
+		case <-client.ended:
+			t.Fatal("an extended deadline closed the connection")
+		default:
+		}
+	}
+	_ = client.SetReadDeadline(time.Time{})
+	for i := range messages {
+		message, err := client.ReadMessage(ctx)
+		if err != nil {
+			t.Fatalf("message %d: %v", i, err)
+		}
+		if want := fmt.Sprintf("m%d", i); string(message.Payload) != want {
+			t.Fatalf("message %d = %q, want %q", i, message.Payload, want)
+		}
 	}
 }

@@ -63,6 +63,7 @@ type Dialer struct {
 	header          http.Header // Header, canonical, fixed at first Dial
 	events          *uio.Events // private transport configuration
 	connections     sync.Map
+	clients         sync.Map // the open pull Clients, for Close to release
 	heartbeat       heartbeatRunner
 	stats           statsCounters
 
@@ -199,6 +200,7 @@ func (d *Dialer) Close(err error) error {
 	d.closeMu.Unlock()
 
 	d.stopHeartbeat()
+	d.releaseClients()
 	if events == nil {
 		return nil
 	}

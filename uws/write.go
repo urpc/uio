@@ -252,7 +252,7 @@ func (c *Conn) sendHeartbeatClose(code uint16, reason string) {
 	if err == nil {
 		err = c.flushLocked()
 	}
-	c.closing.Store(true)
+	c.markClosing()
 	c.unlockWrite()
 	if err != nil {
 		c.setCloseError(err)
@@ -343,7 +343,7 @@ func (c *Conn) sendCloseFrameLocked(payload []byte) (deferred bool, err error) {
 	if errors.Is(err, ErrBackpressure) {
 		deferred, err = c.writes.close.deferClose(payload), nil
 	}
-	c.closing.Store(true)
+	c.markClosing()
 	if err == nil {
 		err = c.flushLocked()
 	}
@@ -791,7 +791,7 @@ func (c *Conn) unlockWrite() {
 // such as one holding part of a message or frames its senders were promised.
 func (c *Conn) failStream(err error) {
 	c.setCloseError(err)
-	c.closing.Store(true)
+	c.markClosing()
 	c.abortTransport(err)
 }
 
@@ -803,6 +803,8 @@ func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) err
 		if errors.Is(err, uio.ErrOutboundOverflow) {
 			return ErrBackpressure
 		}
+		// Any other failure leaves the transport closing.
+		c.releasePullClient()
 		if errors.Is(err, net.ErrClosed) {
 			return ErrClosed
 		}
