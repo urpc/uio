@@ -30,7 +30,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 	"github.com/urpc/uio/uws/internal/handshake"
 )
 
@@ -112,8 +111,8 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	if err != nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return fmt.Errorf("uws: only ws:// and wss:// targets are supported: %w", ErrProtocol)
 	}
-	if target.Scheme == "wss" && len(d.Options.Layers) == 0 {
-		return fmt.Errorf("%w: wss:// needs a secure layer in Layers", ErrInvalidOptions)
+	if target.Scheme == "wss" && len(d.Options.Middleware) == 0 {
+		return fmt.Errorf("%w: wss:// needs TLS middleware in Middleware", ErrInvalidOptions)
 	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
@@ -282,9 +281,10 @@ func (d *Dialer) start(ctx context.Context) error {
 			Outbound: d.onOutbound,
 			Inbound:  d.onInbound,
 		}
-		// The layers wrap what the connections carry, not the traffic the
+		// The middleware wraps what the connections carry, not the traffic the
 		// observer reports or the hooks around Serve.
-		events.Handler = ulayer.Wrap(handler, opts.Layers...)
+		events.Handler = handler
+		events.Use(opts.Middleware...)
 		events.Observer, events.Hooks = handler, handler
 		d.startHeartbeat(d.config)
 		go func() {

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/urpc/uio/ulayer"
+	"github.com/urpc/uio"
 	"github.com/urpc/uio/utls"
 )
 
@@ -85,8 +85,8 @@ func startWSS(t *testing.T, serverTLS *tls.Config) string {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
 		return NewServer(Options{
-			Handler: newWSSRecorder(),
-			Layers:  []ulayer.Layer{utls.Server(serverTLS)},
+			Handler:    newWSSRecorder(),
+			Middleware: uio.Use(utls.Server(serverTLS)),
 		})
 	})
 	t.Cleanup(func() {
@@ -116,8 +116,8 @@ func TestWSSRoundTrip(t *testing.T) {
 
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
-		Handler: client,
-		Layers:  []ulayer.Layer{utls.Client(clientTLS)},
+		Handler:    client,
+		Middleware: uio.Use(utls.Client(clientTLS)),
 	}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -143,9 +143,9 @@ func TestWSSRoundTrip(t *testing.T) {
 	}
 }
 
-// A client whose TLS layer trusts nothing still gets its connection, and
-// the handshake's failure is the connection's close cause — the WebSocket
-// handshake never begins.
+// A client whose TLS layer trusts nothing fails the dial: the handshake's
+// failure is what Dial reports, the WebSocket handshake never begins, and the
+// Handler hears nothing of the connection.
 func TestWSSRefusedCertificate(t *testing.T) {
 	serverTLS, _ := wssConfigs(t)
 	addr := startWSS(t, serverTLS)
@@ -153,27 +153,24 @@ func TestWSSRefusedCertificate(t *testing.T) {
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
 		Handler: client,
-		Layers: []ulayer.Layer{utls.Client(&tls.Config{
+		Middleware: uio.Use(utls.Client(&tls.Config{
 			ServerName: "localhost", // trusts no certificate
-		})},
+		})),
 	}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
-		t.Fatal(err) // the connection was made; the TLS handshake reports by close
-	}
-	select {
-	case err := <-client.closed:
-		if err == nil {
-			t.Fatal("the refused handshake closed cleanly")
-		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("the refused handshake never closed the connection")
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err == nil {
+		t.Fatal("a refused certificate dialed cleanly")
 	}
 	select {
 	case <-client.opened:
 		t.Fatal("a refused TLS handshake still opened the WebSocket")
+	default:
+	}
+	select {
+	case <-client.closed:
+		t.Fatal("a failed dial closed a connection the Handler never saw")
 	default:
 	}
 }

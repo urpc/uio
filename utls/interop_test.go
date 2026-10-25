@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
 // stdEcho serves an echo over a standard crypto/tls listener.
@@ -198,18 +197,15 @@ func TestInteropWithStdlib(t *testing.T) {
 			Data:  func(uio.Conn) error { return nil },
 			Close: func(uio.Conn, error) { callbacks++ },
 		}
-		stack, err := ulayer.Over(events, counting, Client(clientConfig))
-		if err != nil {
-			t.Fatal(err)
-		}
+		events.Handler = counting
+		events.Use(Client(clientConfig))
 		done := make(chan error, 1)
 		go func() { done <- events.Serve() }()
 		t.Cleanup(func() { _ = events.Close(nil); <-done })
 		<-started
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		_, err = stack.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
-		if err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err == nil {
 			t.Fatal("a refused certificate reported no error")
 		}
 		if callbacks != 0 {
@@ -226,7 +222,7 @@ func mustPool(t *testing.T, config *tls.Config) *x509.CertPool {
 }
 
 // TLS over TLS: the stack nests, and the inner handshake runs over the
-// outer layer's connection as any stream does.
+// outer wrapper's connection as any stream does.
 func TestTLSOverTLS(t *testing.T) {
 	outerServer, outerClient := testConfigs(t)
 	innerServer, innerClient := testConfigs(t)
@@ -240,25 +236,24 @@ func TestTLSOverTLS(t *testing.T) {
 	if _, err := client.Write([]byte("nested")); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(wait(t, echo.data, "echo through two TLS layers")); got != "nested" {
+	if got := string(wait(t, echo.data, "echo through two TLS wrappers")); got != "nested" {
 		t.Fatalf("read %q through TLS over TLS", got)
 	}
 	_ = client.Close()
 	wait(t, server.closed, "server close")
 }
 
-// TLS runs over a layer with a handshake of its own: the stack settles one
-// layer at a time, gate first, TLS over it.
-func TestTLSOverGateLayer(t *testing.T) {
+// TLS runs over a wrapper with a handshake of its own: the stack settles one
+// wrapper at a time, gate first, TLS over it.
+func TestTLSOverGateWrapper(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	gate := &gateLayer{}
 	transport := serveTLS(t, server, Server(serverConfig), gate)
 	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, echo := dialTLS(t, Client(clientConfig), &gateLayer{}, "tcp://"+listener.Addr().String())
+	client, echo := dialTLS(t, Client(clientConfig), uio.Middleware(gate), "tcp://"+listener.Addr().String())
 	if _, err := client.Write([]byte("through the gate")); err != nil {
 		t.Fatal(err)
 	}

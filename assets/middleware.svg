@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="188" viewBox="0 0 960 188">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0F1A2E"/>
+  </linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="#22304A"/>
+  </pattern>
+</defs>
+<rect width="960" height="188" rx="16" fill="url(#bg)"/>
+<rect width="960" height="188" rx="16" fill="url(#dots)" opacity="0.55"/>
+<rect x="0.5" y="0.5" width="959" height="187" rx="15.5" fill="none" stroke="#22304A"/>
+
+<text x="40.0" y="30.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">MIDDLEWARE</text>
+<text x="40.0" y="54.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16.5" fill="#E6EDF6" text-anchor="start" font-weight="600">The same chain, both directions</text>
+<text x="920.0" y="54.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="end" font-weight="400">events.Use(tls, websocket)</text>
+
+<text x="40.0" y="90.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="start" font-weight="600">read →</text>
+<text x="40.0" y="142.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#818CF8" text-anchor="start" font-weight="600">write ←</text>
+
+<rect x="140" y="68" width="150" height="40" rx="8" fill="#0E2A36" stroke="#22D3EE" stroke-opacity="0.9" stroke-width="1.1"/>
+<text x="154.0" y="93.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">socket</text>
+
+<rect x="330" y="68" width="150" height="40" rx="8" fill="#0E182B" stroke="#22304A"/>
+<text x="344.0" y="93.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">tls</text>
+
+<rect x="520" y="68" width="150" height="40" rx="8" fill="#0E182B" stroke="#22304A"/>
+<text x="534.0" y="93.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">websocket</text>
+
+<rect x="710" y="68" width="150" height="40" rx="8" fill="#0E182B" stroke="#818CF8" stroke-opacity="0.85" stroke-width="1.1"/>
+<text x="724.0" y="93.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">handler</text>
+
+<line x1="292" y1="88" x2="318" y2="88" stroke="#22D3EE" stroke-width="1.2" opacity="0.85"/>
+<path d="M328,88 l-8,-4 v8 z" fill="#22D3EE"/>
+<text x="310.0" y="78.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">decrypt</text>
+<line x1="482" y1="88" x2="508" y2="88" stroke="#22D3EE" stroke-width="1.2" opacity="0.85"/>
+<path d="M518,88 l-8,-4 v8 z" fill="#22D3EE"/>
+<text x="500.0" y="78.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">deframe</text>
+<line x1="672" y1="88" x2="698" y2="88" stroke="#22D3EE" stroke-width="1.2" opacity="0.85"/>
+<path d="M708,88 l-8,-4 v8 z" fill="#22D3EE"/>
+<text x="690.0" y="78.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">message</text>
+
+<rect x="140" y="120" width="150" height="40" rx="8" fill="#0E2A36" stroke="#22D3EE" stroke-opacity="0.9" stroke-width="1.1"/>
+<text x="154.0" y="145.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">socket</text>
+
+<rect x="330" y="120" width="150" height="40" rx="8" fill="#0E182B" stroke="#22304A"/>
+<text x="344.0" y="145.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">tls</text>
+
+<rect x="520" y="120" width="150" height="40" rx="8" fill="#0E182B" stroke="#22304A"/>
+<text x="534.0" y="145.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">websocket</text>
+
+<rect x="710" y="120" width="150" height="40" rx="8" fill="#0E182B" stroke="#818CF8" stroke-opacity="0.85" stroke-width="1.1"/>
+<text x="724.0" y="145.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#E6EDF6" text-anchor="start" font-weight="600">handler</text>
+
+<line x1="700" y1="140" x2="674" y2="140" stroke="#818CF8" stroke-width="1.2" opacity="0.85"/>
+<path d="M664,140 l8,-4 v8 z" fill="#818CF8"/>
+<text x="690.0" y="130.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">message</text>
+<line x1="510" y1="140" x2="484" y2="140" stroke="#818CF8" stroke-width="1.2" opacity="0.85"/>
+<path d="M474,140 l8,-4 v8 z" fill="#818CF8"/>
+<text x="500.0" y="130.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">frame</text>
+<line x1="320" y1="140" x2="294" y2="140" stroke="#818CF8" stroke-width="1.2" opacity="0.85"/>
+<path d="M284,140 l8,-4 v8 z" fill="#818CF8"/>
+<text x="310.0" y="130.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">encrypt</text>
+
+<text x="480.0" y="176.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">each middleware hands the one above a Conn of its own, so a write descends the chain a read climbed</text>
+</svg>

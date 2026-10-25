@@ -25,18 +25,17 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
-// conn is the connection a TLS layer hands upward: what it reads is what the
+// conn is the connection TLS middleware hands upward: what it reads is what the
 // engine decrypted, what is written to it leaves encrypted, and it opens
 // only once the handshake settled. Everything runs on the connection below's
 // rounds, which UIO serializes: the handshake as a coroutine those rounds
 // resume, the records straight in the round.
 type conn struct {
-	ulayer.Forward
-	layer *Layer
-	next  uio.Handler
+	uio.InnerConn
+	middleware *middleware
+	next       uio.Handler
 
 	// mu carries the engine's own state: the ciphertext pending, the
 	// staging, the handshake's coroutine handles and the flags. crypto/tls
@@ -50,7 +49,7 @@ type conn struct {
 	pending []byte
 	readAt  int
 	// staging is what the engine decrypted, delivered no further than the
-	// layer above reads.
+	// handler above reads.
 	staging []byte
 
 	// resume continues the handshake's coroutine, and stop ends it; both
@@ -61,7 +60,7 @@ type conn struct {
 	yield  func(struct{}) bool
 
 	ready           bool // the handshake settled
-	opened          bool // the layer above learned of the connection
+	opened          bool // the handler above learned of the connection
 	ended           bool // this end asked for the close
 	closed          bool // the connection below's close arrived
 	transportClosed bool // crypto/tls closed the transport
@@ -78,17 +77,17 @@ func (c *conn) open() {
 		return
 	}
 	engine := &transport{c: c}
-	if c.layer.Client {
-		c.tls = stdtls.Client(engine, c.layer.Config)
+	if c.middleware.client {
+		c.tls = stdtls.Client(engine, c.middleware.config)
 	} else {
-		c.tls = stdtls.Server(engine, c.layer.Config)
+		c.tls = stdtls.Server(engine, c.middleware.config)
 	}
 	c.resume, c.stop = iter.Pull(handshake(c))
 	c.mu.Unlock()
 	// The deadline closes the connection below when it passes, and the close
 	// ends the handshake; cleared once it settles.
-	if timeout := c.layer.HandshakeTimeout; timeout >= 0 {
-		_ = c.Lower.SetReadDeadline(time.Now().Add(c.handshakeTimeout()))
+	if timeout := c.middleware.handshakeTimeout; timeout >= 0 {
+		_ = c.Conn.SetReadDeadline(time.Now().Add(c.handshakeTimeout()))
 	}
 	// The first flight needs no data: a client writes its ClientHello here,
 	// and whatever it wrote leaves before the round ends. A server's
@@ -111,16 +110,16 @@ func (c *conn) settle() {
 	c.resume, c.stop, c.yield = nil, nil, nil
 	if err := c.tls.Handshake(); err != nil { // the settled result
 		c.mu.Unlock()
-		_ = c.Lower.CloseWith(err)
+		_ = c.Conn.CloseWith(err)
 		return
 	}
 	c.ready = true
-	_ = c.Lower.SetReadDeadline(time.Time{}) // the handshake's bound
+	_ = c.Conn.SetReadDeadline(time.Time{}) // the handshake's bound
 	c.mu.Unlock()
 }
 
 func (c *conn) handshakeTimeout() time.Duration {
-	if timeout := c.layer.HandshakeTimeout; timeout != 0 {
+	if timeout := c.middleware.handshakeTimeout; timeout != 0 {
 		return timeout
 	}
 	return DefaultHandshakeTimeout
@@ -146,12 +145,12 @@ func (c *conn) data() error {
 		c.mu.Unlock()
 		return nil
 	}
-	chunk := c.Lower.PeekChunk()
+	chunk := c.Conn.PeekChunk()
 	if c.resume != nil {
 		// The round carries the handshake: it takes the bytes and continues,
 		// until it needs more than arrived or it settles.
 		c.pending = append(c.pending, chunk...)
-		_, _ = c.Lower.Discard(len(chunk))
+		_, _ = c.Conn.Discard(len(chunk))
 		resume := c.resume
 		c.mu.Unlock()
 		if _, waiting := resume(); waiting {
@@ -167,22 +166,22 @@ func (c *conn) data() error {
 		// before the tail delivers.
 		c.mu.Unlock()
 		if err := c.pump(c.stagingBound()); err != nil {
-			_ = c.Lower.CloseWith(err)
+			_ = c.Conn.CloseWith(err)
 			return nil
 		}
 		c.mu.Lock()
-		// still locked: the tail below opens the layer above
+		// still locked: the tail below opens the handler above
 	} else if c.ready {
 		bound := c.stagingBound()
 		// A full staging leaves what arrived below unread, so the pause
-		// travels to the wire; what it already holds still reaches the layer
+		// travels to the wire; what it already holds still reaches the handler
 		// above, whose reads make room again.
 		if len(c.staging) < bound {
 			c.pending = append(c.pending, chunk...)
-			_, _ = c.Lower.Discard(len(chunk))
+			_, _ = c.Conn.Discard(len(chunk))
 			c.mu.Unlock()
 			if err := c.pump(bound); err != nil {
-				_ = c.Lower.CloseWith(err)
+				_ = c.Conn.CloseWith(err)
 				return nil
 			}
 			c.mu.Lock()
@@ -239,7 +238,7 @@ func (c *conn) pump(bound int) error {
 }
 
 // closedBelow is the connection below's end: a handshake still running is
-// stopped with it, and what the engine holds whole is the layer above's to
+// stopped with it, and what the engine holds whole is the handler above's to
 // read in OnClose, which always reaches it, with the cause kept.
 func (c *conn) closedBelow(err error) {
 	c.mu.Lock()
@@ -253,7 +252,7 @@ func (c *conn) closedBelow(err error) {
 		stop() // a handshake waiting for data ends with the connection
 	}
 	if first {
-		// The handshake settled with this close in flight: the layer above
+		// The handshake settled with this close in flight: the handler above
 		// learns of the connection before it ends, and reads what arrived.
 		c.next.OnOpen(c)
 	}
@@ -274,7 +273,7 @@ func (c *conn) isGone() bool {
 }
 
 func (c *conn) stagingBound() int {
-	if bound := c.layer.StagingBound; bound > 0 {
+	if bound := c.middleware.stagingBound; bound > 0 {
 		return bound
 	}
 	return DefaultStagingBound
@@ -306,7 +305,7 @@ func (c *conn) State() stdtls.ConnectionState {
 	return c.tls.ConnectionState()
 }
 
-// The reads are the layer above's, in its callbacks.
+// The reads are the handler above's, in its callbacks.
 
 func (c *conn) Peek(b []byte) []byte {
 	n := copy(b, c.staging)
@@ -323,7 +322,7 @@ func (c *conn) Discard(n int) (int, error) {
 	if len(c.staging) < c.stagingBound() {
 		// Room again: a wake runs the round that takes what is left unread
 		// below, and the socket reads with it.
-		_ = c.Lower.Wake()
+		_ = c.Conn.Wake()
 	}
 	return n, nil
 }
@@ -344,14 +343,14 @@ func (c *conn) InboundBuffered() int {
 	c.mu.Lock()
 	held := len(c.staging) + len(c.pending) - c.readAt
 	c.mu.Unlock()
-	return held + c.Lower.InboundBuffered()
+	return held + c.Conn.InboundBuffered()
 }
 
 func (c *conn) ReserveInbound(int) error { return nil }
 
-func (c *conn) OutboundBuffered() int { return c.Lower.OutboundBuffered() }
+func (c *conn) OutboundBuffered() int { return c.Conn.OutboundBuffered() }
 
-// The writes are the layer above's, from any goroutine; the layer above
+// The writes are the handler above's, from any goroutine; the handler above
 // holds the connection only once the handshake settled.
 
 func (c *conn) engine() (*stdtls.Conn, error) {
@@ -402,19 +401,19 @@ func (c *conn) WriteOwned(buffer *uio.Buffer) (int, error) {
 
 func (c *conn) ReserveOutbound(int) ([]byte, error) { return nil, uio.ErrReserveUnsupported }
 
-func (c *conn) Flush() error { return c.Lower.Flush() }
+func (c *conn) Flush() error { return c.Conn.Flush() }
 
 func (c *conn) YieldRead() error {
 	c.mu.Lock()
 	idle := len(c.staging) == 0 && c.readAt == len(c.pending)
 	c.mu.Unlock()
 	if idle {
-		return c.Lower.YieldRead()
+		return c.Conn.YieldRead()
 	}
 	return nil
 }
 
-// The closes are the layer above's; CloseWith sends the peer close_notify
+// The closes are the handler above's; CloseWith sends the peer close_notify
 // once what was accepted has left, then ends the connection below.
 
 func (c *conn) CloseWith(err error) error {
@@ -434,7 +433,7 @@ func (c *conn) CloseWith(err error) error {
 	if ready {
 		_ = c.tls.Close() // close_notify, out through the connection below
 	}
-	return c.Lower.CloseWith(err)
+	return c.Conn.CloseWith(err)
 }
 
 func (c *conn) Close() error { return c.CloseWith(io.ErrUnexpectedEOF) }

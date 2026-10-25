@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
 const testWait = 10 * time.Second
@@ -100,17 +99,15 @@ func wait[T any](t *testing.T, c chan T, what string) T {
 	}
 }
 
-// serveTLS serves a TLS stack over fresh events.
-func serveTLS(t *testing.T, top uio.Handler, layers ...ulayer.Layer) ulayer.Transport {
+// serveTLS serves a stack over fresh events with the wrappers installed in
+// order, bottom first, and returns the events.
+func serveTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) *uio.Events {
 	t.Helper()
 	started := make(chan struct{})
-	events := &uio.Events{Pollers: 2, Hooks: uio.FuncHandler{
+	events := &uio.Events{Pollers: 2, Handler: top, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	transport, err := ulayer.Over(events, top, layers...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	events.Use(wrappers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -126,7 +123,19 @@ func serveTLS(t *testing.T, top uio.Handler, layers ...ulayer.Layer) ulayer.Tran
 	case <-time.After(testWait):
 		t.Fatal("Serve did not start")
 	}
-	return transport
+	return events
+}
+
+// listenTLS serves a stack and listens on a fresh loopback port.
+func listenTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) (string, *uio.Events) {
+	t.Helper()
+	events := serveTLS(t, top, wrappers...)
+	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener.Addr().String(), events
 }
 
 // record is a handler that only reports what it reads.
@@ -155,18 +164,19 @@ func (r *record) OnData(c uio.Conn) error {
 
 func (r *record) OnClose(_ uio.Conn, err error) { r.closed <- err }
 
-// dialTLS dials through a TLS stack of its own and reports what its handler
-// saw, once the whole stack settled.
-func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
+// dialTLS dials addr through a stack of its own with the wrappers installed,
+// and returns the settled connection with the handler that reports it. The
+// last argument is the address.
+func dialTLS(t *testing.T, wrappers ...any) (uio.Conn, *record) {
 	t.Helper()
+	addr, _ := wrappers[len(wrappers)-1].(string)
 	client := newRecord()
 	started := make(chan struct{})
-	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{
+	events := &uio.Events{Pollers: 1, Handler: client, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	transport, err := ulayer.Over(events, client, stack(layers)...)
-	if err != nil {
-		t.Fatal(err)
+	for _, wrapper := range wrappers[:len(wrappers)-1] {
+		events.Use(wrapper.(uio.Middleware))
 	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
@@ -181,30 +191,14 @@ func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := transport.DialContext(ctx, layers[len(layers)-1].(string), nil)
+	conn, err := events.DialContext(ctx, addr, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	return conn, client
 }
 
-// stack splits a dialTLS argument list into its layers and address.
-func stack(args []any) []ulayer.Layer {
-	layers := make([]ulayer.Layer, 0, len(args))
-	for _, arg := range args[:len(args)-1] {
-		switch v := arg.(type) {
-		case *Layer:
-			layers = append(layers, v)
-		case string:
-			panic("utls test: address must come last")
-		default:
-			layers = append(layers, v.(ulayer.Layer))
-		}
-	}
-	return layers
-}
-
-// The two sides of a TLS layer speak to each other through the stack: the
+// The two sides of a TLS wrapper speak to each other through the stack: the
 // handshake settles, plaintext travels both ways, and the certificate the
 // peer served is the test's.
 func TestTLSEchoBothSides(t *testing.T) {

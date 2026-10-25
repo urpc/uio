@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
 // TestThroughputCompare measures bulk-transfer throughput through the TLS
@@ -29,8 +28,8 @@ import (
 //
 //	std tcp    net.Listen and net.Dial, no TLS
 //	std tls    crypto/tls.Listen and tls.Dial
-//	uio        UIO over TCP, a ulayer stack of no layers
-//	utls       UIO over TCP with a TLS layer on top, both sides ours
+//	uio        UIO over TCP, no wrappers installed
+//	utls       UIO over TCP with a TLS wrapper installed, both sides ours
 func TestThroughputCompare(t *testing.T) {
 	if os.Getenv("UTLS_BENCH") == "" {
 		t.Skip("skipping: set UTLS_BENCH=1 to measure throughput")
@@ -161,9 +160,9 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 
 	serverDone := make(chan struct{})
 	var serverCount atomic.Int64
-	serverLayers := []ulayer.Layer{}
+	var serverMiddleware []uio.Middleware
 	if useTLS {
-		serverLayers = append(serverLayers, Server(serverConfig))
+		serverMiddleware = append(serverMiddleware, Server(serverConfig))
 	}
 	serverConnOpened := make(chan uio.Conn, 1)
 	server := uio.FuncHandler{
@@ -190,10 +189,8 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	serverEvents := &uio.Events{Pollers: 2}
 	serverStarted := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(serverStarted) }}
-	serverTransport, err := ulayer.Over(serverEvents, server, serverLayers...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	serverEvents.Handler = server
+	serverEvents.Use(serverMiddleware...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
@@ -202,7 +199,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	case <-time.After(testWait):
 		t.Fatal("server Serve did not start")
 	}
-	listener, err := serverTransport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,9 +207,9 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 
 	clientDone := make(chan struct{})
 	var clientCount atomic.Int64
-	clientLayers := []ulayer.Layer{}
+	var clientMiddleware []uio.Middleware
 	if useTLS {
-		clientLayers = append(clientLayers, Client(clientConfig))
+		clientMiddleware = append(clientMiddleware, Client(clientConfig))
 	}
 	client := uio.FuncHandler{
 		Open: func(uio.Conn) {},
@@ -233,10 +230,8 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	clientEvents := &uio.Events{Pollers: 1}
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
-	clientTransport, err := ulayer.Over(clientEvents, client, clientLayers...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	clientEvents.Handler = client
+	clientEvents.Use(clientMiddleware...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()
@@ -247,7 +242,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := clientTransport.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := clientEvents.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +359,7 @@ func TestMemoryBaseline(t *testing.T) {
 
 // memBaseline returns the heap held by conns settled connections between two
 // stacks, after the garbage collector has run twice.
-func memBaseline(t *testing.T, conns int, serverLayer, clientLayer ulayer.Layer) uint64 {
+func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware) uint64 {
 	t.Helper()
 	opened := make(chan uio.Conn, conns)
 	server := uio.FuncHandler{
@@ -377,22 +372,20 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer ulayer.Layer)
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
-	var serverLayers []ulayer.Layer
-	if serverLayer != nil {
-		serverLayers = append(serverLayers, serverLayer)
+	var serverMiddleware []uio.Middleware
+	if serverMidd != nil {
+		serverMiddleware = append(serverMiddleware, serverMidd)
 	}
 	serverEvents := &uio.Events{Pollers: 2}
 	started := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
-	serverTransport, err := ulayer.Over(serverEvents, server, serverLayers...)
-	if err != nil {
-		t.Fatal(err)
-	}
+	serverEvents.Handler = server
+	serverEvents.Use(serverMiddleware...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
 	<-started
-	listener, err := serverTransport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -401,18 +394,16 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer ulayer.Layer)
 	clientEvents := &uio.Events{Pollers: 2}
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
-	var clientLayers []ulayer.Layer
-	if clientLayer != nil {
-		clientLayers = append(clientLayers, clientLayer)
+	var clientMiddleware []uio.Middleware
+	if clientMidd != nil {
+		clientMiddleware = append(clientMiddleware, clientMidd)
 	}
-	clientTransport, err := ulayer.Over(clientEvents, uio.FuncHandler{
+	clientEvents.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) {},
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
-	}, clientLayers...)
-	if err != nil {
-		t.Fatal(err)
 	}
+	clientEvents.Use(clientMiddleware...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()
@@ -424,7 +415,7 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer ulayer.Layer)
 	runtime.ReadMemStats(&before)
 
 	for range conns {
-		if _, err := clientTransport.Dial("tcp://"+listener.Addr().String(), nil); err != nil {
+		if _, err := clientEvents.Dial("tcp://"+listener.Addr().String(), nil); err != nil {
 			t.Fatal(err)
 		}
 	}

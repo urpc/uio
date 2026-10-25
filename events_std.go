@@ -134,7 +134,8 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		fdc.conn = conn
 	}
 
-	fdc.SetUserdata(userdata)
+	probe, marked := ev.dialMarker(userdata)
+	fdc.SetUserdata(marked)
 	fdc.setLocalAddr(lAddr)
 	fdc.setRemoteAddr(rAddr)
 	fdc.events = ev
@@ -147,7 +148,10 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	if err = ev.addConnContext(dialCtx, fdc); nil != err {
 		return nil, err
 	}
-	return fdc, nil
+	if probe == nil {
+		return fdc, nil
+	}
+	return ev.awaitDial(dialCtx, fdc, probe)
 }
 
 // loopState is this backend's share of Events: a master loop that serves the

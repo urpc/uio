@@ -87,7 +87,8 @@ type Events struct {
 	ioPool         *ioTaskPool
 	readPool       plocal.Cache[*readBuffer] // read buffers, one kept per P
 	readBufferSize int
-	cb             callbacks // Handler, resolved when Serve starts
+	cb             callbacks    // Handler, resolved when Serve starts
+	use            []Middleware // installed by Use, read when Serve starts
 
 	// Pollers is the number of event loops. On Unix each loop is one
 	// epoll or kqueue instance that a few goroutines wait on: they collect
@@ -294,7 +295,7 @@ func (ev *Events) finishLifecycle(err error) {
 }
 
 func (ev *Events) initConfig() error {
-	ev.cb = resolveCallbacks(ev.Handler, ev.Observer, ev.Hooks)
+	ev.cb = resolveCallbacks(ev.wrapHandler(ev.Handler), ev.Observer, ev.Hooks)
 
 	if ev.Pollers <= 0 {
 		ev.Pollers = defaultPollers(runtime.GOMAXPROCS(0))

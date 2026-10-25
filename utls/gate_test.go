@@ -5,29 +5,24 @@ import (
 	"sync"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
-// gateLayer runs a one-round handshake before its connection settles: both
-// sides send HELLO?, answer with HELLO!, and settle on the answer. It is
-// ulayer's gate test layer, trimmed to what the TLS tests need: a layer with
-// a handshake under the TLS layer.
-type gateLayer struct{}
-
-func (g *gateLayer) Handler(next uio.Handler) uio.Handler {
-	perConn := ulayer.Func(func(lower uio.Conn, next uio.Handler) uio.Handler {
-		conn := &gateConn{Forward: ulayer.Forward{Lower: lower}, next: next}
+// gate is a wrapper that runs a one-round handshake before its connection
+// settles: both sides send HELLO?, answer with HELLO!, and settle on the
+// answer. It is a wrapper with a handshake under the TLS wrapper.
+func gate(next uio.Handler) uio.Handler {
+	return uio.PerConn(func(lower uio.Conn, next uio.Handler) uio.Handler {
+		conn := &gateConn{InnerConn: uio.InnerConn{Conn: lower}, next: next}
 		return uio.FuncHandler{
 			Open:  func(uio.Conn) { conn.open() },
 			Data:  func(uio.Conn) error { return conn.data() },
 			Close: func(_ uio.Conn, err error) { next.OnClose(conn, err) },
 		}
-	})
-	return perConn.Handler(next)
+	})(next)
 }
 
 type gateConn struct {
-	ulayer.Forward
+	uio.InnerConn
 	next    uio.Handler
 	mu      sync.Mutex
 	pending []byte
@@ -35,19 +30,19 @@ type gateConn struct {
 }
 
 func (c *gateConn) open() {
-	_, _ = c.Lower.Write([]byte("HELLO?"))
+	_, _ = c.Conn.Write([]byte("HELLO?"))
 }
 
 func (c *gateConn) data() error {
 	c.mu.Lock()
-	chunk := c.Lower.PeekChunk()
+	chunk := c.Conn.PeekChunk()
 	c.pending = append(c.pending, chunk...)
-	_, _ = c.Lower.Discard(len(chunk))
+	_, _ = c.Conn.Discard(len(chunk))
 	for !c.ready && len(c.pending) >= len("HELLO?") {
 		switch {
 		case string(c.pending[:len("HELLO?")]) == "HELLO?":
 			c.pending = c.pending[len("HELLO?"):]
-			_, _ = c.Lower.Write([]byte("HELLO!"))
+			_, _ = c.Conn.Write([]byte("HELLO!"))
 		case string(c.pending[:len("HELLO!")]) == "HELLO!":
 			c.pending = c.pending[len("HELLO!"):]
 			c.ready = true
@@ -76,18 +71,18 @@ func (c *gateConn) Discard(n int) (int, error) {
 }
 func (c *gateConn) InboundBuffered() int                  { return len(c.pending) }
 func (c *gateConn) ReserveInbound(int) error              { return nil }
-func (c *gateConn) OutboundBuffered() int                 { return c.Lower.OutboundBuffered() }
-func (c *gateConn) Write(p []byte) (int, error)           { return c.Lower.Write(p) }
-func (c *gateConn) Writev(v [][]byte) (int, error)        { return c.Lower.Writev(v) }
-func (c *gateConn) WriteOwned(b *uio.Buffer) (int, error) { return c.Lower.WriteOwned(b) }
+func (c *gateConn) OutboundBuffered() int                 { return c.Conn.OutboundBuffered() }
+func (c *gateConn) Write(p []byte) (int, error)           { return c.Conn.Write(p) }
+func (c *gateConn) Writev(v [][]byte) (int, error)        { return c.Conn.Writev(v) }
+func (c *gateConn) WriteOwned(b *uio.Buffer) (int, error) { return c.Conn.WriteOwned(b) }
 func (c *gateConn) ReserveOutbound(n int) ([]byte, error) {
-	return c.Lower.ReserveOutbound(n)
+	return c.Conn.ReserveOutbound(n)
 }
-func (c *gateConn) Flush() error              { return c.Lower.Flush() }
-func (c *gateConn) YieldRead() error          { return c.Lower.YieldRead() }
-func (c *gateConn) CloseWith(err error) error { return c.Lower.CloseWith(err) }
-func (c *gateConn) Close() error              { return c.Lower.Close() }
-func (c *gateConn) CloseWrite() error         { return c.Lower.CloseWrite() }
+func (c *gateConn) Flush() error              { return c.Conn.Flush() }
+func (c *gateConn) YieldRead() error          { return c.Conn.YieldRead() }
+func (c *gateConn) CloseWith(err error) error { return c.Conn.CloseWith(err) }
+func (c *gateConn) Close() error              { return c.Conn.Close() }
+func (c *gateConn) CloseWrite() error         { return c.Conn.CloseWrite() }
 
 func (c *gateConn) Read(b []byte) (int, error) {
 	n := copy(b, c.pending)
@@ -102,8 +97,8 @@ func (c *gateConn) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (c *gateConn) WriteByte(b byte) error {
-	_, err := c.Lower.Write([]byte{b})
+	_, err := c.Conn.Write([]byte{b})
 	return err
 }
 
-func (c *gateConn) WriteString(s string) (int, error) { return c.Lower.Write([]byte(s)) }
+func (c *gateConn) WriteString(s string) (int, error) { return c.Conn.Write([]byte(s)) }

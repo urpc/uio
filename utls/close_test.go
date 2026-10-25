@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/ulayer"
 )
 
 // zeroes reads as zeros, forever.
@@ -37,9 +36,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 	events := &uio.Events{Pollers: 2, MaxInboundBuffered: 32 << 10, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	layer := Server(serverConfig)
-	layer.StagingBound = 16 << 10
-	transport, err := ulayer.Over(events, uio.FuncHandler{
+	events.Handler = uio.FuncHandler{
 		Open: func(c uio.Conn) {
 			_ = c.SetReadBuffer(32 << 10) // the staging bound, not the kernel's
 			top.Store(&c)
@@ -54,10 +51,8 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 			return nil
 		},
 		Close: func(uio.Conn, error) {},
-	}, layer)
-	if err != nil {
-		t.Fatal(err)
 	}
+	events.Use(Server(serverConfig, StagingBound(16<<10)))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
@@ -66,10 +61,11 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("Serve did not start")
 	}
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer func() { _ = listener.Close() }()
 
 	client, err := tls.Dial("tcp", listener.Addr().String(), clientConfig)
 	if err != nil {
@@ -94,15 +90,15 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if stalled.Load() == 0 {
-		t.Fatal("the stack never held bytes below its layer")
+		t.Fatal("the stack never held bytes below its wrapper")
 	}
 	select {
 	case err := <-written:
 		t.Fatalf("the sender finished with the stack stalled: %v", err)
 	case <-time.After(time.Second):
 	}
-	if held := stalled.Load(); held > int64(layer.StagingBound+(32<<10)+(64<<10)) {
-		t.Fatalf("the layer held %d bytes, far past its bound", held)
+	if held := stalled.Load(); held > int64((16<<10)+(32<<10)+(64<<10)) {
+		t.Fatalf("the wrapper held %d bytes, far past its bound", held)
 	}
 
 	close(release) // the reader above reads again, and its round needs a wake
@@ -194,14 +190,12 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 	closed := make(chan error, 1)
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
-	_, err = ulayer.Over(events, uio.FuncHandler{
+	events.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) {},
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(_ uio.Conn, err error) { closed <- err },
-	}, Client(clientConfig))
-	if err != nil {
-		t.Fatal(err)
 	}
+	events.Use(Client(clientConfig))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
@@ -228,10 +222,8 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 // dialing side reports it without running a callback.
 func TestHandshakeTimeout(t *testing.T) {
 	serverConfig, _ := testConfigs(t)
-	layer := Server(serverConfig)
-	layer.HandshakeTimeout = 150 * time.Millisecond
 	server := newEcho()
-	transport := serveTLS(t, server, layer)
+	transport := serveTLS(t, server, Server(serverConfig, HandshakeTimeout(150*time.Millisecond)))
 	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -272,21 +264,19 @@ func TestDialCanceledMidHandshake(t *testing.T) {
 	calls := 0
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
-	transport, err := ulayer.Over(events, uio.FuncHandler{
+	events.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) { mu.Lock(); calls++; mu.Unlock() },
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) { mu.Lock(); calls++; mu.Unlock() },
-	}, Client(&tls.Config{InsecureSkipVerify: true}))
-	if err != nil {
-		t.Fatal(err)
 	}
+	events.Use(Client(&tls.Config{InsecureSkipVerify: true}))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err = transport.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
 	// The deadline is what asked for the close; a transport error that beat
 	// it to the report tells the same story.
 	if err == nil {
