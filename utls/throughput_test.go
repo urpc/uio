@@ -186,7 +186,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 		},
 		Close: func(uio.Conn, error) {},
 	}
-	serverEvents := &uio.Events{Pollers: 2}
+	serverEvents := &uio.Events{Pollers: 2, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	serverStarted := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(serverStarted) }}
 	serverEvents.Handler = server
@@ -227,7 +227,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 		},
 		Close: func(uio.Conn, error) {},
 	}
-	clientEvents := &uio.Events{Pollers: 1}
+	clientEvents := &uio.Events{Pollers: 1, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
 	clientEvents.Handler = client
@@ -376,7 +376,7 @@ func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware)
 	if serverMidd != nil {
 		serverMiddleware = append(serverMiddleware, serverMidd)
 	}
-	serverEvents := &uio.Events{Pollers: 2}
+	serverEvents := &uio.Events{Pollers: 2, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	started := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
 	serverEvents.Handler = server
@@ -391,7 +391,7 @@ func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware)
 	}
 	defer func() { _ = listener.Close() }()
 
-	clientEvents := &uio.Events{Pollers: 2}
+	clientEvents := &uio.Events{Pollers: 2, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
 	var clientMiddleware []uio.Middleware
@@ -432,4 +432,33 @@ func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware)
 	var after runtime.MemStats
 	runtime.ReadMemStats(&after)
 	return after.HeapInuse - before.HeapInuse
+}
+
+// benchReadBuffer is the socket read size the benchmark runs UIO with, from
+// UTLS_BENCH_BUFFER: zero leaves UIO's own default (4 KiB) in place, so the
+// same test measures both.
+func benchReadBuffer() int {
+	v := os.Getenv("UTLS_BENCH_BUFFER")
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
+}
+
+// benchWriteThreshold is the write coalescing threshold from
+// UTLS_BENCH_WRITEBUF; zero leaves UIO's default (no size-based buffering).
+func benchWriteThreshold() int {
+	v := os.Getenv("UTLS_BENCH_WRITEBUF")
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }

@@ -49,8 +49,13 @@ type conn struct {
 	pending []byte
 	readAt  int
 	// staging is what the engine decrypted, delivered no further than the
-	// handler above reads.
+	// handler above reads; stageAt is the delivered prefix of it. Keeping the
+	// prefix instead of reslicing forward lets the capacity be reused once the
+	// handler drains it, which is what a bulk transfer does every round. The
+	// engine decrypts straight into its spare capacity, so a round costs no
+	// buffer of its own and no copy after the decryption.
 	staging []byte
+	stageAt int
 
 	// resume continues the handshake's coroutine, and stop ends it; both
 	// nil once the handshake settled. yield is the suspension inside the
@@ -193,7 +198,7 @@ func (c *conn) data() error {
 
 	first := c.ready && !c.opened
 	c.opened = c.ready
-	staged := len(c.staging)
+	staged := c.stagedLocked()
 	c.mu.Unlock()
 	if first {
 		c.next.OnOpen(c)
@@ -207,18 +212,35 @@ func (c *conn) data() error {
 // pump decrypts into staging, one record at a time, until the staging bound
 // or the end of what arrived. It runs on the connection's round.
 func (c *conn) pump(bound int) error {
-	buf := make([]byte, readBufferSize)
 	for {
 		c.mu.Lock()
-		if len(c.staging) >= bound || c.readEnded || !c.ready {
+		if c.stagedLocked() >= bound || c.readEnded || !c.ready {
 			c.mu.Unlock()
 			return nil
 		}
+		// Nothing left for the engine to read: a Read here could only report
+		// errWouldBlock, and growing the staging for it would cost every
+		// settled connection a buffer it never fills.
+		if c.readAt >= len(c.pending) {
+			c.mu.Unlock()
+			return nil
+		}
+		// Decrypt into the staging's spare capacity: the engine's Read needs
+		// bytes to write, and the delivered prefix keeps its length until the
+		// round extends it, so nothing observes unwritten space. The capacity
+		// is grown here, under the lock, and the slice handed out is the round's
+		// own: pump runs on the connection's round, which serialize.
+		if spare := cap(c.staging) - len(c.staging); spare < readBufferSize {
+			grown := make([]byte, len(c.staging), len(c.staging)+readBufferSize)
+			copy(grown, c.staging)
+			c.staging = grown
+		}
+		target := c.staging[len(c.staging):cap(c.staging)][:readBufferSize]
 		c.mu.Unlock()
-		n, err := c.tls.Read(buf)
+		n, err := c.tls.Read(target)
 		c.mu.Lock()
 		if n > 0 {
-			c.staging = append(c.staging, buf[:n]...)
+			c.staging = c.staging[:len(c.staging)+n]
 		}
 		c.compactLocked()
 		c.mu.Unlock()
@@ -279,28 +301,39 @@ func (c *conn) stagingBound() int {
 	return DefaultStagingBound
 }
 
-// compactLocked drops the ciphertext the engine read; it requires mu.
+// compactLocked drops the ciphertext the engine read and reclaims a fully
+// delivered staging; it requires mu.
 func (c *conn) compactLocked() {
 	if c.readAt > 0 {
 		c.pending = c.pending[:copy(c.pending, c.pending[c.readAt:])]
 		c.readAt = 0
 	}
+	if c.stageAt >= len(c.staging) {
+		c.staging, c.stageAt = c.staging[:0], 0
+	}
 }
 
-// releasePendingLocked drops the whole ciphertext buffer once the engine
-// drained it; it requires mu.
+// stagedLocked reports how many decrypted bytes the handler above has not
+// taken yet; it requires mu.
+func (c *conn) stagedLocked() int {
+	return len(c.staging) - c.stageAt
+}
+
+// releasePendingLocked drops the ciphertext buffer once the engine drained
+// it; it requires mu. The capacity goes with it: a round's ciphertext is at
+// most one socket read, keeping it would cost every settled connection a
+// buffer it never fills, and measured no throughput.
 func (c *conn) releasePendingLocked() {
-	c.pending = nil
-	c.readAt = 0
+	c.pending, c.readAt = nil, 0
 }
 
 // State reports what the handshake settled on; before it settles, the zero
 // ConnectionState.
-func (c *conn) State() stdtls.ConnectionState {
+func (c *conn) State() ConnectionState {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.tls == nil {
-		return stdtls.ConnectionState{}
+		return ConnectionState{}
 	}
 	return c.tls.ConnectionState()
 }
@@ -308,18 +341,22 @@ func (c *conn) State() stdtls.ConnectionState {
 // The reads are the handler above's, in its callbacks.
 
 func (c *conn) Peek(b []byte) []byte {
-	n := copy(b, c.staging)
+	n := copy(b, c.staging[c.stageAt:])
 	return b[:n]
 }
 
-func (c *conn) PeekChunk() []byte { return c.staging }
+func (c *conn) PeekChunk() []byte { return c.staging[c.stageAt:] }
 
 func (c *conn) Discard(n int) (int, error) {
-	if n > len(c.staging) {
-		n = len(c.staging)
+	if staged := c.staged(); n > staged {
+		n = staged
 	}
-	c.staging = c.staging[n:]
-	if len(c.staging) < c.stagingBound() {
+	c.stageAt += n
+	if c.stageAt == len(c.staging) {
+		// Fully delivered: the round that pumps next reuses the capacity.
+		c.staging, c.stageAt = c.staging[:0], 0
+	}
+	if staged := c.staged(); staged < c.stagingBound() {
 		// Room again: a wake runs the round that takes what is left unread
 		// below, and the socket reads with it.
 		_ = c.Conn.Wake()
@@ -328,20 +365,23 @@ func (c *conn) Discard(n int) (int, error) {
 }
 
 func (c *conn) Read(b []byte) (int, error) {
-	n := copy(b, c.staging)
-	c.staging = c.staging[n:]
+	n := copy(b, c.staging[c.stageAt:])
+	c.stageAt += n
 	return n, nil // non-blocking, as a connection below reports nothing
 }
 
 func (c *conn) WriteTo(w io.Writer) (int64, error) {
-	n, err := w.Write(c.staging)
-	c.staging = c.staging[n:]
+	n, err := w.Write(c.staging[c.stageAt:])
+	c.stageAt += n
 	return int64(n), err
 }
 
+// staged reports how many decrypted bytes the handler above has not taken.
+func (c *conn) staged() int { return len(c.staging) - c.stageAt }
+
 func (c *conn) InboundBuffered() int {
 	c.mu.Lock()
-	held := len(c.staging) + len(c.pending) - c.readAt
+	held := c.stagedLocked() + len(c.pending) - c.readAt
 	c.mu.Unlock()
 	return held + c.Conn.InboundBuffered()
 }
@@ -405,7 +445,7 @@ func (c *conn) Flush() error { return c.Conn.Flush() }
 
 func (c *conn) YieldRead() error {
 	c.mu.Lock()
-	idle := len(c.staging) == 0 && c.readAt == len(c.pending)
+	idle := c.stagedLocked() == 0 && c.readAt == len(c.pending)
 	c.mu.Unlock()
 	if idle {
 		return c.Conn.YieldRead()
