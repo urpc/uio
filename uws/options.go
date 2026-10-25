@@ -118,6 +118,10 @@ type Options struct {
 	// reports its cause from Dial on a dialer, and closes the connection with
 	// it on a server.
 	//
+	// This is [uio.Events.Use] on the Events a Server or Dialer builds of its
+	// own: the middleware a connection runs is named here rather than
+	// installed on an Events of yours. The wire order is the same either way —
+	// Middleware, then the WebSocket protocol, then Handler.
 	Middleware []uio.Middleware
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the

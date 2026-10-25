@@ -34,6 +34,13 @@
 // record it buffered and retry. The tests pin it, so a Go release that
 // changes it fails here rather than in the field.
 //
+// Session tickets are the Config's, as they are for crypto/tls: servers that
+// share one Config resume one another's sessions, and servers that each build
+// their own do not — the client falls back to a full handshake, which is
+// slower, not an error. Share one Config across every Events a process serves
+// through, and install the same ticket keys with
+// [tls.Config.SetSessionTicketKeys] on every process that shares an address.
+//
 // Size the transport's reads to the record: a TLS record carries up to 16 KiB,
 // and a socket read smaller than that splits one record across several rounds,
 // each costing a syscall. On UIO that is [uio.Events.MaxBufferSize], whose
