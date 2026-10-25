@@ -25,10 +25,21 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const writevBatchLimit = maxWritevBuffers
+// stackWritevLimit is the iovec count Writev keeps on the stack. UIO hands a
+// writev at most nativeWriteVecLimit buffers, so the common batch never
+// allocates.
+const stackWritevLimit = 64
+
+// writevBatchLimit keeps every batch within stackWritevLimit stack-backed
+// iovecs. Longer vectors go out in batches of that size.
+const writevBatchLimit = stackWritevLimit
 
 // Writev invokes the writev system call directly. Longer vectors than one
 // writev takes go out in batches.
+//
+// The iovecs live on the stack: x/sys's RawSyscall passes its arguments as
+// uintptr, so the array it points at does not escape, and a batch that fits
+// stackWritevLimit allocates nothing.
 //
 // Note that SYS_WRITEV is about to be deprecated on Darwin
 // and the Go team suggested to use libSystem wrappers instead of direct system-calls,
@@ -43,8 +54,9 @@ func Writev(fd int, vec [][]byte) (int, error) {
 	if len(vec) > writevBatchLimit {
 		return writevBatches(fd, vec)
 	}
-	iovecs := make([]unix.Iovec, 0, minIovec)
-	iovecs = appendBytes(iovecs, vec)
+	var storage [stackWritevLimit]unix.Iovec
+	iovecs := storage[:len(vec)]
+	appendBytes(iovecs, vec)
 	n, _, err := unix.RawSyscall(unix.SYS_WRITEV, uintptr(fd), uintptr(unsafe.Pointer(&iovecs[0])), uintptr(len(iovecs))) //nolint:staticcheck
 	if err != 0 {
 		return int(n), err
@@ -52,27 +64,17 @@ func Writev(fd int, vec [][]byte) (int, error) {
 	return int(n), nil
 }
 
-// minIovec is the size of the small initial allocation used by
-// Readv, Writev, etc.
-//
-// This small allocation gets stack allocated, which lets the
-// common use case of len(iovs) <= minIovs avoid more expensive
-// heap allocations.
-const minIovec = 8
-
 var _zero uintptr
 
-// appendBytes converts bs to Iovecs and appends them to vecs.
-func appendBytes(vecs []unix.Iovec, bs [][]byte) []unix.Iovec {
-	for _, b := range bs {
-		var v unix.Iovec
-		v.SetLen(len(b))
+// appendBytes fills vecs, one iovec per element of bs; vecs must hold at
+// least len(bs).
+func appendBytes(vecs []unix.Iovec, bs [][]byte) {
+	for index, b := range bs {
+		vecs[index].SetLen(len(b))
 		if len(b) > 0 {
-			v.Base = &b[0]
+			vecs[index].Base = &b[0]
 		} else {
-			v.Base = (*byte)(unsafe.Pointer(&_zero))
+			vecs[index].Base = (*byte)(unsafe.Pointer(&_zero))
 		}
-		vecs = append(vecs, v)
 	}
-	return vecs
 }
