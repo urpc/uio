@@ -365,7 +365,7 @@ func (h *echoHandler) OnOpen(conn *Conn) {
 
 func (h *echoHandler) OnMessage(conn *Conn, message Message) {
 	h.message <- message.Clone()
-	_ = conn.SendText([]byte("world"))
+	_ = conn.SendText("world")
 }
 
 func (h *echoHandler) OnClose(*Conn, CloseEvent) { h.once.Do(func() { close(h.closed) }) }

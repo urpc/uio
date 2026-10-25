@@ -74,7 +74,7 @@ func (h *wssRecorder) OnOpen(c *Conn) { h.opened <- c }
 
 func (h *wssRecorder) OnMessage(c *Conn, m Message) {
 	h.got <- string(m.Payload)
-	_ = c.SendText(m.Payload) // echo
+	_ = c.SendText(m.Text()) // echo
 }
 
 func (h *wssRecorder) OnClose(_ *Conn, event CloseEvent) { h.closed <- event.Err }
@@ -126,7 +126,7 @@ func TestWSSRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn := wssWait(t, client.opened, "client open over wss")
-	if err := conn.SendText([]byte("secure hello")); err != nil {
+	if err := conn.SendText("secure hello"); err != nil {
 		t.Fatal(err)
 	}
 	// The server echoes, and the client's own echo handler answers back.

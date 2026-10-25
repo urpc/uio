@@ -67,7 +67,7 @@ func TestClientReceivesMessagesSentRightAfterOpen(t *testing.T) {
 	const messages = 3
 	addr := startClientTestServer(t, func(conn *Conn) {
 		for i := range messages {
-			_ = conn.SendText([]byte(fmt.Sprintf("m%d", i)))
+			_ = conn.SendText(fmt.Sprintf("m%d", i))
 		}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -166,7 +166,7 @@ func TestClientReadMessageContextTimesOutIndependently(t *testing.T) {
 	addr := startClientTestServer(t, func(conn *Conn) {
 		go func() {
 			<-trigger
-			_ = conn.SendText([]byte("late"))
+			_ = conn.SendText("late")
 		}()
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -194,8 +194,8 @@ func TestClientReadMessageContextTimesOutIndependently(t *testing.T) {
 // The peer's close reaches ReadMessage as a CloseError once the queue drains.
 func TestClientReportsPeerCloseAfterDrain(t *testing.T) {
 	addr := startClientTestServer(t, func(conn *Conn) {
-		_ = conn.SendText([]byte("one"))
-		_ = conn.SendText([]byte("two"))
+		_ = conn.SendText("one")
+		_ = conn.SendText("two")
 		_ = conn.Close(1000, "bye")
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -234,7 +234,7 @@ func TestClientCloseEndsFullQueue(t *testing.T) {
 	addr := startClientTestServer(t, func(conn *Conn) {
 		go func() {
 			for i := range messages {
-				if err := conn.SendText([]byte(fmt.Sprintf("m%d", i))); err != nil {
+				if err := conn.SendText(fmt.Sprintf("m%d", i)); err != nil {
 					return
 				}
 			}
@@ -282,7 +282,7 @@ func TestClientQueueBackpressureDeliversEverything(t *testing.T) {
 	addr := startClientTestServer(t, func(conn *Conn) {
 		go func() {
 			for i := range messages {
-				if err := conn.SendText([]byte(fmt.Sprintf("m%d", i))); err != nil {
+				if err := conn.SendText(fmt.Sprintf("m%d", i)); err != nil {
 					return
 				}
 			}
@@ -337,7 +337,7 @@ func TestClientCloseInvalidReasonKeepsReading(t *testing.T) {
 	if client.IsClosed() {
 		t.Fatal("an invalid Close closed the connection")
 	}
-	if err := client.SendText([]byte("still here")); err != nil {
+	if err := client.SendText("still here"); err != nil {
 		t.Fatal(err)
 	}
 	message, err := client.ReadMessage(ctx)
@@ -362,7 +362,7 @@ func TestClientCloseErrorCarriesCloseEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := client.SendText([]byte("last")); err != nil {
+	if err := client.SendText("last"); err != nil {
 		t.Fatal(err)
 	}
 	message, err := client.ReadMessage(ctx)
@@ -415,7 +415,7 @@ func floodClient(t *testing.T, dialer *Dialer) *Client {
 	addr := startClientTestServer(t, func(conn *Conn) {
 		go func() {
 			for range 10 * clientQueueMessages {
-				if err := conn.SendText([]byte("flood")); err != nil {
+				if err := conn.SendText("flood"); err != nil {
 					return
 				}
 			}
@@ -562,7 +562,7 @@ func TestClientDeadlineExtendedKeepsDelivery(t *testing.T) {
 	addr := startClientTestServer(t, func(conn *Conn) {
 		go func() {
 			for i := range messages {
-				if err := conn.SendText([]byte(fmt.Sprintf("m%d", i))); err != nil {
+				if err := conn.SendText(fmt.Sprintf("m%d", i)); err != nil {
 					return
 				}
 			}

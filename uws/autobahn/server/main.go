@@ -32,9 +32,9 @@ func (echoHandler) OnMessage(conn *uws.Conn, message uws.Message) {
 	var err error
 	switch message.Type {
 	case uws.TextMessage:
-		err = conn.SendText(message.Payload)
+		err = conn.SendText(message.Text())
 	case uws.BinaryMessage:
-		err = conn.SendBinary(message.Payload)
+		err = conn.SendBinary(message.Bytes())
 	}
 	if err != nil {
 		_ = conn.Close(closeInternalError, "echo failed")

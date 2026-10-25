@@ -267,7 +267,7 @@ func TestHeartbeatBatchRespectsQuota(t *testing.T) {
 	c.heartbeat = &heartbeatState{}
 	var sends []error
 	c.handler = &batchEchoHandler{onMessage: func(c *Conn, m Message) {
-		sends = append(sends, c.SendBinary(m.Payload))
+		sends = append(sends, c.SendBinary(m.Bytes()))
 	}}
 	raw.inbound = maskedFrames(string(bytes.Repeat([]byte("a"), 40)), string(bytes.Repeat([]byte("b"), 40)))
 	if err := c.readAvailable(); err != nil {
@@ -359,7 +359,7 @@ func (h *captureEchoHandler) OnMessage(c *Conn, m Message) {
 	case h.seen <- len(m.Payload):
 	default:
 	}
-	_ = c.SendBinary(m.Payload)
+	_ = c.SendBinary(m.Bytes())
 }
 
 func (h *captureEchoHandler) OnClose(*Conn, CloseEvent) {}
@@ -1005,7 +1005,7 @@ func TestReadRoundsAndExternalSendersNeverStrandBatch(t *testing.T) {
 	handler := &batchEchoHandler{}
 	conn := newBatchConn(raw, handler)
 	handler.onMessage = func(conn *Conn, message Message) {
-		if err := conn.SendBinary(message.Payload); err != nil {
+		if err := conn.SendBinary(message.Bytes()); err != nil {
 			t.Errorf("echo = %v", err)
 		}
 	}
@@ -1153,9 +1153,9 @@ func (h *closeOvertakeHandler) OnMessage(c *Conn, m Message) {
 	if string(m.Payload) != "go" {
 		return
 	}
-	_ = c.SendText([]byte("A"))
+	_ = c.SendText("A")
 	done := make(chan error, 1)
-	go func() { done <- c.SendText([]byte("X")) }()
+	go func() { done <- c.SendText("X") }()
 	h.accepted <- <-done
 	_ = c.Close(1000, "")
 }

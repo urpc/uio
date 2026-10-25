@@ -56,9 +56,9 @@ func (echo) OnClose(*uws.Conn, uws.CloseEvent) {}
 
 func (echo) OnMessage(c *uws.Conn, m uws.Message) {
 	if m.Type == uws.TextMessage {
-		_ = c.SendText(m.Payload)
+		_ = c.SendText(m.Text())
 	} else {
-		_ = c.SendBinary(m.Payload)
+		_ = c.SendBinary(m.Bytes())
 	}
 }
 
@@ -118,7 +118,7 @@ if err != nil {
 }
 defer client.Close(1000, "")
 
-_ = client.SendText([]byte("hello"))
+_ = client.SendText("hello")
 for {
 	message, err := client.ReadMessage(ctx)
 	if err != nil {
@@ -142,7 +142,7 @@ The callback form, for one handler serving every connection a dialer makes:
 ```go
 type client struct{}
 
-func (client) OnOpen(c *uws.Conn)                  { _ = c.SendText([]byte("hello")) }
+func (client) OnOpen(c *uws.Conn)                  { _ = c.SendText("hello") }
 func (client) OnMessage(c *uws.Conn, m uws.Message) { log.Printf("%s", m.Payload) }
 func (client) OnClose(c *uws.Conn, e uws.CloseEvent) {
 	if e.Err != nil {
@@ -295,6 +295,8 @@ reports. Behind `net/http`, `ServeHTTP` does not run the layers — an
 
 - **Payloads are borrowed.** `Message.Payload` is valid until `OnMessage`
   returns. Call `Message.Clone` to keep it or hand it to another goroutine.
+  `Message.Text` and `Message.Bytes` hand the payload back to `SendText` and
+  `SendBinary` without copying, for echoes.
 - **Accepted is not delivered.** A nil error from `SendText`, `SendBinary` or
   `Ping` means the message was queued in order, not that the peer has it.
   Replies to a peer that stops reading pause this connection's reads; sends

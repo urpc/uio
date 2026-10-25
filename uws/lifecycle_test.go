@@ -81,7 +81,7 @@ func (executor *switchableExecutor) SubmitBatch(tasks []uio.IOTask) int {
 
 func (lifecycleEchoHandler) OnOpen(*Conn) {}
 func (lifecycleEchoHandler) OnMessage(conn *Conn, message Message) {
-	_ = conn.SendBinary(message.Payload)
+	_ = conn.SendBinary(message.Bytes())
 }
 func (lifecycleEchoHandler) OnClose(*Conn, CloseEvent) {}
 
@@ -91,7 +91,7 @@ func (h *slowConnectionHandler) OnMessage(conn *Conn, message Message) {
 		close(h.started)
 		<-h.release
 	}
-	_ = conn.SendBinary(message.Payload)
+	_ = conn.SendBinary(message.Bytes())
 }
 func (*slowConnectionHandler) OnClose(*Conn, CloseEvent) {}
 
@@ -102,7 +102,7 @@ func (h *blockingCloseConnectionHandler) OnOpen(conn *Conn) {
 	}
 }
 func (*blockingCloseConnectionHandler) OnMessage(conn *Conn, message Message) {
-	_ = conn.SendBinary(message.Payload)
+	_ = conn.SendBinary(message.Bytes())
 }
 func (h *blockingCloseConnectionHandler) OnClose(conn *Conn, _ CloseEvent) {
 	if conn.Userdata() != "slow" {

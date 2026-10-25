@@ -108,7 +108,7 @@ func TestSendValidatesTextAndMessageLimit(t *testing.T) {
 
 	// Text payloads are the sender's contract and are not revalidated on
 	// send; what a peer sent has already been checked on read.
-	if err := conn.SendText([]byte{0xff}); err != nil {
+	if err := conn.SendText(string([]byte{0xff})); err != nil {
 		t.Fatalf("SendText(unvalidated byte) = %v, want nil", err)
 	}
 	if err := conn.SendBinary([]byte("12345")); err != frame.ErrMessageTooBig {
@@ -249,7 +249,7 @@ func TestDisableUTF8CheckAllowsTextMessages(t *testing.T) {
 	server := &Server{Options: Options{MaxFramePayload: 1024, MaxMessageSize: 1024, DisableUTF8Check: true}}
 	conn := &Conn{raw: raw, config: testServerConfig(server)}
 	conn.opened.Store(true)
-	if err := conn.SendText([]byte{0xff}); err != nil {
+	if err := conn.SendText(string([]byte{0xff})); err != nil {
 		t.Fatalf("SendText with validation disabled = %v", err)
 	}
 	if err := conn.Close(1000, string([]byte{0xff})); !errors.Is(err, frame.ErrInvalidUTF8) {

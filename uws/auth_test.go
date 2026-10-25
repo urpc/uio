@@ -34,7 +34,7 @@ func (h *authRecorder) OnOpen(c *Conn) {
 	h.opened <- struct{}{}
 }
 
-func (h *authRecorder) OnMessage(c *Conn, m Message) { _ = c.SendBinary(m.Payload) }
+func (h *authRecorder) OnMessage(c *Conn, m Message) { _ = c.SendBinary(m.Bytes()) }
 
 func (h *authRecorder) OnClose(*Conn, CloseEvent) {
 	h.mu.Lock()

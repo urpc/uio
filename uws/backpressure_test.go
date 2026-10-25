@@ -302,7 +302,7 @@ func TestPausedReadsWaitForTheLowWatermark(t *testing.T) {
 type echoAllHandler struct{}
 
 func (echoAllHandler) OnOpen(*Conn)                 {}
-func (echoAllHandler) OnMessage(c *Conn, m Message) { _ = c.SendBinary(m.Payload) }
+func (echoAllHandler) OnMessage(c *Conn, m Message) { _ = c.SendBinary(m.Bytes()) }
 func (echoAllHandler) OnClose(*Conn, CloseEvent)    {}
 
 // readServerFrame reads one unmasked frame from the server.
@@ -520,7 +520,7 @@ func (h *batchEchoHandler) OnMessage(conn *Conn, message Message) {
 		h.onMessage(conn, message)
 		return
 	}
-	_ = conn.SendBinary(message.Payload)
+	_ = conn.SendBinary(message.Bytes())
 }
 
 func (*batchEchoHandler) OnClose(*Conn, CloseEvent) {}
@@ -579,7 +579,7 @@ func TestBatchKeepsOrderWithOtherSenders(t *testing.T) {
 	handler := &batchEchoHandler{}
 	conn := newBatchConn(raw, handler)
 	handler.onMessage = func(conn *Conn, message Message) {
-		_ = conn.SendBinary(message.Payload)
+		_ = conn.SendBinary(message.Bytes())
 		if string(message.Payload) == "first" {
 			// A sender on another goroutine joins the batch in order.
 			done := make(chan error, 1)
@@ -820,7 +820,7 @@ func TestBatchUnderOutboundLimitIsNeverRefused(t *testing.T) {
 	conn.config.batchBlockSize = 64
 	refused := 0
 	handler.onMessage = func(conn *Conn, message Message) {
-		switch err := conn.SendBinary(message.Payload); {
+		switch err := conn.SendBinary(message.Bytes()); {
 		case err == nil:
 		case errors.Is(err, ErrBackpressure):
 			refused++

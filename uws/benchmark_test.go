@@ -58,7 +58,7 @@ type echoPathHandler struct{}
 func (echoPathHandler) OnOpen(*Conn) {}
 
 func (echoPathHandler) OnMessage(conn *Conn, message Message) {
-	_ = conn.SendBinary(message.Payload)
+	_ = conn.SendBinary(message.Bytes())
 }
 
 func (echoPathHandler) OnClose(*Conn, CloseEvent) {}
@@ -165,7 +165,7 @@ type echoTextHandler struct{}
 
 func (echoTextHandler) OnOpen(*Conn) {}
 
-func (echoTextHandler) OnMessage(conn *Conn, message Message) { _ = conn.SendText(message.Payload) }
+func (echoTextHandler) OnMessage(conn *Conn, message Message) { _ = conn.SendText(message.Text()) }
 
 func (echoTextHandler) OnClose(*Conn, CloseEvent) {}
 

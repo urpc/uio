@@ -25,6 +25,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"unsafe"
+
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/internal/plocal"
 	"github.com/urpc/uio/uws/internal/frame"
@@ -181,8 +183,22 @@ func (state *connCloseProgress) claimPendingTransportClose() bool {
 // SendText queues payload as one text message. The transport flushes accepted
 // data in the connection's current or next I/O task. payload must be valid
 // UTF-8: it is sent as given, and only received text is validated.
-func (c *Conn) SendText(payload []byte) error {
-	return c.send(MessageType(TextMessage), payload)
+//
+// payload's bytes are framed without a copy: a string converts to the
+// transaction's view of the wire for free, and nothing on the send path writes
+// through it.
+func (c *Conn) SendText(payload string) error {
+	return c.send(TextMessage, stringBytes(payload))
+}
+
+// stringBytes views s as bytes without copying. The result aliases s, so it
+// must not be written through; the send path only reads it and, where it
+// retains bytes past the call, copies them.
+func stringBytes(s string) []byte {
+	if s == "" {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // SendBinary queues payload as one binary message. The transport flushes

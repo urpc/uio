@@ -21,6 +21,7 @@ package uws
 import (
 	"errors"
 	"time"
+	"unsafe"
 
 	"github.com/urpc/uio/uws/internal/frame"
 	"github.com/urpc/uio/uws/internal/handshake"
@@ -94,6 +95,23 @@ type Message struct {
 func (m Message) Clone() Message {
 	m.Payload = append([]byte(nil), m.Payload...)
 	return m
+}
+
+// Text returns Payload as a string without copying, for the common echo —
+// handing a text message straight back to SendText. Like Payload, it is valid
+// only until OnMessage returns; call Clone to keep either past it.
+func (m Message) Text() string {
+	if len(m.Payload) == 0 {
+		return ""
+	}
+	return unsafe.String(unsafe.SliceData(m.Payload), len(m.Payload))
+}
+
+// Bytes returns Payload, the counterpart of Text for a binary message handed
+// straight back to SendBinary. It is Payload itself, valid on the same terms:
+// only until OnMessage returns unless cloned.
+func (m Message) Bytes() []byte {
+	return m.Payload
 }
 
 // CloseEvent describes why a WebSocket connection closed.

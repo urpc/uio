@@ -530,7 +530,7 @@ func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
 		t.Fatal("responsive heartbeat client was closed")
 	default:
 	}
-	if err = client.SendText([]byte("alive")); err != nil {
+	if err = client.SendText("alive"); err != nil {
 		t.Fatal(err)
 	}
 	select {

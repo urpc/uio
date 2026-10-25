@@ -39,9 +39,9 @@ type robustEchoHandler struct{}
 func (robustEchoHandler) OnOpen(*Conn) {}
 func (robustEchoHandler) OnMessage(c *Conn, m Message) {
 	if m.Type == TextMessage {
-		_ = c.SendText(m.Payload)
+		_ = c.SendText(m.Text())
 	} else {
-		_ = c.SendBinary(m.Payload)
+		_ = c.SendBinary(m.Bytes())
 	}
 }
 func (robustEchoHandler) OnClose(*Conn, CloseEvent) {}

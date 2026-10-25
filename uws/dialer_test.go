@@ -222,7 +222,7 @@ func TestDialerUsesUIOEventLoop(t *testing.T) {
 	if client.handshake.Load() != nil {
 		t.Fatal("completed client handshake retained handshake state")
 	}
-	if err = client.SendText([]byte("hello")); err != nil {
+	if err = client.SendText("hello"); err != nil {
 		t.Fatal(err)
 	}
 	select {

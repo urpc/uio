@@ -29,9 +29,9 @@ func (echoHandler) OnOpen(*uws.Conn) {}
 func (echoHandler) OnMessage(conn *uws.Conn, message uws.Message) {
 	switch message.Type {
 	case uws.TextMessage:
-		_ = conn.SendText(message.Payload)
+		_ = conn.SendText(message.Text())
 	case uws.BinaryMessage:
-		_ = conn.SendBinary(message.Payload)
+		_ = conn.SendBinary(message.Bytes())
 	}
 }
 

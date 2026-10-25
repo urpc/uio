@@ -2,7 +2,6 @@ package uws
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"io"
 	"net"
@@ -82,13 +81,13 @@ func TestServerHTTPHandlerEcho(t *testing.T) {
 	if protocol := client.Subprotocol(); protocol != "chat" {
 		t.Fatalf("client subprotocol = %q, want chat", protocol)
 	}
-	payload := bytes.Repeat([]byte("compressible-message-"), 64)
+	payload := strings.Repeat("compressible-message-", 64)
 	if err = client.SendText(payload); err != nil {
 		t.Fatal(err)
 	}
 	select {
 	case message := <-serverHandler.message:
-		if !bytes.Equal(message.Payload, payload) {
+		if string(message.Payload) != payload {
 			t.Fatalf("server message length = %d, want %d", len(message.Payload), len(payload))
 		}
 	case <-time.After(testIOTimeout()):
