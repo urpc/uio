@@ -188,7 +188,7 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `HeartbeatInterval` | off | Pings the peer at this interval; servers and dialers alike. |
 | `HeartbeatTimeout` | 2 × interval | Closes the connection when a ping gets no pong in time. |
 | `Pollers` | uio default | Event loops. |
-| `ReadBufferSize` | 4 KiB | Bytes per socket read; it also sizes the write batch blocks (clamped to 4-64 KiB). |
+| `ReadBufferSize` | 4 KiB | Bytes per socket read; it also sizes the write batch blocks (clamped to 4-64 KiB). Over TLS a record carries up to 16 KiB: a read smaller than that splits one record across several rounds, so a wss server moving bulk data reads about twice as fast with 16 KiB and half again with 64 KiB. |
 | `WriteCoalesce` | 4 KiB | Writes smaller than this join the connection's outbound batch instead of taking a send of their own; a negative value turns size-based buffering off. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `Executor` | uio default | Runs connection and write turns on the native backend; the `stdio` backend does not use it. |

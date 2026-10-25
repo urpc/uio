@@ -92,7 +92,10 @@ type Options struct {
 	Pollers int
 	// ReadBufferSize is the size of each socket read. Zero uses UIO's default
 	// of 4 KiB. It also sizes the write batch blocks the connection's replies
-	// are coalesced into, clamped to 4-64 KiB.
+	// are coalesced into, clamped to 4-64 KiB. Under TLS middleware a record
+	// carries up to 16 KiB and a read smaller than that splits one record
+	// across several rounds; a wss server moving bulk data reads about twice
+	// as fast with 16 KiB and half again with 64 KiB.
 	ReadBufferSize int
 	// WriteCoalesce makes callback writes smaller than this value join the
 	// connection's outbound batch instead of attempting an immediate send.
@@ -114,6 +117,7 @@ type Options struct {
 	// settle before the WebSocket handshake begins: one whose handshake fails
 	// reports its cause from Dial on a dialer, and closes the connection with
 	// it on a server.
+	//
 	Middleware []uio.Middleware
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the
