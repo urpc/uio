@@ -105,10 +105,10 @@ func (s *Server) Serve(addrs ...string) error {
 	if s.config.observeTraffic {
 		handler.Inbound = s.onInbound
 	}
-	// The middleware wraps what the connections carry, not the traffic the
-	// observer reports or the hooks around Serve.
+	// The layers sit under what the connections carry, not under the
+	// traffic the observer reports or the hooks around Serve.
 	events.Handler = handler
-	events.Use(opts.Middleware...)
+	events.Use(opts.Layers...)
 	events.Observer, events.Hooks = handler, handler
 	s.closeMu.Unlock()
 

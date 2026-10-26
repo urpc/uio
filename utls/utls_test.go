@@ -103,15 +103,15 @@ func wait[T any](t *testing.T, c chan T, what string) T {
 	}
 }
 
-// serveTLS serves a stack over fresh events with the wrappers installed in
+// serveTLS serves a stack over fresh events with the layers installed in
 // order, bottom first, and returns the events.
-func serveTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) *uio.Events {
+func serveTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) *uio.Events {
 	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 2, Handler: top, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	events.Use(wrappers...)
+	events.Use(layers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -131,9 +131,9 @@ func serveTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) *uio.Ev
 }
 
 // listenTLS serves a stack and listens on a fresh loopback port.
-func listenTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) (string, *uio.Events) {
+func listenTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) (string, *uio.Events) {
 	t.Helper()
-	events := serveTLS(t, top, wrappers...)
+	events := serveTLS(t, top, layers...)
 	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
 	if err != nil {
 		t.Fatal(err)
@@ -179,19 +179,19 @@ func (r *record) OnData(c uio.Conn) error {
 
 func (r *record) OnClose(_ uio.Conn, err error) { r.closed <- err }
 
-// dialTLS dials addr through a stack of its own with the wrappers installed,
+// dialTLS dials addr through a stack of its own with the layers installed,
 // and returns the settled connection with the handler that reports it. The
 // last argument is the address.
-func dialTLS(t *testing.T, wrappers ...any) (uio.Conn, *record) {
+func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 	t.Helper()
-	addr, _ := wrappers[len(wrappers)-1].(string)
+	addr, _ := layers[len(layers)-1].(string)
 	client := newRecord()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Handler: client, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	for _, wrapper := range wrappers[:len(wrappers)-1] {
-		events.Use(wrapper.(uio.Middleware))
+	for _, layer := range layers[:len(layers)-1] {
+		events.Use(layer.(uio.Layer))
 	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
@@ -213,7 +213,7 @@ func dialTLS(t *testing.T, wrappers ...any) (uio.Conn, *record) {
 	return conn, client
 }
 
-// The two sides of a TLS wrapper speak to each other through the stack: the
+// The two sides of a TLS layer speak to each other through the stack: the
 // handshake settles, plaintext travels both ways, and the certificate the
 // peer served is the test's.
 func TestTLSEchoBothSides(t *testing.T) {
@@ -230,7 +230,7 @@ func TestTLSEchoBothSides(t *testing.T) {
 		t.Fatal(err)
 	}
 	serverConn := wait(t, server.opened, "server open")
-	if state, ok := serverConn.(interface{ State() tls.ConnectionState }); ok {
+	if state, ok := uio.LayerOf(serverConn).(interface{ State() tls.ConnectionState }); ok {
 		if state.State().PeerCertificates == nil {
 			// a server without ClientAuth sees none; the handshake itself is
 			// what matters here

@@ -109,8 +109,8 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	if err != nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return fmt.Errorf("uws: only ws:// and wss:// targets are supported: %w", ErrProtocol)
 	}
-	if target.Scheme == "wss" && len(d.Options.Middleware) == 0 {
-		return fmt.Errorf("%w: wss:// needs TLS middleware in Middleware", ErrInvalidOptions)
+	if target.Scheme == "wss" && len(d.Options.Layers) == 0 {
+		return fmt.Errorf("%w: wss:// needs a TLS layer in Layers", ErrInvalidOptions)
 	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
@@ -278,10 +278,10 @@ func (d *Dialer) start(ctx context.Context) error {
 			Outbound: d.onOutbound,
 			Inbound:  d.onInbound,
 		}
-		// The middleware wraps what the connections carry, not the traffic the
-		// observer reports or the hooks around Serve.
+		// The layers sit under what the connections carry, not under the
+		// traffic the observer reports or the hooks around Serve.
 		events.Handler = handler
-		events.Use(opts.Middleware...)
+		events.Use(opts.Layers...)
 		events.Observer, events.Hooks = handler, handler
 		go func() {
 			err := events.Serve()

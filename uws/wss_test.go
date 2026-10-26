@@ -89,8 +89,8 @@ func startWSS(t *testing.T, serverTLS *tls.Config) string {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
 		return NewServer(Options{
-			Handler:    newWSSRecorder(),
-			Middleware: uio.Use(utls.Server(serverTLS)),
+			Handler: newWSSRecorder(),
+			Layers:  uio.Use(utls.Server(serverTLS)),
 		})
 	})
 	t.Cleanup(func() {
@@ -120,8 +120,8 @@ func TestWSSRoundTrip(t *testing.T) {
 
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
-		Handler:    client,
-		Middleware: uio.Use(utls.Client(clientTLS)),
+		Handler: client,
+		Layers:  uio.Use(utls.Client(clientTLS)),
 	}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -157,7 +157,7 @@ func TestWSSRefusedCertificate(t *testing.T) {
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
 		Handler: client,
-		Middleware: uio.Use(utls.Client(&tls.Config{
+		Layers: uio.Use(utls.Client(&tls.Config{
 			ServerName: "localhost", // trusts no certificate
 		})),
 	}}
@@ -233,7 +233,7 @@ func TestWSSHeartbeatClosesSilentPeer(t *testing.T) {
 		HeartbeatInterval:     10 * time.Millisecond,
 		HeartbeatTimeout:      30 * time.Millisecond,
 		OutboundHighWatermark: -1,
-		Middleware:            uio.Use(utls.Client(clientTLS)),
+		Layers:                uio.Use(utls.Client(clientTLS)),
 	})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
@@ -243,4 +243,79 @@ func TestWSSHeartbeatClosesSilentPeer(t *testing.T) {
 	if event := wssWait(t, watcher.closed, "the heartbeat close"); event.Code != 1001 {
 		t.Fatalf("heartbeat close code = %d, want 1001", event.Code)
 	}
+}
+
+// A wss peer that stops reading: the client's outbound fills, the outbound
+// limit refuses the heartbeat's Ping, and nobody answers. The stall deadline
+// still closes the connection — through the TLS layer, whose timed turns
+// carry no plaintext.
+func TestWSSHeartbeatClosesBackpressuredPeer(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	hold := make(chan struct{})
+	defer close(hold)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		key := ""
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			trimmed := strings.TrimSpace(line)
+			if len(trimmed) > len("sec-websocket-key:") && strings.EqualFold(trimmed[:len("sec-websocket-key:")], "sec-websocket-key:") {
+				key = strings.TrimSpace(trimmed[len("sec-websocket-key:"):])
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", testAcceptKey(key))
+		<-hold // read nothing more: the client's outbound fills
+		_, _ = io.Copy(io.Discard, reader)
+	}()
+	watcher := &connCloseWatcher{closeWatcher: newCloseWatcher(), conns: make(chan *Conn, 1)}
+	dialer := NewDialer(Options{
+		Handler:               watcher,
+		Pollers:               1,
+		HeartbeatInterval:     10 * time.Millisecond,
+		HeartbeatTimeout:      60 * time.Millisecond,
+		OutboundHighWatermark: -1,
+		MaxOutboundBuffered:   64 << 10,
+		Layers:                uio.Use(utls.Client(clientTLS)),
+	})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, watcher.conns, "OnOpen")
+	// Fill the outbound so the next Ping is refused.
+	big := make([]byte, 16<<10)
+	for i := 0; i < 64; i++ {
+		if err := conn.SendBinary(big); err != nil {
+			break
+		}
+	}
+	if event := wssWait(t, watcher.closed, "the heartbeat close"); event.Code != 1001 || event.Reason != "heartbeat timeout" {
+		t.Fatalf("closed with %d %q, want the heartbeat timeout", event.Code, event.Reason)
+	}
+}
+
+type connCloseWatcher struct {
+	*closeWatcher
+	conns chan *Conn
+}
+
+func (w *connCloseWatcher) OnOpen(c *Conn) {
+	w.closeWatcher.OnOpen(c)
+	w.conns <- c
 }

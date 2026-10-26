@@ -136,38 +136,76 @@ This describes the native epoll/kqueue backend. The portable `stdio` backend
 used on Windows (or with `-tags stdio`) gives each stream connection its own
 reader and writer goroutines instead.
 
-## Middleware
+## Protocol layers
 
 A protocol that is not yours to implement — TLS, compression, an auth
-handshake — can sit between the socket and your handler. `Events.Use` installs
-middleware under `Events.Handler`; the first one installed sits nearest the
-wire.
+handshake — can sit between the socket and your handler as a protocol layer.
+`Events.Use` stacks layers under `Events.Handler`; the first one installed sits
+nearest the wire.
 
-A wss server is the smallest complete example: TLS middleware, a WebSocket
-package, and one line joining them. The two directions run over the same
-chain and mirror each other exactly.
+A wss server is the smallest complete example: a TLS layer, a WebSocket
+package, and one line joining them. The two directions run through the same
+stack and mirror each other exactly.
 
-Reading, left to right: the socket hands up TLS records, the TLS middleware
-decrypts them into a plaintext stream, the WebSocket layer deframes that
+Reading, left to right: the socket hands up TLS records, the TLS layer
+decrypts them into a plaintext stream, the WebSocket protocol deframes that
 stream into messages, and your handler sees payloads.
 
 Writing, right to left: `SendText` becomes a frame, the frame is encrypted
 into a TLS record, and the record leaves by the same socket.
 
 <p align="center">
-  <img src="assets/middleware.svg" alt="Two rows over the same four boxes — socket, tls, websocket, handler: the top row reads left to right, decrypting then deframing into messages, and the bottom row writes right to left, framing then encrypting" width="100%">
+  <img src="assets/layers.svg" alt="Two rows over the same four boxes — socket, tls, websocket, handler: the top row reads left to right, decrypting then deframing into messages, and the bottom row writes right to left, framing then encrypting" width="100%">
 </p>
 
-A middleware is one function:
+A layer transforms bytes, and UIO carries everything else. Writing one means
+writing what the protocol changes — nothing more:
 
 ```go
-type Middleware = func(next Handler) Handler
+type Layer interface {
+	Attach(ctx LayerContext) LayerConn // once per connection
+}
+
+type LayerConn interface {
+	OnOpen(ctx LayerContext)                            // start a handshake; ctx.Open() when settled
+	OnInbound(ctx LayerContext) error                   // bytes from below → ctx.Deliver(...)
+	OnOutbound(ctx LayerContext, p []byte) (int, error) // bytes from above → ctx.Write(...)
+	OnTimer(ctx LayerContext) error                     // this layer's own timer came due
+	OnClose(ctx LayerContext, cause error)
+}
 ```
 
-`next` is the handler of the layer above; the return value is the handler of
-the layer below. It reads as *"give me what the layer above wants, and I will
-give you what the layer below should use."* Nothing else: no interface, no
-registry, no lifecycle.
+`Layer` is the protocol, configured once; `LayerConn` is its instance on one
+connection; `LayerContext` is that instance's place in the stack — what lies
+below it, and what it hands up. An obfuscation layer is all of this:
+
+```go
+type xorConn struct {
+	uio.PassThrough // open at once, pass through what is not overridden
+	key byte
+}
+
+func (x *xorConn) OnInbound(ctx uio.LayerContext) error {
+	in := ctx.Lower().PeekChunk()
+	ctx.Deliver(xor(in, x.key))
+	_, err := ctx.Lower().Discard(len(in))
+	return err
+}
+
+func (x *xorConn) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+	if _, err := ctx.Write(xor(p, x.key)); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+events.Use(uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return &xorConn{key: 0x5a} }))
+```
+
+The layer above — the next layer or your Handler — gets a `Conn` UIO builds
+over this one: its reads are what the layer delivered, its writes reach
+`OnOutbound`, and its addresses, userdata, deadlines and socket options are the
+connection's own. A layer writes none of that.
 
 ### Two paths through one stack
 
@@ -175,65 +213,34 @@ Installed with `events.Use(utls.Server(cfg), tracing)`, what arrives climbs
 them in install order and what you write walks back down:
 
 ```
-read    socket → [decrypt] → [decompress] → Handler.OnData
-write   socket ← [encrypt] ← [compress]   ← conn.Write in the Handler
+read    socket → [decrypt] → [trace] → Handler.OnData
+write   socket ← [encrypt] ← [trace] ← conn.Write in the Handler
 ```
 
-What makes both directions work from one object is that **every middleware
-hands the layer above a `Conn` of its own**:
+### What UIO guarantees every layer
 
-```
-    the socket's Conn
-        └─► tlsConn       what utls hands up
-              └─► traceConn   what tracing hands up
-                    └─► the Conn your Handler receives
-```
+These are UIO's to keep, not each layer's to remember:
 
-So `conn.Write` in your handler passes through `tracing`, then encrypts, then
-reaches the socket — and what the socket delivers is decrypted, then traced,
-before `OnData` sees it. One install, both directions.
+1. **Every turn reaches the layers above**, whether or not a layer delivered
+   anything. A wake, or a timer armed higher up, reaches the Handler through
+   any stack — a layer cannot swallow it.
+2. **Every layer has a timer of its own.** `LayerContext.SetTimer` arms the
+   layer's, and the Handler's `SetWakeDeadline` is a slot of its own too: no
+   layer replaces another's.
+3. **One connection's callbacks never overlap.** Everything but `OnOutbound`
+   runs on the connection's turns; `OnOutbound` runs on the writer's goroutine.
+4. **Every layer hears `OnClose` once; the Handler's `OnClose` follows its
+   `OnOpen`.** A connection whose stack never opened — a failed handshake —
+   ends without a Handler callback.
 
-### Middleware with per-connection state
-
-A middleware that keeps nothing — logging, rate limiting — is a plain function
-and serves every connection from one instance. One that keeps state per
-connection — a `crypto/tls.Conn`, a decompressor, a negotiation result — builds
-it when the connection arrives:
-
-```go
-func Server(cfg *Config) uio.Middleware {
-	return uio.PerConn(func(lower uio.Conn, next uio.Handler) uio.Handler {
-		c := &conn{InnerConn: uio.InnerConn{Conn: lower}}
-		return uio.FuncHandler{
-			Open:  func(uio.Conn) { c.open() },
-			Data:  func(uio.Conn) error { return c.data() },
-			Close: func(_ uio.Conn, err error) { c.closedBelow(err) },
-		}
-	})
-}
-```
-
-`PerConn` keeps the map from the connection below to the handler built for it,
-and drops the entry when that connection closes. `InnerConn` carries the
-seventeen methods a middleware leaves alone — addresses, userdata, deadlines, the
-fd-shaped socket options — so only the reads, the writes, the buffered counts
-and the close need writing.
-
-### The three rules
-
-1. **Callbacks upward never overlap.** A middleware driven only by the
-   connection below inherits UIO's serialization; one with goroutines of its
-   own serializes what it delivers itself.
-2. **`OnClose` always reaches the handler above**, including one that never saw
-   `OnOpen`: a failed handshake is the close of the connection it never became.
-3. **The connection handed upward forwards `Userdata` and `SetUserdata`.** A
-   dial recognizes itself by a marker there; break this and `DialContext` never
-   returns.
+A layer carries one connection: one above for each one below. A protocol that
+opens several streams over one connection — HTTP/2, QUIC — is the Handler's to
+model, over a connection the layer below it made.
 
 ### Dials run the same stack
 
-`DialContext` returns only once the whole chain has settled, and the `Conn` it
-returns is the topmost middleware's — encrypted underneath, plaintext to you:
+`DialContext` returns only once the whole stack has opened, and the `Conn` it
+returns is the top layer's — encrypted underneath, plaintext to you:
 
 ```go
 client := &uio.Events{}
@@ -242,17 +249,21 @@ conn, err := client.DialContext(ctx, "tcp://example.org:443", nil)
 // conn reads and writes plaintext; utls encrypts below it
 ```
 
-Middleware that fails before the chain settles reports its error from
-`DialContext`, and the handler hears nothing of the connection — no `OnOpen`,
-no `OnClose`.
+A layer that fails before the stack opens reports its error from
+`DialContext`, and the Handler hears nothing of the connection — no `OnOpen`,
+no `OnClose`. What a layer negotiated is its own to report: `uio.LayerOf(conn)`
+returns the `LayerConn` of the layer that built `conn`, a TLS layer's
+connection state included.
 
 ### What it is not
 
-- **Not per-request middleware.** A middleware runs once per connection, not on
-  every message. Per-message work belongs in `OnData`.
-- **`Observer` and `Hooks` do not run through middleware.** They see the bytes
-  on the wire, which is what makes them right for traffic accounting.
-- **`Use` before `Serve`.** `Serve` reads the middleware once; a `Use` after it
+- **Not request middleware.** A layer runs once per connection and transforms
+  its byte stream; it never sees a request or a message. Per-message work
+  belongs in `OnData`.
+- **`Observer` and `Hooks` do not run through layers.** They count the bytes on
+  the wire, which is what makes them right for traffic accounting; the
+  connection they are told about is the one your Handler holds.
+- **`Use` before `Serve`.** `Serve` reads the layers once; a `Use` after it
   installs nothing.
 
 ## Configuration

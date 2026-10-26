@@ -132,14 +132,14 @@ func (e *collectEcho) payload() []byte {
 }
 
 // startClient serves an Events with no listener, for dialing through the
-// middleware.
-func startClient(t *testing.T, handler uio.Handler, middleware ...uio.Middleware) *uio.Events {
+// layers.
+func startClient(t *testing.T, handler uio.Handler, layers ...uio.Layer) *uio.Events {
 	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Handler: handler, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	events.Use(middleware...)
+	events.Use(layers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -281,7 +281,7 @@ func TestInteropMutualTLS(t *testing.T) {
 			t.Fatalf("server read %q", got)
 		}
 		conn := wait(t, server.opened, "server open")
-		state := conn.(interface{ State() tls.ConnectionState }).State()
+		state := uio.LayerOf(conn).(interface{ State() tls.ConnectionState }).State()
 		if len(state.PeerCertificates) == 0 {
 			t.Fatal("the server settled without the client's certificate")
 		}
@@ -397,7 +397,7 @@ func TestInteropExplicitVersions(t *testing.T) {
 			echo := newCollectEcho(5)
 			events := startClient(t, echo, Client(clientConfig))
 			conn := dialThrough(t, events, string(where))
-			state := conn.(interface{ State() ConnectionState }).State()
+			state := uio.LayerOf(conn).(interface{ State() ConnectionState }).State()
 			if state.Version != version.value {
 				t.Fatalf("negotiated %#x, want %#x", state.Version, version.value)
 			}

@@ -95,7 +95,7 @@ type Options struct {
 	Pollers int
 	// ReadBufferSize is the size of each socket read. Zero uses UIO's default
 	// of 4 KiB. It also sizes the write batch blocks the connection's replies
-	// are coalesced into, clamped to 4-64 KiB. Under TLS middleware a record
+	// are coalesced into, clamped to 4-64 KiB. Under a TLS layer a record
 	// carries up to 16 KiB and a read smaller than that splits one record
 	// across several rounds; a wss server moving bulk data reads about twice
 	// as fast with 16 KiB and half again with 64 KiB.
@@ -110,22 +110,22 @@ type Options struct {
 	// scheduler.
 	Executor uio.Executor
 
-	// Middleware runs under the WebSocket protocol, the first installed
-	// closest to the wire: TLS middleware makes the server a wss one and a
-	// dialer speak wss, as
+	// Layers are the protocol layers under the WebSocket protocol, the first
+	// installed closest to the wire: a TLS layer makes the server a wss one
+	// and a dialer speak wss, as
 	//
-	//	Middleware: uio.Use(utls.Server(config))
+	//	Layers: uio.Use(utls.Server(config))
 	//
-	// does; see uio.Middleware for what one is and uio/utls for TLS. They
-	// settle before the WebSocket handshake begins: one whose handshake fails
+	// does; see uio.Layer for what one is and uio/utls for TLS. They open
+	// before the WebSocket handshake begins: one whose handshake fails
 	// reports its cause from Dial on a dialer, and closes the connection with
 	// it on a server.
 	//
 	// This is [uio.Events.Use] on the Events a Server or Dialer builds of its
-	// own: the middleware a connection runs is named here rather than
-	// installed on an Events of yours. The wire order is the same either way —
-	// Middleware, then the WebSocket protocol, then Handler.
-	Middleware []uio.Middleware
+	// own: the layers a connection runs are named here rather than installed
+	// on an Events of yours. The wire order is the same either way — Layers,
+	// then the WebSocket protocol, then Handler.
+	Layers []uio.Layer
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the
 	// replies to its requests piling up. It paces only what the connection's

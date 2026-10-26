@@ -268,28 +268,28 @@ text; terminate TLS in front of the server.
 
 ## Secure WebSockets (wss)
 
-TLS middleware under the WebSocket protocol makes a server a wss one and a
+A TLS layer under the WebSocket protocol makes a server a wss one and a
 dialer speak `wss://`, with no TLS of its own in UWS: configure
-[`uio/utls`](../utls), or any `uio.Middleware`, in `Options.Middleware` — the
-first one sits next to the wire:
+[`uio/utls`](../utls), or any `uio.Layer`, in `Options.Layers` — the first one
+sits next to the wire:
 
 ```go
 server := uws.NewServer(uws.Options{
-	Handler:    handler,
-	Middleware: uio.Use(utls.Server(tlsConfig)),
+	Handler: handler,
+	Layers:  uio.Use(utls.Server(tlsConfig)),
 })
 
 dialer := uws.NewDialer(uws.Options{
-	Handler:    handler,
-	Middleware: uio.Use(utls.Client(tlsConfig)), // ServerName or InsecureSkipVerify
+	Handler: handler,
+	Layers:  uio.Use(utls.Client(tlsConfig)), // ServerName or InsecureSkipVerify
 })
 err := dialer.Dial(ctx, "wss://example.org/socket", nil)
 ```
 
-The middleware settles before the WebSocket handshake begins: one whose
-handshake fails fails the dial with its cause, and the Handler hears nothing
-of the connection. Behind `net/http`, `ServeHTTP` does not run the middleware —
-an `http.Server`'s own TLS carries them instead.
+The layers open before the WebSocket handshake begins: one whose handshake
+fails fails the dial with its cause, and the Handler hears nothing of the
+connection. Behind `net/http`, `ServeHTTP` does not run the layers — an
+`http.Server`'s own TLS carries the connection instead.
 
 ## Rules of the road
 

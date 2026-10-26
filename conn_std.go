@@ -821,7 +821,7 @@ func (fc *fdConn) drainOutboundReports() {
 		if pending == 0 {
 			return
 		}
-		fc.events.cb.onOutbound(fc, int(pending))
+		fc.events.cb.onOutbound(fc.events.observed(fc), int(pending))
 	}
 }
 

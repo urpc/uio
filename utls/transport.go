@@ -47,7 +47,7 @@ func (t *transport) Read(p []byte) (int, error) {
 			c.mu.Unlock()
 			return n, nil
 		}
-		if c.transportClosed || c.closed {
+		if c.transportClosed || c.ended {
 			c.mu.Unlock()
 			return 0, errClosed
 		}
@@ -75,7 +75,7 @@ func (t *transport) Write(p []byte) (int, error) {
 	if t.c.isGone() {
 		return 0, errClosed
 	}
-	if _, err := t.c.Conn.Write(p); err != nil {
+	if _, err := t.c.ctx.Write(p); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -87,8 +87,8 @@ func (t *transport) Close() error {
 	return nil
 }
 
-func (t *transport) LocalAddr() net.Addr              { return t.c.Conn.LocalAddr() }
-func (t *transport) RemoteAddr() net.Addr             { return t.c.Conn.RemoteAddr() }
+func (t *transport) LocalAddr() net.Addr              { return t.c.ctx.Lower().LocalAddr() }
+func (t *transport) RemoteAddr() net.Addr             { return t.c.ctx.Lower().RemoteAddr() }
 func (t *transport) SetDeadline(time.Time) error      { return nil }
 func (t *transport) SetReadDeadline(time.Time) error  { return nil }
 func (t *transport) SetWriteDeadline(time.Time) error { return nil }

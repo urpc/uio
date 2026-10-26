@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -90,7 +91,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	if stalled.Load() == 0 {
-		t.Fatal("the stack never held bytes below its wrapper")
+		t.Fatal("the stack never held bytes below its layer")
 	}
 	select {
 	case err := <-written:
@@ -98,7 +99,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 	case <-time.After(time.Second):
 	}
 	if held := stalled.Load(); held > int64((16<<10)+(32<<10)+(64<<10)) {
-		t.Fatalf("the wrapper held %d bytes, far past its bound", held)
+		t.Fatalf("the layer held %d bytes, far past its bound", held)
 	}
 
 	close(release) // the reader above reads again, and its round needs a wake
@@ -234,10 +235,24 @@ func TestHandshakeTimeout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer silent.Close()
-	select {
-	case <-server.closed:
-	case <-time.After(testWait):
+	// The timeout closes the connection: the silent peer reads its end. The
+	// handler above never opened, so it hears nothing of the connection.
+	_ = silent.SetReadDeadline(time.Now().Add(testWait))
+	began := time.Now()
+	if _, err := silent.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the silent peer read bytes from a server that never answered")
+	} else if errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatal("the silent peer's connection never closed")
+	}
+	if elapsed := time.Since(began); elapsed > 2*time.Second {
+		t.Fatalf("closed after %v, want the 150ms handshake timeout", elapsed)
+	}
+	select {
+	case <-server.opened:
+		t.Fatal("a connection whose handshake timed out opened the handler above")
+	case <-server.closed:
+		t.Fatal("a connection that never opened reached the handler's OnClose")
+	default:
 	}
 }
 

@@ -11,7 +11,7 @@
 <rect width="960" height="188" rx="16" fill="url(#dots)" opacity="0.55"/>
 <rect x="0.5" y="0.5" width="959" height="187" rx="15.5" fill="none" stroke="#22304A"/>
 
-<text x="40.0" y="30.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">MIDDLEWARE</text>
+<text x="40.0" y="30.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">PROTOCOL LAYERS</text>
 <text x="40.0" y="54.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16.5" fill="#E6EDF6" text-anchor="start" font-weight="600">The same chain, both directions</text>
 <text x="920.0" y="54.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="end" font-weight="400">events.Use(tls, websocket)</text>
 
@@ -62,5 +62,5 @@
 <path d="M284,140 l8,-4 v8 z" fill="#818CF8"/>
 <text x="310.0" y="130.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">encrypt</text>
 
-<text x="480.0" y="176.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">each middleware hands the one above a Conn of its own, so a write descends the chain a read climbed</text>
+<text x="480.0" y="176.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9.5" fill="#8A9BB4" text-anchor="middle" font-weight="400">each layer hands the one above a Conn of its own, so a write descends the stack a read climbed</text>
 </svg>

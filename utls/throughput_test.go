@@ -28,8 +28,8 @@ import (
 //
 //	std tcp    net.Listen and net.Dial, no TLS
 //	std tls    crypto/tls.Listen and tls.Dial
-//	uio        UIO over TCP, no wrappers installed
-//	utls       UIO over TCP with a TLS wrapper installed, both sides ours
+//	uio        UIO over TCP, no layers installed
+//	utls       UIO over TCP with a TLS layer installed, both sides ours
 func TestThroughputCompare(t *testing.T) {
 	if os.Getenv("UTLS_BENCH") == "" {
 		t.Skip("skipping: set UTLS_BENCH=1 to measure throughput")
@@ -160,9 +160,9 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 
 	serverDone := make(chan struct{})
 	var serverCount atomic.Int64
-	var serverMiddleware []uio.Middleware
+	var serverLayers []uio.Layer
 	if useTLS {
-		serverMiddleware = append(serverMiddleware, Server(serverConfig))
+		serverLayers = append(serverLayers, Server(serverConfig))
 	}
 	serverConnOpened := make(chan uio.Conn, 1)
 	server := uio.FuncHandler{
@@ -190,7 +190,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	serverStarted := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(serverStarted) }}
 	serverEvents.Handler = server
-	serverEvents.Use(serverMiddleware...)
+	serverEvents.Use(serverLayers...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
@@ -207,9 +207,9 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 
 	clientDone := make(chan struct{})
 	var clientCount atomic.Int64
-	var clientMiddleware []uio.Middleware
+	var clientLayers []uio.Layer
 	if useTLS {
-		clientMiddleware = append(clientMiddleware, Client(clientConfig))
+		clientLayers = append(clientLayers, Client(clientConfig))
 	}
 	client := uio.FuncHandler{
 		Open: func(uio.Conn) {},
@@ -231,7 +231,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
 	clientEvents.Handler = client
-	clientEvents.Use(clientMiddleware...)
+	clientEvents.Use(clientLayers...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()
@@ -359,7 +359,7 @@ func TestMemoryBaseline(t *testing.T) {
 
 // memBaseline returns the heap held by conns settled connections between two
 // stacks, after the garbage collector has run twice.
-func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware) uint64 {
+func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) uint64 {
 	t.Helper()
 	opened := make(chan uio.Conn, conns)
 	server := uio.FuncHandler{
@@ -372,15 +372,15 @@ func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware)
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
-	var serverMiddleware []uio.Middleware
-	if serverMidd != nil {
-		serverMiddleware = append(serverMiddleware, serverMidd)
+	var serverLayers []uio.Layer
+	if serverLayer != nil {
+		serverLayers = append(serverLayers, serverLayer)
 	}
 	serverEvents := &uio.Events{Pollers: 2, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	started := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
 	serverEvents.Handler = server
-	serverEvents.Use(serverMiddleware...)
+	serverEvents.Use(serverLayers...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
@@ -394,16 +394,16 @@ func memBaseline(t *testing.T, conns int, serverMidd, clientMidd uio.Middleware)
 	clientEvents := &uio.Events{Pollers: 2, MaxBufferSize: benchReadBuffer(), WriteBufferedThreshold: benchWriteThreshold()}
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
-	var clientMiddleware []uio.Middleware
-	if clientMidd != nil {
-		clientMiddleware = append(clientMiddleware, clientMidd)
+	var clientLayers []uio.Layer
+	if clientLayer != nil {
+		clientLayers = append(clientLayers, clientLayer)
 	}
 	clientEvents.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) {},
 		Data:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
-	clientEvents.Use(clientMiddleware...)
+	clientEvents.Use(clientLayers...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()

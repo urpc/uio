@@ -748,7 +748,7 @@ func (conn *fdConn) drainOutbound() {
 		if pending == 0 {
 			return
 		}
-		conn.events.cb.onOutbound(conn, int(pending))
+		conn.events.cb.onOutbound(conn.events.observed(conn), int(pending))
 	}
 }
 

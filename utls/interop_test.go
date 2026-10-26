@@ -142,7 +142,7 @@ func TestInteropWithStdlib(t *testing.T) {
 			t.Fatal(err)
 		}
 		conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
-		state := conn.(interface{ State() tls.ConnectionState }).State()
+		state := uio.LayerOf(conn).(interface{ State() tls.ConnectionState }).State()
 		if state.NegotiatedProtocol != "h2" {
 			t.Fatalf("ALPN negotiated %q, want h2", state.NegotiatedProtocol)
 		}
@@ -162,12 +162,19 @@ func TestInteropWithStdlib(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		first, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		first, firstEcho := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		// A round trip before the close: both ends finished the handshake and
+		// the ticket reached the client, whatever the backend does with
+		// output still queued at a close.
+		if _, err := first.Write([]byte("ticket")); err != nil {
+			t.Fatal(err)
+		}
+		wait(t, firstEcho.data, "the first connection's echo")
 		_ = first.Close()
 		wait(t, server.closed, "first close")
 		second, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
 		defer func() { _ = second.Close() }()
-		state := second.(interface{ State() tls.ConnectionState }).State()
+		state := uio.LayerOf(second).(interface{ State() tls.ConnectionState }).State()
 		if !state.DidResume {
 			t.Fatal("the second handshake did not resume the first's session")
 		}
@@ -222,7 +229,7 @@ func mustPool(t *testing.T, config *tls.Config) *x509.CertPool {
 }
 
 // TLS over TLS: the stack nests, and the inner handshake runs over the
-// outer wrapper's connection as any stream does.
+// outer layer's connection as any stream does.
 func TestTLSOverTLS(t *testing.T) {
 	outerServer, outerClient := testConfigs(t)
 	innerServer, innerClient := testConfigs(t)
@@ -236,16 +243,16 @@ func TestTLSOverTLS(t *testing.T) {
 	if _, err := client.Write([]byte("nested")); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(wait(t, echo.data, "echo through two TLS wrappers")); got != "nested" {
+	if got := string(wait(t, echo.data, "echo through two TLS layers")); got != "nested" {
 		t.Fatalf("read %q through TLS over TLS", got)
 	}
 	_ = client.Close()
 	wait(t, server.closed, "server close")
 }
 
-// TLS runs over a wrapper with a handshake of its own: the stack settles one
-// wrapper at a time, gate first, TLS over it.
-func TestTLSOverGateWrapper(t *testing.T) {
+// TLS runs over a layer with a handshake of its own: the stack settles one
+// layer at a time, gate first, TLS over it.
+func TestTLSOverGateLayer(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig), gate)
@@ -253,7 +260,7 @@ func TestTLSOverGateWrapper(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, echo := dialTLS(t, Client(clientConfig), uio.Middleware(gate), "tcp://"+listener.Addr().String())
+	client, echo := dialTLS(t, Client(clientConfig), gate, "tcp://"+listener.Addr().String())
 	if _, err := client.Write([]byte("through the gate")); err != nil {
 		t.Fatal(err)
 	}
