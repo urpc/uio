@@ -1,6 +1,7 @@
 package uws
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -9,8 +10,11 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"errors"
+	"fmt"
+	"io"
 	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -183,5 +187,60 @@ func TestWSSNeedsALayer(t *testing.T) {
 	err := dialer.Dial(context.Background(), "wss://127.0.0.1:1/", nil)
 	if !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("Dial wss without a layer = %v, want ErrInvalidOptions", err)
+	}
+}
+
+// The heartbeat runs on the transport's timed turns, and over TLS those turns
+// carry no plaintext: a TLS layer that kept them to itself stopped the
+// heartbeat, and a silent wss peer was never closed.
+func TestWSSHeartbeatClosesSilentPeer(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		key := ""
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			trimmed := strings.TrimSpace(line)
+			if len(trimmed) > len("sec-websocket-key:") && strings.EqualFold(trimmed[:len("sec-websocket-key:")], "sec-websocket-key:") {
+				key = strings.TrimSpace(trimmed[len("sec-websocket-key:"):])
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", testAcceptKey(key))
+		// Silent from here: consume everything, answer no Ping.
+		_, _ = io.Copy(io.Discard, reader)
+	}()
+
+	watcher := newCloseWatcher()
+	dialer := NewDialer(Options{
+		Handler:               watcher,
+		Pollers:               1,
+		HeartbeatInterval:     10 * time.Millisecond,
+		HeartbeatTimeout:      30 * time.Millisecond,
+		OutboundHighWatermark: -1,
+		Middleware:            uio.Use(utls.Client(clientTLS)),
+	})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	wssWait(t, watcher.open, "OnOpen")
+	if event := wssWait(t, watcher.closed, "the heartbeat close"); event.Code != 1001 {
+		t.Fatalf("heartbeat close code = %d, want 1001", event.Code)
 	}
 }

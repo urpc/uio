@@ -199,11 +199,17 @@ func (c *conn) data() error {
 	first := c.ready && !c.opened
 	c.opened = c.ready
 	staged := c.stagedLocked()
+	opened := c.opened && !c.closed
 	c.mu.Unlock()
 	if first {
 		c.next.OnOpen(c)
 	}
-	if staged > 0 {
+	// Plaintext goes up, and so does a turn that brought no bytes at all: a
+	// Wake, or a timer a layer above armed, whose turn the handler above is
+	// owed though it carries no data. A turn whose bytes only part-filled a
+	// record is this layer's own business — the read that completes the
+	// record delivers it.
+	if opened && (staged > 0 || len(chunk) == 0) {
 		return c.next.OnData(c)
 	}
 	return nil

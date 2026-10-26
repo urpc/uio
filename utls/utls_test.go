@@ -10,6 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"math/big"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -80,6 +81,9 @@ func (e *echo) OnOpen(c uio.Conn) { e.opened <- c }
 
 func (e *echo) OnData(c uio.Conn) error {
 	payload := append([]byte(nil), c.PeekChunk()...)
+	if len(payload) == 0 {
+		return nil // a turn without data: a wake, a timer
+	}
 	_, _ = c.Discard(len(payload))
 	e.data <- payload
 	_, err := c.Write(payload)
@@ -138,11 +142,13 @@ func listenTLS(t *testing.T, top uio.Handler, wrappers ...uio.Middleware) (strin
 	return listener.Addr().String(), events
 }
 
-// record is a handler that only reports what it reads.
+// record is a handler that only reports what it reads. turn, when set,
+// hears every turn that brings it no data.
 type record struct {
 	opened chan uio.Conn
 	data   chan []byte
 	closed chan error
+	turn   atomic.Pointer[chan struct{}]
 }
 
 func newRecord() *record {
@@ -157,6 +163,15 @@ func (r *record) OnOpen(c uio.Conn) { r.opened <- c }
 
 func (r *record) OnData(c uio.Conn) error {
 	payload := append([]byte(nil), c.PeekChunk()...)
+	if len(payload) == 0 {
+		if turn := r.turn.Load(); turn != nil {
+			select {
+			case *turn <- struct{}{}:
+			default:
+			}
+		}
+		return nil // a turn without data: a wake, a timer
+	}
 	_, _ = c.Discard(len(payload))
 	r.data <- payload
 	return nil
@@ -252,4 +267,29 @@ func TestTLSEchoBothSides(t *testing.T) {
 
 	_ = clientConn.Close()
 	wait(t, server.closed, "server close")
+}
+
+// A turn of an opened connection that carries no bytes — a Wake, a timer a
+// layer above armed — reaches the handler above: the layers above run their
+// clocks on such turns, and a TLS layer that swallowed them stopped those
+// clocks. A turn whose bytes only part-filled a record stays this layer's.
+func TestEmptyTurnReachesHandlerAbove(t *testing.T) {
+	serverConfig, clientConfig := testConfigs(t)
+	server := newRecord()
+	addr, _ := listenTLS(t, server, Server(serverConfig))
+	conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+addr)
+	if _, err := conn.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	if got := wait(t, server.data, "the first bytes"); string(got) != "hello" {
+		t.Fatalf("server read %q, want hello", got)
+	}
+	upper := wait(t, server.opened, "the server's OnOpen")
+
+	turns := make(chan struct{}, 4)
+	server.turn.Store(&turns)
+	if err := upper.SetWakeDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	wait(t, turns, "the empty turn the wake timer runs")
 }
