@@ -24,7 +24,7 @@ func testServerConfig(server *Server) *connConfig {
 	if err != nil {
 		panic(err)
 	}
-	return newServerConnConfig(opts, server.CheckOrigin, server.Authorize, &server.connections, &server.stats)
+	return newServerConnConfig(opts, server.CheckOrigin, server.Authorize, &server.stats)
 }
 
 func testDialerConfig(dialer *Dialer) *connConfig {
@@ -35,7 +35,7 @@ func testDialerConfig(dialer *Dialer) *connConfig {
 	if err != nil {
 		panic(err)
 	}
-	return newDialerConnConfig(opts, &dialer.connections, &dialer.stats)
+	return newDialerConnConfig(opts, &dialer.stats)
 }
 
 func testIOTimeout() time.Duration {
@@ -99,6 +99,11 @@ type writeProbeConn struct {
 	deadlineErr   error
 	noDelay       bool
 	noDelayErr    error
+	// wakeMu guards wakesAt, the deadlines the heartbeat armed. A test reads
+	// it from its own goroutine; the fake itself records no other way.
+	wakeMu     sync.Mutex
+	wakesAt    []time.Time
+	wakeArmErr error // SetWakeDeadline's result, recorded or not
 }
 
 type bufferedProbeConn struct {
@@ -255,6 +260,34 @@ func (c *writeProbeConn) ReserveOutbound(int) ([]byte, error) {
 func (c *writeProbeConn) Flush() error {
 	c.flushes++
 	return nil
+}
+
+// SetWakeDeadline records the deadline the heartbeat arms; the fakes run no
+// timers, so a test drives the ticks itself.
+func (c *writeProbeConn) SetWakeDeadline(when time.Time) error {
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	c.wakesAt = append(c.wakesAt, when)
+	return c.wakeArmErr
+}
+
+func (c *writeProbeConn) SetWakeInterval(time.Duration) error { return nil }
+
+// wakeArms is every deadline SetWakeDeadline recorded, in order.
+func (c *writeProbeConn) wakeArms() []time.Time {
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	return append([]time.Time(nil), c.wakesAt...)
+}
+
+// lastWakeArm is the deadline one-shot timer the transport now holds.
+func (c *writeProbeConn) lastWakeArm() (time.Time, bool) {
+	c.wakeMu.Lock()
+	defer c.wakeMu.Unlock()
+	if len(c.wakesAt) == 0 {
+		return time.Time{}, false
+	}
+	return c.wakesAt[len(c.wakesAt)-1], true
 }
 
 func (c *writeProbeConn) Wake() error {

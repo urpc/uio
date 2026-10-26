@@ -1035,6 +1035,31 @@ func (heartbeat *heartbeatState) expirePing(now time.Time, timeout time.Duration
 	return true
 }
 
+// expiry is the moment the current ping state ends at: the timeout past a
+// queued or sent Ping, or past the first send the outbound limit refused.
+func (heartbeat *heartbeatState) expiry(now time.Time, timeout time.Duration) time.Time {
+	heartbeat.mu.Lock()
+	defer heartbeat.mu.Unlock()
+	return heartbeat.expiryLocked(timeout)
+}
+
+// expiryLocked is expiry with the mutex held.
+func (heartbeat *heartbeatState) expiryLocked(timeout time.Duration) time.Time {
+	started := int64(0)
+	if heartbeat.pingOutstanding.Load() {
+		started = heartbeat.pingQueuedAt
+		if heartbeat.pingSentAt != 0 {
+			started = heartbeat.pingSentAt
+		}
+	} else if heartbeat.sendStalledAt != 0 {
+		started = heartbeat.sendStalledAt
+	}
+	if started == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, started).Add(timeout)
+}
+
 // clearPingLocked only cancels the current Ping attempt. A failed enqueue must
 // retain sendStalledAt so the next attempt cannot restart the send deadline.
 func (heartbeat *heartbeatState) clearPingLocked() {

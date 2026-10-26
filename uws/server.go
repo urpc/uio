@@ -17,11 +17,9 @@
 package uws
 
 import (
-	"errors"
 	"net/http"
 	"sync"
 	"sync/atomic"
-	"time"
 
 	"github.com/urpc/uio"
 )
@@ -44,16 +42,14 @@ type Server struct {
 	// accepts every request.
 	Authorize func(r *http.Request) (userdata any, err error)
 
-	connections sync.Map
-	heartbeat   heartbeatRunner
-	config      *connConfig
-	opts        Options     // resolved snapshot, fixed at Serve
-	events      *uio.Events // private transport configuration
-	stats       statsCounters
-	started     atomic.Bool
-	ready       atomic.Bool
-	closeMu     sync.Mutex
-	closed      bool
+	config  *connConfig
+	opts    Options     // resolved snapshot, fixed at Serve
+	events  *uio.Events // private transport configuration
+	stats   statsCounters
+	started atomic.Bool
+	ready   atomic.Bool
+	closeMu sync.Mutex
+	closed  bool
 
 	// startHook runs inside the transport's OnStart, after ready is set; it
 	// lets tests observe or block startup on the calling goroutine.
@@ -86,7 +82,7 @@ func (s *Server) Serve(addrs ...string) error {
 		return ErrServerStarted
 	}
 	s.opts = opts
-	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.connections, &s.stats)
+	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
 	events := opts.transportEvents()
 	s.events = events
 	handler := uio.FuncHandler{
@@ -114,7 +110,6 @@ func (s *Server) Serve(addrs ...string) error {
 	events.Handler = handler
 	events.Use(opts.Middleware...)
 	events.Observer, events.Hooks = handler, handler
-	s.startHeartbeat(s.config)
 	s.closeMu.Unlock()
 
 	err = events.Serve(addrs...)
@@ -136,62 +131,10 @@ func (s *Server) Close(err error) error {
 	events := s.events
 	s.closeMu.Unlock()
 
-	s.stopHeartbeat()
 	if events == nil {
 		return nil
 	}
 	return events.Close(err)
-}
-
-// startHeartbeat starts the scanner that pings this server's connections.
-func (s *Server) startHeartbeat(config *connConfig) {
-	if config == nil {
-		return
-	}
-	s.heartbeat.start(config.heartbeatConnections, config.heartbeatInterval, config.heartbeatTimeout)
-}
-
-// stopHeartbeat ends the heartbeat scanner and waits for it to exit.
-func (s *Server) stopHeartbeat() {
-	s.heartbeat.stop()
-}
-
-// scanHeartbeat waits at most for one frame submission per connection: the
-// write lock is never held across application code. A Ping the outbound limit
-// refuses starts a send-stall deadline without delaying other peers.
-func scanHeartbeat(connections *sync.Map, now time.Time, timeout time.Duration, stop <-chan struct{}) bool {
-	completed := true
-	connections.Range(func(_, value any) bool {
-		select {
-		case <-stop:
-			completed = false
-			return false
-		default:
-		}
-		conn := value.(*Conn)
-		if conn.closed.Load() || conn.closing.Load() || conn.heartbeat == nil {
-			return true
-		}
-		heartbeat := conn.heartbeat
-		if heartbeat.expirePing(now, timeout) {
-			conn.expireHeartbeat()
-			return true
-		}
-		if heartbeat.pingOutstanding.Load() {
-			return true
-		}
-		switch err := conn.sendHeartbeatPing(now); {
-		case err == nil:
-		case errors.Is(err, ErrBackpressure):
-			heartbeat.noteSendStall(now)
-		case !conn.closed.Load() && !conn.closing.Load():
-			conn.setCloseError(err)
-			conn.closing.Store(true)
-			conn.abortTransport(err)
-		}
-		return true
-	})
-	return completed
 }
 
 func (c *Conn) expireHeartbeat() {
@@ -221,14 +164,14 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 	config := s.config
 	if config == nil {
 		opts, _ := s.Options.resolve()
-		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.connections, &s.stats)
+		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
 	}
 	conn := &Conn{
 		raw:     raw,
 		config:  config,
 		handler: config.handler,
 	}
-	if config.heartbeatConnections != nil {
+	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
 	return conn
@@ -294,7 +237,6 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 		return
 	}
 	conn.stopCloseTimer()
-	s.connections.Delete(conn)
 	info := conn.closeInfo()
 	if info.Err == nil {
 		info.Err = err

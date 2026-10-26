@@ -182,6 +182,12 @@ type heartbeatState struct {
 	pingSentAt    int64
 	pingNonce     uint64
 	pingTarget    uint64
+	// nextPingAt is when the next Ping may be sent — zero until the heartbeat
+	// begins — and armedAt the wake deadline the transport currently holds.
+	// Both change only in the connection's turn, under this mutex with the
+	// rest.
+	nextPingAt int64
+	armedAt    int64
 	// Accepted and retired are monotonic FIFO byte positions. The ping target
 	// marks when its complete frame has left the transport queue without
 	// requiring the connection's later writes to drain first.

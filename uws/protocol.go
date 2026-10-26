@@ -215,6 +215,7 @@ func (c *Conn) readAvailable() error {
 	if c.batching.Load() {
 		c.endWriteBatch()
 	}
+	c.heartbeatTick(time.Now())
 	return err
 }
 
@@ -639,7 +640,7 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		return context.DeadlineExceeded
 	}
 	if c.heartbeat != nil {
-		c.config.heartbeatConnections.Store(c, c)
+		c.beginHeartbeat()
 	}
 	extra := append([]byte(nil), input[consumed:]...)
 	c.notifyOpen()
@@ -690,7 +691,7 @@ func (c *Conn) consumeClientHandshake() error {
 		return context.DeadlineExceeded
 	}
 	if c.heartbeat != nil {
-		c.config.heartbeatConnections.Store(c, c)
+		c.beginHeartbeat()
 	}
 	extra := append([]byte(nil), state.data[consumed:]...)
 	c.notifyOpen()

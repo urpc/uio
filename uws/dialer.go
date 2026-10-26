@@ -64,9 +64,7 @@ type Dialer struct {
 	opts            Options     // resolved snapshot, fixed at first Dial
 	header          http.Header // Header, canonical, fixed at first Dial
 	events          *uio.Events // private transport configuration
-	connections     sync.Map
-	clients         sync.Map // the open pull Clients, for Close to release
-	heartbeat       heartbeatRunner
+	clients         sync.Map    // the open pull Clients, for Close to release
 	stats           statsCounters
 
 	// startHook runs inside the transport's OnStart before the start result
@@ -216,7 +214,6 @@ func (d *Dialer) Close(err error) error {
 	}
 	d.closeMu.Unlock()
 
-	d.stopHeartbeat()
 	d.releaseClients()
 	if events == nil {
 		return nil
@@ -256,7 +253,7 @@ func (d *Dialer) start(ctx context.Context) error {
 		}
 		d.opts = opts
 		d.header = canonicalHeader(d.Header)
-		d.config = newDialerConnConfig(opts, &d.connections, &d.stats)
+		d.config = newDialerConnConfig(opts, &d.stats)
 		events := opts.transportEvents()
 		d.events = events
 		handler := uio.FuncHandler{
@@ -286,7 +283,6 @@ func (d *Dialer) start(ctx context.Context) error {
 		events.Handler = handler
 		events.Use(opts.Middleware...)
 		events.Observer, events.Hooks = handler, handler
-		d.startHeartbeat(d.config)
 		go func() {
 			err := events.Serve()
 			startErr := err
@@ -394,19 +390,6 @@ func canonicalHeader(h http.Header) http.Header {
 	return out
 }
 
-// startHeartbeat starts the scanner that pings this dialer's connections.
-func (d *Dialer) startHeartbeat(config *connConfig) {
-	if config == nil {
-		return
-	}
-	d.heartbeat.start(config.heartbeatConnections, config.heartbeatInterval, config.heartbeatTimeout)
-}
-
-// stopHeartbeat ends the heartbeat scanner and waits for it to exit.
-func (d *Dialer) stopHeartbeat() {
-	d.heartbeat.stop()
-}
-
 func (d *Dialer) onOpen(raw uio.Conn) {
 	setup, _ := raw.Userdata().(*dialSetup)
 	if setup == nil {
@@ -428,7 +411,7 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 	config := d.config
 	if config == nil {
 		opts, _ := d.Options.resolve()
-		config = newDialerConnConfig(opts, &d.connections, &d.stats)
+		config = newDialerConnConfig(opts, &d.stats)
 	}
 	handler := config.handler
 	if setup.handler != nil {
@@ -440,7 +423,7 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		handler:  handler,
 		userData: setup.userdata,
 	}
-	if config.heartbeatConnections != nil {
+	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
 	conn.handshake.Store(&handshakeState{
@@ -528,7 +511,6 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		return
 	}
 	conn.stopCloseTimer()
-	d.connections.Delete(conn)
 	info := conn.closeInfo()
 	if info.Err == nil {
 		info.Err = err

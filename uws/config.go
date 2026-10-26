@@ -18,7 +18,6 @@ package uws
 
 import (
 	"net/http"
-	"sync"
 	"time"
 
 	"github.com/urpc/uio/uws/internal/frame"
@@ -66,9 +65,8 @@ type connConfig struct {
 	// when something is listening.
 	observeTraffic bool
 
-	heartbeatConnections *sync.Map
-	heartbeatInterval    time.Duration
-	heartbeatTimeout     time.Duration
+	heartbeatInterval time.Duration
+	heartbeatTimeout  time.Duration
 
 	// outboundHigh pauses a connection's reads at this queued-output level;
 	// outboundLow resumes them. Zero disables the pause.
@@ -79,7 +77,7 @@ type connConfig struct {
 
 // newServerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Server's connections share.
-func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, authorize func(*http.Request) (any, error), connections *sync.Map, stats *statsCounters) *connConfig {
+func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, authorize func(*http.Request) (any, error), stats *statsCounters) *connConfig {
 	config := &connConfig{
 		parser: frame.ParserConfig{
 			ExpectMask: true, AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
@@ -107,9 +105,6 @@ func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, aut
 		outboundLow:                opts.OutboundLowWatermark,
 		maxOutbound:                opts.MaxOutboundBuffered,
 		stats:                      stats,
-	}
-	if opts.HeartbeatInterval > 0 && connections != nil {
-		config.heartbeatConnections = connections
 	}
 	config.settleShortLimits()
 	return config
@@ -156,7 +151,7 @@ func (config *connConfig) withinMessageLimits(limit int) int {
 
 // newDialerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Dialer's connections share.
-func newDialerConnConfig(opts Options, connections *sync.Map, stats *statsCounters) *connConfig {
+func newDialerConnConfig(opts Options, stats *statsCounters) *connConfig {
 	config := &connConfig{
 		client: true,
 		parser: frame.ParserConfig{
@@ -183,9 +178,6 @@ func newDialerConnConfig(opts Options, connections *sync.Map, stats *statsCounte
 		outboundLow:                opts.OutboundLowWatermark,
 		maxOutbound:                opts.MaxOutboundBuffered,
 		stats:                      stats,
-	}
-	if opts.HeartbeatInterval > 0 && connections != nil {
-		config.heartbeatConnections = connections
 	}
 	config.settleShortLimits()
 	return config

@@ -251,14 +251,6 @@ func TestReadAvailableParsesHandshakeAcrossInboundSegments(t *testing.T) {
 	if conn.compression != nil || conn.metadata.Load() != nil {
 		t.Fatal("unconfigured connection allocated optional steady-state data")
 	}
-	tracked := 0
-	server.connections.Range(func(_, _ any) bool {
-		tracked++
-		return true
-	})
-	if tracked != 0 {
-		t.Fatalf("heartbeat-disabled server tracked %d connections", tracked)
-	}
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	if got, want := strings.Join(handler.events, ","), "open"; got != want {

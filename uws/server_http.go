@@ -164,7 +164,7 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 		return
 	}
 	if conn.heartbeat != nil {
-		conn.config.heartbeatConnections.Store(conn, conn)
+		conn.beginHeartbeat()
 	}
 	conn.notifyOpen()
 }

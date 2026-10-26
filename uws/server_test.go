@@ -82,19 +82,7 @@ func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
 	}
 }
 
-func TestHeartbeatCanBeRestarted(t *testing.T) {
-	server := &Server{Options: Options{HeartbeatInterval: time.Millisecond}}
-	server.startHeartbeat(testServerConfig(server))
-	server.startHeartbeat(testServerConfig(server))
-	server.stopHeartbeat()
-	server.startHeartbeat(testServerConfig(server))
-	server.stopHeartbeat()
-
-	// Give both ticker goroutines a chance to observe their stop channels.
-	time.Sleep(2 * time.Millisecond)
-}
-
-func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
+func TestHeartbeatTimeoutClosesAndPingsOthers(t *testing.T) {
 	server := NewServer(Options{})
 	server.HeartbeatInterval = time.Millisecond
 	server.HeartbeatTimeout = 5 * time.Millisecond
@@ -111,17 +99,10 @@ func TestHeartbeatTimeoutClosesAndScansOthers(t *testing.T) {
 	responsiveRaw := newHeartbeatWriteProbe()
 	responsive := &Conn{raw: responsiveRaw, config: config, heartbeat: &heartbeatState{}}
 	responsive.opened.Store(true)
-	server.connections.Store(expired, expired)
-	server.connections.Store(responsive, responsive)
-	done := make(chan bool, 1)
-	go func() {
-		done <- scanHeartbeat(&server.connections, time.Now(), server.HeartbeatTimeout, make(chan struct{}))
-	}()
-	select {
-	case <-done:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat timeout scan did not finish")
-	}
+	responsive.beginHeartbeat()
+	now := time.Now().Add(time.Millisecond) // one interval in: the first ping is due
+	expired.heartbeatTick(now)
+	responsive.heartbeatTick(now)
 	select {
 	case <-responsiveRaw.written:
 	case <-time.After(testIOTimeout()):
@@ -157,10 +138,7 @@ func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
 	if conn.writes.close.pendingBytes.Load() == 0 || pingTarget == 0 {
 		t.Fatal("heartbeat ping was not tracked in the outbound queue")
 	}
-	server.connections.Store(conn, conn)
-	if !scanHeartbeat(&server.connections, queuedAt.Add(2*server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{})) {
-		t.Fatal("heartbeat scan stopped unexpectedly")
-	}
+	conn.heartbeatTick(queuedAt.Add(2 * server.HeartbeatTimeout))
 	select {
 	case <-raw.closed:
 	case <-time.After(testIOTimeout()):
@@ -176,13 +154,11 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 	raw.writeErr = uio.ErrOutboundOverflow
 	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
-	server.connections.Store(conn, conn)
+	conn.beginHeartbeat()
 	first := time.Now()
 	for i := 0; i < 4; i++ {
 		at := first.Add(time.Duration(i) * server.HeartbeatTimeout / 4)
-		if !scanHeartbeat(&server.connections, at, server.HeartbeatTimeout, make(chan struct{})) {
-			t.Fatal("heartbeat scanner stopped")
-		}
+		conn.heartbeatTick(at)
 		if conn.closing.Load() || conn.heartbeat.pingOutstanding.Load() || raw.closes != 0 {
 			t.Fatalf("attempt %d: heartbeat closed early or retained an unsent Ping", i)
 		}
@@ -199,9 +175,7 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 	if raw.writes != 4 {
 		t.Fatalf("failed Ping writes = %d, want 4", raw.writes)
 	}
-	if !scanHeartbeat(&server.connections, first.Add(server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{})) {
-		t.Fatal("heartbeat scanner stopped")
-	}
+	conn.heartbeatTick(first.Add(server.HeartbeatTimeout))
 	if raw.closes != 1 || !conn.closing.Load() {
 		t.Fatalf("stalled connection = closes:%d closing:%v, want 1/true", raw.closes, conn.closing.Load())
 	}
@@ -217,11 +191,11 @@ func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
 	raw.writeErr = uio.ErrOutboundOverflow
 	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
-	server.connections.Store(conn, conn)
+	conn.beginHeartbeat()
 	first := time.Now()
-	scanHeartbeat(&server.connections, first, server.HeartbeatTimeout, make(chan struct{}))
+	conn.heartbeatTick(first)
 	raw.writeErr = nil
-	scanHeartbeat(&server.connections, first.Add(server.HeartbeatTimeout/2), server.HeartbeatTimeout, make(chan struct{}))
+	conn.heartbeatTick(first.Add(server.HeartbeatTimeout / 2))
 	conn.heartbeat.mu.Lock()
 	queuedAt := conn.heartbeat.pingQueuedAt
 	conn.heartbeat.mu.Unlock()
@@ -248,8 +222,8 @@ func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
 	raw.writeErr = failure
 	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
-	server.connections.Store(conn, conn)
-	scanHeartbeat(&server.connections, time.Now(), time.Second, make(chan struct{}))
+	conn.beginHeartbeat()
+	conn.heartbeatTick(time.Now())
 	if raw.closes != 1 || !conn.closing.Load() {
 		t.Fatalf("failed heartbeat = closes:%d closing:%v", raw.closes, conn.closing.Load())
 	}
@@ -287,13 +261,12 @@ func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
 	if conn.writes.close.pendingBytes.Load() == 0 {
 		t.Fatal("later business write did not remain queued")
 	}
-	server.connections.Store(conn, conn)
 	sent := time.Unix(0, sentAt)
-	scanHeartbeat(&server.connections, sent.Add(server.HeartbeatTimeout/2), server.HeartbeatTimeout, make(chan struct{}))
+	conn.heartbeatTick(sent.Add(server.HeartbeatTimeout / 2))
 	if conn.closing.Load() {
 		t.Fatal("connection timed out before the Pong deadline")
 	}
-	scanHeartbeat(&server.connections, sent.Add(2*server.HeartbeatTimeout), server.HeartbeatTimeout, make(chan struct{}))
+	conn.heartbeatTick(sent.Add(2 * server.HeartbeatTimeout))
 	select {
 	case <-raw.closed:
 	case <-time.After(testIOTimeout()):
@@ -387,13 +360,11 @@ func TestCompletedHandshakeCancelsTimeout(t *testing.T) {
 	conn.stopHandshakeTimer()
 }
 
-func TestServerCloseStopsHeartbeatBeforeEvents(t *testing.T) {
+func TestServerServeAfterCloseReportsClosed(t *testing.T) {
 	server := &Server{Options: Options{HeartbeatInterval: time.Hour}}
-	server.startHeartbeat(testServerConfig(server))
 	if err := server.Close(nil); err != nil {
 		t.Fatal(err)
 	}
-	server.stopHeartbeat()
 	if err := server.Serve("127.0.0.1:0"); !errors.Is(err, ErrClosed) {
 		t.Fatalf("Serve after Close error = %v, want %v", err, ErrClosed)
 	}
@@ -573,13 +544,9 @@ func TestServerLifecycleEdges(t *testing.T) {
 	opened.opened.Store(true)
 	opened.writes.close.pendingBytes.Store(8)
 	openedRaw.userdata = opened
-	server.connections.Store(opened, opened)
 	server.onOutbound(openedRaw, 8)
 	server.onClose(openedRaw, io.EOF)
 	server.onClose(openedRaw, io.EOF)
-	if _, exists := server.connections.Load(opened); exists {
-		t.Fatal("closed connection remained in server map")
-	}
 	handler.mu.Lock()
 	defer handler.mu.Unlock()
 	if got := strings.Join(handler.events, ","); got != "close" {
@@ -623,5 +590,111 @@ func TestHeartbeatPingPositionFollowsEarlierPong(t *testing.T) {
 	conn.heartbeat.mu.Unlock()
 	if sentAt == 0 {
 		t.Fatal("Ping retirement did not start Pong timeout")
+	}
+}
+
+// A Ping the outbound limit refuses must leave a timer aimed at the stall
+// deadline: the one-shot that brought the turn has fired, so re-arming the
+// deadline it carried would never come again and the connection would never
+// time out. This is the heartbeat's "peer silent and our own outbound full"
+// case.
+func TestHeartbeatRearmsAfterBackpressure(t *testing.T) {
+	server := NewServer(Options{})
+	server.HeartbeatInterval = 10 * time.Millisecond
+	server.HeartbeatTimeout = 50 * time.Millisecond
+	raw := newScriptedConn()
+	raw.writeErr = uio.ErrOutboundOverflow
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	conn.beginHeartbeat()
+	first, ok := raw.lastWakeArm()
+	if !ok {
+		t.Fatal("beginHeartbeat armed no wake deadline")
+	}
+
+	// At the interval the Ping is refused for lack of outbound room.
+	conn.heartbeatTick(first)
+	if conn.heartbeat.pingOutstanding.Load() {
+		t.Fatal("a refused Ping stayed outstanding")
+	}
+	heartbeat := conn.heartbeat
+	heartbeat.mu.Lock()
+	stalledAt := heartbeat.sendStalledAt
+	heartbeat.mu.Unlock()
+	if stalledAt != first.UnixNano() {
+		t.Fatalf("stall noted at %d, want the refused attempt's %d", stalledAt, first.UnixNano())
+	}
+	// The wake is re-aimed at the earlier of the next interval and the
+	// stall deadline — never left on the deadline that just fired.
+	next, ok := raw.lastWakeArm()
+	if !ok || next.Equal(first) {
+		t.Fatalf("re-armed at %v; the fired deadline %v left no timer for the stall", next, first)
+	}
+	stallDeadline := first.Add(server.HeartbeatTimeout)
+	if want := first.Add(server.HeartbeatInterval); !next.Equal(want) {
+		t.Fatalf("re-armed at %v, want the next interval %v (before the stall deadline %v)", next, want, stallDeadline)
+	}
+
+	// Each retry is refused again; the stall keeps its first moment, so the
+	// chain of wakes ends at the stall deadline, where the connection times
+	// out.
+	for at := next; at.Before(stallDeadline); {
+		conn.heartbeatTick(at)
+		if conn.closing.Load() {
+			t.Fatalf("closed at %v, before the stall deadline %v", at, stallDeadline)
+		}
+		armed, ok := raw.lastWakeArm()
+		if !ok || !armed.After(at) {
+			t.Fatalf("retry at %v left the timer at %v", at, armed)
+		}
+		at = armed
+	}
+	conn.heartbeatTick(stallDeadline)
+	if !conn.closing.Load() || raw.closes != 1 {
+		t.Fatalf("closing=%v closes=%d, want the stall timeout to close", conn.closing.Load(), raw.closes)
+	}
+	if info := conn.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
+		t.Fatalf("heartbeat close info = %+v", info)
+	}
+}
+
+// A wake deadline the transport refuses is not recorded as armed: the steady
+// fast path would otherwise trust a timer that does not exist, and the
+// connection's heartbeat would stop. The next turn retries the arm.
+func TestHeartbeatRefusedArmIsRetried(t *testing.T) {
+	server := NewServer(Options{})
+	server.HeartbeatInterval = time.Hour
+	raw := newScriptedConn()
+	raw.wakeArmErr = errors.New("transport refused the timer")
+	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
+	conn.opened.Store(true)
+	conn.beginHeartbeat()
+	conn.heartbeat.mu.Lock()
+	armed := conn.heartbeat.armedAt
+	conn.heartbeat.mu.Unlock()
+	if armed != 0 {
+		t.Fatal("a refused arm was recorded as armed")
+	}
+
+	// A data turn long before the interval: with no timer, it must re-arm
+	// rather than take the steady fast path.
+	raw.wakeMu.Lock()
+	raw.wakeArmErr = nil
+	raw.wakeMu.Unlock()
+	before := len(raw.wakeArms())
+	conn.heartbeatTick(time.Now())
+	if len(raw.wakeArms()) != before+1 {
+		t.Fatal("a turn after a refused arm took the fast path and left no timer")
+	}
+	conn.heartbeat.mu.Lock()
+	armed, next := conn.heartbeat.armedAt, conn.heartbeat.nextPingAt
+	conn.heartbeat.mu.Unlock()
+	if armed != next {
+		t.Fatalf("armedAt %d, want the next ping %d once the transport took it", armed, next)
+	}
+	// Now the steady path holds: another turn arms nothing.
+	conn.heartbeatTick(time.Now())
+	if len(raw.wakeArms()) != before+1 {
+		t.Fatal("a steady turn re-armed an already armed timer")
 	}
 }
