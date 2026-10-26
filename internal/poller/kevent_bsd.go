@@ -27,3 +27,14 @@ func makeKevent(fd int, filter, flags int64) unix.Kevent_t {
 		Flags:  uint16(flags),
 	}
 }
+
+// makeTimerKevent is the loop's wake timer: one ident no descriptor holds,
+// with Data carrying the delay in milliseconds.
+func makeTimerKevent(flags int64, ms int64) unix.Kevent_t {
+	return unix.Kevent_t{
+		Ident:  timerIdent,
+		Filter: int16(unix.EVFILT_TIMER),
+		Flags:  uint16(flags),
+		Data:   ms,
+	}
+}

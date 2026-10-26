@@ -28,6 +28,7 @@ import (
 	"github.com/urpc/uio/internal/fdmap"
 	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
+	"github.com/urpc/uio/internal/timewheel"
 )
 
 // maxLoops caps the default loop count at the number of L3 domains a wide AMD
@@ -179,6 +180,14 @@ type eventLoop struct {
 	index uint32
 	count uint32
 
+	// wakeMu guards the wake wheel's lazy construction and, on a loop whose
+	// poller has no kernel timer, the runtime fallback timer; wake holds the
+	// wheel once a connection of this loop has armed a wake timer. See
+	// wake_unix.go.
+	wakeMu    sync.Mutex
+	wake      *timewheel.Wheel[*fdConn]
+	wakeTimer *time.Timer
+
 	// UDP lifetime ownership starts before poller registration. Keeping it
 	// separate from fdMap also keeps stale untagged kqueue events from
 	// reaching a listener before OnStart returns. Only create/close use it.
@@ -233,7 +242,7 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		ioPool = newIOTaskPool(events.Executor)
 		owner = true
 	}
-	return &eventLoop{
+	loop := &eventLoop{
 		events:      events,
 		poller:      loopPoller,
 		fdMap:       newFdMap(),
@@ -241,7 +250,11 @@ func newEventLoop(events *Events) (*eventLoop, error) {
 		ioPoolOwner: owner,
 		ioIdle:      make(chan struct{}),
 		count:       1,
-	}, nil
+	}
+	// The wake timer's expiry sink before any waiter can wait, so an expiry
+	// that lands first thing still reaches the loop.
+	loopPoller.SetTimerSink(loop.expireWakeTimers)
+	return loop, nil
 }
 
 // ioStripes spreads the turn count over that many cache lines. Every turn is
@@ -732,6 +745,14 @@ func (loop *eventLoop) forget(conn *fdConn) {
 // waits for those turns, and then releases each connection itself; OnClose
 // is still delivered by a final turn.
 func (loop *eventLoop) shutdown(err error) {
+	// The fallback wake timer, when a loop ran on one, stops here: entries
+	// the connections' own release paths cancel cover the rest.
+	loop.wakeMu.Lock()
+	if loop.wakeTimer != nil {
+		loop.wakeTimer.Stop()
+		loop.wakeTimer = nil
+	}
+	loop.wakeMu.Unlock()
 	loop.udpMu.Lock()
 	for server := range loop.udpServers {
 		server.beginShutdown()

@@ -277,3 +277,13 @@ func (f InnerConn) Control(fn func(fd uintptr)) error { return f.Conn.Control(fn
 // Wake reaches the connection below; a middleware that must first pump its own
 // protocol overrides it.
 func (f InnerConn) Wake() error { return f.Conn.Wake() }
+
+// SetWakeDeadline and SetWakeInterval reach the connection below: a
+// middleware's timing is the connection it wraps.
+func (f InnerConn) SetWakeDeadline(when time.Time) error {
+	return f.Conn.SetWakeDeadline(when)
+}
+
+func (f InnerConn) SetWakeInterval(interval time.Duration) error {
+	return f.Conn.SetWakeInterval(interval)
+}

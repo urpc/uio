@@ -122,6 +122,16 @@ queued and sent by a short *write turn*, so it does not wait for a slow read.
 Only one sender touches a socket at a time, and bytes leave in the order they
 were written.
 
+**Timed turns.** `SetWakeDeadline` schedules an `OnData` for a connection at
+a time of your choosing — the timed form of `Wake`, for heartbeats, protocol
+update ticks and idle timeouts; `SetWakeInterval` repeats. The turn carries
+no data and no reason: it may run early for another wake and may find bytes
+already buffered, so a callback checks its own clocks every time it runs. On
+the native backend the timers live on a per-loop timing wheel that a kernel
+timer wakes, so an armed timer costs no goroutine and an idle connection
+none at all; the `stdio` backend runs one runtime timer per armed
+connection.
+
 This describes the native epoll/kqueue backend. The portable `stdio` backend
 used on Windows (or with `-tags stdio`) gives each stream connection its own
 reader and writer goroutines instead.
@@ -205,7 +215,7 @@ func Server(cfg *Config) uio.Middleware {
 
 `PerConn` keeps the map from the connection below to the handler built for it,
 and drops the entry when that connection closes. `InnerConn` carries the
-fifteen methods a middleware leaves alone — addresses, userdata, deadlines, the
+seventeen methods a middleware leaves alone — addresses, userdata, deadlines, the
 fd-shaped socket options — so only the reads, the writes, the buffered counts
 and the close need writing.
 

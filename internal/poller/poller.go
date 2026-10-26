@@ -43,6 +43,10 @@ const (
 	Writable
 )
 
+// ErrTimers reports that this poller has no kernel timer (a Linux kernel or
+// seccomp policy without timerfds); the caller falls back to a runtime timer.
+var ErrTimers = errors.New("poller: no kernel timer")
+
 // Event is one normalized readiness notification. A backend may use level or
 // edge triggering; users must follow the registration contract of that fd.
 // Tag echoes the value set with SetTag when the fd was registered, so a

@@ -113,6 +113,17 @@ type fdConn struct {
 	deadlineMu   sync.Mutex
 	readDeadline time.Time
 
+	// wake is the connection's wake timer on the stdio backend, where no
+	// event loop carries a wheel: one runtime timer per armed connection,
+	// replaced by each setter. wakeMu orders the setters against one another
+	// and the close path's stop; the generation makes a timer that fires for
+	// a replaced or cleared deadline harmless.
+	wakeMu    sync.Mutex
+	wakeGen   uint64
+	wakeAt    time.Time
+	wakeEvery time.Duration
+	wakeTimer *time.Timer
+
 	// writeShut records a CloseWrite, guarded by mux: no more output is
 	// accepted, and the writer shuts the socket's writing half once what was
 	// accepted before it is sent, then sets writeShutDone. readEOF records,
@@ -318,6 +329,101 @@ func (udp *stdUDPState) inControl() bool {
 		}
 	}
 	return false
+}
+
+// SetWakeDeadline arms the connection's wake timer for when; see the Conn
+// interface for the contract. A zero time cancels.
+func (fc *fdConn) SetWakeDeadline(when time.Time) error {
+	if fc.isClosing() {
+		return net.ErrClosed
+	}
+	if when.IsZero() {
+		fc.clearWakeTimer()
+		return nil
+	}
+	fc.armWake(when, 0)
+	if fc.isClosing() {
+		fc.clearWakeTimer()
+	}
+	return nil
+}
+
+// SetWakeInterval arms the connection's wake timer to fire every interval;
+// see the Conn interface for the contract. A zero or negative interval
+// cancels.
+func (fc *fdConn) SetWakeInterval(interval time.Duration) error {
+	if fc.isClosing() {
+		return net.ErrClosed
+	}
+	if interval <= 0 {
+		fc.clearWakeTimer()
+		return nil
+	}
+	fc.armWake(time.Now().Add(interval), interval)
+	if fc.isClosing() {
+		fc.clearWakeTimer()
+	}
+	return nil
+}
+
+// armWake runs one runtime timer for the connection's wake deadline. The
+// generation makes a timer whose deadline was replaced or cleared while it
+// fired harmless: the callback re-checks both under the mutex.
+func (fc *fdConn) armWake(when time.Time, every time.Duration) {
+	fc.wakeMu.Lock()
+	defer fc.wakeMu.Unlock()
+	fc.wakeGen++
+	fc.wakeAt, fc.wakeEvery = when, every
+	generation := fc.wakeGen
+	// A fresh timer each arm, never Reset: the callback carries this arm's
+	// generation, which Reset would leave stale in the old closure. A timer
+	// stopped while its callback was already dequeued fires once more; the
+	// generation check makes that harmless.
+	if fc.wakeTimer != nil {
+		fc.wakeTimer.Stop()
+	}
+	delay := time.Until(when)
+	if delay < 0 {
+		delay = 0
+	}
+	fc.wakeTimer = time.AfterFunc(delay, func() { fc.expireWake(generation) })
+}
+
+// clearWakeTimer disarms the timer.
+func (fc *fdConn) clearWakeTimer() {
+	fc.wakeMu.Lock()
+	defer fc.wakeMu.Unlock()
+	fc.wakeGen++
+	fc.wakeAt, fc.wakeEvery = time.Time{}, 0
+	if fc.wakeTimer != nil {
+		fc.wakeTimer.Stop()
+		fc.wakeTimer = nil
+	}
+}
+
+// expireWake is the timer's callback: still-armed, it Wakes the connection —
+// OnData with no socket read — and re-arms an interval.
+func (fc *fdConn) expireWake(generation uint64) {
+	fc.wakeMu.Lock()
+	if generation != fc.wakeGen || fc.wakeAt.IsZero() {
+		fc.wakeMu.Unlock()
+		return
+	}
+	every := fc.wakeEvery
+	if every > 0 {
+		when := fc.wakeAt.Add(every)
+		if !when.After(time.Now()) {
+			when = time.Now().Add(every)
+		}
+		fc.wakeAt = when
+		fc.wakeTimer.Reset(time.Until(when))
+	} else {
+		fc.wakeAt = time.Time{}
+		fc.wakeEvery = 0
+		fc.wakeTimer = nil
+	}
+	fc.wakeMu.Unlock()
+	_ = fc.Wake()
 }
 
 // closeListenerSocket closes a UDP listener's server connection on the
@@ -1140,6 +1246,10 @@ func (fc *fdConn) closeOnLoop(err error) {
 // finishClose is the resource owner's terminal hand-off. Opening may only
 // arrange OnClose once this cleanup has finished, never just from closed.
 func (fc *fdConn) finishClose(err error) {
+	// Every close path ends here, a datagram child's included: an armed wake
+	// timer, a periodic one above all, would keep re-arming itself against a
+	// closed connection forever.
+	fc.clearWakeTimer()
 	if hook := testHookStdCloseReleased.Load(); hook != nil {
 		(*hook)(fc)
 	}

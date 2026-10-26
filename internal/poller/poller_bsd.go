@@ -53,6 +53,10 @@ type Poller struct {
 	kqfd      int
 	wakeRead  int
 	wakeWrite int
+	// onTimer is the loop's wake-timer expiry sink, set before the waiters
+	// start. The timer itself is an EVFILT_TIMER kevent under the reserved
+	// ident below — no descriptor of its own.
+	onTimer func()
 
 	mu      sync.Mutex // protects waiters, parked and descriptor lifetime
 	waiters int        // includes readiness-event conversion after kevent
@@ -208,6 +212,44 @@ func (poller *Poller) removeLocked(fd int, previous Interest) error {
 	return errors.Join(errs...)
 }
 
+// SetTimerSink sets what an expiry of the armed timer runs. It must be
+// called before the waiters start.
+func (poller *Poller) SetTimerSink(sink func()) {
+	poller.onTimer = sink
+}
+
+// timerIdent is the reserved ident of the loop's wake-timer kevent: zero is
+// no descriptor, so its events can never collide with a connection's.
+const timerIdent = 0
+
+// ArmTimer aims the loop's timer at the earliest wake deadline, one shot; a
+// zero delay disarms. kqueue counts EVFILT_TIMER in milliseconds by default,
+// which every BSD carries; the wheel's own tick is coarser than that.
+func (poller *Poller) ArmTimer(delay time.Duration) error {
+	flags := int64(unix.EV_ADD | unix.EV_ONESHOT)
+	if delay <= 0 {
+		flags = unix.EV_DELETE
+	}
+	// Under ctl's read side a release cannot close the kqueue under the
+	// change; EINTR from a signal is retried, since a lost re-arm of a
+	// one-shot timer idles the loop's wake timers until the next one.
+	poller.ctl.RLock()
+	defer poller.ctl.RUnlock()
+	if poller.closed.Load() {
+		return nil
+	}
+	for {
+		_, err := unix.Kevent(poller.kqfd,
+			[]unix.Kevent_t{makeTimerKevent(flags, max(delay.Milliseconds(), 1))}, nil, nil)
+		if errors.Is(err, unix.ENOENT) {
+			return nil // disarming what was never armed
+		}
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+}
+
 func (poller *Poller) change(fd int, filter int64, flags int64, edge bool) error {
 	if edge && flags&unix.EV_ADD != 0 {
 		flags |= unix.EV_CLEAR
@@ -312,6 +354,15 @@ func (poller *Poller) wait(batch *Batch, out []Event, timeout int, park bool) (i
 	}
 	count := 0
 	for _, event := range batch.rawEvents[:n] {
+		if event.Filter == unix.EVFILT_TIMER {
+			// The loop's wake timer expired; no other filter is installed
+			// with this ident, and the filter cannot be confused with a
+			// descriptor's readiness.
+			if sink := poller.onTimer; sink != nil {
+				sink()
+			}
+			continue
+		}
 		fd := int(event.Ident)
 		if fd == poller.wakeRead {
 			poller.drainWake()

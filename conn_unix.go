@@ -94,6 +94,9 @@ type fdConn struct {
 	inflight *bytebuf.CompositeBuffer
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
+	// wake is the connection's wake timer on its loop's wheel, allocated by
+	// the first SetWakeDeadline or SetWakeInterval.
+	wake *wakeState
 
 	// scratch is the read round's reply space while the turn reads: what the
 	// round's callbacks reserve is laid out in it and leaves in one send when
@@ -2041,6 +2044,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 		finalErr = errors.Join(finalErr, UnflushedError{Remaining: remaining})
 	}
 	conn.stopDeadlines()
+	conn.cancelWakeTimer()
 	if conn.udp != nil && conn.udp.server != nil {
 		// A child only leaves the peer map; its server owns the shared fd.
 		// DialPeer may have replaced it there already.

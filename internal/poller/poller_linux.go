@@ -26,6 +26,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -57,6 +58,11 @@ const Tagged = true
 type Poller struct {
 	epfd   int
 	wakefd int
+	// timerfd is the loop's wake-timer source: armed to the wheel's earliest
+	// deadline, its expiry arrives through epoll like any readiness. onTimer
+	// is the expiry's sink, set by the loop before its waiters start.
+	timerfd int
+	onTimer func()
 
 	mu      sync.Mutex // protects waiters, wakers and descriptor lifetime
 	waiters int        // includes readiness-event conversion after epoll_wait
@@ -133,15 +139,75 @@ func New() (*Poller, error) {
 		_ = unix.Close(epfd)
 		return nil, err
 	}
-	poller := &Poller{epfd: epfd, wakefd: wakefd}
+	timerfd, err := unix.TimerfdCreate(unix.CLOCK_MONOTONIC, unix.TFD_NONBLOCK|unix.TFD_CLOEXEC)
+	if err != nil {
+		timerfd = -1 // a kernel or seccomp without timerfds: the runtime timer carries the loop
+	}
+	poller := &Poller{epfd: epfd, wakefd: wakefd, timerfd: timerfd}
 	if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, wakefd, &unix.EpollEvent{
 		Fd: int32(wakefd), Events: readEvents,
 	}); err != nil {
+		_ = unix.Close(timerfd)
 		_ = unix.Close(wakefd)
 		_ = unix.Close(epfd)
 		return nil, err
 	}
+	if timerfd >= 0 {
+		// The timer's descriptor joins the set before any waiter can park,
+		// so an expiry that lands while a waiter is parking still reaches it.
+		if err = unix.EpollCtl(epfd, unix.EPOLL_CTL_ADD, timerfd, &unix.EpollEvent{
+			Fd: int32(timerfd), Events: readEvents,
+		}); err != nil {
+			_ = unix.Close(timerfd)
+			poller.timerfd = -1
+		}
+	}
 	return poller, nil
+}
+
+// SetTimerSink sets what an expiry of the armed timer runs. It must be
+// called before the waiters start.
+func (poller *Poller) SetTimerSink(sink func()) {
+	poller.onTimer = sink
+}
+
+// ArmTimer aims the loop's timer at the earliest wake deadline. A zero delay
+// disarms. Each expiry is one shot: the wheel's sink re-arms. The call runs
+// under ctl's read side, so a release closing the descriptor cannot race the
+// system call onto a reused number, and it reports ErrTimers when this
+// poller has no kernel timer for the caller to fall back on.
+func (poller *Poller) ArmTimer(delay time.Duration) error {
+	poller.ctl.RLock()
+	defer poller.ctl.RUnlock()
+	if poller.closed.Load() {
+		return nil // a released poller disarms, not falls back
+	}
+	if poller.timerfd < 0 {
+		return ErrTimers
+	}
+	spec := unix.ItimerSpec{}
+	if delay > 0 {
+		spec.Value = unix.NsecToTimespec(int64(max(delay, time.Millisecond)))
+	}
+	for {
+		err := unix.TimerfdSettime(poller.timerfd, 0, &spec, nil)
+		if !errors.Is(err, unix.EINTR) {
+			return err
+		}
+	}
+}
+
+// drainTimer reads the expiry count and runs the sink for what it read: a
+// second waiter that saw the same level-triggered readiness after another
+// drained it reads nothing and runs nothing.
+func (poller *Poller) drainTimer() {
+	var expirations [8]byte
+	n, _ := unix.Read(poller.timerfd, expirations[:])
+	if n > 0 {
+		if sink := poller.onTimer; sink != nil {
+			sink()
+		}
+	}
 }
 
 // Add registers a descriptor that is not already watched. Its readiness is
@@ -357,6 +423,10 @@ func (poller *Poller) wait(batch *Batch, out []Event, timeout int, park bool) (i
 	count := 0
 	for _, event := range batch.rawEvents[:n] {
 		fd := int(event.Fd)
+		if fd == poller.timerfd {
+			poller.drainTimer()
+			continue
+		}
 		if fd == poller.wakefd {
 			poller.drainWake()
 			continue
@@ -524,6 +594,10 @@ func (poller *Poller) release() {
 		// that has not started sees it; one in progress finishes first.
 		poller.ctl.Lock()
 		_ = unix.Close(poller.wakefd)
+		if poller.timerfd >= 0 {
+			_ = unix.Close(poller.timerfd)
+			poller.timerfd = -1
+		}
 		_ = unix.Close(poller.epfd)
 		poller.ctl.Unlock()
 	})

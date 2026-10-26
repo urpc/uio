@@ -27,3 +27,13 @@ func makeKevent(fd int, filter, flags int64) unix.Kevent_t {
 		Flags:  uint32(flags),
 	}
 }
+
+// makeTimerKevent mirrors kevent_bsd.go's for NetBSD's wider fields.
+func makeTimerKevent(flags int64, ms int64) unix.Kevent_t {
+	return unix.Kevent_t{
+		Ident:  timerIdent,
+		Filter: uint32(unix.EVFILT_TIMER),
+		Flags:  uint32(flags),
+		Data:   ms,
+	}
+}

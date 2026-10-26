@@ -78,7 +78,8 @@ func (c *gateConn) WriteOwned(b *uio.Buffer) (int, error) { return c.Conn.WriteO
 func (c *gateConn) ReserveOutbound(n int) ([]byte, error) {
 	return c.Conn.ReserveOutbound(n)
 }
-func (c *gateConn) Flush() error              { return c.Conn.Flush() }
+func (c *gateConn) Flush() error { return c.Conn.Flush() }
+
 func (c *gateConn) YieldRead() error          { return c.Conn.YieldRead() }
 func (c *gateConn) CloseWith(err error) error { return c.Conn.CloseWith(err) }
 func (c *gateConn) Close() error              { return c.Conn.Close() }
