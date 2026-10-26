@@ -504,3 +504,31 @@ func TestCursorAtLastTick(t *testing.T) {
 		t.Fatalf("wheel holds %d after firing", w.Len())
 	}
 }
+
+// AdvanceInto appends: a periodic entry the caller already holds in due — an
+// earlier batch it has not drained — is not re-armed a second time.
+func TestAdvanceIntoLeavesPrefixAlone(t *testing.T) {
+	start := time.Now()
+	w := New[int](testTick, 64, start, nil)
+	periodic := &Entry[int]{Val: 1}
+	w.Arm(periodic, start.Add(2*testTick), 10*testTick)
+	first := w.AdvanceInto(start.Add(3*testTick), nil)
+	if len(first) != 1 || first[0] != periodic {
+		t.Fatalf("first Advance = %d entries, want the periodic one", len(first))
+	}
+	rearmed := periodic.When
+
+	// A second Advance with nothing due, appending after the first batch.
+	other := &Entry[int]{Val: 2}
+	w.Arm(other, start.Add(4*testTick), 0)
+	both := w.AdvanceInto(start.Add(5*testTick), first)
+	if len(both) != 2 || both[1] != other {
+		t.Fatalf("second Advance = %d entries, want the prefix plus the new one", len(both))
+	}
+	if !periodic.When.Equal(rearmed) {
+		t.Fatalf("the prefix's periodic entry was re-armed again: %v, want %v", periodic.When, rearmed)
+	}
+	if w.Len() != 1 {
+		t.Fatalf("wheel holds %d, want only the periodic entry", w.Len())
+	}
+}

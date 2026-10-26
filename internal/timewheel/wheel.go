@@ -134,8 +134,9 @@ func New[T any](tick time.Duration, buckets int, now time.Time, arm func(when ti
 	return w
 }
 
-// Arm sets e's deadline; a past deadline is due at the next Advance. A
-// positive period makes the entry re-arm itself each time it is due.
+// Arm sets e's deadline; a past deadline is due at the next Advance, and the
+// zero time cancels. A positive period makes the entry re-arm itself each
+// time it is due.
 func (w *Wheel[T]) Arm(e *Entry[T], when time.Time, period time.Duration) {
 	if when.IsZero() {
 		// The zero time is the wheel's "nothing armed": an entry carrying it
@@ -207,8 +208,11 @@ func (w *Wheel[T]) Advance(now time.Time) []*Entry[T] {
 
 // AdvanceInto is Advance appending to due, so an owner that advances on every
 // expiry reuses one slice instead of allocating per call. It returns the
-// extended slice.
+// extended slice; entries already in due are left as they are. The entries
+// come out in no particular order — a long gap sweeps slots, not time —
+// so an owner that needs time order sorts them by When.
 func (w *Wheel[T]) AdvanceInto(now time.Time, due []*Entry[T]) []*Entry[T] {
+	start := len(due) // only what this Advance appends is its own
 	w.mu.Lock()
 	current := w.tickOf(now)
 	// A gap longer than the window passes over every slot the ring has:
@@ -259,7 +263,7 @@ func (w *Wheel[T]) AdvanceInto(now time.Time, due []*Entry[T]) []*Entry[T] {
 	}
 	// Periodic entries re-arm from when they were due, or from now when the
 	// elapsed time spans their period.
-	for _, e := range due {
+	for _, e := range due[start:] {
 		if e.Period > 0 {
 			e.When = e.When.Add(e.Period)
 			if !e.When.After(now) {
