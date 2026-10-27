@@ -118,7 +118,8 @@ func (s *Server) Serve(addrs ...string) error {
 	return err
 }
 
-// Close permanently stops the server and requests transport shutdown. Serve
+// Close permanently stops the server and requests transport shutdown. It
+// returns once the shutdown is requested; a Serve running on the server
 // returns after all event loops and connection tasks have exited.
 func (s *Server) Close(err error) error {
 	s.closeMu.Lock()

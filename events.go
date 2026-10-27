@@ -51,11 +51,12 @@ type IOTask interface {
 // is unsupported. The batch slice is callback-scoped, so an executor must copy
 // references it retains after SubmitBatch returns. Submit false means the task
 // was not run; a short SubmitBatch result means the rejected suffix was not run.
-// Rejection closes the affected connection, and what a refused turn still owes
-// — OnClose, and OnOutbound for the close's final flush — runs on UIO's own
-// goroutines, a few at a time. A connection whose first turn is refused never
-// got OnOpen, so it closes without OnClose too, and the Dial or Adopt that
-// offered it reports ErrFirstTurnRefused. A native connection may have its
+// Rejection closes the affected connection, and what a refused turn still
+// owes — OnClose, and OnOutbound for the close's final flush — runs on UIO's
+// own goroutines, a few at a time, or inline on the rejecting goroutine when
+// the executor also refuses that cleanup. A connection whose first turn is
+// refused never got OnOpen, so it closes without OnClose too, and the Dial or
+// Adopt that offered it reports ErrFirstTurnRefused. A native connection may have its
 // connection turn and a write turn in flight at once; both arrive here.
 type Executor interface {
 	Submit(task IOTask) bool

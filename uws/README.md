@@ -135,9 +135,10 @@ dialer, whose `Options.Handler` must be nil because the client owns the
 callbacks. A full message queue pauses the connection's reads — TCP flow
 control then slows the peer — so a client must either keep reading or be
 closed; `Client.Close` works either way. No message is dropped while the
-connection lives; with a heartbeat configured, a client nobody reads keeps
-pinging and is closed once a Ping goes unanswered, its Pong stuck behind the
-unread messages. `ReadMessage` reports a
+connection is open; one that arrives once this end has begun closing and finds
+the queue full is dropped rather than holding the close up. With a heartbeat
+configured, a client nobody reads keeps pinging and is closed once a Ping goes
+unanswered, its Pong stuck behind the unread messages. `ReadMessage` reports a
 `*uws.CloseError` after the connection ended and every message received
 before that was returned.
 
@@ -294,7 +295,9 @@ A dialer with a `TLSConfig` still dials `ws://` in the clear; without one it
 refuses `wss://`. The TLS handshake runs before the WebSocket one, within
 `HandshakeTimeout`: one that fails fails the dial with its cause, and the
 Handler hears nothing of the connection. Behind `net/http`, `ServeHTTP` runs
-no TLS of its own — an `http.Server`'s TLS carries the connection instead. A
+no TLS of its own and refuses a request that arrived over TLS: terminate TLS
+elsewhere and pass the plain HTTP/1.1 upgrade through, or let `Serve` take
+`wss://` itself with a `TLSConfig`. A
 TLS record carries up to 16 KiB, so a `ReadBufferSize` of 16 KiB or more reads
 one record per syscall.
 
@@ -337,8 +340,9 @@ up front). For messages, keep to `Server` and `Dialer`.
   overlap, so state kept with `SetUserdata` needs no locking from them;
   `TrafficObserver.OnOutbound` is the exception, and it must only observe —
   never send, close or block.
-- **Closing.** `Conn.Close(code, reason)` sends its close frame after everything
-  already accepted and waits for the peer, up to `CloseTimeout`. Protocol
+- **Closing.** `Conn.Close(code, reason)` queues its close frame after
+  everything already accepted and returns; the connection then completes the
+  handshake with the peer, which `CloseTimeout` bounds. Protocol
   errors close with 1002, invalid UTF-8 with 1007, oversized messages with
   1009.
 - **Lifecycle.** `Server.Close` and `Dialer.Close` request shutdown and return

@@ -123,8 +123,9 @@ Only one sender touches a socket at a time, and bytes leave in the order they
 were written.
 
 **Timed turns.** `SetWakeDeadline` schedules an `OnData` for a connection at
-a time of your choosing — the timed form of `Wake`, for heartbeats, protocol
-update ticks and idle timeouts; `SetWakeInterval` repeats. The turn carries
+a time of your choosing, within one scheduler tick of it — the timed form of
+`Wake`, for heartbeats, protocol update ticks and idle timeouts;
+`SetWakeInterval` repeats. The turn carries
 no data and no reason: it may run early for another wake and may find bytes
 already buffered, so a callback checks its own clocks every time it runs. On
 the native backend the timers live on a per-loop timing wheel that a kernel
@@ -236,10 +237,11 @@ These are UIO's to keep, not each layer's to remember:
    `OnSent`, `OnClose` and the Handler's callbacks run on the connection's
    turns. The others run where they are called for and may overlap the
    turns: `OnOutbound` on the writer's goroutine, `CloseGracefully` and
-   `CloseWrite` on the closing goroutine, `OutboundHeld` and `Flush` on
-   writers' and flushers'. State they share needs a lock. UIO never calls a
-   layer from below or from inside another layer's callback, so a layer may
-   hold its lock while it writes, flushes or closes below.
+   `CloseWrite` on the closing goroutine, `OutboundHeld` on writers' and
+   `Flush` on a turn's or the caller of `Flush`. State they share needs a
+   lock. UIO never calls a layer from below or from inside another layer's
+   callback, so a layer may hold its lock while it writes, flushes or closes
+   below.
 4. **A connection ends once, top down.** The Handler's `OnClose` comes first,
    if its `OnOpen` ran, then every layer's. A connection whose stack never
    opened — a failed handshake — ends without a Handler callback. Once a
@@ -258,7 +260,8 @@ These are UIO's to keep, not each layer's to remember:
 7. **A graceful close lets the queue leave first.** `Close` on a layered
    connection closes the socket once what was queued — the layers' goodbyes
    included — has left, or once it stopped moving for `uio.LingerTimeout`;
-   what arrives meanwhile is discarded. A `CloseWith` an error aborts at once.
+   what arrives meanwhile is discarded. A `CloseWith` with any other error
+   aborts at once.
 8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
    the Handler count against it with the socket's buffer: a stack holding the
    limit takes nothing more from the socket until the Handler reads.
@@ -447,7 +450,9 @@ if dst, err := c.ReserveOutbound(n); err == nil {
 - `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`
   and `CloseWith` are safe from any goroutine.
 - `CloseWrite` shuts a stream connection's writing half after everything
-  accepted has been sent; later writes return `net.ErrClosed`.
+  accepted has been sent; later writes return `net.ErrClosed`. On a layered
+  connection it runs the layer's own `CloseWrite` inline — flushing it, and
+  writing a TLS close_notify — so it may wait on I/O.
 - `OnOutbound` can run concurrently with the connection's other callbacks.
 - `Events.Close` only requests shutdown and returns at once; `Serve` returns
   once everything has stopped, or call `Events.Wait` from another goroutine.

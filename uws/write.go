@@ -287,8 +287,10 @@ func (c *Conn) sendHeartbeatClose(code uint16, reason string) {
 // Close starts a graceful WebSocket close handshake. The Close frame follows
 // every message accepted before it. When the outbound limit has no room for
 // the frame, it waits for the transport to drain instead of failing; either
-// way the connection stops accepting messages, and CloseTimeout bounds the
-// handshake.
+// way the connection stops accepting messages, and one that arrives already
+// received but not yet reported to the Handler is dropped rather than
+// delivered. CloseTimeout bounds the handshake, which the connection carries
+// on after Close returns.
 func (c *Conn) Close(code uint16, reason string) error {
 	if !c.opened.Load() {
 		return c.raw.CloseWith(io.EOF)

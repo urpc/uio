@@ -253,9 +253,12 @@ type Conn interface {
 	// and writes after it return net.ErrClosed. The connection keeps reading
 	// until the peer shuts its own writing half; with Events.AllowHalfOpen it
 	// then closes, without it the end of the stream closes it as before. It
-	// returns at once, may be called from any goroutine, and calling it again
-	// does nothing. Datagram connections, and stdio-backend connections whose
-	// net.Conn cannot shut one half, return an unsupported error.
+	// may be called from any goroutine, and calling it again does nothing. On
+	// a layered connection it runs the layer's own CloseWrite before it
+	// returns — flushing that layer, and for TLS writing a close_notify — so
+	// it may wait on I/O; a bare connection returns at once. Datagram
+	// connections, and stdio-backend connections whose net.Conn cannot shut
+	// one half, return an unsupported error.
 	CloseWrite() error
 }
 

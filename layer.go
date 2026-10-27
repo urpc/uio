@@ -101,11 +101,14 @@ type LayerConn interface {
 	// or on a later turn; a layer that negotiates nothing calls it here.
 	OnOpen(ctx LayerContext)
 
-	// OnInbound runs on every turn once the layer opened: bytes from below
-	// may have arrived, or none. It reads them from LayerContext.Lower,
-	// consumes them with Discard, and hands up what they became with
+	// OnInbound runs on a turn once the layer opened: bytes from below may
+	// have arrived, or none. It reads them from LayerContext.Lower, consumes
+	// them with Discard, and hands up what they became with
 	// LayerContext.Deliver. It may take one chunk at a time: while it consumes
-	// and bytes still wait below, the turn calls it again.
+	// and bytes still wait below, the turn calls it again. The bottom layer is
+	// not called at all while the stack holds MaxInboundBuffered unread, until
+	// a read above makes room; the layers above it go on moving what the stack
+	// already holds up.
 	OnInbound(ctx LayerContext) error
 
 	// OnOutbound runs for what the layer above writes, on the writer's
@@ -149,9 +152,10 @@ type CloseWriter interface {
 // error for an abort.
 //
 // A graceful close of a layered connection lets what was queued leave first,
-// the goodbyes included: the socket closes once the queue — the socket's and
-// the bytes OutboundHolder layers hold — is empty, or once it made no
-// progress for LingerTimeout. Nothing reaches the layers or the Handler
+// the goodbyes included: the socket closes once the queue — the socket's, and
+// the bytes OutboundHolder layers at or below the one that began the close
+// hold — is empty, or once it made no progress for LingerTimeout. Nothing
+// reaches the layers or the Handler
 // meanwhile, and what arrives is discarded. An abort closes at once. A layer
 // that closes the connection itself, through its LayerContext, ends it for
 // the layers above too: what they hold is dropped, and the close waits only
@@ -175,7 +179,8 @@ var lingerTimeout = LingerTimeout
 // bytes cannot match n to its own. What it can rely on is the queue: once
 // Lower's OutboundBuffered is zero, everything it wrote left. It runs on the
 // connection's turn — the one running as the send finished, or one the
-// report asks for — as the turn ends, and may write: the socket may report a
+// report asks for — as the turn ends, possibly more than once before that
+// turn ends, and may write: the socket may report a
 // send inside the write that made it, where no layer can be called.
 type SendObserver interface {
 	OnSent(ctx LayerContext, n int)

@@ -72,7 +72,9 @@ var (
 	ErrClosed = errors.New("uws: connection closed")
 	// ErrNotReady reports an operation attempted before the handshake completes.
 	ErrNotReady = errors.New("uws: handshake not complete")
-	// ErrBackpressure reports that the UIO connection outbound queue is full.
+	// ErrBackpressure reports a send MaxOutboundBuffered has no room for:
+	// the queue is full, or the frame or message is larger than the limit
+	// itself, which the queue's emptiness cannot fix.
 	ErrBackpressure = errors.New("uws: outbound queue is full")
 	// ErrServerStarted reports a second attempt to run a Server listener after
 	// its transport has already started.
