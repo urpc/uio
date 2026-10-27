@@ -109,8 +109,8 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	if err != nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return fmt.Errorf("uws: only ws:// and wss:// targets are supported: %w", ErrProtocol)
 	}
-	if target.Scheme == "wss" && len(d.Options.Layers) == 0 {
-		return fmt.Errorf("%w: wss:// needs a TLS layer in Layers", ErrInvalidOptions)
+	if target.Scheme == "wss" && d.Options.TLSConfig == nil {
+		return fmt.Errorf("%w: wss:// needs TLSConfig", ErrInvalidOptions)
 	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
@@ -142,6 +142,9 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		userdata: userdata,
 		handler:  handler,
 		key:      key,
+	}
+	if target.Scheme == "wss" {
+		setup.secure, setup.serverName = true, target.Hostname()
 	}
 	setup.conn = d.newClientConn(nil, setup)
 	setup.request = request
@@ -278,10 +281,10 @@ func (d *Dialer) start(ctx context.Context) error {
 			Outbound: d.onOutbound,
 			Inbound:  d.onInbound,
 		}
-		// The layers sit under what the connections carry, not under the
-		// traffic the observer reports or the hooks around Serve.
 		events.Handler = handler
-		events.Use(opts.Layers...)
+		if opts.TLSConfig != nil {
+			events.Use(newTLSLayer(opts.TLSConfig, opts, false))
+		}
 		events.Observer, events.Hooks = handler, handler
 		go func() {
 			err := events.Serve()
@@ -456,7 +459,7 @@ func (d *Dialer) onInbound(raw uio.Conn, n int) {
 
 func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.releaseOutbound(n)
+		conn.transportSent(n)
 		if conn.writes.close.closePending() {
 			conn.tryCloseTransport()
 		}
@@ -529,6 +532,8 @@ type dialSetup struct {
 	conn       *Conn
 	attachOnce sync.Once
 	request    []byte // the upgrade request, sent once the layers settle
+	secure     bool   // a wss:// dial: TLSConfig's layer runs TLS
+	serverName string // the host a wss:// dial verifies, when TLSConfig names none
 }
 
 func (setup *dialSetup) attach(raw uio.Conn) {

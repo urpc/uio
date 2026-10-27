@@ -105,10 +105,10 @@ func (s *Server) Serve(addrs ...string) error {
 	if s.config.observeTraffic {
 		handler.Inbound = s.onInbound
 	}
-	// The layers sit under what the connections carry, not under the
-	// traffic the observer reports or the hooks around Serve.
 	events.Handler = handler
-	events.Use(opts.Layers...)
+	if opts.TLSConfig != nil {
+		events.Use(newTLSLayer(opts.TLSConfig, opts, true))
+	}
 	events.Observer, events.Hooks = handler, handler
 	s.closeMu.Unlock()
 
@@ -203,7 +203,7 @@ func (s *Server) onInbound(raw uio.Conn, n int) {
 
 func (s *Server) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.releaseOutbound(n)
+		conn.transportSent(n)
 		if conn.writes.close.closePending() {
 			conn.tryCloseTransport()
 		}

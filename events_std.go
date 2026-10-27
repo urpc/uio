@@ -50,14 +50,28 @@ func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, err
 
 // Adopt transfers ownership of an established stream connection to ev. The
 // caller must not use conn after calling Adopt, including when Adopt returns an
-// error. ev must already be serving.
+// error. ev must already be serving. With layers installed it returns as
+// DialContext does: once the whole stack opened, with the top layer's
+// connection — the one the Handler holds — and a stack that fails before
+// that reports its error; see AdoptContext to bound the wait.
 func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
+	return ev.AdoptContext(context.Background(), conn, userdata)
+}
+
+// AdoptContext is Adopt with ctx bounding the wait for the layers to open; a
+// stack still opening when ctx ends is closed, and AdoptContext reports the
+// cause. Without layers there is nothing to wait for.
+func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any) (Conn, error) {
 	if conn == nil {
 		return nil, errUnsupported
 	}
 	if !ev.ready.Load() || ev.closing.Load() {
 		_ = conn.Close()
 		return nil, net.ErrClosed
+	}
+	if err := ev.refusePacket(conn.LocalAddr().Network()); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	if _, ok := conn.(syscall.Conn); !ok {
 		_ = conn.Close()
@@ -74,17 +88,21 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 		readResume: make(chan struct{}, 1),
 	}
 	fdc.setRemoteAddr(conn.RemoteAddr())
-	fdc.SetUserdata(userdata)
+	probe, marked := ev.dialMarker(userdata)
+	fdc.SetUserdata(marked)
 	fd := fdc.Fd()
 	if fd < 0 {
 		fdc.closeUnregistered()
 		return nil, errUnsupported
 	}
 	fdc.loop = ev.selectLoop(fd)
-	if err := ev.addConn(fdc); err != nil {
+	if err := ev.addConnContext(ctx, fdc); err != nil {
 		return nil, err
 	}
-	return fdc, nil
+	if probe == nil {
+		return fdc, nil
+	}
+	return ev.awaitDial(ctx, fdc, probe)
 }
 
 // DialContext connects synchronously and allows cancellation while resolving
@@ -106,6 +124,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 
 	u, err := url.Parse(addr)
 	if nil != err {
+		return nil, err
+	}
+	if err := ev.refusePacket(u.Scheme); err != nil {
 		return nil, err
 	}
 

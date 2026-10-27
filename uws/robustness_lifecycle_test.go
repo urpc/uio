@@ -870,7 +870,9 @@ func TestRobustDialStormDuringServerClose(t *testing.T) {
 // and no ping or message is lost or duplicated.
 func TestRobustHeartbeatUnderLoad(t *testing.T) {
 	server, addr, serveDone := startTestServer(t, func() *Server {
-		return NewServer(Options{Handler: robustEchoHandler{}, HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond})
+		// Pings every 50ms through the stream; a timeout a loaded test host
+		// keeps — the client answers a Ping only as its reader reaches it.
+		return NewServer(Options{Handler: robustEchoHandler{}, HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 2 * time.Second})
 	})
 	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
 

@@ -17,6 +17,7 @@
 package uws
 
 import (
+	"crypto/tls"
 	"net"
 	"net/http"
 	"sync"
@@ -194,6 +195,12 @@ type heartbeatState struct {
 	outboundAccepted atomic.Uint64
 	outboundRetired  atomic.Uint64
 	pingOutstanding  atomic.Bool
+	// Over a layered transport the positions above are the protocol's bytes
+	// and the transport reports the wire's, which the layers below change.
+	// There pingWireTarget is the wire position the Ping's frame ends at,
+	// taken from the stack's uio.WireCounter once it was handed down; zero
+	// while unknown.
+	pingWireTarget uint64
 }
 
 // closeTimerState protects lazy creation, replacement, and cancellation of the
@@ -343,6 +350,21 @@ func (c *Conn) Userdata() any { return c.userData }
 // safe for concurrent use from multiple goroutines.
 func (c *Conn) SetUserdata(value any) {
 	c.userData = value
+}
+
+// TLSState reports the TLS connection state of a connection that runs over
+// TLS — a wss one, or one whose stack has a TLS layer below the WebSocket
+// protocol: what the handshake settled on, the server name the client asked
+// for, the client's certificates.
+func (c *Conn) TLSState() (tls.ConnectionState, bool) {
+	if c.raw == nil {
+		return tls.ConnectionState{}, false
+	}
+	layer, ok := uio.FindLayer[interface{ State() tls.ConnectionState }](c.raw)
+	if !ok {
+		return tls.ConnectionState{}, false
+	}
+	return layer.State(), true
 }
 
 // Subprotocol returns the negotiated WebSocket subprotocol, or an empty string.

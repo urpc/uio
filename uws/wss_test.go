@@ -14,17 +14,20 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/urpc/uio"
-	"github.com/urpc/uio/utls"
+	"github.com/urpc/uio/uws/internal/frame"
 )
 
 // wssConfigs makes a matching pair: a certificate for the server, a client
 // that trusts it.
-func wssConfigs(t *testing.T) (serverTLS *tls.Config, clientTLS *tls.Config) {
+func wssConfigs(t testing.TB) (serverTLS *tls.Config, clientTLS *tls.Config) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
 	if err != nil {
@@ -83,14 +86,13 @@ func (h *wssRecorder) OnMessage(c *Conn, m Message) {
 
 func (h *wssRecorder) OnClose(_ *Conn, event CloseEvent) { h.closed <- event.Err }
 
-// startWSS serves an echoing wss server — a TLS layer under the WebSocket
-// protocol — and returns its address.
+// startWSS serves an echoing wss server and returns its address.
 func startWSS(t *testing.T, serverTLS *tls.Config) string {
 	t.Helper()
 	server, addr, serveDone := startTestServer(t, func() *Server {
 		return NewServer(Options{
-			Handler: newWSSRecorder(),
-			Layers:  uio.Use(utls.Server(serverTLS)),
+			Handler:   newWSSRecorder(),
+			TLSConfig: serverTLS,
 		})
 	})
 	t.Cleanup(func() {
@@ -111,7 +113,7 @@ func wssWait[T any](t *testing.T, c chan T, what string) T {
 	}
 }
 
-// A dialer with a TLS layer speaks wss to a server with one: the upgrade
+// A dialer with a TLSConfig speaks wss to a server with one: the upgrade
 // travels inside TLS, messages go both ways through it, and a close travels
 // back as the close handshake.
 func TestWSSRoundTrip(t *testing.T) {
@@ -120,8 +122,8 @@ func TestWSSRoundTrip(t *testing.T) {
 
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
-		Handler: client,
-		Layers:  uio.Use(utls.Client(clientTLS)),
+		Handler:   client,
+		TLSConfig: clientTLS,
 	}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -147,7 +149,7 @@ func TestWSSRoundTrip(t *testing.T) {
 	}
 }
 
-// A client whose TLS layer trusts nothing fails the dial: the handshake's
+// A client whose TLSConfig trusts nothing fails the dial: the handshake's
 // failure is what Dial reports, the WebSocket handshake never begins, and the
 // Handler hears nothing of the connection.
 func TestWSSRefusedCertificate(t *testing.T) {
@@ -157,9 +159,9 @@ func TestWSSRefusedCertificate(t *testing.T) {
 	client := newWSSRecorder()
 	dialer := &Dialer{Options: Options{
 		Handler: client,
-		Layers: uio.Use(utls.Client(&tls.Config{
+		TLSConfig: &tls.Config{
 			ServerName: "localhost", // trusts no certificate
-		})),
+		},
 	}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -179,14 +181,14 @@ func TestWSSRefusedCertificate(t *testing.T) {
 	}
 }
 
-// wss without a secure layer is a configuration error, before anything is
+// wss without a TLSConfig is a configuration error, before anything is
 // dialed.
-func TestWSSNeedsALayer(t *testing.T) {
+func TestWSSNeedsATLSConfig(t *testing.T) {
 	dialer := &Dialer{}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	err := dialer.Dial(context.Background(), "wss://127.0.0.1:1/", nil)
 	if !errors.Is(err, ErrInvalidOptions) {
-		t.Fatalf("Dial wss without a layer = %v, want ErrInvalidOptions", err)
+		t.Fatalf("Dial wss without a TLSConfig = %v, want ErrInvalidOptions", err)
 	}
 }
 
@@ -233,7 +235,7 @@ func TestWSSHeartbeatClosesSilentPeer(t *testing.T) {
 		HeartbeatInterval:     10 * time.Millisecond,
 		HeartbeatTimeout:      30 * time.Millisecond,
 		OutboundHighWatermark: -1,
-		Layers:                uio.Use(utls.Client(clientTLS)),
+		TLSConfig:             clientTLS,
 	})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
@@ -248,7 +250,8 @@ func TestWSSHeartbeatClosesSilentPeer(t *testing.T) {
 // A wss peer that stops reading: the client's outbound fills, the outbound
 // limit refuses the heartbeat's Ping, and nobody answers. The stall deadline
 // still closes the connection — through the TLS layer, whose timed turns
-// carry no plaintext.
+// carry no plaintext — with the heartbeat's close code, whether its Close
+// frame was refused or queued behind what never drains.
 func TestWSSHeartbeatClosesBackpressuredPeer(t *testing.T) {
 	serverTLS, clientTLS := wssConfigs(t)
 	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
@@ -284,14 +287,17 @@ func TestWSSHeartbeatClosesBackpressuredPeer(t *testing.T) {
 		_, _ = io.Copy(io.Discard, reader)
 	}()
 	watcher := &connCloseWatcher{closeWatcher: newCloseWatcher(), conns: make(chan *Conn, 1)}
+	// The heartbeat's Close frame may fit the queue, which never drains: the
+	// close handshake then ends at CloseTimeout.
 	dialer := NewDialer(Options{
 		Handler:               watcher,
 		Pollers:               1,
 		HeartbeatInterval:     10 * time.Millisecond,
 		HeartbeatTimeout:      60 * time.Millisecond,
+		CloseTimeout:          100 * time.Millisecond,
 		OutboundHighWatermark: -1,
 		MaxOutboundBuffered:   64 << 10,
-		Layers:                uio.Use(utls.Client(clientTLS)),
+		TLSConfig:             clientTLS,
 	})
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
@@ -318,4 +324,259 @@ type connCloseWatcher struct {
 func (w *connCloseWatcher) OnOpen(c *Conn) {
 	w.closeWatcher.OnOpen(c)
 	w.conns <- c
+}
+
+// A Dialer's TLSConfig that names no server verifies the host each wss://
+// URL names, as crypto/tls's own dial does: crypto/tls refuses a client
+// Config that names neither a server nor InsecureSkipVerify.
+func TestWSSDialVerifiesTheURLHost(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	addr := startWSS(t, serverTLS)
+	clientTLS.ServerName = ""
+
+	client := newWSSRecorder()
+	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, client.opened, "client open over wss")
+	state, ok := uio.LayerOf(conn.raw).(interface{ State() tls.ConnectionState })
+	if !ok {
+		t.Fatal("the connection runs no TLS layer")
+	}
+	if chains := state.State().VerifiedChains; len(chains) == 0 {
+		t.Fatal("the server's certificate was not verified")
+	}
+}
+
+// One Dialer with a TLSConfig dials ws:// and wss:// alike: TLS runs for the
+// wss:// dial only.
+func TestWSSDialerDialsWSAndWSS(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	secure := startWSS(t, serverTLS)
+	plain := startEchoServer(t, robustEchoHandler{})
+
+	client := quietRecorder{newWSSRecorder()}
+	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel() // it bounds the handshakes too
+	for _, target := range []string{"ws://" + plain + "/", "wss://" + secure + "/"} {
+		if err := dialer.Dial(ctx, target, nil); err != nil {
+			t.Fatalf("Dial %s: %v", target, err)
+		}
+		conn := wssWait(t, client.opened, "open of "+target)
+		if _, tlsRuns := uio.LayerOf(conn.raw).(interface{ State() tls.ConnectionState }); tlsRuns != strings.HasPrefix(target, "wss") {
+			t.Fatalf("%s runs TLS = %v", target, tlsRuns)
+		}
+		if err := conn.SendText("hello " + target); err != nil {
+			t.Fatal(err)
+		}
+		if got := wssWait(t, client.got, "echo of "+target); got != "hello "+target {
+			t.Fatalf("echo = %q", got)
+		}
+	}
+}
+
+// A Server with a TLSConfig adopts net/http's plain upgrades without TLS of
+// its own.
+func TestWSSServerAdoptsHTTPUpgradesWithoutTLS(t *testing.T) {
+	serverTLS, _ := wssConfigs(t)
+	server := NewServer(Options{Handler: newWSSRecorder(), TLSConfig: serverTLS, Pollers: 1})
+	serveWithoutListener(t, server)
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	client := quietRecorder{newWSSRecorder()}
+	dialer := &Dialer{Options: Options{Handler: client}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, client.opened, "client open through net/http")
+	if err := conn.SendText("adopted"); err != nil {
+		t.Fatal(err)
+	}
+	if got := wssWait(t, client.got, "the adopted connection's echo"); got != "adopted" {
+		t.Fatalf("echo = %q", got)
+	}
+}
+
+// quietRecorder records what it reads and answers nothing, so a peer that
+// echoes sends each message back once.
+type quietRecorder struct{ *wssRecorder }
+
+func (h quietRecorder) OnMessage(_ *Conn, m Message) { h.got <- string(m.Payload) }
+
+// Authorize sees the TLS state a wss connection settled on, and so does the
+// connection: the server name the client asked for.
+func TestWSSAuthorizeSeesTLS(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	seen := make(chan string, 1)
+	server := newWSSRecorder()
+	srv, addr, done := startTestServer(t, func() *Server {
+		s := NewServer(Options{Handler: server, TLSConfig: serverTLS})
+		s.Authorize = func(r *http.Request) (any, error) {
+			if r.TLS == nil {
+				seen <- "no TLS"
+			} else {
+				seen <- r.TLS.ServerName
+			}
+			return nil, nil
+		}
+		return s
+	})
+	t.Cleanup(func() { stopTestServer(t, srv, done) })
+	dialer := &Dialer{Options: Options{Handler: quietRecorder{newWSSRecorder()}, TLSConfig: clientTLS}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := wssWait(t, seen, "Authorize"); got != "localhost" {
+		t.Fatalf("Authorize saw server name %q, want localhost", got)
+	}
+	conn := wssWait(t, server.opened, "the server's open")
+	if state, ok := conn.TLSState(); !ok || !state.HandshakeComplete {
+		t.Fatalf("TLSState = %v, %v", state.HandshakeComplete, ok)
+	}
+}
+
+// A frame batched in a read round is still owed while it sits in the batch:
+// over a layered transport, a report that the queue below is empty retires
+// what was handed down, not what has not been yet.
+func TestBatchedFrameStaysOwedOverLayers(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	addr := startWSS(t, serverTLS)
+	client := quietRecorder{newWSSRecorder()}
+	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, client.opened, "the client's open")
+	deadline := time.Now().Add(testIOTimeout())
+	for conn.raw.OutboundBuffered() != 0 || conn.writes.close.pendingBytes.Load() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the handshake's bytes never left")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	conn.writes.mu.Lock()
+	conn.batching.Store(true) // as a read round does
+	payload := []byte("batched")
+	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
+		conn.batching.Store(false)
+		conn.writes.mu.Unlock()
+		t.Fatal(err)
+	}
+	conn.transportSent(1) // the queue below is empty: all handed down left
+	owed := conn.writes.close.pendingBytes.Load() + int64(conn.batchUntracked)
+	conn.batching.Store(false)
+	conn.unlockWrite()
+	if want := int64(frameWireSize(len(payload), true)); owed < want {
+		t.Fatalf("%d bytes owed with a %d-byte frame still in the batch", owed, want)
+	}
+}
+
+// Heartbeats on both ends of a wss connection under a steady pipelined load:
+// the Pings follow their frames through TLS by wire position, are answered,
+// and no end is closed for a heartbeat it kept.
+func TestWSSHeartbeatUnderPipelinedLoad(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	// Pings every 20ms through a load that stays in flight; a timeout a
+	// loaded test host keeps.
+	heartbeat := Options{HeartbeatInterval: 20 * time.Millisecond, HeartbeatTimeout: time.Second}
+	serverClosed := make(chan CloseEvent, 1)
+	srv, addr, done := startTestServer(t, func() *Server {
+		opts := heartbeat
+		opts.Handler = echoUntilClose{closed: serverClosed}
+		opts.TLSConfig = serverTLS
+		return NewServer(opts)
+	})
+	t.Cleanup(func() { stopTestServer(t, srv, done) })
+
+	counter := &countingClient{opened: make(chan *Conn, 1), closed: make(chan CloseEvent, 1)}
+	opts := heartbeat
+	opts.Handler, opts.TLSConfig = counter, clientTLS
+	dialer := &Dialer{Options: opts}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, counter.opened, "the client's open")
+	payload := make([]byte, 1024)
+	sent := 0
+	closedWith := func() string {
+		select {
+		case event := <-counter.closed:
+			return fmt.Sprintf("the client closed with %d %q", event.Code, event.Reason)
+		case event := <-serverClosed:
+			return fmt.Sprintf("the server closed with %d %q", event.Code, event.Reason)
+		case <-time.After(time.Second):
+			return "no close reported"
+		}
+	}
+	for began := time.Now(); time.Since(began) < 2*time.Second; {
+		// Pipelined, with at most 512 messages in flight.
+		for sent-int(counter.got.Load()) < 512 {
+			if err := conn.SendBinary(payload); err != nil {
+				t.Fatalf("send %d: %v; %s", sent, err, closedWith())
+			}
+			sent++
+		}
+		time.Sleep(time.Millisecond)
+	}
+	deadline := time.Now().Add(testIOTimeout())
+	for counter.got.Load() < int64(sent) {
+		select {
+		case event := <-counter.closed:
+			t.Fatalf("the client closed with %d %q after %d of %d echoes", event.Code, event.Reason, counter.got.Load(), sent)
+		case event := <-serverClosed:
+			t.Fatalf("the server closed with %d %q", event.Code, event.Reason)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%d of %d echoes", counter.got.Load(), sent)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+type echoUntilClose struct{ closed chan CloseEvent }
+
+func (echoUntilClose) OnOpen(*Conn) {}
+func (echoUntilClose) OnMessage(c *Conn, m Message) {
+	_ = c.SendBinary(m.Bytes())
+}
+func (e echoUntilClose) OnClose(_ *Conn, event CloseEvent) {
+	select {
+	case e.closed <- event:
+	default:
+	}
+}
+
+type countingClient struct {
+	opened chan *Conn
+	closed chan CloseEvent
+	got    atomic.Int64
+}
+
+func (c *countingClient) OnOpen(conn *Conn)        { c.opened <- conn }
+func (c *countingClient) OnMessage(*Conn, Message) { c.got.Add(1) }
+func (c *countingClient) OnClose(_ *Conn, e CloseEvent) {
+	select {
+	case c.closed <- e:
+	default:
+	}
 }

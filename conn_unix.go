@@ -1409,6 +1409,10 @@ func (conn *fdConn) enterDescriptor() (*descriptorGate, bool) {
 	return gate, gate.enter()
 }
 
+// testHookSocketClosePublished, when set, runs as a socket's close has been
+// published and before it starts: tests hold it there.
+var testHookSocketClosePublished atomic.Pointer[func(*fdConn)]
+
 // releaseSocket hands the socket close to its one owner, started by whoever
 // calls first, and returns a channel closed once the socket is closed: it
 // stops new syscalls on the socket, then — once those in progress have ended
@@ -1425,9 +1429,17 @@ func (server *fdConn) releaseSocket() <-chan struct{} {
 		return done
 	}
 	done := make(chan struct{})
+	// Counted before it is published: whoever finds the close under way —
+	// the shutdown's own teardown among them — finds Serve's wait covering it
+	// too, so Serve returns with the address free.
+	server.events.socketCloses.add()
 	server.udp.closed = done
 	server.udp.closeMu.Unlock()
+	if hook := testHookSocketClosePublished.Load(); hook != nil {
+		(*hook)(server)
+	}
 	go func() {
+		defer server.events.socketCloses.done()
 		defer close(done)
 		server.udp.gate.markClosed()
 		for !server.udp.gate.waitDrain(socketCloseWait) {

@@ -202,6 +202,11 @@ func (x *xorConn) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
 events.Use(uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return &xorConn{key: 0x5a} }))
 ```
 
+[`examples/xorlayer`](examples/xorlayer) runs this layer for real, on both
+ends of one connection, under a second layer that prints the bytes on the
+wire: `go run ./xorlayer` in `examples` shows a message leave as plaintext,
+cross the wire XOR'd, and arrive as plaintext again.
+
 The layer above — the next layer or your Handler — gets a `Conn` UIO builds
 over this one: its reads are what the layer delivered, its writes reach
 `OnOutbound`, and its addresses, userdata, deadlines and socket options are the
@@ -227,20 +232,48 @@ These are UIO's to keep, not each layer's to remember:
 2. **Every layer has a timer of its own.** `LayerContext.SetTimer` arms the
    layer's, and the Handler's `SetWakeDeadline` is a slot of its own too: no
    layer replaces another's.
-3. **One connection's callbacks never overlap.** Everything but `OnOutbound`
-   runs on the connection's turns; `OnOutbound` runs on the writer's goroutine.
-4. **Every layer hears `OnClose` once; the Handler's `OnClose` follows its
-   `OnOpen`.** A connection whose stack never opened — a failed handshake —
-   ends without a Handler callback.
+3. **The turn callbacks never overlap.** `OnOpen`, `OnInbound`, `OnTimer`,
+   `OnSent`, `OnClose` and the Handler's callbacks run on the connection's
+   turns. The others run where they are called for and may overlap the
+   turns: `OnOutbound` on the writer's goroutine, `CloseGracefully` and
+   `CloseWrite` on the closing goroutine, `OutboundHeld` and `Flush` on
+   writers' and flushers'. State they share needs a lock. UIO never calls a
+   layer from below or from inside another layer's callback, so a layer may
+   hold its lock while it writes, flushes or closes below.
+4. **A connection ends once, top down.** The Handler's `OnClose` comes first,
+   if its `OnOpen` ran, then every layer's. A connection whose stack never
+   opened — a failed handshake — ends without a Handler callback. Once a
+   close has begun — from the Handler or from any layer, even inside its
+   `OnSent` or `Flush` — no new call reaches a layer: writes, flushes and
+   closes return `net.ErrClosed`, and only `OnClose` follows.
+5. **The end of a stream travels up.** A layer whose peer ended its stream
+   calls `LayerContext.End`; the layer above reads `io.EOF` after the rest.
+   At the top it closes the connection, or, with `AllowHalfOpen`, leaves the
+   Handler to end its own half with `CloseWrite`.
+6. **`MaxOutboundBuffered` refuses whole writes, at the top.** The Handler's
+   write is checked against the queue below it before it enters the stack,
+   and reserves its room, so concurrent writers cannot pass the limit
+   together; what a layer writes below is never refused — a TLS record, once
+   encrypted, has to reach the wire.
+7. **A graceful close lets the queue leave first.** `Close` on a layered
+   connection closes the socket once what was queued — the layers' goodbyes
+   included — has left, or once it stopped moving for `uio.LingerTimeout`;
+   what arrives meanwhile is discarded. A `CloseWith` an error aborts at once.
+8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
+   the Handler count against it with the socket's buffer: a stack holding the
+   limit takes nothing more from the socket until the Handler reads.
+9. **Layers carry streams.** An Events with layers refuses UDP, IP, unixgram
+   and unixpacket connections with `ErrLayersNeedStream`.
 
 A layer carries one connection: one above for each one below. A protocol that
 opens several streams over one connection — HTTP/2, QUIC — is the Handler's to
 model, over a connection the layer below it made.
 
-### Dials run the same stack
+### Dials and adopted connections run the same stack
 
 `DialContext` returns only once the whole stack has opened, and the `Conn` it
-returns is the top layer's — encrypted underneath, plaintext to you:
+returns is the top layer's — encrypted underneath, plaintext to you. `Adopt`
+and `AdoptContext` do the same for a `net.Conn` you hand over:
 
 ```go
 client := &uio.Events{}
@@ -251,9 +284,26 @@ conn, err := client.DialContext(ctx, "tcp://example.org:443", nil)
 
 A layer that fails before the stack opens reports its error from
 `DialContext`, and the Handler hears nothing of the connection — no `OnOpen`,
-no `OnClose`. What a layer negotiated is its own to report: `uio.LayerOf(conn)`
-returns the `LayerConn` of the layer that built `conn`, a TLS layer's
-connection state included.
+no `OnClose`. What a layer negotiated is its own to report:
+`uio.FindLayer[T](conn)` returns the first layer of type `T` below `conn` —
+`uio.FindLayer[interface{ State() tls.ConnectionState }](conn)` finds the TLS
+state under any stack — and `uio.LayerOf(conn)` the one that built `conn`.
+
+A `LayerConn` may also implement optional interfaces:
+
+- `CloseWriter` ends one direction in its own protocol (a TLS close_notify).
+  A layer without it does not support `CloseWrite`; `PassThrough` passes it
+  down. UIO calls it only after what was written before `CloseWrite` has
+  gone below: writes in flight finished, the layer flushed, held output
+  sent.
+- `GracefulCloser` says goodbye as the layer above closes, told the close's
+  cause.
+- `SendObserver` hears every byte the socket sends, on the connection's
+  turn — for a protocol whose state moves as its output leaves, a ping's
+  timeout or a close waiting for its frame.
+- `OutboundHolder` and `Flusher` are for a layer that holds output of its own,
+  a send window or a compressor's buffer: what it holds counts as queued, and
+  `Flush` reaches it.
 
 ### What it is not
 
@@ -262,7 +312,9 @@ connection state included.
   belongs in `OnData`.
 - **`Observer` and `Hooks` do not run through layers.** They count the bytes on
   the wire, which is what makes them right for traffic accounting; the
-  connection they are told about is the one your Handler holds.
+  connection they are told about is the one your Handler holds. They only
+  observe: `OnOutbound` may run inside a layer's write, so it must not write
+  to or close the connection.
 - **`Use` before `Serve`.** `Serve` reads the layers once; a `Use` after it
   installs nothing.
 

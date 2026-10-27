@@ -61,7 +61,7 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 	}
 	// This fast rejection belongs after the direct path: data sent straight to
 	// the kernel never counts against the user-space payload limit.
-	if limit := conn.events.MaxOutboundBuffered; limit > 0 && len(data) > limit {
+	if limit := conn.events.socketLimit(); limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
 	if err := conn.precheckOutbound(len(data)); err != nil {
@@ -96,7 +96,7 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 	if conn.directOwner() {
 		return conn.writevOnLoop(vec, total)
 	}
-	if limit := conn.events.MaxOutboundBuffered; limit > 0 && total > limit {
+	if limit := conn.events.socketLimit(); limit > 0 && total > limit {
 		return 0, ErrOutboundOverflow
 	}
 	if err := conn.precheckOutbound(total); err != nil {
@@ -321,7 +321,7 @@ func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
 // OnOutbound and a failure's close run after the lock is released. The lock
 // also orders the send before a later CloseWith.
 func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
-	if limit := conn.events.MaxOutboundBuffered; limit > 0 && len(data) > limit {
+	if limit := conn.events.socketLimit(); limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
 	owner := conn.descriptorOwner()
@@ -342,7 +342,7 @@ func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 }
 
 func (conn *fdConn) precheckOutbound(size int) error {
-	if limit := int64(conn.events.MaxOutboundBuffered); limit > 0 {
+	if limit := int64(conn.events.socketLimit()); limit > 0 {
 		pending := conn.pending.Load()
 		if int64(size) > limit-pending {
 			return ErrOutboundOverflow
@@ -357,7 +357,7 @@ func (conn *fdConn) precheckOutbound(size int) error {
 // bytes are sent by a write turn, beside whatever the connection's turn is
 // reading. ErrOutboundOverflow accepts nothing and returns owned to the caller.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
-	if limit := conn.events.MaxOutboundBuffered; limit > 0 && size > limit {
+	if limit := conn.events.socketLimit(); limit > 0 && size > limit {
 		return 0, ErrOutboundOverflow
 	}
 	// Allocation and the only payload copy have already happened off-lock.
@@ -379,7 +379,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 
 func (conn *fdConn) reservePending(size int64) bool {
 	// Both callback partial writes and external producers reserve this counter.
-	limit := int64(conn.events.MaxOutboundBuffered)
+	limit := int64(conn.events.socketLimit())
 	if limit <= 0 {
 		conn.pending.Add(size)
 		return true

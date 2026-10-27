@@ -17,6 +17,7 @@
 package utls
 
 import (
+	"io"
 	"net"
 	"time"
 )
@@ -50,6 +51,10 @@ func (t *transport) Read(p []byte) (int, error) {
 		if c.transportClosed || c.ended {
 			c.mu.Unlock()
 			return 0, errClosed
+		}
+		if c.lowerEnded {
+			c.mu.Unlock()
+			return 0, io.EOF // the stream below ended: no more bytes come
 		}
 		if c.yield == nil {
 			c.mu.Unlock()

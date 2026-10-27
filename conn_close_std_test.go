@@ -3,9 +3,12 @@
 package uio
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net"
 	"net/netip"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -163,5 +166,100 @@ func TestStdCloseHandoffsJoinLifecycle(t *testing.T) {
 				t.Fatalf("close cause = %v, want %v", cause, want)
 			}
 		})
+	}
+}
+
+// A close requested from outside is counted before it is published: a
+// shutdown that sees it leaves the close to the request, and Serve's join
+// waits for that.
+func TestCloseRequestCountedBeforeShutdownSeesIt(t *testing.T) {
+	addr, _ := serveLayered(t, nil)
+	ev := dialLayered(t, addr, nil)
+	conn, err := ev.DialContext(context.Background(), "tcp://"+addr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socket := conn.(*fdConn)
+	requested := make(chan struct{})
+	resume := make(chan struct{})
+	hook := func(c *fdConn) {
+		if c == socket {
+			close(requested)
+			<-resume
+		}
+	}
+	testHookStdCloseRequested.Store(&hook)
+	defer testHookStdCloseRequested.Store(nil)
+	closed := make(chan error, 1)
+	go func() { closed <- conn.CloseWith(errors.New("canceled")) }()
+	<-requested
+	_ = ev.Close(nil)
+	joined := make(chan struct{})
+	go func() { _ = ev.Wait(); close(joined) }()
+	select {
+	case <-joined:
+		close(resume)
+		t.Fatal("Wait returned while a requested close was still being handed on")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(resume)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	<-joined
+}
+
+// Writes refused while a CloseWrite waits schedule no turns: with the turns
+// held up by a slow inbound Observer, each would otherwise leave a goroutine
+// waiting for the callback lock.
+func TestRefusedWritesScheduleNoTurns(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	say := make(chan struct{})
+	go func() {
+		if peer, err := listener.Accept(); err == nil {
+			defer peer.Close()
+			<-say
+			_, _ = peer.Write([]byte("!"))
+			_, _ = io.Copy(io.Discard, peer)
+		}
+	}()
+	busy, release := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	addr := listener.Addr().String()
+	events := dialLayered(t, addr, func(ev *Events) {
+		ev.Use(LayerFunc(func(LayerContext) LayerConn { return &windowFlush{} }))
+		ev.Observer = FuncHandler{Inbound: func(Conn, int) {
+			once.Do(func() { close(busy) })
+			<-release
+		}}
+	})
+	defer close(release)
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("held")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.CloseWrite(); err != nil { // waits: the window holds "held"
+		t.Fatal(err)
+	}
+	close(say)
+	layerWaitFor(t, busy, "the busy Observer")
+	before := runtime.NumGoroutine()
+	for range 1000 {
+		if _, err := conn.Write([]byte("no")); !errors.Is(err, net.ErrClosed) {
+			t.Fatalf("a write after CloseWrite = %v, want net.ErrClosed", err)
+		}
+	}
+	time.Sleep(50 * time.Millisecond)
+	if added := runtime.NumGoroutine() - before; added > 10 {
+		t.Fatalf("1000 refused writes left %d goroutines waiting", added)
 	}
 }

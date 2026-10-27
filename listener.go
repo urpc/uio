@@ -19,6 +19,7 @@ package uio
 import (
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 )
 
@@ -76,6 +77,13 @@ type PacketListener interface {
 func (ev *Events) Listen(addr string, userdata any, opts ...ListenOption) (Listener, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
+	}
+	network := "tcp"
+	if scheme, _, ok := strings.Cut(addr, "://"); ok {
+		network = scheme
+	}
+	if err := ev.refusePacket(network); err != nil {
+		return nil, err
 	}
 	// Socket creation can call application controls. The acceptor admits the
 	// resulting sockets under its own shutdown lock, after those calls return.

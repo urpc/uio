@@ -1923,8 +1923,11 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 		if err := unix.Sendto(sender, payload, 0, target); err != nil {
 			panic(err)
 		}
+		// Bounded by time, not by polls: on a loaded host a loopback packet
+		// can take longer than any fixed number of yields.
+		deadline := time.Now().Add(5 * time.Second)
 		for polls := 0; packets == before; polls++ {
-			if polls == 10000 {
+			if polls%1024 == 1023 && time.Now().After(deadline) {
 				panic("sent UDP packet was not consumed")
 			}
 			if err := server.onRecvUDP(); err != nil {

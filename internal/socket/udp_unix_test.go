@@ -31,13 +31,23 @@ func TestRecvUDPIPv4(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Close(sender)
-	if err = unix.Sendto(sender, []byte("ping"), 0, target); err != nil {
+	// A loaded host may drop a loopback datagram: receive with a timeout and
+	// send again, rather than wait forever for one that never comes.
+	if err = unix.SetsockoptTimeval(receiver, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Usec: 100_000}); err != nil {
 		t.Fatal(err)
 	}
-
 	var receive UDPReceive
 	packet := make([]byte, 16)
-	n, err := RecvUDP(receiver, packet, &receive)
+	var n int
+	for attempt := 0; ; attempt++ {
+		if err = unix.Sendto(sender, []byte("ping"), 0, target); err != nil {
+			t.Fatal(err)
+		}
+		n, err = RecvUDP(receiver, packet, &receive)
+		if !errors.Is(err, unix.EAGAIN) || attempt == 50 {
+			break
+		}
+	}
 	if err != nil || string(packet[:n]) != "ping" {
 		t.Fatalf("RecvUDP = %q, %v", packet[:n], err)
 	}

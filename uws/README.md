@@ -102,7 +102,8 @@ log.Fatal(http.ListenAndServe(":8080", nil))
 ```
 
 The handler takes over plain HTTP/1.1 connections. TLS and HTTP/2 connections
-cannot be moved onto uio's event loops, so terminate TLS in a proxy in front.
+cannot be moved onto uio's event loops: terminate TLS in a proxy in front, or
+let `Serve` take wss itself with `TLSConfig`.
 A request that arrives before `Serve` has started gets HTTP 500.
 
 ## Client
@@ -133,7 +134,10 @@ long as the process. `Dialer.DialClient` is the same with a configured
 dialer, whose `Options.Handler` must be nil because the client owns the
 callbacks. A full message queue pauses the connection's reads — TCP flow
 control then slows the peer — so a client must either keep reading or be
-closed; `Client.Close` works either way. `ReadMessage` reports a
+closed; `Client.Close` works either way. No message is dropped while the
+connection lives; with a heartbeat configured, a client nobody reads keeps
+pinging and is closed once a Ping goes unanswered, its Pong stuck behind the
+unread messages. `ReadMessage` reports a
 `*uws.CloseError` after the connection ended and every message received
 before that was returned.
 
@@ -264,32 +268,59 @@ status, header and reason; any other error with 403. The answer is sent before
 the connection closes, and the client gets it as a `*HandshakeError` — in
 `CloseEvent.Err`, or from `DialClient` through `errors.As` — carrying the
 status, the header and the reason. Without TLS the credentials travel in clear
-text; terminate TLS in front of the server.
+text: serve wss with `TLSConfig`, whose state `Authorize` sees on `r.TLS` —
+the server name asked for, a client certificate.
 
 ## Secure WebSockets (wss)
 
-A TLS layer under the WebSocket protocol makes a server a wss one and a
-dialer speak `wss://`, with no TLS of its own in UWS: configure
-[`uio/utls`](../utls), or any `uio.Layer`, in `Options.Layers` — the first one
-sits next to the wire:
+`Options.TLSConfig` makes a server a wss one and lets a dialer speak
+`wss://` — a `crypto/tls` configuration, run by [`uio/utls`](../utls) under
+the WebSocket protocol:
 
 ```go
 server := uws.NewServer(uws.Options{
-	Handler: handler,
-	Layers:  uio.Use(utls.Server(tlsConfig)),
+	Handler:   handler,
+	TLSConfig: &tls.Config{Certificates: certs},
 })
 
 dialer := uws.NewDialer(uws.Options{
-	Handler: handler,
-	Layers:  uio.Use(utls.Client(tlsConfig)), // ServerName or InsecureSkipVerify
+	Handler:   handler,
+	TLSConfig: &tls.Config{}, // system roots; each dial verifies its URL's host
 })
 err := dialer.Dial(ctx, "wss://example.org/socket", nil)
 ```
 
-The layers open before the WebSocket handshake begins: one whose handshake
-fails fails the dial with its cause, and the Handler hears nothing of the
-connection. Behind `net/http`, `ServeHTTP` does not run the layers — an
-`http.Server`'s own TLS carries the connection instead.
+A dialer with a `TLSConfig` still dials `ws://` in the clear; without one it
+refuses `wss://`. The TLS handshake runs before the WebSocket one, within
+`HandshakeTimeout`: one that fails fails the dial with its cause, and the
+Handler hears nothing of the connection. Behind `net/http`, `ServeHTTP` runs
+no TLS of its own — an `http.Server`'s TLS carries the connection instead. A
+TLS record carries up to 16 KiB, so a `ReadBufferSize` of 16 KiB or more reads
+one record per syscall.
+
+## As a protocol layer
+
+`ServerLayer` and `ClientLayer` run the WebSocket protocol as a `uio.Layer`,
+for stacks of your own — TLS, an obfuscation, a tunnel, in any order, on an
+`uio.Events` you configure:
+
+```go
+events.Use(utls.Server(tlsConfig), uws.ServerLayer(uws.LayerOptions{Authorize: checkToken}), tunnel)
+
+client.Use(utls.Client(tlsConfig), uws.ClientLayer("wss://example.org/tunnel", uws.LayerOptions{}), tunnel)
+conn, err := client.DialContext(ctx, "tcp://example.org:443", nil)
+```
+
+The layer carries a byte stream: what the layer above writes leaves as
+Binary messages, and each message that arrives is handed up once whole,
+message boundaries dropped. It answers Pings, runs the heartbeat, answers a
+peer's Close, and sends one as the connection closes from above; a dial
+returns once the handshake succeeded, and reports a refusal as a
+`*HandshakeError`. The protocol's settings are `Options`' own; the
+transport's — `Handler`, `Pollers`, `ReusePort`, `Executor`, `TLSConfig`,
+`MaxOutboundBuffered` — belong to the Events, and options that name them fail
+every connection with `ErrInvalidOptions` (`LayerOptions.Validate` reports it
+up front). For messages, keep to `Server` and `Dialer`.
 
 ## Rules of the road
 

@@ -59,6 +59,7 @@ type conn struct {
 	ended           bool // the connection's OnClose ran
 	transportClosed bool // crypto/tls closed the transport
 	readEnded       bool // the peer's close_notify or a read failure
+	lowerEnded      bool // the stream below ended; read below it reports io.EOF
 }
 
 var (
@@ -81,10 +82,10 @@ func (c *conn) OnOpen(ctx uio.LayerContext) {
 	c.resume, c.stop = iter.Pull(handshake(c))
 	resume := c.resume
 	c.mu.Unlock()
-	// The deadline closes the connection below when it passes, and the close
-	// ends the handshake; cleared once it settles.
+	// The layer's own timer bounds the handshake: OnTimer closes a
+	// connection still negotiating, and the close ends the handshake.
 	if timeout := c.tlsLayer.handshakeTimeout; timeout >= 0 {
-		_ = ctx.Lower().SetReadDeadline(time.Now().Add(c.handshakeTimeout()))
+		_ = ctx.SetTimer(time.Now().Add(c.handshakeTimeout()))
 	}
 	// The first flight needs no data: a client writes its ClientHello here.
 	// A server's handshake asks to read at once and suspends until a turn
@@ -107,7 +108,7 @@ func (c *conn) settle(ctx uio.LayerContext) {
 	}
 	c.ready = true
 	c.mu.Unlock()
-	_ = ctx.Lower().SetReadDeadline(time.Time{}) // the handshake's bound
+	_ = ctx.SetTimer(time.Time{}) // the handshake's bound
 	// What arrived with the last flight may hold records already.
 	if err := c.pump(ctx); err != nil {
 		_ = ctx.CloseWith(err)
@@ -141,9 +142,19 @@ func (c *conn) OnInbound(ctx uio.LayerContext) error {
 	lower := ctx.Lower()
 	c.mu.Lock()
 	if c.resume != nil {
+		// Take no more than the staging bound unread: the handshake reads
+		// what arrives as it arrives, so this binds only what a flood sends
+		// past it, and leaves that below, where the connection's own limits
+		// apply. Taking less than all of it, the turn calls again once the
+		// handshake read this.
 		chunk := lower.PeekChunk()
+		bound := max(c.stagingBound(), handshakeTakeFloor)
+		if room := bound - (len(c.pending) - c.readAt); len(chunk) > room {
+			chunk = chunk[:max(room, 0)]
+		}
 		c.pending = append(c.pending, chunk...)
 		_, _ = lower.Discard(len(chunk))
+		c.noteLowerEndLocked(lower)
 		resume := c.resume
 		c.mu.Unlock()
 		if _, waiting := resume(); !waiting {
@@ -166,8 +177,9 @@ func (c *conn) OnInbound(ctx uio.LayerContext) error {
 	chunk := lower.PeekChunk()
 	c.mu.Lock()
 	c.pending = append(c.pending, chunk...)
-	c.mu.Unlock()
 	_, _ = lower.Discard(len(chunk))
+	c.noteLowerEndLocked(lower)
+	c.mu.Unlock()
 	if err := c.pump(ctx); err != nil {
 		_ = ctx.CloseWith(err)
 	}
@@ -180,8 +192,11 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 	bound := c.stagingBound()
 	for {
 		if ctx.HeldAbove() >= bound {
+			// Work left for a later turn — ciphertext still to read, or the end
+			// of the stream below still to read out — needs the read above
+			// that makes room to run that turn.
 			c.mu.Lock()
-			waiting := c.readAt < len(c.pending)
+			waiting := c.readAt < len(c.pending) || (c.lowerEnded && !c.readEnded)
 			c.mu.Unlock()
 			if waiting {
 				ctx.Stall()
@@ -189,9 +204,10 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			return nil
 		}
 		c.mu.Lock()
-		if c.readEnded || !c.ready || c.readAt >= len(c.pending) {
+		if c.readEnded || !c.ready || (c.readAt >= len(c.pending) && !c.lowerEnded) {
 			// Nothing left for the engine to read: a Read here could only
-			// report errWouldBlock.
+			// report errWouldBlock. Once the stream below ended it reads on,
+			// to learn whether it ended at a record's edge or inside one.
 			c.mu.Unlock()
 			return nil
 		}
@@ -211,6 +227,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 				c.mu.Lock()
 				c.readEnded = true
 				c.mu.Unlock()
+				ctx.End()
 				return nil
 			}
 			return err
@@ -218,8 +235,28 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 	}
 }
 
-// OnTimer: TLS arms no timer of its own.
-func (c *conn) OnTimer(uio.LayerContext) error { return nil }
+// noteLowerEndLocked records that the stream below ended, once it holds
+// nothing more: the transport then reports io.EOF to crypto/tls, which tells
+// an end at a record's edge — io.EOF, handed up as the end of the stream —
+// from one inside a record, a truncation it reports as an error. It requires
+// c.mu.
+func (c *conn) noteLowerEndLocked(lower uio.Conn) {
+	if _, err := lower.Read(nil); err == io.EOF {
+		c.lowerEnded = true
+	}
+}
+
+// OnTimer is the handshake's bound: a connection still negotiating when it
+// comes due closes.
+func (c *conn) OnTimer(uio.LayerContext) error {
+	c.mu.Lock()
+	ready := c.ready
+	c.mu.Unlock()
+	if ready {
+		return nil
+	}
+	return errHandshakeTimeout
+}
 
 // OnClose is the connection's end: a handshake still running is stopped
 // with it.
@@ -245,32 +282,41 @@ func (c *conn) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
 
 // CloseGracefully sends the peer close_notify, once what was accepted has
 // left, as the layer above closes the connection.
-func (c *conn) CloseGracefully(uio.LayerContext) {
+func (c *conn) CloseGracefully(uio.LayerContext, error) {
 	if engine, err := c.engine(); err == nil {
 		_ = engine.Close()
 	}
 }
 
-// CloseWrite sends close_notify one way: the peer's reads end, this end's
-// go on.
-func (c *conn) CloseWrite(uio.LayerContext) error {
+// CloseWrite sends close_notify one way, then shuts the socket's writing
+// half behind it: the peer's reads end, this end's go on.
+func (c *conn) CloseWrite(ctx uio.LayerContext) error {
 	engine, err := c.engine()
 	if err != nil {
 		return err
 	}
-	return engine.CloseWrite()
+	if err := engine.CloseWrite(); err != nil {
+		return err
+	}
+	return ctx.Lower().CloseWrite()
 }
 
 // State reports what the handshake settled on; before it settles, the zero
 // ConnectionState. The connection the layer above holds reports it through
 // uio.LayerOf.
+//
+// Before the handshake settles it reports the zero state without asking
+// crypto/tls: the handshake's coroutine, suspended for input, holds the
+// engine's handshake lock, and asking would wait for it while holding the
+// layer's. After, the engine is asked without the layer's lock.
 func (c *conn) State() ConnectionState {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.tls == nil {
+	engine, ready := c.tls, c.ready
+	c.mu.Unlock()
+	if engine == nil || !ready {
 		return ConnectionState{}
 	}
-	return c.tls.ConnectionState()
+	return engine.ConnectionState()
 }
 
 func (c *conn) engine() (*stdtls.Conn, error) {

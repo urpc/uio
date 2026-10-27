@@ -56,7 +56,8 @@ type TrafficObserver interface {
 	// native backend a Write made inside OnOutbound is queued and sent after it
 	// returns. A UDP connection's datagrams leave on the goroutines that write
 	// them, and OnOutbound may report several of them, on any one of those
-	// goroutines, after its send.
+	// goroutines, after its send. With layers installed it may run inside a
+	// layer's write below, so it must not write to or close the connection.
 	OnOutbound(c Conn, writeBytes int)
 }
 

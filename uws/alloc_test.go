@@ -3,6 +3,7 @@
 package uws
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/urpc/uio/uws/internal/frame"
@@ -148,5 +149,31 @@ func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	})
 	if allocations != 0 {
 		t.Fatalf("large client owned frame allocations = %v, want 0", allocations)
+	}
+}
+
+// A large frame the outbound limit refuses is refused before it is built:
+// no buffer for it, no copy of its payload, however large it is.
+func TestRefusedLargeFrameIsNotBuilt(t *testing.T) {
+	opts, err := (Options{MaxOutboundBuffered: 1024, OutboundHighWatermark: -1, MaxFramePayload: 32 << 20, MaxMessageSize: 32 << 20}).resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := &Conn{raw: &limitedWire{limit: 1024}, config: newDialerConnConfig(opts, nil)}
+	conn.opened.Store(true)
+	payload := make([]byte, 1<<20)
+	if err := conn.SendBinary(payload); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("SendBinary past the limit = %v, want ErrBackpressure", err)
+	}
+	allocs := testing.AllocsPerRun(20, func() {
+		if err := conn.SendBinary(payload); !errors.Is(err, ErrBackpressure) {
+			t.Fatal(err)
+		}
+	})
+	if allocs > 0 {
+		t.Fatalf("a refused 1 MiB frame allocated %v times", allocs)
+	}
+	if got := conn.writes.close.pendingBytes.Load(); got != 0 {
+		t.Fatalf("%d bytes still counted pending after refusals", got)
 	}
 }

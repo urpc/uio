@@ -174,12 +174,12 @@ func (e *Encoder) EncodeBorrowed(payload []byte, use func([]byte) error) error {
 		job.writer.Reset(&job.output)
 		return encodeWithFlateWriter(job.writer, &job.output, payload, use)
 	}
-	var output bytes.Buffer
-	writer, err := stdflate.NewWriterDict(&output, e.level, e.dictionary)
+	job, err := acquireDictWriter(e.level, DefaultWindowBits)
 	if err != nil {
 		return err
 	}
-	return encodeWithFlateWriter(writer, &output, payload, use)
+	defer releaseDictWriter(job)
+	return job.encode(e.dictionary, payload, use)
 }
 
 func encodeWithFlateWriter(writer *stdflate.Writer, output *bytes.Buffer, payload []byte, use func([]byte) error) error {
@@ -198,37 +198,98 @@ func encodeWithFlateWriter(writer *stdflate.Writer, output *bytes.Buffer, payloa
 }
 
 // encodeWindowedBorrowed uses klauspost's explicit-window encoder when RFC
-// negotiation selects less than the stdlib's fixed 32 KiB window.
+// negotiation selects less than the stdlib's fixed 32 KiB window. The
+// custom-window API intentionally uses its fast windowed encoder. The
+// negotiated window size is a wire-level constraint; the configured level
+// remains effective on the default 32 KiB paths.
 func (e *Encoder) encodeWindowedBorrowed(payload []byte, use func([]byte) error) error {
-	var output bytes.Buffer
-	// The custom-window API intentionally uses its fast windowed encoder. The
-	// negotiated window size is a wire-level constraint; the configured level
-	// remains effective on the default 32 KiB stdlib path.
-	writer, err := kflate.NewWriterWindow(&output, e.windowBytes)
+	job, err := acquireDictWriter(0, e.windowBits)
 	if err != nil {
 		return err
 	}
-	if len(e.dictionary) > 0 {
-		writer.ResetDict(&output, e.dictionary)
+	defer releaseDictWriter(job)
+	return job.encode(e.dictionary, payload, use)
+}
+
+// dictWriterJob is a pooled encoder that starts each message from a
+// dictionary of its own: klauspost's Writer resets to any dictionary, where
+// the stdlib's resets only to the one it was built with. The context a
+// message continues is the Encoder's committed dictionary, so a message that
+// is never sent leaves it as it was. Building a writer per message cost about
+// a megabyte of allocation each.
+type dictWriterJob struct {
+	writer *kflate.Writer
+	output bytes.Buffer
+	pool   *sync.Pool
+}
+
+// dictWriterPools hold the default-window writers by level, and the
+// negotiated smaller windows by their bits.
+var (
+	dictWriterLevelPools  [stdflate.BestCompression - stdflate.HuffmanOnly + 1]sync.Pool
+	dictWriterWindowPools [DefaultWindowBits]sync.Pool
+)
+
+// acquireDictWriter takes a writer for level at the default window, or for
+// windowBits when it is smaller, where the level does not apply.
+func acquireDictWriter(level, windowBits int) (*dictWriterJob, error) {
+	var pool *sync.Pool
+	if windowBits < DefaultWindowBits {
+		pool = &dictWriterWindowPools[windowBits]
+	} else if index, ok := flateWriterPoolIndex(level); ok {
+		pool = &dictWriterLevelPools[index]
 	}
-	if _, err = writer.Write(payload); err != nil {
-		_ = writer.Close()
+	if pool != nil {
+		if job, _ := pool.Get().(*dictWriterJob); job != nil {
+			return job, nil
+		}
+	}
+	var writer *kflate.Writer
+	var err error
+	if windowBits < DefaultWindowBits {
+		writer, err = kflate.NewWriterWindow(io.Discard, 1<<windowBits)
+	} else {
+		if level == stdflate.DefaultCompression {
+			// The stdlib's default is level 6 and klauspost's level 5, whose
+			// faster matcher makes little of a dictionary: keep the stdlib's.
+			level = 6
+		}
+		writer, err = kflate.NewWriter(io.Discard, level)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &dictWriterJob{writer: writer, pool: pool}, nil
+}
+
+func releaseDictWriter(job *dictWriterJob) {
+	job.writer.Reset(io.Discard)
+	if job.output.Cap() > maxPooledCompressionOutput {
+		job.output = bytes.Buffer{}
+	} else {
+		job.output.Reset()
+	}
+	if job.pool != nil {
+		job.pool.Put(job)
+	}
+}
+
+// encode compresses payload as one message continuing dictionary, ending it
+// with a sync flush whose tail RFC 7692 drops, and passes the result to use.
+func (job *dictWriterJob) encode(dictionary, payload []byte, use func([]byte) error) error {
+	job.output.Reset()
+	job.writer.ResetDict(&job.output, dictionary)
+	if _, err := job.writer.Write(payload); err != nil {
 		return err
 	}
-	if err = writer.Flush(); err != nil {
-		_ = writer.Close()
+	if err := job.writer.Flush(); err != nil {
 		return err
 	}
-	data := output.Bytes()
+	data := job.output.Bytes()
 	if len(data) < len(syncFlushTail) || !bytes.Equal(data[len(data)-len(syncFlushTail):], []byte(syncFlushTail)) {
-		_ = writer.Close()
 		return errors.New("websocket: invalid deflate sync flush")
 	}
-	resultLen := len(data) - len(syncFlushTail)
-	if err = writer.Close(); err != nil {
-		return err
-	}
-	return use(output.Bytes()[:resultLen])
+	return use(data[:len(data)-len(syncFlushTail)])
 }
 
 // Commit advances the compression context after the encoded message has been
@@ -429,7 +490,14 @@ func appendDictionary(dictionary, payload []byte, limit int) []byte {
 	if limit <= 0 || limit > maxDictionaryBytes {
 		limit = maxDictionaryBytes
 	}
+	// A full window slides in place: the flate readers and writers copy the
+	// dictionary they are given, so nothing else holds this one.
 	if len(payload) >= limit {
+		if cap(dictionary) >= limit {
+			dictionary = dictionary[:limit]
+			copy(dictionary, payload[len(payload)-limit:])
+			return dictionary
+		}
 		return append([]byte(nil), payload[len(payload)-limit:]...)
 	}
 	need := len(dictionary) + len(payload)
@@ -437,6 +505,10 @@ func appendDictionary(dictionary, payload []byte, limit int) []byte {
 		return append(dictionary, payload...)
 	}
 	keep := limit - len(payload)
+	if cap(dictionary) >= limit {
+		copy(dictionary, dictionary[len(dictionary)-keep:])
+		return append(dictionary[:keep], payload...)
+	}
 	result := make([]byte, 0, limit)
 	result = append(result, dictionary[len(dictionary)-keep:]...)
 	return append(result, payload...)

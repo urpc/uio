@@ -9,7 +9,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1844,4 +1847,157 @@ func TestStdUDPChildCloseReasonPublished(t *testing.T) {
 	}
 	_ = events.Close(nil)
 	<-done
+}
+
+// A Control that starts while Listener.Close is closing the socket — after
+// Close found no Control running — is refused, and a Close made inside it
+// cannot wait on the first: the check and the refusal are one step, so the
+// socket's close never waits for a Control that waits for it.
+func TestUDPControlDuringListenerCloseIsRefused(t *testing.T) {
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Hooks: FuncHandler{Start: func(*Events) { close(started) }}}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	t.Cleanup(func() { _ = events.Close(nil); <-done })
+	<-started
+	listener, err := events.Listen("udp4://127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	peer, err := listener.(PacketListener).DialPeer(netip.MustParseAddrPort("127.0.0.1:9001"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := listener.(packetListener).group.members[0].udpSvr
+	server.mux.Lock() // hold the first Close inside its socket close
+	firstDone := make(chan struct{})
+	go func() { _ = listener.Close(); close(firstDone) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		buf := make([]byte, 1<<20)
+		stacks := string(buf[:runtime.Stack(buf, true)])
+		if strings.Contains(stacks, "(*fdConn).closeOnLoop") && strings.Contains(stacks, "(*fdConn).closeListenerSocket") {
+			break
+		}
+		if time.Now().After(deadline) {
+			server.mux.Unlock()
+			t.Fatal("the first Close never reached the socket's close")
+		}
+		runtime.Gosched()
+	}
+	controlled := make(chan error, 1)
+	go func() {
+		controlled <- peer.Control(func(uintptr) { _ = listener.Close() })
+	}()
+	select {
+	case err := <-controlled:
+		if !errors.Is(err, net.ErrClosed) {
+			server.mux.Unlock()
+			t.Fatalf("a Control during the close = %v, want net.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		server.mux.Unlock()
+		t.Fatal("a Control during the close neither ran nor was refused")
+	}
+	server.mux.Unlock()
+	select {
+	case <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first Close never finished")
+	}
+}
+
+// AdoptContext answers its context while the connection waits to register:
+// with the loop held up by another connection's close, a deadline ends the
+// wait at once; the adopted connection is closed once the loop gets to it,
+// and no callback runs for it.
+func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
+	started := make(chan struct{})
+	var calls atomic.Int32
+	events := &Events{Pollers: 1, Hooks: FuncHandler{Start: func(*Events) { close(started) }}}
+	count := func(c Conn) { // the canceled adopt's callbacks, not the first one's
+		if c.Userdata() == "canceled" {
+			calls.Add(1)
+		}
+	}
+	events.Handler = FuncHandler{Open: count, Close: func(c Conn, _ error) { count(c) }}
+	events.Use(LayerFunc(func(LayerContext) LayerConn { return PassThrough{} }))
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	t.Cleanup(func() { _ = events.Close(nil); <-done })
+	<-started
+
+	pair := func() (net.Conn, net.Conn) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer listener.Close()
+		remote, err := net.Dial("tcp", listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		local, err := listener.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = remote.Close() })
+		return local, remote
+	}
+	local, _ := pair()
+	blocker := &closeBlocker{Conn: local, entered: make(chan struct{}), release: make(chan struct{})}
+	first, err := events.Adopt(blocker, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocker.block.Store(true)
+	_ = first.CloseWith(errors.New("abort"))
+	<-blocker.entered // the one loop is held in this close
+
+	second, peer := pair()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	adopted := make(chan error, 1)
+	go func() { _, err := events.AdoptContext(ctx, second, "canceled"); adopted <- err }()
+	var adoptErr error
+	select {
+	case adoptErr = <-adopted:
+	case <-time.After(500 * time.Millisecond):
+		close(blocker.release)
+		<-adopted
+		t.Fatal("AdoptContext went on waiting past its deadline for the loop")
+	}
+	close(blocker.release) // the loop moves on, and closes what the adopt left
+	if !errors.Is(adoptErr, context.DeadlineExceeded) {
+		t.Fatalf("AdoptContext = %v, want the deadline", adoptErr)
+	}
+	_ = peer.SetReadDeadline(time.Now().Add(5 * time.Second))
+	if _, err := peer.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("the connection the canceled adopt took was not closed: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("a canceled adopt ran %d callbacks", n)
+	}
+}
+
+// closeBlocker holds its Close, once told to, until released.
+type closeBlocker struct {
+	net.Conn
+	block   atomic.Bool
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *closeBlocker) SyscallConn() (syscall.RawConn, error) {
+	return c.Conn.(syscall.Conn).SyscallConn()
+}
+
+func (c *closeBlocker) Close() error {
+	if c.block.Load() {
+		c.once.Do(func() { close(c.entered) })
+		<-c.release
+	}
+	return c.Conn.Close()
 }

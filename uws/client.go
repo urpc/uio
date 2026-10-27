@@ -233,12 +233,12 @@ func newClient() *Client {
 // room — the backpressure that pauses a client which has stopped reading — and
 // gives up once intake ended or the connection started closing; from then on
 // every message gives up, queued or not, so a close under way loses messages
-// whole rather than leaving gaps between delivered ones. The wait also ends at
-// the connection's next heartbeat decision: a client nobody reads must not
-// block its own turns past it, or the timeout that would close it could never
-// run. Past that moment the message is dropped, the round completes, and the
-// heartbeat tick that follows pings or expires the connection. The boundary is
-// read only when the queue is full, so a reading client pays nothing for it.
+// whole rather than leaving gaps between delivered ones. While it waits, the
+// connection's turn is here, so the heartbeat decisions that fall due — a
+// Ping to send, a timeout to end the connection — are made here too: a client
+// nobody reads still pings, and is closed once its Ping goes unanswered,
+// without dropping the message it holds. The boundary is read only when the
+// queue is full, so a reading client pays nothing for it.
 func (c *Client) enqueue(message Message, conn *Conn) {
 	select {
 	case <-c.stop:
@@ -252,23 +252,29 @@ func (c *Client) enqueue(message Message, conn *Conn) {
 		return
 	default:
 	}
-	until := conn.heartbeatBoundary()
-	if !until.IsZero() && !time.Now().Before(until) {
-		return // the decision is already due: let the round reach its tick
-	}
-	var deadline <-chan time.Time
-	if !until.IsZero() {
-		// A timer this wait stops on the way out: time.After's would keep
-		// the runtime's wheel busy until the heartbeat's deadline passed.
-		timer := time.NewTimer(time.Until(until))
-		defer timer.Stop()
-		deadline = timer.C
-	}
-	select {
-	case c.queue <- message:
-	case <-c.done:
-	case <-c.stop:
-	case <-deadline:
+	for {
+		var deadline <-chan time.Time
+		var timer *time.Timer
+		if until := conn.heartbeatBoundary(); !until.IsZero() {
+			// A timer this wait stops on the way out: time.After's would
+			// keep the runtime's wheel busy until the boundary passed.
+			timer = time.NewTimer(time.Until(until))
+			deadline = timer.C
+		}
+		select {
+		case c.queue <- message:
+		case <-c.done:
+		case <-c.stop:
+		case <-deadline:
+			// The decision the turn would have made: it may ping, or close
+			// the connection, which releases this wait through stop.
+			conn.heartbeatTick(time.Now())
+			continue
+		}
+		if timer != nil {
+			timer.Stop()
+		}
+		return
 	}
 }
 

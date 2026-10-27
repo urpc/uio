@@ -599,6 +599,9 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		if request.RemoteAddr == "" {
 			request.RemoteAddr = c.raw.RemoteAddr().String()
 		}
+		if state, ok := c.TLSState(); ok {
+			request.TLS = &state
+		}
 		req.HTTP = request
 		userdata, err := authorize(request)
 		if err != nil {

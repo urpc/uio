@@ -602,3 +602,65 @@ func TestClientDeadlineExtendedKeepsDelivery(t *testing.T) {
 		}
 	}
 }
+
+// A Client waiting on a full queue keeps its heartbeat and loses nothing: a
+// reader that is only slow gets every message in order, and one nobody
+// reads is closed by its heartbeat even when the peer answers every Ping —
+// the Pong waits behind the messages the Client does not read.
+func TestClientFullQueueKeepsHeartbeatAndMessages(t *testing.T) {
+	t.Run("slow reader", func(t *testing.T) {
+		const total = 200
+		addr := startClientTestServer(t, func(conn *Conn) {
+			go func() {
+				for i := range total {
+					if err := conn.SendText(fmt.Sprint(i)); err != nil {
+						return
+					}
+				}
+			}()
+		})
+		dialer := &Dialer{Options: Options{HeartbeatInterval: 10 * time.Millisecond, HeartbeatTimeout: 2 * time.Second}}
+		t.Cleanup(func() { _ = dialer.Close(nil) })
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+		defer cancel()
+		client, err := dialer.DialClient(ctx, "ws://"+addr+"/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(50 * time.Millisecond) // past several heartbeat intervals, the queue full
+		for want := range total {
+			message, err := client.ReadMessage(ctx)
+			if err != nil {
+				t.Fatalf("after %d messages: %v", want, err)
+			}
+			if got := string(message.Payload); got != fmt.Sprint(want) {
+				t.Fatalf("message %d reads %q: a live connection lost the messages between", want, got)
+			}
+		}
+	})
+	t.Run("nobody reads", func(t *testing.T) {
+		// One message past the queue: the rest of the stream is the peer's
+		// Pongs, which the Client must not get to.
+		addr := startClientTestServer(t, func(conn *Conn) {
+			go func() {
+				for range clientQueueMessages + 1 {
+					if err := conn.SendText("flood"); err != nil {
+						return
+					}
+				}
+			}()
+		})
+		dialer := &Dialer{Options: Options{HeartbeatInterval: 10 * time.Millisecond, HeartbeatTimeout: 50 * time.Millisecond}}
+		t.Cleanup(func() { _ = dialer.Close(nil) })
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+		defer cancel()
+		client, err := dialer.DialClient(ctx, "ws://"+addr+"/")
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitClientClosed(t, client, "a heartbeat timeout")
+		if closeErr := drainToClose(t, client); closeErr.Code != 1001 {
+			t.Fatalf("closed with %d/%q, want the heartbeat's 1001", closeErr.Code, closeErr.Reason)
+		}
+	})
+}

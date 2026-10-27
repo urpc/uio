@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1080,4 +1081,82 @@ func TestUnixConnectionColdStateIsLazy(t *testing.T) {
 	if !conn.isDatagram() {
 		t.Fatal("UDP state did not mark connection as datagram")
 	}
+}
+
+// Serve returns with a UDP listener's address free: the socket's close runs
+// off the loop, and Serve waits for it as Listener.Close does.
+func TestServeReturnsWithUDPAddressFree(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	for round := range 100 {
+		var addr string
+		events := &Events{Pollers: 1}
+		events.Hooks = FuncHandler{Start: func(ev *Events) {
+			listener, err := ev.Listen("udp4://127.0.0.1:0", nil)
+			if err != nil {
+				t.Error(err)
+			} else {
+				addr = listener.Addr().String()
+			}
+			_ = ev.Close(nil)
+		}}
+		if err := events.Serve(); err != nil {
+			t.Fatal(err)
+		}
+		if addr == "" {
+			t.FailNow()
+		}
+		probe, err := net.ListenPacket("udp4", addr)
+		if err != nil {
+			t.Fatalf("round %d: Serve returned with %s still bound: %v", round, addr, err)
+		}
+		_ = probe.Close()
+	}
+}
+
+// A Listener.Close beside Events.Close: the shutdown finds the socket's close
+// already under way and leaves it to that caller, and Serve still waits for
+// it — the close is counted before anyone can find it — so Serve returns
+// with the address free.
+func TestServeWaitsForAListenerCloseUnderWay(t *testing.T) {
+	previous := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previous)
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Hooks: FuncHandler{Start: func(*Events) { close(started) }}}
+	served := make(chan error, 1)
+	go func() { served <- events.Serve() }()
+	<-started
+	listener, err := events.Listen("udp4://127.0.0.1:0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	published, release := make(chan struct{}), make(chan struct{})
+	hold := func(*fdConn) { close(published); <-release }
+	testHookSocketClosePublished.Store(&hold)
+	defer testHookSocketClosePublished.Store(nil)
+	closed := make(chan struct{})
+	go func() { _ = listener.Close(); close(closed) }()
+	select {
+	case <-published:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Listener.Close never published its close")
+	}
+	testHookSocketClosePublished.Store(nil)
+	_ = events.Close(nil)
+	select {
+	case <-served:
+		close(release)
+		t.Fatal("Serve returned while the socket's close was still to run")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	<-closed
+	if err := <-served; err != nil {
+		t.Fatal(err)
+	}
+	probe, err := net.ListenPacket("udp4", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("Serve returned with the address still bound: %v", err)
+	}
+	_ = probe.Close()
 }

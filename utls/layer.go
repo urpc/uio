@@ -18,8 +18,8 @@
 // bytes the round read; a record that arrives across several rounds stays
 // cut in crypto/tls's buffer until it is whole.
 //
-// The handshake is bounded by a deadline it sets on the connection
-// below, whose expiry closes it, as UIO's deadlines do. A connection opens
+// The handshake is bounded by the layer's own timer, whose expiry closes the
+// connection. A connection opens
 // to the handler above once its handshake settles; one accepted whose
 // handshake fails or times out reaches OnClose instead, with its cause, and a
 // dial that fails before it settles reports its cause from DialContext, the
@@ -51,6 +51,8 @@ package utls
 import (
 	stdtls "crypto/tls"
 	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/urpc/uio"
@@ -77,6 +79,11 @@ const DefaultStagingBound = 64 << 10
 // a drain never splits a record's plaintext across calls.
 const readBufferSize = 16 << 10
 
+// handshakeTakeFloor is the least the handshake takes from below at once,
+// whatever StagingBound says: one whole record, ciphertext and header, so a
+// tiny bound slows nothing to a byte at a time.
+const handshakeTakeFloor = readBufferSize + 1<<10
+
 // errWouldBlock is what the transport tells crypto/tls when a read would
 // have to wait for bytes the connection below has not delivered yet.
 var errWouldBlock error = wouldBlockError{}
@@ -88,6 +95,9 @@ func (wouldBlockError) Timeout() bool   { return false }
 func (wouldBlockError) Temporary() bool { return true }
 
 var errClosed = errors.New("utls: connection closed")
+
+// errHandshakeTimeout ends a connection whose handshake outlasted its bound.
+var errHandshakeTimeout = fmt.Errorf("utls: handshake timeout: %w", os.ErrDeadlineExceeded)
 
 // tlsLayer is what Server and Client build: the configuration its
 // connections run with, and the bounds it keeps.
@@ -109,8 +119,9 @@ func HandshakeTimeout(timeout time.Duration) Option {
 
 // StagingBound bounds the decrypted bytes the layer holds for the handler
 // above. Once it holds its bound it stops consuming the connection below, so a
-// pause at the top stills the wire. Zero means
-// DefaultStagingBound.
+// pause at the top stills the wire. During the handshake it bounds the
+// ciphertext the layer takes from below that the handshake has not read yet,
+// though never below one TLS record. Zero means DefaultStagingBound.
 func StagingBound(bytes int) Option {
 	return func(m *tlsLayer) { m.stagingBound = bytes }
 }

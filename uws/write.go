@@ -246,8 +246,14 @@ func (c *Conn) sendHeartbeatPing(now time.Time) error {
 	}
 	if err != nil {
 		heartbeat.cancelPing(nonce)
+		return err
 	}
-	return err
+	if counter, ok := c.raw.(uio.WireCounter); ok {
+		// Handed down and flushed: the frame sits in the wire queue, which
+		// ends where the wire position will be once it left.
+		heartbeat.markPingWireTarget(nonce, counter.WireQueued(), counter.WireSent(), c.raw)
+	}
+	return nil
 }
 
 // sendHeartbeatClose starts the close handshake with a peer that missed its
@@ -545,7 +551,14 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 		if err := c.batchFrame(f, maskKey, wireSize); err != nil {
 			return err
 		}
-		c.trackOutbound(wireSize)
+		// Pending once the batch is handed over, as batchMessageLocked's
+		// frames are: until then the bytes sit above the transport, and a
+		// transport report — "its queue is empty" over layers — must not
+		// retire them.
+		c.batchUntracked += wireSize
+		if heartbeat := c.heartbeat; heartbeat != nil {
+			heartbeat.outboundAccepted.Add(uint64(wireSize))
+		}
 		c.markHeartbeatPingTarget(f)
 		return c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
 	}
@@ -581,8 +594,13 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 }
 
 // writeFrameOwned encodes f into a buffer the transport takes over. The caller
-// has already tracked wireSize.
+// has already tracked wireSize. A frame the outbound limit refuses is refused
+// before it is built: building copies and masks the whole payload, for
+// nothing when the transport turns it away.
 func (c *Conn) writeFrameOwned(f frame.Frame, maskKey [4]byte, wireSize int) error {
+	if c.outboundRefuses(wireSize) {
+		return c.finishFrameWrite(f.Opcode, 0, wireSize, uio.ErrOutboundOverflow)
+	}
 	owned := uio.AcquireBuffer(wireSize)
 	dst := owned.AvailableBuffer()[:wireSize]
 	wire := frame.Append(dst[:0], f, maskKey)
@@ -593,6 +611,31 @@ func (c *Conn) writeFrameOwned(f frame.Frame, maskKey [4]byte, wireSize int) err
 		uio.ReleaseBuffer(owned)
 	}
 	return c.finishFrameWrite(f.Opcode, n, wireSize, err)
+}
+
+// refuseBeforeBuild is the frame size from which outboundRefuses looks
+// before the frame is built. A smaller frame costs little to build and is left
+// to the transport to refuse: a Close frame's refusal there is what its
+// deferral watches for room.
+const refuseBeforeBuild = 4 << 10
+
+// outboundRefuses reports a large frame MaxOutboundBuffered turns away: one
+// larger than the limit, which no queue holds, or one the queue has no room
+// for once a flush sent what it could — the transport flushes before it
+// refuses too. It requires writes.mu.
+func (c *Conn) outboundRefuses(wireSize int) bool {
+	limit := c.maxOutbound()
+	if limit <= 0 || wireSize < refuseBeforeBuild {
+		return false
+	}
+	if wireSize > limit {
+		return true
+	}
+	if c.raw.OutboundBuffered()+wireSize <= limit {
+		return false
+	}
+	_ = c.raw.Flush()
+	return c.raw.OutboundBuffered()+wireSize > limit
 }
 
 // batchMessageLocked is send for the common message of a batching read round:
@@ -924,6 +967,38 @@ func (c *Conn) rollbackOutbound(n int) {
 	}
 }
 
+// transportSent is the transport's report that n bytes left its queue. On a
+// plain socket they are this connection's own bytes, retired one for one.
+// Over layers they are the wire's — a TLS record's, a frame of a layer below —
+// and match nothing this connection counted: the Ping is followed by the
+// stack's wire positions instead (uio.WireCounter), and the protocol's bytes
+// retire only once the queue below is empty, when all of them certainly
+// left.
+func (c *Conn) transportSent(n int) {
+	counter, ok := c.raw.(uio.WireCounter)
+	if !ok {
+		c.releaseOutbound(n)
+		return
+	}
+	if heartbeat := c.heartbeat; heartbeat != nil {
+		heartbeat.markPingWireSent(counter.WireSent(), c.raw)
+	}
+	if c.raw.OutboundBuffered() == 0 {
+		c.retireOutbound(int(c.writes.close.pendingBytes.Load()))
+	} else if c.writes.close.closeIsDeferred() {
+		c.sendDeferredClose()
+	}
+}
+
+// retireOutbound is releaseOutbound without the Ping's progress, which a
+// layered transport follows by wire position.
+func (c *Conn) retireOutbound(n int) {
+	c.reducePendingOutbound(n)
+	if c.writes.close.closeIsDeferred() {
+		c.sendDeferredClose()
+	}
+}
+
 // releaseOutbound advances protocol send progress only for UIO's OnOutbound
 // callback, which confirms bytes actually left its queue. Retiring bytes may
 // also make room for a deferred Close frame.
@@ -958,6 +1033,38 @@ func (heartbeat *heartbeatState) markPingSent(retired uint64) {
 	heartbeat.mu.Unlock()
 }
 
+// markPingWireTarget records, over a layered transport, the wire position the
+// Ping's frame ends at: what the socket was handed once the frame was handed
+// down, taken in one read — a single counter, so a report arriving meanwhile
+// cannot make the target sit behind the Ping it belongs to.
+func (heartbeat *heartbeatState) markPingWireTarget(nonce uint64, target, sent uint64, below uio.Conn) {
+	heartbeat.mu.Lock()
+	if heartbeat.pingOutstanding.Load() && heartbeat.pingNonce == nonce {
+		heartbeat.pingWireTarget = target
+	}
+	heartbeat.mu.Unlock()
+	heartbeat.markPingWireSent(sent, below)
+}
+
+// markPingWireSent marks the Ping sent once the wire passed its position, or
+// once the queue below is empty: the position is an estimate that may lie
+// past where the wire ends (see uio.WireCounter), and an empty queue means
+// everything handed down left, the Ping with it. The queue is read after the
+// target, which is set only once the Ping was handed down, so an empty queue
+// seen here never predates the Ping.
+func (heartbeat *heartbeatState) markPingWireSent(sent uint64, below uio.Conn) {
+	if !heartbeat.pingOutstanding.Load() {
+		return
+	}
+	heartbeat.mu.Lock()
+	if heartbeat.pingOutstanding.Load() && heartbeat.pingSentAt == 0 && heartbeat.pingWireTarget != 0 &&
+		(sent >= heartbeat.pingWireTarget || below.OutboundBuffered() == 0) {
+		heartbeat.pingSentAt = time.Now().UnixNano()
+		heartbeat.sendStalledAt = 0
+	}
+	heartbeat.mu.Unlock()
+}
+
 func (heartbeat *heartbeatState) beginPing(now time.Time, nonce uint64) bool {
 	heartbeat.mu.Lock()
 	defer heartbeat.mu.Unlock()
@@ -971,6 +1078,7 @@ func (heartbeat *heartbeatState) beginPing(now time.Time, nonce uint64) bool {
 	heartbeat.pingSentAt = 0
 	heartbeat.pingNonce = nonce
 	heartbeat.pingTarget = 0
+	heartbeat.pingWireTarget = 0
 	heartbeat.pingOutstanding.Store(true)
 	return true
 }
@@ -1068,6 +1176,7 @@ func (heartbeat *heartbeatState) clearPingLocked() {
 	heartbeat.pingSentAt = 0
 	heartbeat.pingNonce = 0
 	heartbeat.pingTarget = 0
+	heartbeat.pingWireTarget = 0
 }
 
 func (c *Conn) flush() error {

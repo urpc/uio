@@ -52,14 +52,33 @@ func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, err
 
 // Adopt transfers ownership of an established stream connection to ev. The
 // caller must not use conn after calling Adopt, including when Adopt returns an
-// error. ev must already be serving.
+// error. ev must already be serving. With layers installed it returns as
+// DialContext does: once the whole stack opened, with the top layer's
+// connection — the one the Handler holds — and a stack that fails before
+// that reports its error; see AdoptContext to bound the wait.
 func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
+	return ev.AdoptContext(context.Background(), conn, userdata)
+}
+
+// AdoptContext is Adopt with ctx bounding the wait for the layers to open; a
+// stack still opening when ctx ends is closed, and AdoptContext reports the
+// cause. Without layers there is nothing to wait for. With them, like
+// DialContext, it cannot be called on an event loop goroutine.
+func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any) (Conn, error) {
 	if conn == nil {
 		return nil, errUnsupported
 	}
 	if !ev.ready.Load() || ev.closing.Load() {
 		_ = conn.Close()
 		return nil, net.ErrClosed
+	}
+	if len(ev.use) > 0 && isEventLoopGoroutine() {
+		_ = conn.Close()
+		return nil, ErrDialOnEventLoop
+	}
+	if err := ev.refusePacket(conn.LocalAddr().Network()); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	localAddr := conn.LocalAddr()
 	remoteAddr := conn.RemoteAddr()
@@ -84,12 +103,16 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 		fd: int32(fd),
 	}
 	fdc.setRemoteAddr(remoteAddr)
-	fdc.SetUserdata(userdata)
+	probe, marked := ev.dialMarker(userdata)
+	fdc.SetUserdata(marked)
 	fdc.loop = ev.selectLoop()
-	if err = ev.addConn(fdc); err != nil {
+	if err = ev.addConnContext(ctx, fdc); err != nil {
 		return nil, err
 	}
-	return fdc, nil
+	if probe == nil {
+		return fdc, nil
+	}
+	return ev.awaitDial(ctx, fdc, probe)
 }
 
 // DialContext connects synchronously and allows cancellation while resolving
@@ -112,6 +135,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 
 	u, err := url.Parse(addr)
 	if nil != err {
+		return nil, err
+	}
+	if err := ev.refusePacket(u.Scheme); err != nil {
 		return nil, err
 	}
 
@@ -272,6 +298,10 @@ func (ev *Events) shutdownLoops(err error) {
 		ev.acceptor.close()
 	}
 	ev.stopIOPool()
+	// A UDP socket closes off the loop, once the syscalls on it ended; Serve
+	// returns with its address free. A Control still running on it holds
+	// this until it returns, as it holds Listener.Close.
+	ev.socketCloses.wait()
 }
 
 func (ev *Events) rollbackInit(err error) {

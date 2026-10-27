@@ -17,6 +17,7 @@
 package uws
 
 import (
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"sync/atomic"
@@ -95,7 +96,7 @@ type Options struct {
 	Pollers int
 	// ReadBufferSize is the size of each socket read. Zero uses UIO's default
 	// of 4 KiB. It also sizes the write batch blocks the connection's replies
-	// are coalesced into, clamped to 4-64 KiB. Under a TLS layer a record
+	// are coalesced into, clamped to 4-64 KiB. With TLSConfig a record
 	// carries up to 16 KiB and a read smaller than that splits one record
 	// across several rounds; a wss server moving bulk data reads about twice
 	// as fast with 16 KiB and half again with 64 KiB.
@@ -110,22 +111,17 @@ type Options struct {
 	// scheduler.
 	Executor uio.Executor
 
-	// Layers are the protocol layers under the WebSocket protocol, the first
-	// installed closest to the wire: a TLS layer makes the server a wss one
-	// and a dialer speak wss, as
-	//
-	//	Layers: uio.Use(utls.Server(config))
-	//
-	// does; see uio.Layer for what one is and uio/utls for TLS. They open
-	// before the WebSocket handshake begins: one whose handshake fails
-	// reports its cause from Dial on a dialer, and closes the connection with
-	// it on a server.
-	//
-	// This is [uio.Events.Use] on the Events a Server or Dialer builds of its
-	// own: the layers a connection runs are named here rather than installed
-	// on an Events of yours. The wire order is the same either way — Layers,
-	// then the WebSocket protocol, then Handler.
-	Layers []uio.Layer
+	// TLSConfig makes the connections wss. On a Server it holds the
+	// certificates, and every connection the Server accepts runs TLS under
+	// the WebSocket protocol; ServeHTTP still takes plain HTTP/1.1 upgrades
+	// only. Authorize sees the TLS state on its request's TLS field, and
+	// Conn.TLSState reports it. On a Dialer it is what wss:// dials verify
+	// the server with — an empty Config verifies against the system roots —
+	// and when it names no ServerName, each dial verifies the host its URL
+	// names; ws:// dials run without TLS. A Dialer without it refuses wss://.
+	// The TLS handshake runs before the WebSocket one, each bounded by
+	// HandshakeTimeout, and a dial that fails it reports its cause.
+	TLSConfig *tls.Config
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the
 	// replies to its requests piling up. It paces only what the connection's

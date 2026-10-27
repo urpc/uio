@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"fmt"
 	"net"
 	"runtime"
 	"sync"
@@ -81,6 +82,7 @@ type Events struct {
 	closing        atomic.Bool
 	ready          atomic.Bool    // Dial is allowed only after full initialization
 	callbackWG     sync.WaitGroup // std connections, I/O goroutines, and callbacks
+	socketCloses   closeCounter   // native UDP sockets closing; Serve waits for them
 	done           chan struct{}  // closed after OnStop and all owned work exits
 	doneOnce       sync.Once
 	closeReason    atomic.Pointer[error]
@@ -136,6 +138,15 @@ type Events struct {
 	// keep flowing so a full-duplex peer can always drain its side. Callers
 	// treat overflow as overload — defer, drop, or close — and bound the
 	// receive side with MaxInboundBuffered. Zero disables the limit.
+	//
+	// With layers installed it bounds what the Handler writes: a write is
+	// refused before it enters the top layer when the queue below has no room
+	// for it, and what a layer writes below is never refused for size — a TLS
+	// record, once encrypted, must reach the wire. A write reserves its room
+	// as it enters, so concurrent writers cannot pass the limit together. The
+	// limit counts the Handler's bytes, so the queue can exceed it by what the
+	// layers add — a record's or a frame's few bytes of framing — and by the
+	// layers' own control output, a handshake or a ping.
 	MaxOutboundBuffered int
 
 	// MaxInboundBuffered bounds payload read but not yet consumed. Once
@@ -144,6 +155,12 @@ type Events struct {
 	// growing; a Wake whose OnData consumes below the limit reads again. The
 	// buffer exceeds the limit by at most one read. A ReserveInbound larger
 	// than the limit returns ErrInboundOverflow. Zero disables the limit.
+	//
+	// With layers installed it bounds what the layers hold for the Handler
+	// too: once they hold the limit unread, the stack takes nothing more from
+	// the socket, whose own buffer then fills to the limit and stops its
+	// reads. A connection holds at most twice the limit, and a layer's one
+	// delivery more.
 	MaxInboundBuffered int
 
 	// AllowHalfOpen keeps a stream connection open after its peer shuts its
@@ -295,7 +312,13 @@ func (ev *Events) finishLifecycle(err error) {
 }
 
 func (ev *Events) initConfig() error {
+	if len(ev.use) > maxLayers {
+		return fmt.Errorf("uio: %d layers installed, at most %d", len(ev.use), maxLayers)
+	}
 	ev.cb = resolveCallbacks(ev.stackHandler(ev.Handler), ev.Observer, ev.Hooks)
+	if len(ev.use) > 0 {
+		ev.cb.onOutbound = stackSent(ev.cb.onOutbound)
+	}
 
 	if ev.Pollers <= 0 {
 		ev.Pollers = defaultPollers(runtime.GOMAXPROCS(0))
@@ -333,8 +356,50 @@ func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 	}
 }
 
+// onSocketBytesWrite stays small enough to inline into every send path, so a
+// connection nobody observes pays a nil check and no call.
 func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
-	if onOutbound := ev.cb.onOutbound; writeBytes > 0 && onOutbound != nil {
-		onOutbound(ev.observed(fdc), writeBytes)
+	if writeBytes > 0 && ev.cb.onOutbound != nil {
+		ev.reportBytesWritten(fdc, writeBytes)
 	}
+}
+
+func (ev *Events) reportBytesWritten(fdc *fdConn, writeBytes int) {
+	ev.cb.onOutbound(ev.observed(fdc), writeBytes)
+}
+
+// closeCounter counts closes Serve waits for. Unlike a sync.WaitGroup, a close
+// may begin while Serve is already waiting — a Listener.Close beside
+// Events.Close — and the wait then covers it too.
+type closeCounter struct {
+	mu   sync.Mutex
+	cond *sync.Cond
+	n    int
+}
+
+func (c *closeCounter) add() {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+}
+
+func (c *closeCounter) done() {
+	c.mu.Lock()
+	c.n--
+	if c.n == 0 && c.cond != nil {
+		c.cond.Broadcast()
+	}
+	c.mu.Unlock()
+}
+
+// wait returns once no counted close is running.
+func (c *closeCounter) wait() {
+	c.mu.Lock()
+	for c.n > 0 {
+		if c.cond == nil {
+			c.cond = sync.NewCond(&c.mu)
+		}
+		c.cond.Wait()
+	}
+	c.mu.Unlock()
 }

@@ -209,6 +209,9 @@ func TestWakeRaceCloseAndTurns(t *testing.T) {
 				close(stop)
 			}()
 			wg.Wait()
+			// Close requests the close and returns: a turn queued before it
+			// may still run, as on the stdio backend. Count from OnClose on.
+			waitFor(t, 3*time.Second, func() bool { return rec.closed.Load() > 0 })
 			fires := rec.fires()
 			time.Sleep(50 * time.Millisecond)
 			if got := rec.fires(); got > fires {

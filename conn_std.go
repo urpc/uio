@@ -74,6 +74,11 @@ type stdUDPState struct {
 	// them; see closeListenerSocket.
 	controlMu   sync.Mutex
 	controlling []int64
+	// sealed refuses new Controls once a close found none running and went
+	// on to close the socket: a Control that started after the check would
+	// hold a descriptor reference that close waits for, and a Close inside
+	// it would wait for that close in turn.
+	sealed bool
 }
 
 type fdConn struct {
@@ -274,19 +279,26 @@ func (fc *fdConn) Control(fn func(fd uintptr)) error {
 		if fc.udp.svr != nil {
 			server = fc.udp.svr
 		}
-		defer server.udp.leaveControl(server.udp.enterControl())
+		id, ok := server.udp.enterControl()
+		if !ok {
+			return net.ErrClosed // the socket is closing
+		}
+		defer server.udp.leaveControl(id)
 	}
 	return raw.Control(func(fd uintptr) { fn(fd) })
 }
 
 // enterControl records the calling goroutine as inside a Control on the
-// socket, until leaveControl.
-func (udp *stdUDPState) enterControl() int64 {
+// socket, until leaveControl; it refuses once a close sealed the socket.
+func (udp *stdUDPState) enterControl() (int64, bool) {
 	id := currentGoroutineID()
 	udp.controlMu.Lock()
+	defer udp.controlMu.Unlock()
+	if udp.sealed {
+		return 0, false
+	}
 	udp.controlling = append(udp.controlling, id)
-	udp.controlMu.Unlock()
-	return id
+	return id, true
 }
 
 func (udp *stdUDPState) leaveControl(id int64) {
@@ -300,12 +312,17 @@ func (udp *stdUDPState) leaveControl(id int64) {
 	udp.controlMu.Unlock()
 }
 
-// controlsQuiet waits, bounded, for the Controls on the socket to end.
+// controlsQuiet waits, bounded, for the Controls on the socket to end, and
+// seals it against new ones as it finds none: the check and the seal are one
+// step, so no Control slips in between it and the socket's close.
 func (udp *stdUDPState) controlsQuiet() bool {
 	deadline := time.Now().Add(socketCloseWait)
 	for {
 		udp.controlMu.Lock()
 		held := len(udp.controlling)
+		if held == 0 {
+			udp.sealed = true
+		}
 		udp.controlMu.Unlock()
 		if held == 0 {
 			return true
@@ -751,7 +768,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 	if len(p) >= stdOwnedWriteThreshold {
-		if limit := fc.events.MaxOutboundBuffered; limit > 0 && len(p) > limit {
+		if limit := fc.events.socketLimit(); limit > 0 && len(p) > limit {
 			return 0, ErrOutboundOverflow
 		}
 		owned := bytebuf.CloneBuffer(p)
@@ -768,7 +785,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-len(p) {
+	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-len(p) {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
@@ -853,7 +870,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, nil
 	}
 	if total >= stdOwnedWriteThreshold {
-		if limit := fc.events.MaxOutboundBuffered; limit > 0 && total > limit {
+		if limit := fc.events.socketLimit(); limit > 0 && total > limit {
 			return 0, ErrOutboundOverflow
 		}
 		var inline [8]*bytebuf.Buffer
@@ -873,7 +890,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 			releaseStdBuffers(owned)
 			return 0, net.ErrClosed
 		}
-		if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
+		if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 			fc.mux.Unlock()
 			releaseStdBuffers(owned)
 			return 0, ErrOutboundOverflow
@@ -893,7 +910,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
+	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
@@ -952,7 +969,7 @@ func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.MaxOutboundBuffered; limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
+	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
 		fc.mux.Unlock()
 		// An overflowed buffer was never accepted, so it remains the caller's.
 		return 0, ErrOutboundOverflow
@@ -1069,6 +1086,11 @@ func (fc *fdConn) enqueueClose(err error) error {
 	// Publish the first request's cause together with closing. A listener's
 	// release may overtake the task, but must retain that requested cause.
 	fc.err = err
+	// The request joins the lifecycle before closing is published: until
+	// then the connection's own count holds Serve's join, and once it is
+	// published a shutdown leaves the close to this request, which must
+	// still be counted when it hands the close on.
+	fc.events.callbackWG.Add(1)
 	fc.closing.Store(true)
 	if fc.udp != nil && fc.internal {
 		fc.udp.closingPeers = fc.udp.peers
@@ -1082,13 +1104,14 @@ func (fc *fdConn) enqueueClose(err error) error {
 	t := acquireTask(closeTask, fc)
 	t.err = err
 	if fc.loop != nil && fc.loop.submitTask(t) {
+		fc.events.callbackWG.Done() // the loop, which Serve joins, has it
 		return nil
 	}
 	releaseTask(t)
-	// A sealed queue transfers the close to a counted owner. Keep cleanup
-	// off the caller: it may hold a RawConn.Control descriptor reference, or
-	// another resource that closing the socket must wait for it to release.
-	fc.events.callbackWG.Add(1)
+	// A sealed queue transfers the close, with the request's count, to a
+	// goroutine. Keep cleanup off the caller: it may hold a RawConn.Control
+	// descriptor reference, or another resource that closing the socket must
+	// wait for it to release.
 	go func() {
 		defer fc.events.callbackWG.Done()
 		fc.closeOnLoop(err)

@@ -107,10 +107,19 @@ func wait[T any](t *testing.T, c chan T, what string) T {
 // order, bottom first, and returns the events.
 func serveTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) *uio.Events {
 	t.Helper()
+	return serveTLSWith(t, top, nil, layers...)
+}
+
+// serveTLSWith is serveTLS with the events configured by setup first.
+func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers ...uio.Layer) *uio.Events {
+	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 2, Handler: top, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
+	if setup != nil {
+		setup(events)
+	}
 	events.Use(layers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
