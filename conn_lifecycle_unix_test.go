@@ -73,7 +73,8 @@ func TestStaleEventDuringAdmissionFoldsIntoTheOpenTurn(t *testing.T) {
 	}
 
 	conn := &fdConn{fd: int32(fds[0])}
-	conn.events, conn.loop = events, loop
+	conn.loop = loop
+	conn.entry = events.plainEntry()
 	if !conn.admitAccepted(false) {
 		t.Fatal("connection was not admitted")
 	}
@@ -842,13 +843,13 @@ func TestStopRaceKeepsClaimReserved(t *testing.T) {
 	pool := newIOTaskPool(nil)
 	defer pool.stop()
 	loop := &eventLoop{
-		events: events,
 		poller: ep,
 		fdMap:  newFdMap(),
 		ioPool: pool,
 		ioIdle: make(chan struct{}),
 	}
-	conn := &fdConn{fd: int32(sockets[0]), commonConn: commonConn{events: events, loop: loop}}
+	conn := &fdConn{fd: int32(sockets[0]), commonConn: commonConn{loop: loop}}
+	conn.entry = events.plainEntry()
 	if err := loop.fdMap.Put(int(conn.fd), conn); err != nil {
 		t.Fatal(err)
 	}
@@ -1054,6 +1055,7 @@ func TestUnixConnectionColdStateIsLazy(t *testing.T) {
 	}
 
 	conn := &fdConn{}
+	conn.entry = (&Events{}).plainEntry()
 	if conn.udp != nil || conn.deadlines != nil || conn.isDatagram() {
 		t.Fatal("new TCP connection allocated cold state")
 	}

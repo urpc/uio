@@ -140,8 +140,10 @@ reader and writer goroutines instead.
 
 A protocol that is not yours to implement — TLS, compression, an auth
 handshake — can sit between the socket and your handler as a protocol layer.
-`Events.Use` stacks layers under `Events.Handler`; the first one installed sits
-nearest the wire.
+`WithLayers` names a chain on an endpoint — a `Listen`, a dial, an
+adoption — and UIO stacks it under `Events.Handler`; the first layer in it
+sits nearest the wire. A `Listener` carries its one chain for its life; a
+`Dialer` may hold defaults each dial overrides.
 
 A wss server is the smallest complete example: a TLS layer, a WebSocket
 package, and one line joining them. The two directions run through the same
@@ -206,7 +208,9 @@ func (x *xorHandler) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	return len(p), nil
 }
 
-events.Use(uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &xorHandler{key: 0x5a} }))
+ln, err := events.Listen(addr, nil, uio.WithLayers(
+	uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &xorHandler{key: 0x5a} }),
+))
 ```
 
 [`examples/xorlayer`](examples/xorlayer) runs this layer for real, on both
@@ -221,16 +225,18 @@ connection's own. A layer writes none of that.
 
 ### One connection through the stack
 
-A dial or an adoption can bring its own chain for that connection alone —
-`DialContext(ctx, addr, nil, uio.WithLayers(tls))` — which is how one client
-speaks several schemes: a wss:// dial brings the TLS layer, a ws:// dial
-`WithLayers(PassThroughLayer)`. The Events still needs layers of its own
-(`Use`), since that is what installs the stack each connection's chain runs
-on.
+Every endpoint names its own chain. A `Listener` carries the one a `Listen`
+gave it, fixed for its life: one port, one stack. A `Dialer` holds the
+defaults it was built with — `events.Dialer(uio.WithLayers(tls))` — and each
+dial may name its own, replacing them for that connection alone: one Dialer
+serves `wss://` and `ws://` alike, the first dial naming the TLS layer and the
+second `WithLayers(PassThroughLayer)`. `DialContext(ctx, addr, nil,
+uio.WithLayers(tls))` on the Events is the chainless default Dialer naming
+the chain for that one dial.
 
-`events.Use(kcp, tls, trace)` creates one `LayerHandler` for each connection. The
-first installed layer is closest to the wire; the Handler sees the top layer.
-The whole path is:
+`uio.WithLayers(kcp, tls, trace)` creates one `LayerHandler` for each
+connection of that endpoint. The first layer named is closest to the wire;
+the Handler sees the top layer. The whole path is:
 
 ```
 build + open (once per connection)
@@ -314,8 +320,8 @@ These are UIO's to keep, not each layer's to remember:
 8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
    the Handler count against it with the socket's buffer: a stack holding the
    limit takes nothing more from the socket until the Handler reads.
-9. **Layers carry streams.** An Events with layers refuses UDP, IP, unixgram
-   and unixpacket connections with `ErrLayersNeedStream`.
+9. **Layers carry streams.** An endpoint whose chain has layers refuses
+   UDP, IP, unixgram and unixpacket connections with `ErrLayersNeedStream`.
 
 A layer carries one connection: one above for each one below. A protocol that
 opens several streams over one connection — HTTP/2, QUIC — is the Handler's to
@@ -329,8 +335,8 @@ and `AdoptContext` do the same for a `net.Conn` you hand over:
 
 ```go
 client := &uio.Events{}
-client.Use(utls.Client(cfg))
-conn, err := client.DialContext(ctx, "tcp://example.org:443", nil)
+conn, err := client.DialContext(ctx, "tcp://example.org:443", nil,
+	uio.WithLayers(utls.Client(cfg)))
 // conn reads and writes plaintext; utls encrypts below it
 ```
 
@@ -376,11 +382,12 @@ turn, replacing the old probe reads.
   connection they are told about is the one your Handler holds. They only
   observe: `OnBytesWritten` may run inside a layer's write, so it must not write
   to or close the connection.
-- **`Use` before `Serve`.** `Serve` reads the layers once; a `Use` after it
-  installs nothing.
-- **The stack is fixed once a connection starts.** `Use` composes it per
-  Events; `WithLayers` picks it per dial or adoption. There is no runtime
-  layer replacement — a protocol that sniffs its first bytes (ALPN, a PROXY
+- **A chain belongs to an endpoint, not to the Events.** A `Listen` names
+  its chain when the listener is created and keeps it for its life; a dial
+  names one, or takes its `Dialer`'s defaults. An endpoint that names no
+  chain runs plain.
+- **The stack is fixed once a connection starts.** There is no runtime layer
+  replacement — a protocol that sniffs its first bytes (ALPN, a PROXY
   header) decides inside one layer, not by trading the stack.
 - **Packet connections carry no layers.** UDP, IP and unixgram/unixpacket are
   refused with `ErrLayersNeedStream`: there is no data-unit declaration yet,

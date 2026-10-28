@@ -51,7 +51,7 @@ func (fc *commonConn) endInboundCallback(started bool) {
 func (fc *commonConn) assertInboundAccess() {
 	// Unregistered connections are used by low-level helpers and tests before an
 	// owner exists. Registered connections always have both fields.
-	if fc.loop == nil || fc.events == nil {
+	if fc.loop == nil || fc.events() == nil {
 		return
 	}
 	if fc.inboundLive.Load() {

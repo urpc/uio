@@ -507,6 +507,7 @@ func TestFlushCountsFilteredEvents(t *testing.T) {
 	pool := &ioTaskPool{executor: exec}
 	loop := &eventLoop{fdMap: newFdMap(), ioPool: pool, events: &Events{Executor: exec}}
 	conn := &fdConn{}
+	conn.entry = (&Events{}).plainEntry()
 	conn.loop = loop
 	conn.pollTag.Store(7)
 	const liveFD = 42
@@ -657,6 +658,7 @@ func TestTurnKeyKeepsALoopOnItsOwnShards(t *testing.T) {
 		seen := map[uint32]bool{}
 		for fd := int32(3); fd < 3+4*shards; fd++ {
 			conn := &fdConn{fd: fd}
+			conn.entry = (&Events{}).plainEntry()
 			conn.loop = loop
 			shard := conn.turnKey() % shards
 			if shard%loops != index {
@@ -708,7 +710,8 @@ func TestLoopWaitModeFollowsTheMeasuredRange(t *testing.T) {
 func TestIOAdmissionRaceWithShutdown(t *testing.T) {
 	for range 1000 {
 		loop := &eventLoop{ioIdle: make(chan struct{}), ioPool: &ioTaskPool{}}
-		conn := &fdConn{commonConn: commonConn{events: &Events{}, loop: loop}}
+		conn := &fdConn{commonConn: commonConn{loop: loop}}
+		conn.entry = (&Events{}).plainEntry()
 		start := make(chan struct{})
 		producerDone := make(chan struct{})
 		stopDone := make(chan struct{})

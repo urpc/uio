@@ -87,15 +87,39 @@ func (p *streamPeer) waitRead(t *testing.T, n int) []byte {
 	}
 }
 
-// layerEvents serves events with the layers installed and handler on top,
-// listening when listen is set; it returns the events and the address.
-func layerEvents(t *testing.T, handler uio.Handler, listen bool, layers ...uio.Layer) (*uio.Events, string) {
+// layeredEvents is layerEvents' Events: its endpoints carry the layers.
+type layeredEvents struct {
+	*uio.Events
+	layers []uio.Layer
+}
+
+func (e *layeredEvents) Listen(addr string, userdata any, opts ...uio.ListenOption) (uio.Listener, error) {
+	if len(e.layers) > 0 {
+		opts = append([]uio.ListenOption{uio.WithLayers(e.layers...)}, opts...)
+	}
+	return e.Events.Listen(addr, userdata, opts...)
+}
+
+func (e *layeredEvents) Dial(addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+	return e.DialContext(context.Background(), addr, userdata, opts...)
+}
+
+func (e *layeredEvents) DialContext(ctx context.Context, addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+	if len(e.layers) > 0 {
+		opts = append([]uio.DialOption{uio.WithLayers(e.layers...)}, opts...)
+	}
+	return e.Events.DialContext(ctx, addr, userdata, opts...)
+}
+
+// layerEvents serves events whose endpoints carry the layers and handler on
+// top, listening when listen is set; it returns the events and the address.
+func layerEvents(t *testing.T, handler uio.Handler, listen bool, layers ...uio.Layer) (*layeredEvents, string) {
 	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Handler: handler, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	events.Use(layers...)
+	layered := &layeredEvents{Events: events, layers: layers}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -108,17 +132,23 @@ func layerEvents(t *testing.T, handler uio.Handler, listen bool, layers ...uio.L
 		t.Fatal("Serve did not start")
 	}
 	if !listen {
-		return events, ""
+		return layered, ""
 	}
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	var listener uio.Listener
+	var err error
+	if len(layers) > 0 {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(layers...))
+	} else {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+	}
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	return events, listener.Addr().String()
+	return layered, listener.Addr().String()
 }
 
-func dialLayer(t *testing.T, events *uio.Events, addr string) uio.Conn {
+func dialLayer(t *testing.T, events *layeredEvents, addr string) uio.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
@@ -534,12 +564,11 @@ func TestServerLayerKeepsUserdataAuthorizeLeaves(t *testing.T) {
 	server := newStreamPeer(false)
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Handler: server, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
-	events.Use(ServerLayer(LayerOptions{Authorize: func(*http.Request) (any, error) { return nil, nil }}))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", "listener's")
+	listener, err := events.Listen("tcp://127.0.0.1:0", "listener's", uio.WithLayers(ServerLayer(LayerOptions{Authorize: func(*http.Request) (any, error) { return nil, nil }})))
 	if err != nil {
 		t.Fatal(err)
 	}

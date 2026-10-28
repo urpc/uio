@@ -103,8 +103,8 @@ func (l *trackedLayer) OnWrite(ctx LayerContext, p []byte) (int, error) {
 func TestWriteTrackedReportsWhenBytesLeave(t *testing.T) {
 	layer := &trackedLayer{writes: [][]byte{[]byte("tracked")}, sent: make(chan SendReceipt, 2)}
 	addr, got := receiptPeer(t, 7)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -130,8 +130,8 @@ func TestWriteTrackedReportsInOrder(t *testing.T) {
 		sent:   make(chan SendReceipt, 4),
 	}
 	addr, got := receiptPeer(t, 6)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -171,8 +171,8 @@ func TestWriteTrackedStopsReportingAtClose(t *testing.T) {
 		}
 		time.Sleep(500 * time.Millisecond) // and nothing reads it
 	}()
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -196,8 +196,8 @@ func TestWriteTrackedStopsReportingAtClose(t *testing.T) {
 // A write into the top reports to no one and does not fault.
 func TestWriteTrackedOnTopConn(t *testing.T) {
 	addr, got := receiptPeer(t, 2)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)

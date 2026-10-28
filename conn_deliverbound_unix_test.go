@@ -62,8 +62,8 @@ func TestFullDeliveryPacesTheLayer(t *testing.T) {
 		}
 	}()
 	var armed, read, heldMax atomic.Int64
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{
 			Read: func(c Conn) error {
 				if armed.Load() == 0 {
@@ -141,8 +141,8 @@ func TestUpWriteTakesAll(t *testing.T) {
 		}
 	}()
 	var read atomic.Int64
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{
 			Read: func(c Conn) error {
 				read.Add(int64(c.InboundBuffered()))

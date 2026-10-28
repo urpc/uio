@@ -171,7 +171,6 @@ func TestHandlerTimerThroughLayers(t *testing.T) {
 		Timer: func(Conn) error { rec.note("timer"); return nil },
 		Close: func(Conn, error) {},
 	}, Hooks: FuncHandler{Start: func(*Events) { close(started) }}}
-	events.Use(LayerFunc(func(ctx LayerContext) LayerHandler { return PassThrough{} }))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -184,7 +183,7 @@ func TestHandlerTimerThroughLayers(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil, WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}

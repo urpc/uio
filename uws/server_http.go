@@ -111,7 +111,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// A handoff is HTTP/1.1 plaintext (ServeHTTP refuses TLS requests):
 	// when the Server's own accepts speak TLS, this connection's chain
 	// leaves it out.
-	var opts []uio.DialOption
+	var opts []uio.AdoptOption
 	if s.opts.TLSConfig != nil {
 		opts = append(opts, uio.WithLayers(uio.PassThroughLayer))
 	}

@@ -79,8 +79,8 @@ func TestSelfCloseIsNotReentrant(t *testing.T) {
 	}()
 	layer := &lockedCloser{}
 	closed := make(chan struct{}, 1)
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(Conn, error) { close(closed) }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -131,8 +131,8 @@ func TestCloseModeSurvivesTheWalk(t *testing.T) {
 			}
 		}
 	}()
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(PassThroughLayer)
+	events := dialLayered(t, listener.Addr().String(), []Layer{PassThroughLayer}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { closed <- err }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -219,9 +219,8 @@ func TestCallbackErrorSaysGoodbye(t *testing.T) {
 	}()
 	below := &goodbyeRecorder{cause: make(chan error, 1)}
 	closed := make(chan error, 1)
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return below }))
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return erroringLayer{} }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return below }), LayerFunc(func(LayerContext) LayerHandler { return erroringLayer{} })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { closed <- err }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -252,8 +251,8 @@ func TestCallbackErrorSaysGoodbye(t *testing.T) {
 func TestDialReportsCloseFromOnOpen(t *testing.T) {
 	addr := overrideListener(t, 1)
 	cause := errors.New("nope")
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(PassThroughLayer)
+	events := dialLayered(t, addr, []Layer{PassThroughLayer}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Open: func(c Conn) { _ = c.CloseWith(cause) }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -279,8 +278,8 @@ func (shortWriter) OnWrite(_ LayerContext, p []byte) (int, error) { return 1, ni
 func TestShortOnWriteIsErrShortWrite(t *testing.T) {
 	addr := overrideListener(t, 1)
 	wrote := make(chan error, 1)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return shortWriter{} }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return shortWriter{} })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{
 			Open:  func(c Conn) { _, err := c.Write([]byte("hello")); wrote <- err },
 			Close: func(Conn, error) {},
@@ -306,8 +305,8 @@ func (plainEmbedder) OnRead(ctx LayerContext) error { return nil }
 
 func TestPassThroughEmbeddingHasNoCloseWrite(t *testing.T) {
 	addr := overrideListener(t, 1)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return plainEmbedder{} }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return plainEmbedder{} })}, func(ev *Events) {
+
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -357,8 +356,8 @@ func TestReceiptSentWriteReachesTheHandler(t *testing.T) {
 	}()
 	layer := &sentWriterReceipt{done: make(chan struct{})}
 	var read atomic.Int64
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
+
 		ev.Handler = FuncHandler{Read: func(c Conn) error {
 			read.Add(int64(c.InboundBuffered()))
 			_, _ = c.Discard(c.InboundBuffered())

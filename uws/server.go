@@ -88,8 +88,36 @@ func (s *Server) Serve(addrs ...string) error {
 	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
 	events := opts.transportEvents()
 	s.events = events
+	// One listener per address, each carrying the TLS chain when a TLSConfig
+	// asks for wss: the layers belong to the listener, not to the Events.
+	// OnStart binds them — the runtime is up by then, accepting has not
+	// started, and it runs on the goroutine that called Serve.
+	var layers []uio.Layer
+	if opts.TLSConfig != nil {
+		layers = []uio.Layer{serverTLSLayer(opts.TLSConfig, opts)}
+	}
+	var listenErr error
 	handler := uio.FuncHandler{
 		Start: func(*uio.Events) {
+			for _, addr := range addrs {
+				if addr == "" {
+					continue
+				}
+				var ln uio.Listener
+				if len(layers) > 0 {
+					ln, listenErr = events.Listen(addr, nil, uio.WithLayers(layers...))
+				} else {
+					ln, listenErr = events.Listen(addr, nil)
+				}
+				_ = ln
+				if listenErr != nil {
+					break
+				}
+			}
+			if listenErr != nil {
+				_ = events.Close(listenErr)
+				return
+			}
 			s.closeMu.Lock()
 			if !s.closed {
 				s.ready.Store(true)
@@ -109,15 +137,15 @@ func (s *Server) Serve(addrs ...string) error {
 		handler.BytesRead = s.onInbound
 	}
 	events.Handler = handler
-	if opts.TLSConfig != nil {
-		events.Use(serverTLSLayer(opts.TLSConfig, opts))
-	}
 	events.Observer, events.Hooks = handler, handler
 	s.closeMu.Unlock()
 
-	err = events.Serve(addrs...)
+	err = events.Serve()
 	s.ready.Store(false)
 	_ = s.Close(err)
+	if listenErr != nil {
+		return listenErr
+	}
 	return err
 }
 

@@ -76,7 +76,6 @@ func startPacketFixture(t *testing.T) *packetFixture {
 	local := peer.LocalAddr().(*net.UDPAddr)
 	f := &packetFixture{
 		t:        t,
-		events:   events,
 		ln:       ln,
 		packet:   ln.(PacketListener),
 		reporter: reporter,

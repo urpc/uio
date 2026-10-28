@@ -110,7 +110,8 @@ func TestUDPServerReleaseClosesReplacedPeers(t *testing.T) {
 		family: 4,
 		peers:  make(map[socket.UDPAddress]*fdConn),
 	}}
-	server.events, server.loop = ev, loop
+	server.loop = loop
+	server.entry = ev.plainEntry()
 	addr := netip.MustParseAddrPort("127.0.0.1:9876")
 	old, err := server.dialPeer(addr, nil)
 	if err != nil {

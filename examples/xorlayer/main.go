@@ -138,10 +138,9 @@ func main() {
 		},
 		Close: func(uio.Conn, error) {},
 	}}
-	server.Use(stack("server")...)
 	start(server)
 	defer server.Close(nil)
-	listener, err := server.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := server.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(stack("server")...))
 	if err != nil {
 		fail(err)
 	}
@@ -161,7 +160,6 @@ func main() {
 		},
 		Close: func(uio.Conn, error) {},
 	}}
-	client.Use(stack("client")...)
 	start(client)
 	defer client.Close(nil)
 
@@ -169,7 +167,7 @@ func main() {
 	defer cancel()
 	// The connection DialContext returns is the top layer's: what is written
 	// to it passes the xor layer, then the wiretap, then the socket.
-	conn, err := client.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := client.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(stack("client")...))
 	if err != nil {
 		fail(err)
 	}

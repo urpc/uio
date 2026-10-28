@@ -55,7 +55,6 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 		},
 		Close: func(uio.Conn, error) {},
 	}
-	events.Use(Server(serverConfig, StagingBound(16<<10)))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
@@ -64,7 +63,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("Serve did not start")
 	}
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(Server(serverConfig, StagingBound(16<<10))))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,12 +202,11 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 		Read:  func(uio.Conn) error { return nil },
 		Close: func(_ uio.Conn, err error) { closed <- err },
 	}
-	events.Use(Client(clientConfig))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	raw, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	raw, err := events.Dial("tcp://"+listener.Addr().String(), nil, uio.WithLayers(Client(clientConfig)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,14 +289,13 @@ func TestDialCanceledMidHandshake(t *testing.T) {
 		Read:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) { mu.Lock(); calls++; mu.Unlock() },
 	}
-	events.Use(Client(&tls.Config{InsecureSkipVerify: true}))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil, uio.WithLayers(Client(&tls.Config{InsecureSkipVerify: true})))
 	// The deadline is what asked for the close; a transport error that beat
 	// it to the report tells the same story.
 	if err == nil {

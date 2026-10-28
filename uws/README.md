@@ -308,10 +308,12 @@ for stacks of your own — TLS, an obfuscation, a tunnel, in any order, on an
 `uio.Events` you configure:
 
 ```go
-events.Use(utls.Server(tlsConfig), uws.ServerLayer(uws.LayerOptions{Authorize: checkToken}), tunnel)
-
-client.Use(utls.Client(tlsConfig), uws.ClientLayer("wss://example.org/tunnel", uws.LayerOptions{}), tunnel)
-conn, err := client.DialContext(ctx, "tcp://example.org:443", nil)
+listener, err := server.Listen(addr, nil, uio.WithLayers(
+	utls.Server(tlsConfig), uws.ServerLayer(uws.LayerOptions{Authorize: checkToken}), tunnel,
+))
+conn, err := client.DialContext(ctx, "tcp://example.org:443", nil, uio.WithLayers(
+	utls.Client(tlsConfig), uws.ClientLayer("wss://example.org/tunnel", uws.LayerOptions{}), tunnel,
+))
 ```
 
 The layer carries a byte stream: what the layer above writes leaves as

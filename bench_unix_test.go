@@ -27,7 +27,8 @@ func BenchmarkCallbackWrite(b *testing.B) {
 			events := &Events{}
 			loop := &eventLoop{}
 			conn := &fdConn{fd: int32(fds[0])}
-			conn.events, conn.loop = events, loop
+			conn.loop = loop
+			conn.entry = events.plainEntry()
 			conn.ioOwner.Store(currentGoroutineID())
 			payload := make([]byte, size)
 			drainDone := make(chan struct{})
@@ -230,7 +231,7 @@ func newIOTaskBenchmarkRunner(batch int, scheduler ioBenchmarkScheduler) *ioTask
 	for index := range runner.connections {
 		// Distinct descriptors spread the turns over the scheduler's shards,
 		// as real connections' do; no socket is touched.
-		runner.connections[index] = &fdConn{commonConn: commonConn{events: events}, fd: int32(index)}
+		runner.connections[index] = &fdConn{fd: int32(index)}
 		runner.tasks[index] = runner.connections[index]
 		scheduler.bind(runner.connections[index])
 	}

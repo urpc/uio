@@ -7,8 +7,8 @@ import "testing"
 func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 	loop := &eventLoop{}
 	conn := &fdConn{fd: -1}
+	conn.entry = (&Events{WriteBufferedThreshold: 2048, MaxOutboundBuffered: -1}).plainEntry()
 	conn.ioOwner.Store(currentGoroutineID())
-	conn.events = &Events{WriteBufferedThreshold: 2048, MaxOutboundBuffered: -1}
 	conn.loop = loop
 	payload := make([]byte, 1024)
 
@@ -30,6 +30,7 @@ func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 
 func TestUnixRejectedWriteOwnedReleasesBuffer(t *testing.T) {
 	conn := &fdConn{}
+	conn.entry = bareEntry()
 	conn.close.phase.Store(closeRequested)
 	payload := make([]byte, 1024)
 	write := func() {

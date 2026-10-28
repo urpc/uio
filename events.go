@@ -17,7 +17,6 @@
 package uio
 
 import (
-	"fmt"
 	"net"
 	"runtime"
 	"sync"
@@ -73,6 +72,15 @@ type readBuffer struct {
 	out *bytebuf.Buffer
 }
 
+// entry is what one endpoint — a Listen, a Dial, an Adopt — hands each of
+// its connections: the callbacks resolved for its chain, and whether that
+// chain has layers. Every connection carries its own, read-only for its life.
+type entry struct {
+	ev      *Events // the Events the endpoint dials or listens through
+	cb      callbacks
+	layered bool // the chain has layers: the socket takes no payload limit
+}
+
 // Events owns listeners, event loops, the native connection-task scheduler,
 // shared read buffers, and application callbacks for one server/dialer
 // lifecycle. Configure it before Serve; an Events value is not restartable.
@@ -91,7 +99,8 @@ type Events struct {
 	readPool       plocal.Cache[*readBuffer] // read buffers, one kept per P
 	readBufferSize int
 	cb             callbacks // Handler, resolved when Serve starts
-	use            []Layer   // stacked by Use, read when Serve starts
+	plain          *entry    // the entry of a connection that brings no chain
+	plainOnce      sync.Once
 
 	// Pollers is the number of event loops. On Unix each loop is one
 	// epoll or kqueue instance that a few goroutines wait on: they collect
@@ -316,13 +325,9 @@ func (ev *Events) finishLifecycle(err error) {
 }
 
 func (ev *Events) initConfig() error {
-	if len(ev.use) > maxLayers {
-		return fmt.Errorf("uio: %d layers installed, at most %d", len(ev.use), maxLayers)
-	}
-	ev.cb = resolveCallbacks(ev.stackHandler(ev.Handler), ev.Observer, ev.Hooks)
-	if len(ev.use) > 0 {
-		ev.cb.onBytesWritten = stackSent(ev.cb.onBytesWritten)
-	}
+	ev.cb = resolveCallbacks(ev.Handler, ev.Observer, ev.Hooks)
+	// The plain entry is built on first use, when an endpoint takes it, just
+	// as a layered one is built at its Listen or Dial.
 
 	if ev.Pollers <= 0 {
 		ev.Pollers = defaultPollers(runtime.GOMAXPROCS(0))
@@ -349,7 +354,7 @@ func (ev *Events) onRead(fdc *fdConn) error {
 	if skipRead {
 		return nil // the timer callback closed: no read callback follows
 	}
-	if onRead := ev.cb.onRead; onRead != nil {
+	if onRead := fdc.callbacks().onRead; onRead != nil {
 		return onRead(fdc)
 	}
 	// Without a data callback the received bytes are discarded.
@@ -360,7 +365,7 @@ func (ev *Events) onRead(fdc *fdConn) error {
 }
 
 func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
-	if onInbound := ev.cb.onBytesRead; readBytes > 0 && onInbound != nil {
+	if onInbound := fdc.callbacks().onBytesRead; readBytes > 0 && onInbound != nil {
 		started := fdc.beginInboundCallback()
 		onInbound(ev.observed(fdc), readBytes)
 		fdc.endInboundCallback(started)
@@ -370,13 +375,13 @@ func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 // onSocketBytesWrite stays small enough to inline into every send path, so a
 // connection nobody observes pays a nil check and no call.
 func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
-	if writeBytes > 0 && ev.cb.onBytesWritten != nil {
+	if writeBytes > 0 && fdc.callbacks().onBytesWritten != nil {
 		ev.reportBytesWritten(fdc, writeBytes)
 	}
 }
 
 func (ev *Events) reportBytesWritten(fdc *fdConn, writeBytes int) {
-	ev.cb.onBytesWritten(ev.observed(fdc), writeBytes)
+	fdc.callbacks().onBytesWritten(ev.observed(fdc), writeBytes)
 }
 
 // closeCounter counts closes Serve waits for. Unlike a sync.WaitGroup, a close

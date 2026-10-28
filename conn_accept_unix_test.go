@@ -421,6 +421,7 @@ func TestAddConnContextRejectsAlreadyCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(cause)
 	conn := &fdConn{fd: int32(fds[0]), commonConn: commonConn{loop: &eventLoop{}}}
+	conn.entry = (&Events{}).plainEntry()
 	if err = (&Events{}).addConnContext(ctx, conn); !errors.Is(err, cause) {
 		t.Fatalf("addConnContext() error = %v, want %v", err, cause)
 	}

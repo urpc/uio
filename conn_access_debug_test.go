@@ -23,7 +23,7 @@ func TestInboundAccessPanicsOutsideCallback(t *testing.T) {
 	for name, operation := range operations {
 		t.Run(name, func(t *testing.T) {
 			conn := &commonConn{
-				events:      &Events{},
+				entry:       (&Events{}).plainEntry(),
 				loop:        &eventLoop{},
 				inboundTail: []byte("x"),
 			}
@@ -40,7 +40,7 @@ func TestInboundAccessPanicsOutsideCallback(t *testing.T) {
 func TestInboundAccessAllowsCurrentConnectionCallback(t *testing.T) {
 	events := &Events{}
 	loop := &eventLoop{}
-	conn := &commonConn{events: events, loop: loop, inboundTail: []byte("x")}
+	conn := &commonConn{entry: events.plainEntry(), loop: loop, inboundTail: []byte("x")}
 
 	started := conn.beginInboundCallback()
 	if conn.InboundBuffered() != 1 {
@@ -58,8 +58,8 @@ func TestInboundAccessAllowsCurrentConnectionCallback(t *testing.T) {
 func TestInboundAccessIsConnectionScoped(t *testing.T) {
 	events := &Events{}
 	loop := &eventLoop{}
-	first := &commonConn{events: events, loop: loop, inboundTail: []byte("a")}
-	second := &commonConn{events: events, loop: loop, inboundTail: []byte("b")}
+	first := &commonConn{entry: events.plainEntry(), loop: loop, inboundTail: []byte("a")}
+	second := &commonConn{entry: events.plainEntry(), loop: loop, inboundTail: []byte("b")}
 	started := first.beginInboundCallback()
 	defer first.endInboundCallback(started)
 	if first.InboundBuffered() != 1 {

@@ -43,7 +43,8 @@ func TestOwnedBufferPoolReusesLargeBuffer(t *testing.T) {
 // serialization. This pins the documented release behavior: a call outside a
 // callback is served normally, it simply loses the timely panic.
 func TestInboundAccessOutsideCallbackIsUndiagnosed(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}, inboundTail: []byte("x")}
+	conn := &commonConn{loop: &eventLoop{}, inboundTail: []byte("x")}
+	conn.entry = bareEntry()
 	if got := conn.InboundBuffered(); got != 1 {
 		t.Fatalf("inbound data = %d, want 1", got)
 	}

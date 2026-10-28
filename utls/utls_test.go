@@ -106,13 +106,38 @@ func wait[T any](t *testing.T, c chan T, what string) T {
 
 // serveTLS serves a stack over fresh events with the layers installed in
 // order, bottom first, and returns the events.
-func serveTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) *uio.Events {
+func serveTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) *layeredEvents {
 	t.Helper()
 	return serveTLSWith(t, top, nil, layers...)
 }
 
 // serveTLSWith is serveTLS with the events configured by setup first.
-func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers ...uio.Layer) *uio.Events {
+// layeredEvents carries a chain every endpoint of its Events uses, in the
+// test the way a port's chain would.
+type layeredEvents struct {
+	*uio.Events
+	layers []uio.Layer
+}
+
+func (e *layeredEvents) Listen(addr string, userdata any, opts ...uio.ListenOption) (uio.Listener, error) {
+	if len(e.layers) > 0 {
+		opts = append([]uio.ListenOption{uio.WithLayers(e.layers...)}, opts...)
+	}
+	return e.Events.Listen(addr, userdata, opts...)
+}
+
+func (e *layeredEvents) Dial(addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+	return e.DialContext(context.Background(), addr, userdata, opts...)
+}
+
+func (e *layeredEvents) DialContext(ctx context.Context, addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+	if len(e.layers) > 0 {
+		opts = append([]uio.DialOption{uio.WithLayers(e.layers...)}, opts...)
+	}
+	return e.Events.DialContext(ctx, addr, userdata, opts...)
+}
+
+func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers ...uio.Layer) *layeredEvents {
 	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 2, Handler: top, Hooks: uio.FuncHandler{
@@ -121,7 +146,6 @@ func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers
 	if setup != nil {
 		setup(events)
 	}
-	events.Use(layers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -137,11 +161,11 @@ func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers
 	case <-time.After(testWait):
 		t.Fatal("Serve did not start")
 	}
-	return events
+	return &layeredEvents{Events: events, layers: layers}
 }
 
 // listenTLS serves a stack and listens on a fresh loopback port.
-func listenTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) (string, *uio.Events) {
+func listenTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) (string, *layeredEvents) {
 	t.Helper()
 	events := serveTLS(t, top, layers...)
 	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
@@ -201,8 +225,9 @@ func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 	events := &uio.Events{Pollers: 1, Handler: client, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
+	var chain []uio.Layer
 	for _, layer := range layers[:len(layers)-1] {
-		events.Use(layer.(uio.Layer))
+		chain = append(chain, layer.(uio.Layer))
 	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
@@ -217,7 +242,7 @@ func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, addr, nil)
+	conn, err := events.DialContext(ctx, addr, nil, uio.WithLayers(chain...))
 	if err != nil {
 		t.Fatal(err)
 	}

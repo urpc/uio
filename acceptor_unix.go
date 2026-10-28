@@ -54,7 +54,10 @@ type listener struct {
 
 	// userdata is every accepted connection's initial Userdata.
 	userdata any
-	started  bool // registered with its loop; guarded by acceptor.mux
+	// entry is what every connection this listener accepts runs: its
+	// callbacks and chain.
+	entry   *entry
+	started bool // registered with its loop; guarded by acceptor.mux
 	// The gate counts the waiters accepting on the listener. A waiter may
 	// have looked l up just before it left its loop, so its descriptor is
 	// closed only after retire returns: closed earlier, the number could be
@@ -251,6 +254,7 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 				return err
 			}
 			l.udpSvr = &fdConn{}
+			l.udpSvr.entry = ld.events.plainEntry()
 			l.udpSvr.fd = int32(l.fd)
 			l.udpSvr.udp = &unixUDPState{
 				file:   l.file,
@@ -259,7 +263,6 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			}
 			l.file = nil // The logical server owns the duplicated poller fd.
 			l.udpSvr.loop = ld.events.selectLoop()
-			l.udpSvr.events = ld.events
 			l.udpSvr.internal = true
 			l.udpSvr.addr = l.pair
 			l.udpSvr.SetUserdata(userdata) // What its peers start with.
@@ -279,9 +282,23 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 // listenGroup adds addr while Serve runs: it records its listeners and starts
 // accepting on them at once.
 func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
-	group, err := ld.bindGroup(addr, listenConfigFor(opts).Control)
+	cfg := listenConfigFor(opts)
+	group, err := ld.bindGroup(addr, cfg.Control)
 	if err != nil {
 		return nil, err
+	}
+	entry, err := ld.events.entryFor(cfg.layers, cfg.hasLayers)
+	if err != nil {
+		for _, l := range group {
+			ld.closeListener(l)
+		}
+		return nil, err
+	}
+	for _, l := range group {
+		l.entry = entry
+		if l.udpSvr != nil {
+			l.udpSvr.entry = entry
+		}
 	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
@@ -448,6 +465,9 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	}
 
 	var l listener
+	if ld.events != nil {
+		l.entry = ld.events.plainEntry()
+	}
 	listenConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {

@@ -619,7 +619,8 @@ func TestInboundLimitDeadlineEdgeValuesWhileHeld(t *testing.T) {
 }
 
 func TestReserveInboundJoinsBufferedBytes(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}}
+	conn := &commonConn{loop: &eventLoop{}}
+	conn.entry = (&Events{}).plainEntry()
 	started := conn.beginInboundCallback()
 	defer conn.endInboundCallback(started)
 	_, _ = conn.inbound.Write(bytes.Repeat([]byte("a"), 3000))
@@ -644,7 +645,8 @@ func TestReserveInboundJoinsBufferedBytes(t *testing.T) {
 }
 
 func TestReserveInboundTakesOnlyTheUnitFromTheTail(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}}
+	conn := &commonConn{loop: &eventLoop{}}
+	conn.entry = (&Events{}).plainEntry()
 	started := conn.beginInboundCallback()
 	defer conn.endInboundCallback(started)
 	_, _ = conn.inbound.Write(bytes.Repeat([]byte("a"), 3000))
@@ -663,7 +665,8 @@ func TestReserveInboundTakesOnlyTheUnitFromTheTail(t *testing.T) {
 }
 
 func TestReserveInboundLeavesAWholeTailAlone(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}}
+	conn := &commonConn{loop: &eventLoop{}}
+	conn.entry = (&Events{}).plainEntry()
 	started := conn.beginInboundCallback()
 	defer conn.endInboundCallback(started)
 	tail := []byte("a whole unit")
@@ -677,7 +680,8 @@ func TestReserveInboundLeavesAWholeTailAlone(t *testing.T) {
 }
 
 func TestReserveInboundAboveTheLimitOverflows(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}}
+	conn := &commonConn{loop: &eventLoop{}}
+	conn.entry = (&Events{}).plainEntry()
 	started := conn.beginInboundCallback()
 	defer conn.endInboundCallback(started)
 	conn.inboundTail = []byte("head")

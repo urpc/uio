@@ -294,11 +294,6 @@ func (d *Dialer) start(ctx context.Context) error {
 			BytesRead:    d.onInbound,
 		}
 		events.Handler = handler
-		if opts.TLSConfig != nil {
-			// The stack every dial's own chain runs on: a wss:// dial brings
-			// its TLS layer, a ws:// dial the layer that changes nothing.
-			events.Use(uio.PassThroughLayer)
-		}
 		events.Observer, events.Hooks = handler, handler
 		go func() {
 			err := events.Serve()

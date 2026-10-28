@@ -50,16 +50,17 @@ func BenchmarkSocketEcho(b *testing.B) {
 				}
 				started := make(chan struct{})
 				events.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
+				var chain []uio.Layer
 				if secure {
 					events.MaxBufferSize = 16 << 10
-					events.Use(utls.Server(serverTLS))
+					chain = append(chain, utls.Server(serverTLS))
 				}
-				events.Use(ServerLayer(LayerOptions{}))
+				chain = append(chain, ServerLayer(LayerOptions{}))
 				done := make(chan error, 1)
 				go func() { done <- events.Serve() }()
 				b.Cleanup(func() { _ = events.Close(nil); <-done })
 				<-started
-				listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+				listener, err := events.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(chain...))
 				if err != nil {
 					b.Fatal(err)
 				}

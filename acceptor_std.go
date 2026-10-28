@@ -40,9 +40,10 @@ type listener struct {
 	ln       net.Listener
 	udp      net.PacketConn
 	udpSvr   *fdConn
-	key      int  // its key in acceptor.listeners
-	started  bool // its accept goroutine runs; guarded by acceptor.mux
-	userdata any  // every accepted connection's initial Userdata
+	key      int    // its key in acceptor.listeners
+	started  bool   // its accept goroutine runs; guarded by acceptor.mux
+	userdata any    // every accepted connection's initial Userdata
+	entry    *entry // every accepted connection's callbacks and chain
 }
 
 // acceptor owns blocking listener goroutines. The logical event loop is used
@@ -86,9 +87,19 @@ func (ld *acceptor) addListen(addr string) error {
 func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
 	// A socket control may close Events or another listener. Create the
 	// socket before taking the registry lock, then admit it against shutdown.
-	l, err := ld.listen(addr, ld.events.ReusePort, listenConfigFor(opts).Control)
+	cfg := listenConfigFor(opts)
+	l, err := ld.listen(addr, ld.events.ReusePort, cfg.Control)
 	if err != nil {
 		return nil, err
+	}
+	entry, err := ld.events.entryFor(cfg.layers, cfg.hasLayers)
+	if err != nil {
+		ld.closeListener(l)
+		return nil, err
+	}
+	l.entry = entry
+	if l.udpSvr != nil {
+		l.udpSvr.entry = entry
 	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
@@ -164,8 +175,8 @@ func (ld *acceptor) addLocked(l *listener, userdata any) error {
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
+		l.udpSvr.entry = ld.events.plainEntry()
 		l.udpSvr.loop = ld.loop
-		l.udpSvr.events = ld.events
 		l.udpSvr.internal = true
 		l.udpSvr.setLocalAddr(l.udp.LocalAddr()) // what its peers report
 		l.udpSvr.SetUserdata(userdata)           // what its peers start with
@@ -219,8 +230,9 @@ func (ld *acceptor) startLocked(l *listener) {
 			tempDelay = 0
 
 			fdc := &fdConn{}
+			fdc.entry = l.entry
 			fdc.conn = conn
-			fdc.events = ld.events
+
 			fdc.loop = ld.events.selectWorker(fdc.Fd())
 			fdc.SetUserdata(l.userdata)
 			fdc.setLocalAddr(conn.LocalAddr())
@@ -251,6 +263,9 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	}
 
 	var l listener
+	if ld.events != nil {
+		l.entry = ld.events.plainEntry()
+	}
 	listenConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {

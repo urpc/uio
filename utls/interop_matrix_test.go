@@ -134,13 +134,12 @@ func (e *collectEcho) payload() []byte {
 
 // startClient serves an Events with no listener, for dialing through the
 // layers.
-func startClient(t *testing.T, handler uio.Handler, layers ...uio.Layer) *uio.Events {
+func startClient(t *testing.T, handler uio.Handler, layers ...uio.Layer) *layeredEvents {
 	t.Helper()
 	started := make(chan struct{})
 	events := &uio.Events{Pollers: 1, Handler: handler, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
-	events.Use(layers...)
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() {
@@ -148,12 +147,12 @@ func startClient(t *testing.T, handler uio.Handler, layers ...uio.Layer) *uio.Ev
 		<-done
 	})
 	<-started
-	return events
+	return &layeredEvents{Events: events, layers: layers}
 }
 
 // dialThrough dials addr through a stack of its own, settling before it
 // returns.
-func dialThrough(t *testing.T, events *uio.Events, addr string) uio.Conn {
+func dialThrough(t *testing.T, events *layeredEvents, addr string) uio.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()

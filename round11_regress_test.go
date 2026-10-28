@@ -75,19 +75,16 @@ func TestCloseReleasesDeliveredBuffers(t *testing.T) {
 		},
 		Close: func(Conn, error) {},
 	}}
-	events.Use(LayerFunc(func(ctx LayerContext) LayerHandler {
-		return PassThrough{}
-	}))
 	started := make(chan struct{})
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0", nil, WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil, WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}

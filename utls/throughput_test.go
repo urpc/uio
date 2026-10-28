@@ -190,7 +190,6 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	serverStarted := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(serverStarted) }}
 	serverEvents.Handler = server
-	serverEvents.Use(serverLayers...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
@@ -199,7 +198,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	case <-time.After(testWait):
 		t.Fatal("server Serve did not start")
 	}
-	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(serverLayers...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +230,6 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	clientStarted := make(chan struct{})
 	clientEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(clientStarted) }}
 	clientEvents.Handler = client
-	clientEvents.Use(clientLayers...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()
@@ -242,7 +240,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := clientEvents.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := clientEvents.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(clientLayers...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,12 +378,11 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) ui
 	started := make(chan struct{})
 	serverEvents.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
 	serverEvents.Handler = server
-	serverEvents.Use(serverLayers...)
 	serverServe := make(chan error, 1)
 	go func() { serverServe <- serverEvents.Serve() }()
 	defer func() { _ = serverEvents.Close(nil); <-serverServe }()
 	<-started
-	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := serverEvents.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(serverLayers...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -403,7 +400,6 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) ui
 		Read:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
-	clientEvents.Use(clientLayers...)
 	clientServe := make(chan error, 1)
 	go func() { clientServe <- clientEvents.Serve() }()
 	defer func() { _ = clientEvents.Close(nil); <-clientServe }()
@@ -415,7 +411,7 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) ui
 	runtime.ReadMemStats(&before)
 
 	for range conns {
-		if _, err := clientEvents.Dial("tcp://"+listener.Addr().String(), nil); err != nil {
+		if _, err := clientEvents.Dial("tcp://"+listener.Addr().String(), nil, uio.WithLayers(clientLayers...)); err != nil {
 			t.Fatal(err)
 		}
 	}

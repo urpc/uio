@@ -115,7 +115,7 @@ func (conn *fdConn) wakeState() *wakeState {
 // OnTimer. skipRead reports a close the timer callback made, which asked for
 // no further callbacks on the connection.
 func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
-	if conn.events.cb.onTimer == nil {
+	if conn.callbacks().onTimer == nil {
 		return false, nil
 	}
 	wake := conn.wake.Load()
@@ -143,7 +143,7 @@ func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
 	if conn.isClosing() {
 		return false, nil
 	}
-	if err := conn.events.cb.onTimer(conn); err != nil {
+	if err := conn.callbacks().onTimer(conn); err != nil {
 		return true, err
 	}
 	return conn.isClosing(), nil

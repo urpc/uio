@@ -207,6 +207,7 @@ func fillOutboundLimitOnce() func(Conn, int) error {
 
 func TestSkipsEdge(t *testing.T) {
 	conn := &fdConn{}
+	conn.entry = bareEntry()
 	if conn.skipsEdge(poller.ReadEvents) {
 		t.Fatal("a read edge was dropped while no read was owed")
 	}

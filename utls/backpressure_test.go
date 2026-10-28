@@ -46,14 +46,13 @@ func TestTLSWritesAgainAfterTheQueueDrains(t *testing.T) {
 		MaxOutboundBuffered: 64 << 10,
 		Hooks:               uio.FuncHandler{Start: func(*uio.Events) { close(started) }},
 	}
-	events.Use(Client(clientConfig))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(Client(clientConfig)))
 	if err != nil {
 		t.Fatal(err)
 	}

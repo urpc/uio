@@ -352,8 +352,8 @@ var lingerTimeout = LingerTimeout
 // callback touches come first so they share a cache line; the addresses are
 // read only on request.
 type commonConn struct {
-	events *Events    // events
-	loop   *eventLoop // event loop
+	loop  *eventLoop // event loop
+	entry *entry     // this connection's endpoint: its Events, callbacks and chain
 	inboundScope
 	userdata    atomic.Pointer[any]     // user-defined data; see Conn.SetUserdata
 	inboundTail []byte                  // inbound tail buffer
@@ -372,6 +372,22 @@ type commonConn struct {
 type addrPair struct {
 	local  net.Addr
 	remote net.Addr
+}
+
+// events is the Events this connection runs in: the endpoint's.
+func (fc *commonConn) events() *Events { return fc.entry.ev }
+
+// callbacks is the callback set this connection runs: its endpoint's.
+func (fc *commonConn) callbacks() *callbacks { return &fc.entry.cb }
+
+// payloadLimit is the accepted payload the socket refuses past:
+// MaxOutboundBuffered on a bare connection, none under layers (the stack's
+// top enforces it instead).
+func (fc *commonConn) payloadLimit() int {
+	if fc.entry != nil && fc.entry.layered {
+		return 0
+	}
+	return fc.events().MaxOutboundBuffered
 }
 
 func (fc *commonConn) LocalAddr() net.Addr {

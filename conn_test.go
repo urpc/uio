@@ -30,6 +30,7 @@ func TestCommonConnMetadataAndUnsupportedDeadlines(t *testing.T) {
 	local := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 1}
 	remote := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 2}
 	conn := &commonConn{addr: &addrPair{local: local}, remoteAddr: remoteAddrFrom(remote)}
+	conn.entry = bareEntry()
 	conn.SetUserdata("userdata")
 	if conn.LocalAddr() != local || conn.Userdata() != "userdata" {
 		t.Fatal("connection metadata was not preserved")
@@ -52,6 +53,7 @@ func TestCommonConnMetadataAndUnsupportedDeadlines(t *testing.T) {
 
 func TestCommonConnReadAndWriteToAcrossBuffers(t *testing.T) {
 	conn := &commonConn{inboundTail: []byte("cd")}
+	conn.entry = bareEntry()
 	_, _ = conn.inbound.WriteString("ab")
 	var dst bytes.Buffer
 	n, err := conn.WriteTo(&dst)
@@ -72,6 +74,7 @@ func TestCommonConnReadAndWriteToAcrossBuffers(t *testing.T) {
 	}
 
 	conn = &commonConn{inboundTail: []byte("cd")}
+	conn.entry = bareEntry()
 	_, _ = conn.inbound.WriteString("ab")
 	buffer := make([]byte, 3)
 	if n, err := conn.Read(buffer); err != nil || n != 3 || string(buffer) != "abc" {
@@ -82,6 +85,7 @@ func TestCommonConnReadAndWriteToAcrossBuffers(t *testing.T) {
 	}
 
 	conn = &commonConn{}
+	conn.entry = bareEntry()
 	_, _ = conn.inbound.WriteString("ab")
 	if n, err := conn.Read(buffer[:1]); err != nil || n != 1 || buffer[0] != 'a' {
 		t.Fatalf("buffer-only Read = %d, %v, %q", n, err, buffer[:1])
@@ -90,6 +94,7 @@ func TestCommonConnReadAndWriteToAcrossBuffers(t *testing.T) {
 
 func TestCommonConnPeekVariants(t *testing.T) {
 	conn := &commonConn{inboundTail: []byte("tail")}
+	conn.entry = bareEntry()
 	if got := conn.Peek(nil); got != nil {
 		t.Fatalf("Peek(nil) = %q", got)
 	}
@@ -104,6 +109,7 @@ func TestCommonConnPeekVariants(t *testing.T) {
 	}
 
 	conn = &commonConn{inboundTail: []byte("cd")}
+	conn.entry = bareEntry()
 	_, _ = conn.inbound.WriteString("ab")
 	buffer := make([]byte, 4)
 	if got := string(conn.Peek(buffer)); got != "abcd" {
@@ -138,6 +144,7 @@ func TestCommonConnDiscardVariants(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			conn := &commonConn{inboundTail: []byte(test.tail)}
+			conn.entry = bareEntry()
 			_, _ = conn.inbound.WriteString(test.buffered)
 			n, err := conn.Discard(test.discard)
 			if err != nil || n != test.wantN {
@@ -233,7 +240,8 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 }
 
 func TestUserdataMayBeSerializedOutsideCallback(t *testing.T) {
-	conn := &commonConn{events: &Events{}, loop: &eventLoop{}}
+	conn := &commonConn{loop: &eventLoop{}}
+	conn.entry = bareEntry()
 	conn.SetUserdata("value")
 	if conn.Userdata() != "value" {
 		t.Fatal("userdata was not available outside callback")
@@ -245,9 +253,8 @@ func TestUserdataMayBeSerializedOutsideCallback(t *testing.T) {
 // scope diagnostic; without the race detector the diagnostic is compiled out
 // and this is the access's own cost.
 func BenchmarkInboundAccessAssertion(b *testing.B) {
-	events := &Events{}
 	loop := &eventLoop{}
-	conn := &commonConn{events: events, loop: loop}
+	conn := &commonConn{loop: loop, entry: &entry{ev: &Events{}}}
 	b.Run("current-callback", func(b *testing.B) {
 		started := conn.beginInboundCallback()
 		for b.Loop() {

@@ -139,7 +139,7 @@ func newStdFDConn(events *Events, raw *stdRegistrationConn) *fdConn {
 	conn := &fdConn{
 		conn: raw, writeSig: make(chan struct{}, 1),
 	}
-	conn.events = events
+	conn.entry = events.plainEntry()
 	conn.loop = events.workers[0]
 	return conn
 }
@@ -422,7 +422,7 @@ func TestStdFlushDoesNotWaitForBlockedWriter(t *testing.T) {
 
 func TestStdWritevCopiesBeforeReturnAndDoesNotRetainVector(t *testing.T) {
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 		writeSig:   make(chan struct{}, 1),
 	}
 	first := []byte("header")
@@ -447,7 +447,7 @@ func TestStdWritevCopiesBeforeReturnAndDoesNotRetainVector(t *testing.T) {
 func TestStdLargeWritevUsesOwnedBuffersAndSmallWritesCoalesce(t *testing.T) {
 	t.Run("large Writev", func(t *testing.T) {
 		conn := &fdConn{
-			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 			writeSig:   make(chan struct{}, 1),
 		}
 		header := []byte("header")
@@ -478,7 +478,7 @@ func TestStdLargeWritevUsesOwnedBuffersAndSmallWritesCoalesce(t *testing.T) {
 
 	t.Run("small writes", func(t *testing.T) {
 		conn := &fdConn{
-			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 			writeSig:   make(chan struct{}, 1),
 		}
 		if _, err := conn.Write([]byte{'a'}); err != nil {
@@ -503,7 +503,7 @@ func TestStdLargeWritevUsesOwnedBuffersAndSmallWritesCoalesce(t *testing.T) {
 
 	t.Run("many tiny vectors", func(t *testing.T) {
 		conn := &fdConn{
-			commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+			commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 			writeSig:   make(chan struct{}, 1),
 		}
 		vec := make([][]byte, stdOwnedWriteThreshold)
@@ -527,7 +527,7 @@ func TestStdLargeWritevUsesOwnedBuffersAndSmallWritesCoalesce(t *testing.T) {
 
 func BenchmarkStdWritev1MiB(b *testing.B) {
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 		writeSig:   make(chan struct{}, 1),
 	}
 	header := make([]byte, 10)
@@ -580,7 +580,7 @@ func BenchmarkStdConcurrentWritev64KiB(b *testing.B) {
 	} {
 		b.Run(benchmark.name, func(b *testing.B) {
 			conn := &fdConn{
-				commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+				commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 				writeSig:   make(chan struct{}, 1),
 			}
 			b.ReportAllocs()
@@ -596,7 +596,7 @@ func BenchmarkStdConcurrentWritev64KiB(b *testing.B) {
 
 func BenchmarkStdWriteOwned1MiB(b *testing.B) {
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 		writeSig:   make(chan struct{}, 1),
 	}
 	payload := make([]byte, 1<<20)
@@ -621,7 +621,7 @@ func BenchmarkStdWriteOwned1MiB(b *testing.B) {
 
 func TestStdWriteOwnedTransfersBufferWithoutCopy(t *testing.T) {
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: 16}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: 16}).plainEntry()},
 		writeSig:   make(chan struct{}, 1),
 	}
 	buffer := AcquireBuffer(8)
@@ -651,7 +651,7 @@ func TestStdUDPWriteOwnedSendsOneDatagram(t *testing.T) {
 	}
 	defer sender.Close()
 	conn := &fdConn{udp: &stdUDPState{sock: sender}}
-	conn.events = &Events{}
+	conn.entry = (&Events{}).plainEntry()
 
 	buffer := AcquireBuffer(8)
 	_, _ = buffer.WriteString("datagram")
@@ -692,8 +692,8 @@ func TestStdDrainOutboundPreservesWritesQueuedDuringIO(t *testing.T) {
 	conn := &fdConn{
 		conn: raw, writeSig: make(chan struct{}, 1),
 	}
-	conn.events = &Events{MaxOutboundBuffered: 3}
-	conn.events.callbackWG.Add(1)
+	conn.entry = (&Events{MaxOutboundBuffered: 3}).plainEntry()
+	conn.events().callbackWG.Add(1)
 	writeLoopDone := make(chan struct{})
 	go func() {
 		conn.writeLoop()
@@ -791,7 +791,7 @@ func TestStdDrainOutboundClearsVectorStorage(t *testing.T) {
 
 	raw := newStdRegistrationConn(30003)
 	raw.openReturned.Store(true)
-	conn := &fdConn{commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}}, conn: raw}
+	conn := &fdConn{commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()}, conn: raw}
 	if _, err := conn.outbound.Write([]byte("payload")); err != nil {
 		t.Fatal(err)
 	}
@@ -812,7 +812,7 @@ func TestStdDrainOutboundClearsVectorStorage(t *testing.T) {
 
 func TestStdFlushCoalescesWakeWithoutAllocating(t *testing.T) {
 	conn := &fdConn{writeSig: make(chan struct{}, 1)}
-	conn.events = &Events{}
+	conn.entry = (&Events{}).plainEntry()
 
 	if err := conn.Flush(); err != nil {
 		t.Fatal(err)
@@ -1051,7 +1051,7 @@ func TestStdReadLoopKeepsLifetimeUntilExit(t *testing.T) {
 		return nil
 	}
 	conn := &fdConn{conn: raw}
-	conn.events = events
+	conn.entry = events.plainEntry()
 	events.callbackWG.Add(1)
 	readDone := make(chan struct{})
 	go func() {
@@ -1113,7 +1113,7 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 		return nil
 	}
 	conn := &fdConn{conn: raw}
-	conn.events = events
+	conn.entry = events.plainEntry()
 	events.callbackWG.Add(1)
 	done := make(chan struct{})
 	go func() {
@@ -1227,7 +1227,7 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 		in.Add(-1)
 	}
 	conn := &fdConn{udp: &stdUDPState{sock: client}}
-	conn.events = events
+	conn.entry = events.plainEntry()
 
 	firstDone := make(chan error, 1)
 	go func() {
@@ -1493,7 +1493,7 @@ func TestStdWakesBeforeOnOpenEachRunOnInbound(t *testing.T) {
 		Read: func(Conn) error { seq = append(seq, "data"); return nil },
 	})
 	conn := &fdConn{}
-	conn.events = events
+	conn.entry = events.plainEntry()
 	for range wakes {
 		events.callbackWG.Add(1)
 		conn.deliverWake()
@@ -1521,7 +1521,7 @@ func TestStdCloseBeforeReaderStillOpensAndCloses(t *testing.T) {
 		Close: func(_ Conn, err error) { seq = append(seq, "close: "+err.Error()) },
 	})
 	conn := &fdConn{}
-	conn.events = events
+	conn.entry = events.plainEntry()
 	conn.closing.Store(true)
 	conn.err = cause
 	atomic.StoreInt32(&conn.closed, 1)
@@ -1921,7 +1921,6 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 		}
 	}
 	events.Handler = FuncHandler{Open: count, Close: func(c Conn, _ error) { count(c) }}
-	events.Use(LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} }))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
@@ -1946,7 +1945,7 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 	}
 	local, _ := pair()
 	blocker := &closeBlocker{Conn: local, entered: make(chan struct{}), release: make(chan struct{})}
-	first, err := events.Adopt(blocker, nil)
+	first, err := events.Adopt(blocker, nil, WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1958,7 +1957,10 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	adopted := make(chan error, 1)
-	go func() { _, err := events.AdoptContext(ctx, second, "canceled"); adopted <- err }()
+	go func() {
+		_, err := events.AdoptContext(ctx, second, "canceled", WithLayers(PassThroughLayer))
+		adopted <- err
+	}()
 	var adoptErr error
 	select {
 	case adoptErr = <-adopted:

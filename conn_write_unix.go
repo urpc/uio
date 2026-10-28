@@ -61,7 +61,7 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 	}
 	// This fast rejection belongs after the direct path: data sent straight to
 	// the kernel never counts against the user-space payload limit.
-	if limit := conn.events.socketLimit(); limit > 0 && len(data) > limit {
+	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
 	if err := conn.precheckOutbound(len(data)); err != nil {
@@ -96,7 +96,7 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 	if conn.directOwner() {
 		return conn.writevOnLoop(vec, total)
 	}
-	if limit := conn.events.socketLimit(); limit > 0 && total > limit {
+	if limit := conn.payloadLimit(); limit > 0 && total > limit {
 		return 0, ErrOutboundOverflow
 	}
 	if err := conn.precheckOutbound(total); err != nil {
@@ -247,7 +247,7 @@ func (conn *fdConn) dropScratch() {
 		bytebuf.ReleaseBuffer(out)
 		holder.out = nil
 	}
-	conn.events.readPool.Put(holder)
+	conn.events().readPool.Put(holder)
 }
 
 // sendScratch sends the replies a read round reserved once it has ended,
@@ -312,11 +312,11 @@ func (conn *fdConn) sendScratch(holder *readBuffer) error {
 // midFlushThreshold is how many queued replies a read round accumulates
 // before it sends them mid-round (see readRound).
 func (conn *fdConn) midFlushThreshold() int {
-	return min(64<<10, conn.events.readBufferSize*4)
+	return min(64<<10, conn.events().readBufferSize*4)
 }
 
 func (conn *fdConn) coalesceBlockSize() int {
-	return min(64<<10, conn.events.readBufferSize*2)
+	return min(64<<10, conn.events().readBufferSize*2)
 }
 
 // coalesceOwnedMax is the largest owned buffer a corked round copies into its
@@ -344,12 +344,12 @@ func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
 // OnBytesWritten and a failure's close run after the lock is released. The lock
 // also orders the send before a later CloseWith.
 func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
-	if limit := conn.events.socketLimit(); limit > 0 && len(data) > limit {
+	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
 	owner := conn.descriptorOwner()
 	owner.submitMu.Lock()
-	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events().closing.Load() || conn.loop.stopping.Load() {
 		owner.submitMu.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -365,7 +365,7 @@ func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 }
 
 func (conn *fdConn) precheckOutbound(size int) error {
-	if limit := int64(conn.events.socketLimit()); limit > 0 {
+	if limit := int64(conn.payloadLimit()); limit > 0 {
 		pending := conn.pending.Load()
 		if int64(size) > limit-pending {
 			return ErrOutboundOverflow
@@ -380,12 +380,12 @@ func (conn *fdConn) precheckOutbound(size int) error {
 // bytes are sent by a write turn, beside whatever the connection's turn is
 // reading. ErrOutboundOverflow accepts nothing and returns owned to the caller.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
-	if limit := conn.events.socketLimit(); limit > 0 && size > limit {
+	if limit := conn.payloadLimit(); limit > 0 && size > limit {
 		return 0, ErrOutboundOverflow
 	}
 	// Allocation and the only payload copy have already happened off-lock.
 	conn.submitMu.Lock()
-	if conn.loop == nil || conn.outputClosed() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.loop == nil || conn.outputClosed() || conn.events().closing.Load() || conn.loop.stopping.Load() {
 		conn.submitMu.Unlock()
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
@@ -402,7 +402,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 
 func (conn *fdConn) reservePending(size int64) bool {
 	// Both callback partial writes and external producers reserve this counter.
-	limit := int64(conn.events.socketLimit())
+	limit := int64(conn.payloadLimit())
 	if limit <= 0 {
 		conn.pending.Add(size)
 		return true
@@ -461,7 +461,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		return conn.sendUDPOnLoop(data)
 	}
 	conn.handOverScratch()
-	threshold := conn.events.WriteBufferedThreshold
+	threshold := conn.events().WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && len(data) < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
@@ -499,7 +499,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		testHookDirectSendRefused(conn)
 	}
 	if written == len(data) {
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := data[written:]
@@ -510,7 +510,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 		}
 		// A partial payload is on the wire and its suffix cannot be queued:
 		// the stream is broken, so report a short write, not an overflow.
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		conn.failDirectWrite(ErrOutboundOverflow)
 		return written, io.ErrShortWrite
 	}
@@ -519,7 +519,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	conn.setWriteBlocked(written == 0)
 	// Reported once the suffix is accounted, so OnBytesWritten never observes a
 	// transient empty queue in the middle of this write.
-	conn.events.onSocketBytesWrite(conn, written)
+	conn.events().onSocketBytesWrite(conn, written)
 	return len(data), nil
 }
 
@@ -531,7 +531,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		return 0, ErrUnsupported
 	}
 	conn.handOverScratch()
-	threshold := conn.events.WriteBufferedThreshold
+	threshold := conn.events().WriteBufferedThreshold
 	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && total < threshold)
 	if !queued && !conn.claimDirectSend() {
 		queued = true
@@ -563,7 +563,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		}
 	}
 	if written == total {
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := total - written
@@ -574,14 +574,14 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 		}
 		// A partial vector is on the wire and its suffix cannot be queued:
 		// the stream is broken, so report a short write, not an overflow.
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		conn.failDirectWrite(ErrOutboundOverflow)
 		return written, io.ErrShortWrite
 	}
 	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
 	conn.queueDirectSuffix(owned)
 	conn.setWriteBlocked(written == 0)
-	conn.events.onSocketBytesWrite(conn, written)
+	conn.events().onSocketBytesWrite(conn, written)
 	return total, nil
 }
 
@@ -598,7 +598,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 // short; see coalesceOwned for which are copied.
 func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
 	conn.handOverScratch()
-	threshold := conn.events.WriteBufferedThreshold
+	threshold := conn.events().WriteBufferedThreshold
 	// A corked read round never sends directly, exactly as writevOnLoop does
 	// not: its replies queue, coalesced, and leave together when the round
 	// ends, or at the mid-round flush once they pass midFlushThreshold.
@@ -644,7 +644,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	}
 	if written == size {
 		bytebuf.ReleaseBuffer(owned)
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		return written, nil
 	}
 	remaining := size - written
@@ -658,7 +658,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		// the stream is broken, so the buffer is consumed and the caller is
 		// told the write was short rather than merely overflowed.
 		bytebuf.ReleaseBuffer(owned)
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		conn.failDirectWrite(ErrOutboundOverflow)
 		return written, io.ErrShortWrite
 	}
@@ -667,7 +667,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 	}
 	conn.queueDirectSuffix(owned)
 	conn.setWriteBlocked(written == 0)
-	conn.events.onSocketBytesWrite(conn, written)
+	conn.events().onSocketBytesWrite(conn, written)
 	return size, nil
 }
 
@@ -746,7 +746,7 @@ func (conn *fdConn) finishDatagram(data []byte, written int, err error) (int, er
 // inside OnBytesWritten is reported once that call returns. Nobody waits for the
 // claim, so OnBytesWritten callbacks that write to each other cannot deadlock.
 func (conn *fdConn) reportOutbound(n int) {
-	if n <= 0 || conn.events.cb.onBytesWritten == nil {
+	if n <= 0 || conn.callbacks().onBytesWritten == nil {
 		return
 	}
 	udp := conn.udp
@@ -771,7 +771,7 @@ func (conn *fdConn) drainOutbound() {
 		if pending == 0 {
 			return
 		}
-		conn.events.cb.onBytesWritten(conn.events.observed(conn), int(pending))
+		conn.callbacks().onBytesWritten(conn.events().observed(conn), int(pending))
 	}
 }
 
@@ -906,7 +906,7 @@ func (conn *fdConn) flushWrite() (int, error) {
 func (conn *fdConn) retireFlush(written int, err error) (int, error) {
 	if written > 0 {
 		conn.retireSent(written)
-		conn.events.onSocketBytesWrite(conn, written)
+		conn.events().onSocketBytesWrite(conn, written)
 		if conn.close.isDraining() {
 			// A drain's queue is moving: its bound starts over, so a close
 			// waits as long as its output keeps leaving, not a fixed time.

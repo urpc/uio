@@ -641,7 +641,7 @@ func (conn *fdConn) readHeld() bool { return conn.flags.Load()&readHeldFlag != 0
 // unconsumed, so TCP flow control slows the peer instead of the buffer
 // growing. It runs only after a callback left bytes behind.
 func (conn *fdConn) holdsRead() bool {
-	if limit := conn.events.MaxInboundBuffered; limit > 0 && conn.inbound.Len() >= limit {
+	if limit := conn.events().MaxInboundBuffered; limit > 0 && conn.inbound.Len() >= limit {
 		conn.flags.Or(readHeldFlag)
 		return true
 	}
@@ -652,7 +652,7 @@ func (conn *fdConn) holdsRead() bool {
 // below MaxInboundBuffered. Edges that arrived while reads were held were
 // dropped, so the read is scheduled here rather than left to the next edge.
 func (conn *fdConn) resumeHeldRead() {
-	if conn.inbound.Len() >= conn.events.MaxInboundBuffered || conn.isClosing() {
+	if conn.inbound.Len() >= conn.events().MaxInboundBuffered || conn.isClosing() {
 		return
 	}
 	conn.flags.And(^readHeldFlag)
@@ -726,7 +726,7 @@ func (conn *fdConn) CloseWrite() error {
 		return net.ErrClosed
 	}
 	conn.submitMu.Lock()
-	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() {
+	if conn.isClosing() || conn.events().closing.Load() || conn.loop.stopping.Load() {
 		conn.submitMu.Unlock()
 		return net.ErrClosed
 	}
@@ -783,7 +783,7 @@ func (conn *fdConn) shutWrite() {
 // the application sees Read report io.EOF, and the connection closes once its
 // own writing half is shut as well and callbacks consumed what the peer sent.
 func (conn *fdConn) onReadEOF() error {
-	if !conn.events.AllowHalfOpen {
+	if !conn.events().AllowHalfOpen {
 		return io.EOF
 	}
 	conn.flags.Or(readEOFFlag)
@@ -1021,7 +1021,7 @@ func (conn *fdConn) watch() error {
 // accepts (Linux; see setListenerOptions), there is nothing left to apply and
 // accepting a connection costs no setsockopt at all.
 func (conn *fdConn) admitAccepted(tcp bool) bool {
-	if conn.loop == nil || conn.events.closing.Load() {
+	if conn.loop == nil || conn.events().closing.Load() {
 		conn.closeUnregistered()
 		return false
 	}
@@ -1489,14 +1489,14 @@ func (server *fdConn) releaseSocket() <-chan struct{} {
 	// Counted before it is published: whoever finds the close under way —
 	// the shutdown's own teardown among them — finds Serve's wait covering it
 	// too, so Serve returns with the address free.
-	server.events.socketCloses.add()
+	server.events().socketCloses.add()
 	server.udp.closed = done
 	server.udp.closeMu.Unlock()
 	if hook := testHookSocketClosePublished.Load(); hook != nil {
 		(*hook)(server)
 	}
 	go func() {
-		defer server.events.socketCloses.done()
+		defer server.events().socketCloses.done()
 		defer close(done)
 		server.udp.gate.markClosed()
 		for !server.udp.gate.waitDrain(socketCloseWait) {
@@ -1563,7 +1563,7 @@ func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
 }
 
 func (conn *fdConn) fireOnOpen() {
-	if callback := conn.events.cb.onOpen; callback != nil {
+	if callback := conn.callbacks().onOpen; callback != nil {
 		started := conn.beginInboundCallback()
 		callback(conn)
 		conn.endInboundCallback(started)
@@ -1584,7 +1584,7 @@ func (conn *fdConn) fireOnRead() error {
 	var skipRead bool
 	skipRead, err = conn.fireWakeTimer()
 	if err == nil && !skipRead {
-		if callback := conn.events.cb.onRead; callback != nil {
+		if callback := conn.callbacks().onRead; callback != nil {
 			err = callback(conn)
 		} else {
 			_, _ = conn.Discard(-1)
@@ -1633,14 +1633,14 @@ func (conn *fdConn) ReserveInbound(n int) error {
 	if conn.isDatagram() || n <= 0 {
 		return nil
 	}
-	return conn.reserveInbound(n, conn.events.MaxInboundBuffered)
+	return conn.reserveInbound(n, conn.events().MaxInboundBuffered)
 }
 
 // onRead drains an edge-triggered stream with bounded work per task. The
 // borrowed read buffer is exposed directly during OnRead; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
-	holder := conn.events.readPool.Get()
+	holder := conn.events().readPool.Get()
 	conn.scratch = holder
 	// A read round is corked: its replies accumulate in outbound and are
 	// flushed once when the event ends, or at the mid-round flush once they
@@ -1660,7 +1660,7 @@ func (conn *fdConn) onRead() error {
 			err = sendErr
 		}
 	}
-	conn.events.readPool.Put(holder)
+	conn.events().readPool.Put(holder)
 	return err
 }
 
@@ -1684,8 +1684,8 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		// inboundTail aliases the pooled read buffer. Unconsumed bytes are copied
 		// into inbound before the buffer is reused by the next syscall.
 		conn.inboundTail = buffer[:n]
-		if conn.events.cb.onBytesRead != nil {
-			conn.events.onSocketBytesRead(conn, n)
+		if conn.callbacks().onBytesRead != nil {
+			conn.events().onSocketBytesRead(conn, n)
 		}
 		if conn.isClosing() {
 			conn.inboundTail = nil
@@ -1740,7 +1740,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 func (conn *fdConn) onRecvUDP() error {
 	buffer := conn.udp.readBuffer
 	if buffer == nil {
-		buffer = make([]byte, conn.events.readBufferSize)
+		buffer = make([]byte, conn.events().readBufferSize)
 		conn.udp.readBuffer = buffer
 	}
 	totalRead := 0
@@ -1785,7 +1785,8 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 				return
 			}
 			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
-			packetConn.events, packetConn.loop = conn.events, conn.loop
+			packetConn.entry = conn.entry
+			packetConn.loop = conn.loop
 			packetConn.SetUserdata(conn.Userdata()) // the listener's
 			packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
 			udp.peers[source] = packetConn
@@ -1803,7 +1804,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 		return
 	}
 	packetConn.inboundTail = packet
-	packetConn.events.onSocketBytesRead(packetConn, len(packet))
+	packetConn.events().onSocketBytesRead(packetConn, len(packet))
 	err := packetConn.fireOnRead()
 	started := packetConn.beginInboundCallback()
 	_, _ = packetConn.Discard(-1)
@@ -1839,7 +1840,7 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	}
 	sockaddr := key.Sockaddr()
 	udp.peerMu.Lock()
-	if udp.peers == nil || server.isClosing() || server.events.closing.Load() {
+	if udp.peers == nil || server.isClosing() || server.events().closing.Load() {
 		udp.peerMu.Unlock()
 		return nil, net.ErrClosed
 	}
@@ -1854,7 +1855,8 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 		udp.closing = append(udp.closing, existing)
 	}
 	child := &fdConn{fd: server.fd, udp: &unixUDPState{remote: sockaddr, server: server, key: key}}
-	child.events, child.loop = server.events, server.loop
+	child.entry = server.entry
+	child.loop = server.loop
 	child.addr, child.remoteAddr = server.addr, key.NetAddr().AddrPort()
 	child.SetUserdata(userdata)
 	child.udp.openOwed.Store(true)
@@ -1877,7 +1879,7 @@ func (server *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 	sockaddr := key.Sockaddr()
 	server.submitMu.Lock()
 	defer server.submitMu.Unlock()
-	if server.isClosing() || server.close.isReleased() || server.events.closing.Load() {
+	if server.isClosing() || server.close.isReleased() || server.events().closing.Load() {
 		return 0, net.ErrClosed
 	}
 	if !server.udp.gate.enter() {
@@ -2001,7 +2003,7 @@ func (conn *fdConn) CloseGracefully(cause error) error {
 		return conn.CloseWith(cause)
 	}
 	conn.submitMu.Lock()
-	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.drain() {
+	if conn.isClosing() || conn.events().closing.Load() || conn.loop.stopping.Load() || !conn.close.drain() {
 		conn.submitMu.Unlock()
 		return net.ErrClosed
 	}
@@ -2058,7 +2060,7 @@ func (conn *fdConn) CloseWith(err error) error {
 		return net.ErrClosed
 	}
 	conn.submitMu.Lock()
-	if conn.isClosing() || conn.descriptorOwner().isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.request() {
+	if conn.isClosing() || conn.descriptorOwner().isClosing() || conn.events().closing.Load() || conn.loop.stopping.Load() || !conn.close.request() {
 		conn.submitMu.Unlock()
 		return net.ErrClosed
 	}
@@ -2247,7 +2249,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 // owed, refused by the Executor, never got OnOpen, so it gets no OnClose
 // either.
 func (conn *fdConn) closeCallbackDue() bool {
-	return !conn.internal && conn.events.cb.onClose != nil && conn.taskState.Load()&ioEventOpen == 0
+	return !conn.internal && conn.callbacks().onClose != nil && conn.taskState.Load()&ioEventOpen == 0
 }
 
 // deliverClose runs OnClose for a released connection on the owner that
@@ -2329,13 +2331,13 @@ func (conn *fdConn) fireCloseCallback() {
 	err := conn.takeDeferredCloseCause()
 	if conn.udp != nil && conn.udp.openOwed.CompareAndSwap(true, false) {
 		// A DialPeer child closed before its OnOpen ran gets it first.
-		if callback := conn.events.cb.onOpen; callback != nil {
+		if callback := conn.callbacks().onOpen; callback != nil {
 			started := conn.beginInboundCallback()
 			callback(conn)
 			conn.endInboundCallback(started)
 		}
 	}
-	if callback := conn.events.cb.onClose; callback != nil && !conn.internal {
+	if callback := conn.callbacks().onClose; callback != nil && !conn.internal {
 		started := conn.beginInboundCallback()
 		callback(conn, err)
 		conn.endInboundCallback(started)

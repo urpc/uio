@@ -38,7 +38,7 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 	pool := newIOTaskPool(rejectingNativeExecutor{})
 	tasks := make([]IOTask, connections)
 	for index := range tasks {
-		conn := &fdConn{commonConn: commonConn{events: events}}
+		conn := &fdConn{commonConn: commonConn{entry: events.plainEntry()}}
 		conn.close.phase.Store(closeResourcesReleased)
 		conn.taskState.Store(ioEventClose)
 		conn.taskState.Or(taskScheduledBit)

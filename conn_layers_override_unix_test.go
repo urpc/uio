@@ -72,7 +72,7 @@ func overrideListener(t *testing.T, count int) string {
 	return listener.Addr().String()
 }
 
-func dialOverride(t *testing.T, events *Events, addr string, opts ...DialOption) Conn {
+func dialOverride(t *testing.T, events *layeredEvents, addr string, opts ...DialOption) Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -89,8 +89,8 @@ func dialOverride(t *testing.T, events *Events, addr string, opts ...DialOption)
 func TestDialWithLayersOverridesTheChain(t *testing.T) {
 	def, own := &markLayer{}, &markLayer{}
 	addr := overrideListener(t, 2)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return def }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return def })}, func(ev *Events) {
+
 	})
 	dialOverride(t, events, addr, WithLayers(layerOf(own)))
 	if got := own.opened.Load(); got != 1 {
@@ -110,8 +110,8 @@ func TestDialWithLayersOverridesTheChain(t *testing.T) {
 func TestDialWithLayersEmptyIsPassThrough(t *testing.T) {
 	def := &markLayer{}
 	addr := overrideListener(t, 1)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return def }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return def })}, func(ev *Events) {
+
 	})
 	conn := dialOverride(t, events, addr, WithLayers())
 	if _, ok := conn.(*layerNode); !ok {
@@ -122,32 +122,38 @@ func TestDialWithLayersEmptyIsPassThrough(t *testing.T) {
 	}
 }
 
-// A dial or adoption asking for its own chain on an Events with no layers is
-// refused before the socket moves.
-func TestWithLayersNeedsTheStack(t *testing.T) {
-	addr := overrideListener(t, 0)
-	events := dialLayered(t, addr, nil) // no Use: no stack
-	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
-	defer cancel()
-	_, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(layerOf(&markLayer{})))
-	if !errors.Is(err, ErrLayersWithoutStack) {
-		t.Fatalf("DialContext = %v, want ErrLayersWithoutStack", err)
+// A chain needs nothing of the Events: the endpoint builds its own stack, so
+// a dial and an adoption on an Events with no chain at all run theirs.
+func TestWithLayersOnChainlessEvents(t *testing.T) {
+	addr := overrideListener(t, 1)
+	events := dialLayered(t, addr, nil, nil) // no chain anywhere
+	own := &markLayer{}
+	_ = dialOverride(t, events, addr, WithLayers(layerOf(own)))
+	if got := own.opened.Load(); got != 1 {
+		t.Fatalf("the dial's own layer opened %d times, want 1", got)
 	}
 	raw, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = events.Adopt(raw, nil, WithLayers(layerOf(&markLayer{})))
-	if !errors.Is(err, ErrLayersWithoutStack) {
-		t.Fatalf("Adopt = %v, want ErrLayersWithoutStack", err)
+	adopted := &markLayer{}
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.AdoptContext(ctx, raw, nil, WithLayers(layerOf(adopted)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got := adopted.opened.Load(); got != 1 {
+		t.Fatalf("the adopted connection's own layer opened %d times, want 1", got)
 	}
 }
 
 // A chain past the stack's layer cap is refused before dialing.
 func TestWithLayersLayerCap(t *testing.T) {
 	addr := overrideListener(t, 0)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(PassThroughLayer)
+	events := dialLayered(t, addr, []Layer{PassThroughLayer}, func(ev *Events) {
+
 	})
 	chain := make([]Layer, maxLayers+1)
 	for i := range chain {
@@ -161,10 +167,9 @@ func TestWithLayersLayerCap(t *testing.T) {
 	}
 }
 
-// A packet connection carries no layers, whether they come from Use or from
-// the dial itself.
+// A packet connection carries no layers.
 func TestWithLayersRefusesPacketConnections(t *testing.T) {
-	events := dialLayered(t, overrideListener(t, 0), nil)
+	events := dialLayered(t, overrideListener(t, 0), nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
 	if _, err := events.DialContext(ctx, "udp://127.0.0.1:1", nil, WithLayers(PassThroughLayer)); !errors.Is(err, ErrLayersNeedStream) {
@@ -177,8 +182,8 @@ func TestWithLayersRefusesPacketConnections(t *testing.T) {
 func TestWithLayersConcurrentDials(t *testing.T) {
 	const dials = 8
 	addr := overrideListener(t, dials)
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(PassThroughLayer)
+	events := dialLayered(t, addr, []Layer{PassThroughLayer}, func(ev *Events) {
+
 	})
 	own := make([]*markLayer, dials)
 	var wg sync.WaitGroup
@@ -209,8 +214,8 @@ func TestWithLayersConcurrentDials(t *testing.T) {
 // Events' chain, for that connection alone.
 func TestAdoptWithLayersOverridesTheChain(t *testing.T) {
 	def, own := &markLayer{}, &markLayer{}
-	events := dialLayered(t, overrideListener(t, 0), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return def }))
+	events := dialLayered(t, overrideListener(t, 0), []Layer{LayerFunc(func(LayerContext) LayerHandler { return def })}, func(ev *Events) {
+
 	})
 	addr := overrideListener(t, 1)
 	raw, err := net.Dial("tcp", addr)

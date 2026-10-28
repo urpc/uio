@@ -194,7 +194,7 @@ func (fc *fdConn) afterRegister() {
 // loop before the loop can stop. Readers and openers have their own counts:
 // this count covers the connection after it leaves those owners' tables.
 func (fc *fdConn) retainLifecycle() {
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	fc.lifecycle = true
 }
 
@@ -210,7 +210,7 @@ func (fc *fdConn) openOnReader() bool {
 	fc.ensureOpenLocked()
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
 		started := fc.beginInboundCallback()
-		err := fc.events.onRead(fc)
+		err := fc.events().onRead(fc)
 		fc.endInboundCallback(started)
 		if err != nil {
 			fc.requestClose(err)
@@ -243,7 +243,7 @@ func (fc *fdConn) ensureOpenLocked() {
 }
 
 func (fc *fdConn) fireOnOpen() {
-	if callback := fc.events.cb.onOpen; callback != nil {
+	if callback := fc.callbacks().onOpen; callback != nil {
 		started := fc.beginInboundCallback()
 		callback(fc)
 		fc.endInboundCallback(started)
@@ -428,7 +428,7 @@ func (fc *fdConn) armWake(when time.Time, every time.Duration) {
 // deadline passed; see the Conn interface's OnTimer and the native
 // fireWakeTimer for skipRead's meaning.
 func (fc *fdConn) fireWakeTimer() (skipRead bool, err error) {
-	if fc.events.cb.onTimer == nil {
+	if fc.callbacks().onTimer == nil {
 		return false, nil
 	}
 	fc.wakeMu.Lock()
@@ -450,7 +450,7 @@ func (fc *fdConn) fireWakeTimer() (skipRead bool, err error) {
 	if fc.isClosing() {
 		return false, nil
 	}
-	if err := fc.events.cb.onTimer(fc); err != nil {
+	if err := fc.callbacks().onTimer(fc); err != nil {
 		return true, err
 	}
 	return fc.isClosing(), nil
@@ -500,7 +500,7 @@ func (fc *fdConn) expireWake(generation uint64) {
 // socketCloseWait may be waiting for this very Close, so both fall back to
 // the counted close task, which closes the socket once the Control returns.
 func (fc *fdConn) closeListenerSocket(err error) {
-	events := fc.events
+	events := fc.events()
 	if fc.udp.inControl() || !fc.udp.controlsQuiet() {
 		fc.requestClose(err)
 		return
@@ -818,7 +818,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		return 0, nil
 	}
 	if len(p) >= stdOwnedWriteThreshold {
-		if limit := fc.events.socketLimit(); limit > 0 && len(p) > limit {
+		if limit := fc.payloadLimit(); limit > 0 && len(p) > limit {
 			return 0, ErrOutboundOverflow
 		}
 		owned := bytebuf.CloneBuffer(p)
@@ -835,7 +835,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-len(p) {
+	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-len(p) {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
@@ -863,7 +863,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 // reported once that call returns. Nobody waits for the claim, so OnBytesWritten
 // callbacks that write to each other cannot deadlock.
 func (fc *fdConn) reportOutbound(n int) {
-	if fc.events.cb.onBytesWritten == nil {
+	if fc.callbacks().onBytesWritten == nil {
 		return
 	}
 	udp := fc.udp
@@ -888,7 +888,7 @@ func (fc *fdConn) drainOutboundReports() {
 		if pending == 0 {
 			return
 		}
-		fc.events.cb.onBytesWritten(fc.events.observed(fc), int(pending))
+		fc.callbacks().onBytesWritten(fc.events().observed(fc), int(pending))
 	}
 }
 
@@ -920,7 +920,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return 0, nil
 	}
 	if total >= stdOwnedWriteThreshold {
-		if limit := fc.events.socketLimit(); limit > 0 && total > limit {
+		if limit := fc.payloadLimit(); limit > 0 && total > limit {
 			return 0, ErrOutboundOverflow
 		}
 		var inline [8]*bytebuf.Buffer
@@ -940,7 +940,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 			releaseStdBuffers(owned)
 			return 0, net.ErrClosed
 		}
-		if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
+		if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 			fc.mux.Unlock()
 			releaseStdBuffers(owned)
 			return 0, ErrOutboundOverflow
@@ -960,7 +960,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
+	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
@@ -1019,7 +1019,7 @@ func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
 	}
-	if limit := fc.events.socketLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
+	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
 		fc.mux.Unlock()
 		// An overflowed buffer was never accepted, so it remains the caller's.
 		return 0, ErrOutboundOverflow
@@ -1227,7 +1227,7 @@ func (fc *fdConn) enqueueClose(err error) error {
 	// then the connection's own count holds Serve's join, and once it is
 	// published a shutdown leaves the close to this request, which must
 	// still be counted when it hands the close on.
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	fc.closing.Store(true)
 	if fc.udp != nil && fc.internal {
 		fc.udp.closingPeers = fc.udp.peers
@@ -1241,7 +1241,7 @@ func (fc *fdConn) enqueueClose(err error) error {
 	t := acquireTask(closeTask, fc)
 	t.err = err
 	if fc.loop != nil && fc.loop.submitTask(t) {
-		fc.events.callbackWG.Done() // the loop, which Serve joins, has it
+		fc.events().callbackWG.Done() // the loop, which Serve joins, has it
 		return nil
 	}
 	releaseTask(t)
@@ -1250,7 +1250,7 @@ func (fc *fdConn) enqueueClose(err error) error {
 	// descriptor reference, or another resource that closing the socket must
 	// wait for it to release.
 	go func() {
-		defer fc.events.callbackWG.Done()
+		defer fc.events().callbackWG.Done()
 		fc.closeOnLoop(err)
 	}()
 	return nil
@@ -1277,7 +1277,7 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	if err := fc.checkPeerAddr(addr); err != nil {
 		return nil, err
 	}
-	events := fc.events
+	events := fc.events()
 	events.mux.Lock()
 	if events.closing.Load() {
 		events.mux.Unlock()
@@ -1300,11 +1300,11 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	}
 	// A closing peer's counted task owns its end even after replacement.
 	child := &fdConn{}
+	child.entry = fc.entry
 	child.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
 	child.addr = fc.addr
 	child.setRemoteAddr(net.UDPAddrFromAddrPort(rAddr))
 	child.loop = fc.loop
-	child.events = fc.events
 	child.SetUserdata(userdata)
 	child.retainLifecycle()
 	fc.udp.peers[rAddr] = child
@@ -1481,9 +1481,9 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 	// The connection's lifecycle reservation, or its still-counted owner
 	// for an unregistered/internal connection, precedes this Add. Shutdown
 	// cannot finish between resource release and this hand-off.
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	go func() {
-		defer fc.events.callbackWG.Done()
+		defer fc.events().callbackWG.Done()
 		fc.deliverCloseCallback(err)
 	}()
 }
@@ -1504,9 +1504,9 @@ func (fc *fdConn) deliverCloseCallback(err error) {
 	}
 	if fc.lifecycle {
 		fc.lifecycle = false
-		defer fc.events.callbackWG.Done()
+		defer fc.events().callbackWG.Done()
 	}
-	if callback := fc.events.cb.onClose; callback != nil && !fc.internal {
+	if callback := fc.callbacks().onClose; callback != nil && !fc.internal {
 		fc.inbound.Reset()
 		fc.inboundTail = nil
 		started := fc.beginInboundCallback()
@@ -1541,13 +1541,13 @@ func (fc *fdConn) YieldRead() error { return fc.Wake() }
 // OnClose — callbackMu serializes them — and it counts as a lifecycle callback
 // so Wait joins it.
 func (fc *fdConn) runWakeTask() error {
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	go fc.deliverWake()
 	return nil
 }
 
 func (fc *fdConn) deliverWake() {
-	defer fc.events.callbackWG.Done()
+	defer fc.events().callbackWG.Done()
 	if fc.isClosing() {
 		return
 	}
@@ -1565,12 +1565,12 @@ func (fc *fdConn) deliverWake() {
 	}
 	started := fc.beginInboundCallback()
 	defer fc.endInboundCallback(started)
-	if err := fc.events.onRead(fc); err != nil {
+	if err := fc.events().onRead(fc); err != nil {
 		fc.requestClose(err)
 		return
 	}
 	fc.noteReadEnded()
-	if fc.readHeld && fc.inbound.Len() < fc.events.MaxInboundBuffered {
+	if fc.readHeld && fc.inbound.Len() < fc.events().MaxInboundBuffered {
 		fc.readHeld = false
 		// A close may have filled the slot already; either signal resumes.
 		select {
@@ -1589,17 +1589,17 @@ func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}
 // connection closes: a close wakes it through the same notification channel,
 // and the drain then reports the closed transport.
 func (fc *fdConn) writeLoop() {
-	defer fc.events.callbackWG.Done()
+	defer fc.events().callbackWG.Done()
 	for range fc.writeSig {
 		written, err := fc.drainOutbound()
 		if written > 0 {
-			fc.events.onSocketBytesWrite(fc, written)
+			fc.events().onSocketBytesWrite(fc, written)
 		}
 		if err == nil {
 			err = fc.shutWriteIfDrained()
 		}
 		if err != nil {
-			fc.events.closeConn(fc, err)
+			fc.events().closeConn(fc, err)
 			return
 		}
 	}
@@ -1691,14 +1691,14 @@ func (fc *fdConn) onReadEOF() {
 	}
 	fc.readEOF.Store(true)
 	started := fc.beginInboundCallback()
-	err := fc.events.onRead(fc)
+	err := fc.events().onRead(fc)
 	fc.endInboundCallback(started)
 	if err == nil {
 		fc.noteReadEnded()
 	}
 	fc.callbackMu.Unlock()
 	if err != nil {
-		fc.events.closeConn(fc, err)
+		fc.events().closeConn(fc, err)
 	}
 }
 
@@ -1717,22 +1717,22 @@ func (fc *fdConn) ReserveInbound(n int) error {
 	if fc.isDatagram() || n <= 0 {
 		return nil
 	}
-	return fc.reserveInbound(n, fc.events.MaxInboundBuffered)
+	return fc.reserveInbound(n, fc.events().MaxInboundBuffered)
 }
 
 // readUDPLoop owns a connected UDP socket. A datagram is borrowed for one
 // callback and always discarded before the next blocking read.
 func (fc *fdConn) readUDPLoop() {
-	defer fc.events.callbackWG.Done()
+	defer fc.events().callbackWG.Done()
 
-	holder := fc.events.readPool.Get()
-	defer fc.events.readPool.Put(holder)
+	holder := fc.events().readPool.Get()
+	defer fc.events().readPool.Put(holder)
 	buffer := holder.bytes
 	for {
 		n, _, err := fc.udp.sock.ReadFrom(buffer)
 		if nil != err {
 			// close on error.
-			fc.events.closeConn(fc, err)
+			fc.events().closeConn(fc, err)
 			return
 		}
 
@@ -1745,15 +1745,15 @@ func (fc *fdConn) readUDPLoop() {
 		fc.inboundTail = buffer[:n]
 
 		// trigger inbound event.
-		fc.events.onSocketBytesRead(fc, n)
+		fc.events().onSocketBytesRead(fc, n)
 
 		// fire data callback.
 		started := fc.beginInboundCallback()
-		if err = fc.events.onRead(fc); nil != err {
+		if err = fc.events().onRead(fc); nil != err {
 			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
 			// close on error.
-			fc.events.closeConn(fc, err)
+			fc.events().closeConn(fc, err)
 			break
 		}
 
@@ -1768,10 +1768,10 @@ func (fc *fdConn) readUDPLoop() {
 // io.Reader. callbackMu protects both the borrowed slice and retained inbound
 // storage for the full callback lifetime.
 func (fc *fdConn) readLoop() {
-	defer fc.events.callbackWG.Done()
+	defer fc.events().callbackWG.Done()
 
-	holder := fc.events.readPool.Get()
-	defer fc.events.readPool.Put(holder)
+	holder := fc.events().readPool.Get()
+	defer fc.events().readPool.Put(holder)
 	buffer := holder.bytes
 	for {
 		n, readErr := fc.conn.Read(buffer)
@@ -1786,18 +1786,18 @@ func (fc *fdConn) readLoop() {
 				return
 			}
 			fc.inboundTail = buffer[:n]
-			fc.events.onSocketBytesRead(fc, n)
+			fc.events().onSocketBytesRead(fc, n)
 			started := fc.beginInboundCallback()
-			if callbackErr := fc.events.onRead(fc); callbackErr != nil {
+			if callbackErr := fc.events().onRead(fc); callbackErr != nil {
 				fc.endInboundCallback(started)
 				fc.callbackMu.Unlock()
-				fc.events.closeConn(fc, callbackErr)
+				fc.events().closeConn(fc, callbackErr)
 				return
 			}
 			if len(fc.inboundTail) > 0 {
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
-				if limit := fc.events.MaxInboundBuffered; limit > 0 && fc.inbound.Len() >= limit {
+				if limit := fc.events().MaxInboundBuffered; limit > 0 && fc.inbound.Len() >= limit {
 					fc.readHeld = true
 				}
 			}
@@ -1809,11 +1809,11 @@ func (fc *fdConn) readLoop() {
 			}
 		}
 		if readErr != nil {
-			if readErr == io.EOF && fc.events.AllowHalfOpen {
+			if readErr == io.EOF && fc.events().AllowHalfOpen {
 				fc.onReadEOF()
 				return
 			}
-			fc.events.closeConn(fc, readErr)
+			fc.events().closeConn(fc, readErr)
 			return
 		}
 	}
@@ -1842,7 +1842,7 @@ func (fc *fdConn) waitHeldRead() bool {
 			if heldDeadlineExpiredForTest != nil {
 				heldDeadlineExpiredForTest()
 			}
-			fc.events.closeConn(fc, os.ErrDeadlineExceeded)
+			fc.events().closeConn(fc, os.ErrDeadlineExceeded)
 			fc.deadlineMu.Unlock()
 			return false
 		}
@@ -1878,7 +1878,7 @@ func (fc *fdConn) fireWriteEvent() error {
 		return nil // udp client nothing to do.
 	}
 
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	go fc.writeLoop()
 
 	return nil
@@ -1887,10 +1887,10 @@ func (fc *fdConn) fireWriteEvent() error {
 // fireReadEvent starts the connection's read goroutine, which runs OnOpen
 // before its first read; see openOnReader.
 func (fc *fdConn) fireReadEvent() error {
-	fc.events.callbackWG.Add(1)
+	fc.events().callbackWG.Add(1)
 	go func() {
 		if !fc.openOnReader() {
-			fc.events.callbackWG.Done()
+			fc.events().callbackWG.Done()
 			return
 		}
 		if fc.udp != nil {
@@ -1906,10 +1906,10 @@ func (fc *fdConn) fireReadEvent() error {
 // borrowed for one callback and discarded before the receive buffer is reused.
 func (fc *fdConn) listenUDP() error {
 	// UDP peer callbacks all run on this listener goroutine.
-	defer fc.events.callbackWG.Done()
+	defer fc.events().callbackWG.Done()
 
-	holder := fc.events.readPool.Get()
-	defer fc.events.readPool.Put(holder)
+	holder := fc.events().readPool.Get()
+	defer fc.events().readPool.Put(holder)
 	buffer := holder.bytes
 
 	for {
@@ -1929,11 +1929,11 @@ func (fc *fdConn) listenUDP() error {
 		// and inserting would panic. The datagram is dropped instead.
 		if !ok && fc.udp.peers != nil {
 			udpConn = &fdConn{}
+			udpConn.entry = fc.entry
 			udpConn.udp = &stdUDPState{sock: fc.udp.sock, svr: fc}
 			udpConn.addr = fc.addr
 			udpConn.setRemoteAddr(addr)
 			udpConn.loop = fc.loop
-			udpConn.events = fc.events
 			udpConn.SetUserdata(fc.Userdata()) // the listener's
 			udpConn.retainLifecycle()
 
@@ -1961,11 +1961,11 @@ func (fc *fdConn) listenUDP() error {
 		udpConn.inboundTail = buffer[:n]
 
 		// trigger inbound event
-		fc.events.onSocketBytesRead(udpConn, n)
+		fc.events().onSocketBytesRead(udpConn, n)
 
 		// fire udp on-data event.
 		started := udpConn.beginInboundCallback()
-		err = fc.events.onRead(udpConn)
+		err = fc.events().onRead(udpConn)
 
 		// drop unread udp packet.
 		_, _ = udpConn.Discard(-1)

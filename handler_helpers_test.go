@@ -19,6 +19,16 @@ func (l *liveFuncs) OnStop(ev *Events)            { l.fh.OnStop(ev) }
 // first call installs it, keeping any FuncHandler withFuncs installed, as
 // ev's Handler, Observer and Hooks through liveFuncs, and resolves them, so a
 // test may set a callback whenever it likes, Serve or no Serve.
+// bareEntry is the endpoint of a connection the tests build by hand: the
+// Events' own callbacks, no chain.
+func bareEntry() *entry {
+	e, err := (&Events{}).newEntry(nil)
+	if err != nil {
+		panic(err)
+	}
+	return e
+}
+
 func funcs(ev *Events) *FuncHandler {
 	if live, ok := ev.Handler.(*liveFuncs); ok {
 		return live.fh

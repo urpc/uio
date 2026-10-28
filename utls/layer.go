@@ -1,12 +1,13 @@
 // Package utls runs TLS as a protocol layer over a UIO transport, with
 // crypto/tls doing the cryptography.
 //
-// Server and Client return a [uio.Layer]: stack one with [uio.Events.Use]
-// and it hands everything above it plaintext, so whatever runs there — a
-// protocol handler, another layer, another TLS layer — speaks TLS without
-// knowing it:
+// Server and Client return a [uio.Layer]: name one in a Listen's or a
+// Dial's [uio.WithLayers] and it hands everything above it plaintext, so
+// whatever runs there — a protocol handler, another layer, another TLS
+// layer — speaks TLS without knowing it:
 //
-//	events.Use(utls.Server(config))
+//	listener, err := events.Listen(addr, nil, uio.WithLayers(utls.Server(config)))
+//	conn, err := events.Dial(addr, nil, uio.WithLayers(utls.Client(config)))
 //
 // Nothing costs a goroutine. The handshake runs as a coroutine that OnRead
 // resumes with the bytes that arrive: when crypto/tls asks its transport

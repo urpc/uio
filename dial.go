@@ -43,72 +43,108 @@ type DialConfig struct {
 	// Control does, so a bind-time option such as SO_REUSEPORT can be set.
 	Control SocketControl
 
-	// layers is this connection's own chain; only WithLayers sets it.
-	// hasLayers tells an override, of one layer or none, from no override.
+	// layers is this endpoint's chain; only WithLayers sets it. hasLayers
+	// tells a chain, of one layer or none, from none.
 	layers    []Layer
 	hasLayers bool
 }
 
-// DialOption configures one dial — and one adoption, which takes the same
-// options and honors WithLayers; the socket-shaping ones apply to a dial
-// only.
-type DialOption func(*DialConfig)
-
-// WithLocalAddr binds the dial's socket to addr; see DialConfig.LocalAddr.
-func WithLocalAddr(addr string) DialOption {
-	return func(config *DialConfig) { config.LocalAddr = addr }
-}
-
-// WithLayers runs this dial or adoption with its own chain instead of the
-// Events' Use chain — the layers given, in install order, the first closest
-// to the wire, for this connection alone. It is how one client serves several
-// schemes: a wss:// dial brings its TLS layer, a ws:// dial
-// WithLayers(PassThroughLayer) — or nothing, which stands for the same.
-//
-// The Events must have layers installed — its Serve resolves the stack that
-// runs them — and a packet connection carries none: both are refused before
-// the socket moves. Adopt and AdoptContext honor it; the other options shape
-// a dial's socket and do not apply to an adoption.
-func WithLayers(layers ...Layer) DialOption {
-	return func(config *DialConfig) {
-		config.layers = append([]Layer(nil), layers...)
-		if len(config.layers) == 0 {
-			// A stack always has a layer: an override of none is the layer
-			// that changes nothing.
-			config.layers = []Layer{PassThroughLayer}
-		}
-		config.hasLayers = true
-	}
-}
-
-// WithDialControl runs control on the dialing socket before it connects; see
-// DialConfig.Control.
-func WithDialControl(control SocketControl) DialOption {
-	return func(config *DialConfig) { config.Control = control }
-}
-
-// ListenConfig is what a Listen's options collected into; see ListenOption.
+// ListenConfig is what a listen's options collected into; see ListenOption.
 type ListenConfig struct {
 	// Control runs on the listening socket's descriptor before it binds.
 	// With ReusePort it runs after the sharing option itself was set.
 	Control SocketControl
+
+	// layers is this listener's chain; see DialConfig.layers.
+	layers    []Layer
+	hasLayers bool
 }
 
-// ListenOption configures one Listen; see WithListenControl.
-type ListenOption func(*ListenConfig)
+// AdoptConfig is what an adoption's options collected into; see AdoptOption.
+type AdoptConfig struct {
+	// layers is the adopted connection's chain; see DialConfig.layers.
+	layers    []Layer
+	hasLayers bool
+}
+
+// DialOption configures one dial: the defaults of a Dialer, or one Dialer
+// call's own. A Listen takes ListenOption, an adoption AdoptOption; WithLayers
+// is all three, the one option that names a chain.
+type DialOption interface{ applyDial(*DialConfig) }
+
+// ListenOption configures one listener; see Listen.
+type ListenOption interface{ applyListen(*ListenConfig) }
+
+// AdoptOption configures one adoption; see Adopt.
+type AdoptOption interface{ applyAdopt(*AdoptConfig) }
+
+// LayersOption is the chain an endpoint runs: WithLayers' value. It is a
+// DialOption, a ListenOption and an AdoptOption, so the same call reads the
+// same everywhere.
+type LayersOption []Layer
+
+// WithLayers runs this endpoint with its own chain instead of none — the
+// layers given, in install order, the first closest to the wire. A Listen
+// gives its listener the chain; a dial, or one Dialer call, gives that
+// connection. On a Dialer call it replaces the Dialer's own chain for that
+// call. WithLayers() with no layers runs the layer that changes nothing
+// (PassThroughLayer), so a chain always has a layer.
+func WithLayers(layers ...Layer) LayersOption {
+	normalized := append([]Layer(nil), layers...)
+	if len(normalized) == 0 {
+		normalized = []Layer{PassThroughLayer}
+	}
+	return LayersOption(normalized)
+}
+
+func (o LayersOption) applyDial(c *DialConfig) {
+	c.layers, c.hasLayers = []Layer(o), true
+}
+
+func (o LayersOption) applyListen(c *ListenConfig) {
+	c.layers, c.hasLayers = []Layer(o), true
+}
+
+func (o LayersOption) applyAdopt(c *AdoptConfig) {
+	c.layers, c.hasLayers = []Layer(o), true
+}
+
+// localAddrOption is WithLocalAddr's value.
+type localAddrOption string
+
+// WithLocalAddr binds the dial's socket to addr; see DialConfig.LocalAddr.
+func WithLocalAddr(addr string) localAddrOption { return localAddrOption(addr) }
+
+func (o localAddrOption) applyDial(c *DialConfig) { c.LocalAddr = string(o) }
+
+// dialControlOption is WithDialControl's value.
+type dialControlOption SocketControl
+
+// WithDialControl runs control on the dialing socket before it connects; see
+// DialConfig.Control.
+func WithDialControl(control SocketControl) dialControlOption {
+	return dialControlOption(control)
+}
+
+func (o dialControlOption) applyDial(c *DialConfig) { c.Control = SocketControl(o) }
+
+// listenControlOption is WithListenControl's value.
+type listenControlOption SocketControl
 
 // WithListenControl runs control on the listening socket before it binds; see
 // ListenConfig.Control.
-func WithListenControl(control SocketControl) ListenOption {
-	return func(config *ListenConfig) { config.Control = control }
+func WithListenControl(control SocketControl) listenControlOption {
+	return listenControlOption(control)
 }
+
+func (o listenControlOption) applyListen(c *ListenConfig) { c.Control = SocketControl(o) }
 
 // dialConfigFor collects opts.
 func dialConfigFor(opts []DialOption) DialConfig {
 	var config DialConfig
 	for _, opt := range opts {
 		if opt != nil {
-			opt(&config)
+			opt.applyDial(&config)
 		}
 	}
 	return config
@@ -119,7 +155,18 @@ func listenConfigFor(opts []ListenOption) ListenConfig {
 	var config ListenConfig
 	for _, opt := range opts {
 		if opt != nil {
-			opt(&config)
+			opt.applyListen(&config)
+		}
+	}
+	return config
+}
+
+// adoptConfigFor collects opts.
+func adoptConfigFor(opts []AdoptOption) AdoptConfig {
+	var config AdoptConfig
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyAdopt(&config)
 		}
 	}
 	return config

@@ -64,7 +64,7 @@ func TestConnStateBits(t *testing.T) {
 	}()
 	opened := make(chan Conn, 1)
 	var seen, closeSeen atomic.Uint32
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
+	events := dialLayered(t, listener.Addr().String(), nil, func(ev *Events) {
 		ev.AllowHalfOpen = true
 		ev.Handler = FuncHandler{
 			Open: func(c Conn) { opened <- c },
@@ -133,9 +133,9 @@ func TestLayerDownStatePeerEnded(t *testing.T) {
 	}()
 	probe := &stateProbe{}
 	var read atomic.Int64
-	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return probe })}, func(ev *Events) {
 		ev.AllowHalfOpen = true
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return probe }))
+
 		ev.Handler = FuncHandler{
 			Read: func(c Conn) error {
 				read.Add(int64(c.InboundBuffered()))

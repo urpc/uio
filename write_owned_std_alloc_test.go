@@ -6,7 +6,7 @@ import "testing"
 
 func TestStdWriteOwnedReusesAllocation(t *testing.T) {
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 		writeSig:   make(chan struct{}, 1),
 	}
 	payload := make([]byte, 1024)
@@ -37,7 +37,7 @@ func TestStdDrainOutboundAllocatesNothing(t *testing.T) {
 	raw := newStdRegistrationConn(30004)
 	raw.openReturned.Store(true)
 	conn := &fdConn{
-		commonConn: commonConn{events: &Events{MaxOutboundBuffered: -1}},
+		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
 		conn:       raw,
 		writeSig:   make(chan struct{}, 1),
 	}

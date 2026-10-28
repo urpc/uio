@@ -42,7 +42,8 @@ func TestStdRejectedCloseReturnsInsideControl(t *testing.T) {
 	}
 	defer loop.poller.Close(nil)
 	loop.beginStop(nil) // The request must use the fallback, with no loop running.
-	fc := &fdConn{commonConn: commonConn{events: ev, loop: loop}, conn: conn, opened: true}
+	fc := &fdConn{commonConn: commonConn{loop: loop}, conn: conn, opened: true}
+	fc.entry = ev.plainEntry()
 	fc.retainLifecycle()
 	done := make(chan struct{})
 	go func() {
@@ -173,8 +174,8 @@ func TestStdCloseHandoffsJoinLifecycle(t *testing.T) {
 // shutdown that sees it leaves the close to the request, and Serve's join
 // waits for that.
 func TestCloseRequestCountedBeforeShutdownSeesIt(t *testing.T) {
-	addr, _ := serveLayered(t, nil)
-	ev := dialLayered(t, addr, nil)
+	addr, _ := serveLayered(t, nil, nil)
+	ev := dialLayered(t, addr, nil, nil)
 	conn, err := ev.DialContext(context.Background(), "tcp://"+addr, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -230,8 +231,8 @@ func TestRefusedWritesScheduleNoTurns(t *testing.T) {
 	busy, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
 	addr := listener.Addr().String()
-	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &windowFlush{} }))
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return &windowFlush{} })}, func(ev *Events) {
+
 		ev.Observer = FuncHandler{BytesRead: func(Conn, int) {
 			once.Do(func() { close(busy) })
 			<-release

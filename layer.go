@@ -32,8 +32,9 @@ import (
 // compression, an obfuscation, a handshake of its own. It transforms bytes —
 // what arrives on its way up, what the Handler writes on its way down — and
 // UIO carries everything else: the connection's turns, the Handler's
-// callbacks, its addressing and options, its closes. [Events.Use] stacks
-// layers under the [Events.Handler].
+// callbacks, its addressing and options, its closes. An endpoint stacks
+// layers under the [Events.Handler]: [WithLayers] in a [Events.Listen] or in
+// a dial names the chain its connections run.
 //
 // A layer carries one connection: one connection above for each one below.
 // A protocol that opens several streams over one connection — HTTP/2, QUIC —
@@ -425,36 +426,6 @@ type LayerUp interface {
 	Yield()
 }
 
-// Use stacks layers under the Handler, the first installed closest to the
-// wire, so what arrives passes them in install order on its way up and what
-// the Handler writes passes them in reverse on its way down:
-//
-//	events.Use(kcp, tls).Use(trace)
-//
-// reads bottom up — kcp next to the wire, tls over it, trace just under the
-// Handler. Use before Serve: Serve reads the layers once, with the Handler,
-// and a Use after it does nothing. It appends, and returns the Events, so
-// calls chain. An empty Use does nothing.
-//
-// Every connection the Events accepts, adopts and dials runs the layers.
-// DialContext returns only once the whole stack opened, with the top layer's
-// connection; one that fails before that reports its error from
-// DialContext, and the Handler hears nothing of the connection.
-func (ev *Events) Use(layers ...Layer) *Events {
-	ev.mux.Lock()
-	defer ev.mux.Unlock()
-	if ev.ready.Load() {
-		return ev // Serve read the layers already
-	}
-	for _, layer := range layers {
-		if layer == nil {
-			panic("uio: Use a nil Layer")
-		}
-	}
-	ev.use = append(ev.use, layers...)
-	return ev
-}
-
 // LayerFunc is a layer written as the function its Attach runs.
 type LayerFunc func(ctx LayerContext) LayerHandler
 
@@ -519,23 +490,81 @@ func (PassThrough) OnClose(LayerContext, error) {}
 
 // stackHandler puts the installed layers between the socket's callbacks and
 // handler. It runs under ev.mux, in Serve's initialization.
-func (ev *Events) stackHandler(handler Handler) Handler {
-	if len(ev.use) == 0 {
-		return handler
+// newEntry builds what one endpoint's connections run: the callbacks
+// resolved for its chain, with the stack driver over the Events' Handler. A
+// chain of no layers resolves the plain callbacks — the same the Events use.
+func (ev *Events) newEntry(layers []Layer) (*entry, error) {
+	if len(layers) > maxLayers {
+		return nil, fmt.Errorf("uio: %d layers in the chain, at most %d", len(layers), maxLayers)
 	}
-	if fh, ok := asFuncs(handler); handler == nil || (ok && fh == nil) {
-		// No Handler — nil, or a nil *FuncHandler, as resolveCallbacks reads
-		// one: no callbacks and the input discarded, as without layers.
-		// FuncHandler's zero value does exactly that.
-		handler = FuncHandler{}
+	var handler Handler = ev.Handler
+	if len(layers) > 0 {
+		for _, layer := range layers {
+			if layer == nil {
+				return nil, errors.New("uio: a nil Layer in the chain")
+			}
+		}
+		if fh, ok := asFuncs(handler); handler == nil || (ok && fh == nil) {
+			// No Handler — nil, or a nil *FuncHandler, as resolveCallbacks
+			// reads one: no callbacks and the input discarded. FuncHandler's
+			// zero value does exactly that.
+			handler = FuncHandler{}
+		}
+		handler = &stackDriver{
+			layers:   append([]Layer(nil), layers...),
+			top:      handler,
+			limit:    ev.MaxOutboundBuffered,
+			inLimit:  ev.MaxInboundBuffered,
+			halfOpen: ev.AllowHalfOpen,
+		}
 	}
-	return &stackDriver{
-		layers:   append([]Layer(nil), ev.use...),
-		top:      handler,
-		limit:    ev.MaxOutboundBuffered,
-		inLimit:  ev.MaxInboundBuffered,
-		halfOpen: ev.AllowHalfOpen,
+	cb := resolveCallbacks(handler, ev.Observer, ev.Hooks)
+	if len(layers) > 0 {
+		cb.onBytesWritten = stackSent(cb.onBytesWritten)
 	}
+	return &entry{ev: ev, cb: cb, layered: len(layers) > 0}, nil
+}
+
+// plainEntry is the entry of a connection without a chain: the Events' own
+// callbacks. Serve builds it with the rest of the configuration; an Events
+// built by hand — in tests — gets it here.
+func (ev *Events) plainEntry() *entry {
+	ev.plainOnce.Do(func() {
+		if ev.plain == nil {
+			plain, err := ev.newEntry(nil)
+			if err != nil {
+				panic(err) // a chain of no layers cannot fail
+			}
+			ev.plain = plain
+		}
+	})
+	return ev.plain
+}
+
+// entryFor hands an endpoint its entry: the Events' shared plain one when it
+// brings no chain of its own, or the one its chain builds.
+func (ev *Events) entryFor(layers []Layer, hasLayers bool) (*entry, error) {
+	if !hasLayers {
+		return ev.plainEntry(), nil
+	}
+	return ev.newEntry(layers)
+}
+
+// validateChain reports a chain no connection can carry: past the stack's
+// layer cap, or a nil layer.
+func validateChain(layers []Layer, hasLayers bool) error {
+	if !hasLayers {
+		return nil
+	}
+	if len(layers) > maxLayers {
+		return fmt.Errorf("uio: %d layers in the chain, at most %d", len(layers), maxLayers)
+	}
+	for _, layer := range layers {
+		if layer == nil {
+			return errors.New("uio: a nil Layer in the chain")
+		}
+	}
+	return nil
 }
 
 // stackDriver is the socket's Handler when layers are installed: it builds
@@ -558,9 +587,6 @@ func (h *stackDriver) OnOpen(socket Conn) {
 		held = probe.user
 	}
 	layers := h.layers
-	if probe := c.probe.Load(); probe != nil && probe.layers != nil {
-		layers = probe.layers
-	}
 	c.userdata.Store(&held)
 	c.layers = make([]*layerNode, len(layers))
 	var below Conn = socketLower{Conn: socket, stack: c}
@@ -2323,17 +2349,6 @@ func FindLayer[T any](conn LayerDown) (T, bool) {
 // keep.
 var ErrLayersNeedStream = errors.New("uio: layers carry streams, not packet connections")
 
-// refusePacket refuses a packet network on an Events with layers.
-func (ev *Events) refusePacket(network string) error {
-	if len(ev.use) == 0 {
-		return nil
-	}
-	if packetNetwork(network) {
-		return ErrLayersNeedStream
-	}
-	return nil
-}
-
 // packetNetwork reports a network whose connections carry messages, not a
 // byte stream.
 func packetNetwork(network string) bool {
@@ -2345,42 +2360,13 @@ func packetNetwork(network string) bool {
 	return false
 }
 
-// dialLayers checks the chain a dial or an adoption brings against the
-// Events, and reports it — nil when the connection takes the Events' chain.
-func (ev *Events) dialLayers(config DialConfig, network string) ([]Layer, error) {
-	if !config.hasLayers {
-		return nil, nil
+// refuseLayerPacket refuses a packet network on an endpoint that carries a
+// chain.
+func refuseLayerPacket(network string, layered bool) error {
+	if layered && packetNetwork(network) {
+		return ErrLayersNeedStream
 	}
-	if packetNetwork(network) {
-		return nil, ErrLayersNeedStream
-	}
-	if len(ev.use) == 0 {
-		return nil, ErrLayersWithoutStack
-	}
-	if len(config.layers) > maxLayers {
-		return nil, fmt.Errorf("uio: %d layers in this connection's chain, at most %d", len(config.layers), maxLayers)
-	}
-	for _, layer := range config.layers {
-		if layer == nil {
-			return nil, errors.New("uio: a nil Layer in the connection's chain")
-		}
-	}
-	return config.layers, nil
-}
-
-// ErrLayersWithoutStack reports a dial or adoption asking for its own chain
-// on an Events with no layers: Serve resolved the plain callbacks, so no
-// stack exists to run them. Use any layer — PassThroughLayer changes nothing
-// — to install the stack the override needs.
-var ErrLayersWithoutStack = errors.New("uio: a connection's own layers need the Events to have layers")
-
-// socketLimit is the MaxOutboundBuffered the socket enforces: none once
-// layers run, where the stack's top enforces it instead; see stack.reserve.
-func (ev *Events) socketLimit() int {
-	if len(ev.use) > 0 {
-		return 0
-	}
-	return ev.MaxOutboundBuffered
+	return nil
 }
 
 // observed is the connection an Observer hears about: the socket counts the
@@ -2388,20 +2374,17 @@ func (ev *Events) socketLimit() int {
 // top layer's, once layers run — so it reads the same Userdata, and the
 // same identity, the Handler's callbacks see.
 func (ev *Events) observed(socket Conn) Conn {
-	if len(ev.use) == 0 {
-		return socket // no stack: the socket is the Handler's connection
-	}
 	if c, ok := socket.Userdata().(*stack); ok {
 		return c.topConn()
 	}
 	return socket
 }
 
-// dialMarker replaces the dial's userdata with a probe when layers are
-// installed, so the stack can report the dial once it opened. The second
-// return is the userdata the dialed connection starts with.
-func (ev *Events) dialMarker(userdata any) (*dialProbe, any) {
-	if len(ev.use) == 0 {
+// dialMarker replaces the dial's userdata with a probe when the connection's
+// entry carries a chain, so the stack can report the dial once it opened. The
+// second return is the userdata the dialed connection starts with.
+func (ev *Events) dialMarker(userdata any, layered bool) (*dialProbe, any) {
+	if !layered {
 		return nil, userdata
 	}
 	probe := &dialProbe{user: userdata, done: make(chan struct{})}
@@ -2413,7 +2396,6 @@ func (ev *Events) dialMarker(userdata any) (*dialProbe, any) {
 // gives up on it first. Whichever claims it first decides.
 type dialProbe struct {
 	user    any
-	layers  []Layer // this connection's own chain; nil takes the Events'
 	claimed atomic.Bool
 	done    chan struct{} // closed once, with conn or err in place
 	conn    Conn

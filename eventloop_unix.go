@@ -598,8 +598,8 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 			l.acceptDelay.Store(0)
 		}
 		conn := &fdConn{}
+		conn.entry = l.entry
 		conn.fd = int32(nfd)
-		conn.events = loop.events
 		conn.loop = loop.events.loopAt(waiter.accepted)
 		waiter.accepted++
 		conn.addr = l.pair

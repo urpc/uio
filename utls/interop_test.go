@@ -205,14 +205,13 @@ func TestInteropWithStdlib(t *testing.T) {
 			Close: func(uio.Conn, error) { callbacks++ },
 		}
 		events.Handler = counting
-		events.Use(Client(clientConfig))
 		done := make(chan error, 1)
 		go func() { done <- events.Serve() }()
 		t.Cleanup(func() { _ = events.Close(nil); <-done })
 		<-started
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(Client(clientConfig))); err == nil {
 			t.Fatal("a refused certificate reported no error")
 		}
 		if callbacks != 0 {

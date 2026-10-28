@@ -47,14 +47,21 @@ func benchEcho(b *testing.B, layers int, observed bool) {
 			BytesWritten: func(Conn, int) {},
 		}
 	}
-	for range layers {
-		events.Use(benchPassThrough{})
-	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	defer func() { _ = events.Close(nil); <-done }()
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	chain := make([]Layer, layers)
+	for i := range chain {
+		chain[i] = benchPassThrough{}
+	}
+	var listener Listener
+	var err error
+	if len(chain) > 0 {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil, WithLayers(chain...))
+	} else {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+	}
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -120,14 +127,21 @@ func benchPipelined(b *testing.B, layers int) {
 		Close: func(Conn, error) {},
 	}}
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
-	for range layers {
-		events.Use(benchPassThrough{})
-	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	defer func() { _ = events.Close(nil); <-done }()
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	chain := make([]Layer, layers)
+	for i := range chain {
+		chain[i] = benchPassThrough{}
+	}
+	var listener Listener
+	var err error
+	if len(chain) > 0 {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil, WithLayers(chain...))
+	} else {
+		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+	}
 	if err != nil {
 		b.Fatal(err)
 	}

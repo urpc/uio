@@ -56,7 +56,8 @@ type LayerOptions struct {
 // ServerLayer runs the server side of the WebSocket protocol as a uio.Layer,
 // for a stack of your own:
 //
-//	events.Use(tls, uws.ServerLayer(opts), tunnel)
+//	listener, err := events.Listen(addr, nil,
+//		uio.WithLayers(tls, uws.ServerLayer(opts), tunnel))
 //
 // It answers the upgrade request, and opens the layers above once the
 // handshake succeeded; a request it refuses gets its answer and closes the
