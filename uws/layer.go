@@ -33,10 +33,6 @@ import (
 	"github.com/urpc/uio/uws/internal/handshake"
 )
 
-// layerDeliverBound is how much a WebSocket layer hands up that the layer
-// above has not read before it stops reading frames.
-const layerDeliverBound = 64 << 10
-
 // LayerOptions configures ServerLayer and ClientLayer.
 type LayerOptions struct {
 	// Options holds the protocol's settings: subprotocols, limits,
@@ -176,8 +172,10 @@ type wsLayerHandler struct {
 	conn atomic.Pointer[Conn]
 	// staged holds the frames that arrived behind the handshake: the engine
 	// hands them over rather than reading them before the layers above
-	// opened. Only the connection's turns touch it.
-	staged []byte
+	// opened. pendingUp holds message bytes the layer above's delivery had
+	// no room for. Only the connection's turns touch either.
+	staged    []byte
+	pendingUp []byte
 	// writeMu keeps one write from above whole: the messages a large write
 	// is split into go out together, never between another writer's.
 	writeMu sync.Mutex
@@ -237,6 +235,16 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 	if conn == nil {
 		return nil
 	}
+	if len(w.pendingUp) > 0 {
+		// Message bytes the layer above has not taken yet go first, in order.
+		n, _ := ctx.Up().Write(w.pendingUp)
+		w.pendingUp = w.pendingUp[n:]
+		if len(w.pendingUp) > 0 {
+			ctx.Up().Yield()
+			_ = ctx.Wake() // the read above makes room; hand them up then
+			return nil
+		}
+	}
 	if len(w.staged) > 0 {
 		// Frames that arrived behind a handshake which settled on an earlier
 		// round: the layers above open after that callback returned, so they
@@ -249,10 +257,6 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 			}
 			return conn.protocolClose(err)
 		}
-	}
-	if conn.opened.Load() && ctx.Up().Buffered() >= layerDeliverBound {
-		ctx.Up().Yield() // the layer above's next read runs the turn again
-		return nil
 	}
 	err := conn.readAvailable()
 	if protocolCloseOwnsTransport(err) {
@@ -270,10 +274,10 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 		}
 		return cause
 	}
-	if len(w.staged) > 0 {
-		// Frames that arrived behind a handshake that settled this round: the
-		// layers above open after this callback returns, and the round asked
-		// for here feeds them up then.
+	if len(w.staged) > 0 || len(w.pendingUp) > 0 {
+		// Frames behind a handshake that settled this round, or message
+		// bytes a full delivery held back: the round asked for here carries
+		// them once the layers above opened, or read.
 		_ = ctx.Wake()
 	}
 	return nil
@@ -375,6 +379,15 @@ func (s layerSink) OnOpen(c *Conn) {
 	s.w.ctx.Up().Open()
 }
 
-func (s layerSink) OnMessage(_ *Conn, m Message) { s.w.ctx.Up().Write(m.Payload) }
+func (s layerSink) OnMessage(_ *Conn, m Message) {
+	w := s.w
+	if len(w.pendingUp) > 0 {
+		w.pendingUp = append(w.pendingUp, m.Payload...)
+		return
+	}
+	if n, _ := w.ctx.Up().Write(m.Payload); n < len(m.Payload) {
+		w.pendingUp = append(w.pendingUp, m.Payload[n:]...)
+	}
+}
 
 func (s layerSink) OnClose(*Conn, CloseEvent) {}

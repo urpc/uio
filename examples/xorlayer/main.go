@@ -68,13 +68,24 @@ func (x *xorConn) OnRead(ctx uio.LayerContext) error {
 	if len(chunk) == 0 {
 		return nil
 	}
-	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
+	total := len(chunk)
+	out := ctx.Up().Reserve(total)
+	if len(out) == 0 {
+		ctx.Up().Yield() // the layer above's delivery is full; its read runs on
+		return nil
+	}
+	chunk = chunk[:len(out)]
 	for i, b := range chunk {
 		out[i] = b ^ x.key
 	}
 	ctx.Up().Commit(len(chunk)) // hand the plaintext up
-	_, err := lower.Discard(len(chunk))
-	return err
+	if _, err := lower.Discard(len(chunk)); err != nil {
+		return err
+	}
+	if len(chunk) < total {
+		ctx.Up().Yield() // the rest goes up on the turn the read above makes
+	}
+	return nil
 }
 
 // OnWrite runs when the layer above writes: it XORs the bytes and writes

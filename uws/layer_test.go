@@ -430,8 +430,8 @@ watch:
 			break watch
 		}
 	}
-	if most == 0 || most > 4*layerDeliverBound {
-		t.Fatalf("handed up %d bytes the layer above did not read, want about %d", most, layerDeliverBound)
+	if most == 0 || most > 4*uio.DefaultDeliverBound {
+		t.Fatalf("handed up %d bytes the layer above did not read, want about %d", most, uio.DefaultDeliverBound)
 	}
 	close(holder.release)
 	accepted := <-holder.conn

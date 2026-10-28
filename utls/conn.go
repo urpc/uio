@@ -212,7 +212,14 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			return nil
 		}
 		c.mu.Unlock()
-		n, err := c.tls.Read(ctx.Up().Reserve(readBufferSize)[:readBufferSize])
+		room := ctx.Up().Reserve(readBufferSize)
+		if len(room) == 0 {
+			// The layer above's delivery is full: its read runs the turn
+			// that carries the rest.
+			ctx.Up().Yield()
+			return nil
+		}
+		n, err := c.tls.Read(room)
 		if n > 0 {
 			ctx.Up().Commit(n)
 		}

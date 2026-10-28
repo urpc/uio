@@ -277,6 +277,11 @@ type ReceiptObserver interface {
 	OnSent(ctx LayerContext, r SendReceipt)
 }
 
+// DefaultDeliverBound bounds what one layer delivers to the layer above
+// before that layer reads — each layer's delivery, whichever way the stack is
+// stacked. Events.MaxInboundBuffered, when set, is the bound instead.
+const DefaultDeliverBound = 64 << 10
+
 // maxLayers is how many layers one stack takes: their timers, and the
 // Handler's, share one bit mask.
 const maxLayers = 63
@@ -363,7 +368,11 @@ type LayerDown interface {
 }
 
 // LayerUp is the layer above's input, as the layer below writes to it. Write
-// always takes all of p and never fails. A layer may hold the Up it got.
+// never fails; it takes what the layer above's delivery has room for —
+// DefaultDeliverBound bytes past what it has not read, or
+// Events.MaxInboundBuffered when set — and reports a short write for the
+// rest, which asks the layer to Yield and hand the remainder up on a later
+// turn, once a read above made room. A layer may hold the Up it got.
 // Its methods run in OnRead or OnTimer, on the connection's turn, whose pass
 // then carries what they wrote up through the layers above; a call made
 // anywhere else races the turn.
@@ -384,9 +393,11 @@ type LayerUp interface {
 	// opened. Call it on the connection's turn.
 	Open()
 
-	// Reserve returns at least n bytes of room past what is written, for the
+	// Reserve returns up to n bytes of room past what is written, for the
 	// layer to fill in place — decrypting straight into it — and Commit
-	// delivers the first n of them. Call both in OnRead or OnTimer.
+	// delivers the first n of them. It returns fewer than asked, or nothing,
+	// when the layer above's delivery bound is reached; see Write. Call both
+	// in OnRead or OnTimer.
 	Reserve(n int) []byte
 	Commit(n int)
 
@@ -447,9 +458,16 @@ func (PassThrough) OnOpen(ctx LayerContext) { ctx.Up().Open() }
 func (PassThrough) OnRead(ctx LayerContext) error {
 	lower := ctx.Down()
 	if chunk := lower.PeekChunk(); len(chunk) > 0 {
-		_, _ = ctx.Up().Write(chunk)
-		if _, err := lower.Discard(len(chunk)); err != nil {
-			return err
+		n, _ := ctx.Up().Write(chunk)
+		if n > 0 {
+			if _, err := lower.Discard(n); err != nil {
+				return err
+			}
+		}
+		if n < len(chunk) {
+			// The delivery is full: the read above runs the turn that
+			// carries the rest.
+			ctx.Up().Yield()
 		}
 	}
 	if lowerEnded(lower) {
@@ -947,6 +965,15 @@ func (c *stack) inbound(layer *layerNode) error {
 	}
 }
 
+// deliverBound is how much one layer may deliver to the layer above:
+// MaxInboundBuffered when set, DefaultDeliverBound otherwise.
+func (c *stack) deliverBound() int {
+	if c.inLimit > 0 {
+		return c.inLimit
+	}
+	return DefaultDeliverBound
+}
+
 // inboundFull reports a stack whose layers hold MaxInboundBuffered or more
 // that the Handler has not read: it takes nothing more from the socket, so
 // the bytes wait there, and the socket's own hold stops its reads, until a
@@ -1407,10 +1434,18 @@ func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
 type layerUp struct{ l *layerNode }
 
 func (u layerUp) Write(p []byte) (int, error) {
+	l := u.l
+	if room := l.stack.deliverBound() - l.held(); room < len(p) {
+		// The layer above has not read what is already delivered: take what
+		// its delivery has room for and report the rest for a later turn.
+		if room <= 0 {
+			return 0, nil
+		}
+		p = p[:room]
+	}
 	if len(p) == 0 {
 		return 0, nil
 	}
-	l := u.l
 	l.compact()
 	l.delivered = append(l.delivered, p...)
 	return len(p), nil
@@ -1431,6 +1466,14 @@ func (u layerUp) Open() {
 
 func (u layerUp) Reserve(n int) []byte {
 	l := u.l
+	if room := l.stack.deliverBound() - l.held(); room < n {
+		// As Write: the layer above has room for what its delivery bound
+		// leaves, and the rest waits for the read that makes room.
+		if room <= 0 {
+			return nil
+		}
+		n = room
+	}
 	l.compact()
 	if spare := cap(l.delivered) - len(l.delivered); spare < n {
 		// Grow by doubling, as append does: a layer that commits a little at

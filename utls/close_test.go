@@ -682,8 +682,12 @@ func TestEndBelowAtTheStagingBound(t *testing.T) {
 	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
 		t.Fatal(err)
 	}
-	if n := wait(t, read, "the plaintext"); n != DefaultStagingBound {
-		t.Fatalf("read %d bytes, want exactly the staging bound", n)
+	total := 0
+	for total < DefaultStagingBound {
+		total += wait(t, read, "the plaintext")
+	}
+	if total != DefaultStagingBound {
+		t.Fatalf("read %d bytes, want exactly the staging bound", total)
 	}
 	if err := wait(t, ended, "the end of the stream"); err != io.EOF {
 		t.Fatalf("the end reached the handler as %v, want io.EOF", err)
@@ -703,12 +707,19 @@ func (e *endWithTheLast) OnRead(ctx uio.LayerContext) error {
 		return e.PassThrough.OnRead(ctx)
 	}
 	lower := ctx.Down()
-	chunk := lower.PeekChunk()
-	e.held = append(e.held, chunk...)
-	_, _ = lower.Discard(len(chunk))
+	if chunk := lower.PeekChunk(); len(chunk) > 0 {
+		e.held = append(e.held, chunk...)
+		_, _ = lower.Discard(len(chunk))
+	}
 	if _, err := lower.Read(nil); err == io.EOF {
-		ctx.Up().Write(e.held)
-		e.held = nil
+		// Deliver what was held in the chunks the delivery takes, and the
+		// end after the last of it.
+		n, _ := ctx.Up().Write(e.held)
+		e.held = e.held[n:]
+		if len(e.held) > 0 {
+			ctx.Up().Yield()
+			return nil
+		}
 		ctx.Up().End()
 	}
 	return nil
