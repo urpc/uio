@@ -114,7 +114,7 @@ func (c *Conn) expireHandshake(state *handshakeState, epoch uint64, cause error)
 	c.handshake.CompareAndSwap(state, nil)
 	state.mu.Unlock()
 	resources.stop()
-	_ = c.raw.CloseWith(cause)
+	_ = c.requestClose(cause)
 }
 
 // stopHandshakeTimer tears down the complete handshake state on rejection or
@@ -728,7 +728,7 @@ func (c *Conn) rejectHandshake(err error) error {
 		return err
 	}
 	if c.isClient() {
-		_ = c.raw.CloseWith(err)
+		_ = c.requestClose(err)
 		return err
 	}
 	response := rejectResponse(err)
@@ -741,6 +741,23 @@ func (c *Conn) rejectHandshake(err error) error {
 		return errors.Join(err, closeErr)
 	}
 	return &ownedProtocolClose{cause: err}
+}
+
+// requestClose asks this end's connection to close. A plain Conn closes its
+// transport; one running as a layer asks the stack, so the Close frame its
+// layer says and the drain the stack waits for run as one close from this
+// layer. A graceful cause closes gracefully, anything else aborts.
+func (c *Conn) requestClose(cause error) error {
+	if sink, ok := c.handler.(layerSink); ok {
+		if cause == nil || errors.Is(cause, io.EOF) || errors.Is(cause, io.ErrUnexpectedEOF) {
+			return sink.w.ctx.Close(cause)
+		}
+		return sink.w.ctx.Abort(cause)
+	}
+	if closer, ok := c.raw.(uio.Conn); ok {
+		return closer.CloseWith(cause)
+	}
+	return net.ErrClosed
 }
 
 // closeTransport requests graceful transport shutdown. The raw connection
@@ -822,7 +839,7 @@ func (c *Conn) closePendingTransport() (bool, error) {
 		return false, nil
 	}
 	c.stopCloseTimer()
-	return true, c.raw.CloseWith(io.EOF)
+	return true, c.requestClose(io.EOF)
 }
 
 // abortTransport claims the same terminal responsibility as a graceful drain.
@@ -834,7 +851,7 @@ func (c *Conn) abortTransport(err error) {
 	}
 	c.stopCloseTimer()
 	c.releasePullClient()
-	_ = c.raw.CloseWith(err)
+	_ = c.requestClose(err)
 }
 
 // markClosing records that this end is closing the connection: messages

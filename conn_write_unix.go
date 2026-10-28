@@ -91,7 +91,7 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	if conn.isDatagram() {
-		return 0, errUnsupported
+		return 0, ErrUnsupported
 	}
 	if conn.directOwner() {
 		return conn.writevOnLoop(vec, total)
@@ -528,7 +528,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 // slices or an unbounded vector list.
 func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	if conn.isDatagram() {
-		return 0, errUnsupported
+		return 0, ErrUnsupported
 	}
 	conn.handOverScratch()
 	threshold := conn.events.WriteBufferedThreshold

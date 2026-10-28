@@ -191,7 +191,7 @@ var (
 
 func (w *wsLayerHandler) OnOpen(ctx uio.LayerContext) {
 	if err := w.layer.err; err != nil {
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 		return
 	}
 	config := w.layer.config
@@ -207,13 +207,13 @@ func (w *wsLayerHandler) OnOpen(ctx uio.LayerContext) {
 	}
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 		return
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
 	request, err := handshake.BuildClientRequest(w.layer.target, key, config.subprotocols, config.clientExtensions(), w.layer.header)
 	if err != nil {
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 		return
 	}
 	conn.handshake.Store(&handshakeState{clientKey: key})
@@ -227,7 +227,7 @@ func (w *wsLayerHandler) OnOpen(ctx uio.LayerContext) {
 	if err != nil {
 		conn.rollbackOutbound(len(request) - n)
 		if !errors.Is(err, net.ErrClosed) {
-			_ = ctx.Down().CloseWith(err)
+			_ = ctx.Abort(err)
 		}
 	}
 }

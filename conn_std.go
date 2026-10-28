@@ -282,7 +282,7 @@ func (fc *fdConn) Control(fn func(fd uintptr)) error {
 		}
 		holder, ok := fc.conn.(syscall.Conn)
 		if !ok {
-			return errUnsupported
+			return ErrUnsupported
 		}
 		conn = holder
 	}
@@ -562,7 +562,7 @@ func (fc *fdConn) SetLinger(secs int) error {
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
 		return tcpConn.SetLinger(secs)
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetNoDelay(nodelay bool) error {
@@ -572,7 +572,7 @@ func (fc *fdConn) SetNoDelay(nodelay bool) error {
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
 		return tcpConn.SetNoDelay(nodelay)
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetKeepAlive(keepalive bool) error {
@@ -582,7 +582,7 @@ func (fc *fdConn) SetKeepAlive(keepalive bool) error {
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
 		return tcpConn.SetKeepAlive(keepalive)
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
@@ -600,7 +600,7 @@ func (fc *fdConn) SetKeepAlivePeriod(secs int) error {
 		}
 		return nil
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetReadBuffer(size int) error {
@@ -610,7 +610,7 @@ func (fc *fdConn) SetReadBuffer(size int) error {
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
 		return tcpConn.SetReadBuffer(size)
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetWriteBuffer(size int) error {
@@ -620,7 +620,7 @@ func (fc *fdConn) SetWriteBuffer(size int) error {
 	if tcpConn, ok := fc.conn.(*net.TCPConn); ok {
 		return tcpConn.SetWriteBuffer(size)
 	}
-	return errUnsupported
+	return ErrUnsupported
 }
 
 func (fc *fdConn) SetDeadline(deadline time.Time) error {
@@ -664,7 +664,7 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 		target = fc.udp.sock
 	}
 	if target == nil {
-		return errUnsupported
+		return ErrUnsupported
 	}
 	fc.deadlineMu.Lock()
 	defer fc.deadlineMu.Unlock()
@@ -778,7 +778,7 @@ func (fc *fdConn) stopChildDeadlines() {
 	}
 }
 
-func (fc *fdConn) applySocketOption(socketOptionKind, int) error { return errUnsupported }
+func (fc *fdConn) applySocketOption(socketOptionKind, int) error { return ErrUnsupported }
 
 func (fc *fdConn) WriteByte(b byte) error {
 	var bb [1]byte
@@ -902,7 +902,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	if fc.udp != nil {
-		return 0, errUnsupported
+		return 0, ErrUnsupported
 	}
 
 	total := 0
@@ -1591,10 +1591,10 @@ type halfCloser interface{ CloseWrite() error }
 // accepted before it; see Conn.CloseWrite.
 func (fc *fdConn) CloseWrite() error {
 	if fc.udp != nil {
-		return errUnsupported
+		return ErrUnsupported
 	}
 	if _, ok := fc.conn.(halfCloser); !ok {
-		return errUnsupported
+		return ErrUnsupported
 	}
 	fc.mux.Lock()
 	if fc.isClosing() {

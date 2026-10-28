@@ -2301,7 +2301,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 	if n, err := conn.Write([]byte("too-large")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
 		t.Fatalf("UDP overflow = %d, %v", n, err)
 	}
-	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, errUnsupported) {
+	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("UDP Writev = %d, %v", n, err)
 	}
 	if got := conn.OutboundBuffered(); got != 0 {

@@ -272,7 +272,11 @@ type Conn interface {
 	CloseWrite() error
 }
 
-var errUnsupported = fmt.Errorf("unsupported method")
+// ErrUnsupported reports a method this connection cannot carry: CloseWrite on
+// a datagram or stdio connection, or on a layered one whose layers do not
+// implement CloseWriter; a deadline, a reserve or an option the backend has no
+// way to honor.
+var ErrUnsupported = fmt.Errorf("unsupported method")
 
 var (
 	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")
@@ -407,9 +411,9 @@ func (fc *commonConn) SetUserdata(value any) {
 	fc.userdata.Store(&value)
 }
 
-func (fc *commonConn) SetDeadline(t time.Time) error      { return errUnsupported }
-func (fc *commonConn) SetReadDeadline(t time.Time) error  { return errUnsupported }
-func (fc *commonConn) SetWriteDeadline(t time.Time) error { return errUnsupported }
+func (fc *commonConn) SetDeadline(t time.Time) error      { return ErrUnsupported }
+func (fc *commonConn) SetReadDeadline(t time.Time) error  { return ErrUnsupported }
+func (fc *commonConn) SetWriteDeadline(t time.Time) error { return ErrUnsupported }
 
 func (fc *commonConn) WriteTo(w io.Writer) (n int64, err error) {
 	fc.assertInboundAccess()

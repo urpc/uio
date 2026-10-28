@@ -103,7 +103,7 @@ func (c *conn) settle(ctx uio.LayerContext) {
 	c.resume, c.stop, c.yield = nil, nil, nil
 	if err := c.tls.Handshake(); err != nil { // the settled result
 		c.mu.Unlock()
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 		return
 	}
 	c.ready = true
@@ -111,7 +111,7 @@ func (c *conn) settle(ctx uio.LayerContext) {
 	_ = ctx.SetTimer(time.Time{}) // the handshake's bound
 	// What arrived with the last flight may hold records already.
 	if err := c.pump(ctx); err != nil {
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 		return
 	}
 	ctx.Up().Open()
@@ -181,7 +181,7 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 	c.noteLowerEndLocked(lower)
 	c.mu.Unlock()
 	if err := c.pump(ctx); err != nil {
-		_ = ctx.Down().CloseWith(err)
+		_ = ctx.Abort(err)
 	}
 	return nil
 }
@@ -240,7 +240,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 // an end at a record's edge — io.EOF, handed up as the end of the stream —
 // from one inside a record, a truncation it reports as an error. It requires
 // c.mu.
-func (c *conn) noteLowerEndLocked(lower uio.Conn) {
+func (c *conn) noteLowerEndLocked(lower uio.LayerDown) {
 	if _, err := lower.Read(nil); err == io.EOF {
 		c.lowerEnded = true
 	}

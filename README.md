@@ -176,9 +176,14 @@ type LayerHandler interface {
 ```
 
 `Layer` is the protocol, configured once; `LayerHandler` is its instance on
-one connection; `LayerContext` is that instance's place in the stack — two
-faces: `Down()`, the connection below it reads come from, and `Up()`, the
-layer above's input it writes to. An obfuscation layer is all of this:
+one connection; `LayerContext` is that instance's place in the stack: `Down()`,
+the connection below it reads from, `Up()`, the layer above's input it writes
+to, and the connection's lifecycle — `ctx.Close(cause)` says this layer's
+goodbye and drains the queue like a close from above, `ctx.Abort(cause)` ends
+it at once. `Down()` carries bytes, options and addressing, never closing: a
+layer ends the connection through the context, so every close runs the stack's
+one close algorithm from the layer that began it. An obfuscation layer is all
+of this:
 
 ```go
 type xorHandler struct {
@@ -267,16 +272,17 @@ These are UIO's to keep, not each layer's to remember:
    `CloseWrite` on the closing goroutine, `OutboundHeld` on writers' and
    `Flush` on a turn's or the caller of `Flush`. State they share needs a
    lock. UIO never calls a layer from below or from inside another layer's
-   callback, so a layer may hold its lock while it writes, flushes or closes
-   below. `Up().Open()` is the one exception, by design: it opens the layers
-   above right there, whose first writes descend through this layer's
-   `OnWrite` before it returns — call it without a lock `OnWrite` takes.
+   callback — `Up().Open()` records a request, and the layers above open on
+   the turn's open stage, after the calling callback returned — so a layer may
+   hold its lock while it writes, flushes or closes below.
 4. **A connection ends once, top down.** The Handler's `OnClose` comes first,
    if its `OnOpen` ran, then every layer's. A connection whose stack never
    opened — a failed handshake — ends without a Handler callback. Once a
    close has begun — from the Handler or from any layer, even inside its
-   `OnWireSent` or `Flush` — no new call reaches a layer: writes, flushes and
-   closes return `net.ErrClosed`, and only `OnClose` follows.
+   `OnWireSent` or `Flush` — no new call reaches a layer from a turn: writes,
+   flushes and closes return `net.ErrClosed`, and only `OnClose` follows. The
+   close itself is the one caller left: the goodbyes it walks, and the
+   flushes it makes below the layer that began it.
 5. **The end of a stream travels up.** A layer whose peer ended its stream
    calls `LayerContext.Up().End()`; the layer above reads `io.EOF` after the
    rest.
@@ -290,8 +296,10 @@ These are UIO's to keep, not each layer's to remember:
 7. **A graceful close lets the queue leave first.** `Close` on a layered
    connection closes the socket once what was queued — the layers' goodbyes
    included — has left, or once it stopped moving for `uio.LingerTimeout`;
-   what arrives meanwhile is discarded. A `CloseWith` with any other error
-   aborts at once.
+   what arrives meanwhile is discarded. A `CloseWith` with any other error,
+   and `ctx.Abort`, end it at once. A layer closing the connection itself
+   does so through `ctx.Close(cause)` or `ctx.Abort(cause)`: the same one
+   close algorithm, begun at that layer.
 8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
    the Handler count against it with the socket's buffer: a stack holding the
    limit takes nothing more from the socket until the Handler reads.

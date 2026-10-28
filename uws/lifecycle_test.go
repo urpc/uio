@@ -253,7 +253,7 @@ func TestBlockingOnCloseDoesNotBlockOtherWebSocket(t *testing.T) {
 		t.Fatal("server OnOpen never marked a connection slow")
 	}
 	fast, fastHandler := newClient()
-	if err := slow.raw.CloseWith(io.EOF); err != nil {
+	if err := slow.requestClose(io.EOF); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -428,7 +428,7 @@ func TestRejectedFinalCallbackKeepsOnCloseReentrant(t *testing.T) {
 		t.Fatal("client connection did not open")
 	}
 	executor.reject.Store(true)
-	if err := clientHandler.conn.raw.CloseWith(io.EOF); err != nil {
+	if err := clientHandler.conn.requestClose(io.EOF); err != nil {
 		t.Fatal(err)
 	}
 	select {

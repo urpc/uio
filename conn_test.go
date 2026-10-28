@@ -43,8 +43,8 @@ func TestCommonConnMetadataAndUnsupportedDeadlines(t *testing.T) {
 		"write deadline": func() error { return conn.SetWriteDeadline(time.Now()) },
 	} {
 		t.Run(name, func(t *testing.T) {
-			if err := set(); !errors.Is(err, errUnsupported) {
-				t.Fatalf("error = %v, want %v", err, errUnsupported)
+			if err := set(); !errors.Is(err, ErrUnsupported) {
+				t.Fatalf("error = %v, want %v", err, ErrUnsupported)
 			}
 		})
 	}

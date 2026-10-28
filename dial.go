@@ -121,7 +121,7 @@ func netDialerFor(network string, config DialConfig) (*net.Dialer, error) {
 			}
 			dialer.LocalAddr = &net.UnixAddr{Name: name, Net: network}
 		default:
-			return nil, errUnsupported
+			return nil, ErrUnsupported
 		}
 	}
 	if config.Control != nil {

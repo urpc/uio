@@ -293,7 +293,7 @@ func (c *Conn) sendHeartbeatClose(code uint16, reason string) {
 // on after Close returns.
 func (c *Conn) Close(code uint16, reason string) error {
 	if !c.opened.Load() {
-		return c.raw.CloseWith(io.EOF)
+		return c.requestClose(io.EOF)
 	}
 	payload, err := c.closePayload(code, reason)
 	if err != nil {
@@ -1039,7 +1039,7 @@ func (heartbeat *heartbeatState) markPingSent(retired uint64) {
 // Ping's frame ends at: what the socket was handed once the frame was handed
 // down, taken in one read — a single counter, so a report arriving meanwhile
 // cannot make the target sit behind the Ping it belongs to.
-func (heartbeat *heartbeatState) markPingWireTarget(nonce uint64, target, sent uint64, below uio.Conn) {
+func (heartbeat *heartbeatState) markPingWireTarget(nonce uint64, target, sent uint64, below uio.LayerDown) {
 	heartbeat.mu.Lock()
 	if heartbeat.pingOutstanding.Load() && heartbeat.pingNonce == nonce {
 		heartbeat.pingWireTarget = target
@@ -1054,7 +1054,7 @@ func (heartbeat *heartbeatState) markPingWireTarget(nonce uint64, target, sent u
 // everything handed down left, the Ping with it. The queue is read after the
 // target, which is set only once the Ping was handed down, so an empty queue
 // seen here never predates the Ping.
-func (heartbeat *heartbeatState) markPingWireSent(sent uint64, below uio.Conn) {
+func (heartbeat *heartbeatState) markPingWireSent(sent uint64, below uio.LayerDown) {
 	if !heartbeat.pingOutstanding.Load() {
 		return
 	}

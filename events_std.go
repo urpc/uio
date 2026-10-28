@@ -63,7 +63,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // cause. Without layers there is nothing to wait for.
 func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any) (Conn, error) {
 	if conn == nil {
-		return nil, errUnsupported
+		return nil, ErrUnsupported
 	}
 	if !ev.ready.Load() || ev.closing.Load() {
 		_ = conn.Close()
@@ -75,7 +75,7 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any)
 	}
 	if _, ok := conn.(syscall.Conn); !ok {
 		_ = conn.Close()
-		return nil, errUnsupported
+		return nil, ErrUnsupported
 	}
 
 	fdc := &fdConn{
@@ -93,7 +93,7 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any)
 	fd := fdc.Fd()
 	if fd < 0 {
 		fdc.closeUnregistered()
-		return nil, errUnsupported
+		return nil, ErrUnsupported
 	}
 	fdc.loop = ev.selectLoop(fd)
 	if err := ev.addConnContext(ctx, fdc); err != nil {

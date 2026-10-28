@@ -20,5 +20,5 @@ package uio
 
 func (conn *fdConn) runUDPWriteTask(owned *Buffer) udpWriteResult {
 	ReleaseBuffer(owned)
-	return udpWriteResult{err: errUnsupported}
+	return udpWriteResult{err: ErrUnsupported}
 }

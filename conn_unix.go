@@ -701,7 +701,7 @@ func (conn *fdConn) Read(b []byte) (int, error) {
 // been sent; see Conn.CloseWrite.
 func (conn *fdConn) CloseWrite() error {
 	if conn.isDatagram() {
-		return errUnsupported
+		return ErrUnsupported
 	}
 	if conn.loop == nil {
 		return net.ErrClosed
@@ -1959,7 +1959,7 @@ func (conn *fdConn) YieldRead() error {
 		return net.ErrClosed
 	}
 	if !conn.directOwner() {
-		return errUnsupported
+		return ErrUnsupported
 	}
 	conn.setReadStalled(true)
 	return nil

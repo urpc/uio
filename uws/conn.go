@@ -36,7 +36,7 @@ import (
 // fields every message touches come first, so they share as few cache lines
 // as the struct's size class allows.
 type Conn struct {
-	raw         uio.Conn
+	raw         uio.LayerDown
 	config      *connConfig
 	handler     Handler
 	parser      *frame.Parser    // retained only while a frame spans input reads

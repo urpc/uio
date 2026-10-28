@@ -151,16 +151,16 @@ func (s *Server) openHTTPConnection(conn *Conn, state *handshakeState) {
 	wire := handshake.AppendServerResponse(response.AvailableBuffer()[:0], upgrade.request, upgrade.protocol, upgrade.extensions)
 	response.CommitWrite(len(wire))
 	if err := conn.writeTransportOwned(response); err != nil {
-		_ = raw.CloseWith(err)
+		_ = conn.requestClose(err)
 		return
 	}
 	if err := raw.Flush(); err != nil {
-		_ = raw.CloseWith(err)
+		_ = conn.requestClose(err)
 		return
 	}
 	conn.setSubprotocol(upgrade.protocol)
 	if !conn.markOpened() {
-		_ = raw.CloseWith(ErrClosed)
+		_ = conn.requestClose(ErrClosed)
 		return
 	}
 	if conn.heartbeat != nil {

@@ -66,7 +66,7 @@ func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
 // DialContext, it cannot be called on an event loop goroutine.
 func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any) (Conn, error) {
 	if conn == nil {
-		return nil, errUnsupported
+		return nil, ErrUnsupported
 	}
 	if !ev.ready.Load() || ev.closing.Load() {
 		_ = conn.Close()

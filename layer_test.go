@@ -324,7 +324,7 @@ type refuseLayer struct {
 	cause error
 }
 
-func (r refuseLayer) OnOpen(ctx LayerContext) { _ = ctx.Down().CloseWith(r.cause) }
+func (r refuseLayer) OnOpen(ctx LayerContext) { _ = ctx.Abort(r.cause) }
 
 // neverOpens negotiates forever: it never opens the layers above.
 type neverOpens struct{ PassThrough }
@@ -1801,7 +1801,7 @@ func (deliverThenClose) OnRead(ctx LayerContext) error {
 	}
 	ctx.Up().Write(chunk)
 	_, _ = lower.Discard(len(chunk))
-	return ctx.Down().CloseWith(io.EOF)
+	return ctx.Close(io.EOF)
 }
 
 // A close as the stack opens — the Handler aborting in its OnOpen — flushes
@@ -1855,7 +1855,7 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 type closeThenOpen struct{ PassThrough }
 
 func (closeThenOpen) OnOpen(ctx LayerContext) {
-	_ = ctx.Down().CloseWith(errors.New("refused"))
+	_ = ctx.Abort(errors.New("refused"))
 	ctx.Up().Open()
 }
 
@@ -1919,7 +1919,7 @@ func (b *byteThenClose) OnRead(ctx LayerContext) error {
 	}
 	_, _ = lower.Discard(1)
 	b.closed.Store(true)
-	return ctx.Down().CloseWith(io.EOF)
+	return ctx.Close(io.EOF)
 }
 
 // A reader that always leaves a little unread — a partial header, the start
@@ -2722,7 +2722,7 @@ func (s *selfCloser) OnRead(ctx LayerContext) error {
 	entered := s.guard.enter()
 	defer s.guard.exit(entered)
 	_, _ = ctx.Down().Discard(-1)
-	_ = ctx.Down().CloseWith(nil)
+	_ = ctx.Close(nil)
 	return nil
 }
 
@@ -2881,7 +2881,7 @@ type closesOnQ struct{ PassThrough }
 func (closesOnQ) OnRead(ctx LayerContext) error {
 	if bytes.Contains(ctx.Down().PeekChunk(), []byte("q")) {
 		_, _ = ctx.Down().Discard(-1)
-		return ctx.Down().CloseWith(nil)
+		return ctx.Close(nil)
 	}
 	return PassThrough{}.OnRead(ctx)
 }
@@ -3050,7 +3050,7 @@ type closesFromSent struct {
 }
 
 func (c *closesFromSent) OnWireSent(ctx LayerContext, _ int) {
-	c.once.Do(func() { _ = ctx.Down().CloseWith(nil) })
+	c.once.Do(func() { _ = ctx.Close(nil) })
 }
 
 // closesFromFlush closes the connection gracefully from a flush once armed.
@@ -3061,7 +3061,7 @@ type closesFromFlush struct {
 
 func (c *closesFromFlush) Flush(ctx LayerContext) error {
 	if c.armed.CompareAndSwap(true, false) {
-		_ = ctx.Down().CloseWith(nil)
+		_ = ctx.Close(nil)
 	}
 	return nil
 }
@@ -3198,7 +3198,7 @@ type closesInShutFlush struct {
 
 func (c *closesInShutFlush) Flush(ctx LayerContext) error {
 	if c.armed.CompareAndSwap(true, false) {
-		return ctx.Down().CloseWith(nil)
+		return ctx.Close(nil)
 	}
 	c.lateCall(ctx)
 	return nil
