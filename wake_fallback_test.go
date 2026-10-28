@@ -25,7 +25,7 @@ func TestWakeFallsBackWhenKernelTimerFails(t *testing.T) {
 	<-started
 	sinkStarted := make(chan struct{})
 	sink := &Events{Pollers: 1, Handler: FuncHandler{
-		Open: func(Conn) {}, Data: func(Conn) error { return nil }, Close: func(Conn, error) {},
+		Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(Conn, error) {},
 	}, Hooks: FuncHandler{Start: func(*Events) { close(sinkStarted) }}}
 	sinkDone := make(chan error, 1)
 	go func() { sinkDone <- sink.Serve() }()
@@ -85,7 +85,7 @@ func TestWakeIntervalFallsBackAndRepeats(t *testing.T) {
 	<-started
 	sinkStarted := make(chan struct{})
 	sink := &Events{Pollers: 1, Handler: FuncHandler{
-		Open: func(Conn) {}, Data: func(Conn) error { return nil }, Close: func(Conn, error) {},
+		Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(Conn, error) {},
 	}, Hooks: FuncHandler{Start: func(*Events) { close(sinkStarted) }}}
 	sinkDone := make(chan error, 1)
 	go func() { sinkDone <- sink.Serve() }()

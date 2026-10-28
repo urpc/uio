@@ -48,8 +48,8 @@ func newTLSLayer(config *tls.Config, opts Options, server bool) *tlsLayer {
 	return layer
 }
 
-func (l *tlsLayer) Attach(ctx uio.LayerContext) uio.LayerConn {
-	switch held := ctx.Lower().Userdata().(type) {
+func (l *tlsLayer) Attach(ctx uio.LayerContext) uio.LayerHandler {
+	switch held := ctx.Down().Userdata().(type) {
 	case *dialSetup:
 		if !held.secure {
 			return uio.PassThrough{}

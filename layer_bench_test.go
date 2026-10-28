@@ -29,7 +29,7 @@ func benchEcho(b *testing.B, layers int, observed bool) {
 	started := make(chan struct{})
 	events := &Events{Pollers: 1, Handler: FuncHandler{
 		Open: func(Conn) {},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			chunk := c.PeekChunk()
 			if len(chunk) == 0 {
 				return nil
@@ -43,8 +43,8 @@ func benchEcho(b *testing.B, layers int, observed bool) {
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	if observed {
 		events.Observer = FuncHandler{
-			Inbound:  func(Conn, int) {},
-			Outbound: func(Conn, int) {},
+			BytesRead:    func(Conn, int) {},
+			BytesWritten: func(Conn, int) {},
 		}
 	}
 	for range layers {
@@ -91,7 +91,7 @@ func benchEcho(b *testing.B, layers int, observed bool) {
 
 type benchPassThrough struct{}
 
-func (benchPassThrough) Attach(LayerContext) LayerConn { return PassThrough{} }
+func (benchPassThrough) Attach(LayerContext) LayerHandler { return PassThrough{} }
 
 // BenchmarkLayerPipelined streams small messages through the server
 // back to back — the CPU, not the round trip, bounds it, so per-turn and
@@ -108,7 +108,7 @@ func benchPipelined(b *testing.B, layers int) {
 	started := make(chan struct{})
 	events := &Events{Pollers: 1, Handler: FuncHandler{
 		Open: func(Conn) {},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			chunk := c.PeekChunk()
 			if len(chunk) == 0 {
 				return nil

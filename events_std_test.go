@@ -183,7 +183,7 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 		}
 		raw.openReturned.Store(true)
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		raw := conn.(*fdConn).conn.(*stdRegistrationConn)
 		if !raw.openReturned.Load() {
 			raw.orderViolation.Store(true)
@@ -243,7 +243,7 @@ func TestStdRegisterStartsIOAfterOnOpen(t *testing.T) {
 	select {
 	case <-dataCalled:
 	case <-time.After(time.Second):
-		t.Fatal("OnData was not called")
+		t.Fatal("OnRead was not called")
 	}
 	if raw.orderViolation.Load() {
 		t.Fatal("I/O callback ran before OnOpen returned")
@@ -850,7 +850,7 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 		events.acceptor.mux.Unlock()
 	}
 	funcs(events).Open = func(conn Conn) { opened <- conn }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		dataCalls <- struct{}{}
 		_, err := conn.WriteTo(conn)
 		return err
@@ -890,7 +890,7 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 	select {
 	case <-dataCalls:
 	case <-time.After(time.Second):
-		t.Fatal("stdio Wake did not invoke OnData")
+		t.Fatal("stdio Wake did not invoke OnRead")
 	}
 
 	shutdownErr := errors.New("stdio shutdown")
@@ -907,7 +907,7 @@ func TestStdServeEchoAndShutdown(t *testing.T) {
 	}
 }
 
-func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
+func TestStdEventsCloseFromOnInboundDoesNotDeadlock(t *testing.T) {
 	started := make(chan string, 1)
 	closeReturned := make(chan struct{})
 	shutdownErr := errors.New("stdio callback shutdown")
@@ -920,7 +920,7 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 		}
 		events.acceptor.mux.Unlock()
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		if err := events.Close(shutdownErr); err != nil {
 			return err
@@ -949,7 +949,7 @@ func TestStdEventsCloseFromOnDataDoesNotDeadlock(t *testing.T) {
 	select {
 	case <-closeReturned:
 	case <-time.After(time.Second):
-		t.Fatal("Events.Close blocked in stdio OnData")
+		t.Fatal("Events.Close blocked in stdio OnRead")
 	}
 	select {
 	case err = <-serveDone:
@@ -977,7 +977,7 @@ func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 			return
 		}
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		callbackOnce.Do(func() {
 			callbackEntered <- struct{}{}
 			<-releaseCallback
@@ -1013,7 +1013,7 @@ func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 	go func() { waitDone <- events.Wait() }()
 	select {
 	case <-waitDone:
-		t.Fatal("Wait returned while OnData was blocked")
+		t.Fatal("Wait returned while OnRead was blocked")
 	case <-time.After(50 * time.Millisecond):
 	}
 	close(releaseCallback)
@@ -1024,7 +1024,7 @@ func TestStdWaitWaitsForLifetimeCallback(t *testing.T) {
 			t.Fatalf("Wait error = %v", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("Wait did not finish after OnData returned")
+		t.Fatal("Wait did not finish after OnRead returned")
 	}
 	select {
 	case err = <-serveDone:
@@ -1045,7 +1045,7 @@ func TestStdReadLoopKeepsLifetimeUntilExit(t *testing.T) {
 		t.Fatal(err)
 	}
 	callbackDone := make(chan struct{}, 1)
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		callbackDone <- struct{}{}
 		return nil
@@ -1106,7 +1106,7 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 		t.Fatal(err)
 	}
 	received := make(chan string, 1)
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		chunk := append([]byte(nil), conn.PeekChunk()...)
 		_, _ = conn.Discard(-1)
 		received <- string(chunk)
@@ -1137,7 +1137,7 @@ func TestStdReadLoopDeliversPayloadBeforeTerminalError(t *testing.T) {
 
 // A close requested while a read is returning its bytes may deliver OnClose
 // before the read loop takes the callback mutex; the loop must then drop the
-// bytes rather than run OnData after the final callback.
+// bytes rather than run OnRead after the final callback.
 func TestStdReadLoopRunsNoDataAfterOnClose(t *testing.T) {
 	events := &Events{Pollers: 1, MaxBufferSize: 64}
 	closed := make(chan struct{})
@@ -1146,7 +1146,7 @@ func TestStdReadLoopRunsNoDataAfterOnClose(t *testing.T) {
 		closedFlag.Store(true)
 		close(closed)
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if closedFlag.Load() {
 			dataAfterClose.Store(true)
 		}
@@ -1191,11 +1191,11 @@ func TestStdReadLoopRunsNoDataAfterOnClose(t *testing.T) {
 	// Serve joins the read loop, so its handling of the bytes is over.
 	stopStdTestEvents(t, events, serveDone, errors.New("stop"))
 	if dataAfterClose.Load() {
-		t.Fatal("OnData ran after OnClose")
+		t.Fatal("OnRead ran after OnClose")
 	}
 }
 
-// OnOutbound calls for one UDP connection never overlap, though its datagrams
+// OnWrite calls for one UDP connection never overlap, though its datagrams
 // leave on the goroutines that write them: a sender that finds another one
 // reporting leaves its bytes to that one and returns.
 func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
@@ -1215,7 +1215,7 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	events := &Events{}
-	funcs(events).Outbound = func(_ Conn, n int) {
+	funcs(events).BytesWritten = func(_ Conn, n int) {
 		if in.Add(1) > 1 {
 			overlap.Add(1)
 		}
@@ -1237,20 +1237,20 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(time.Second):
-		t.Fatal("OnOutbound did not run for the first datagram")
+		t.Fatal("OnWrite did not run for the first datagram")
 	}
 	if _, err := conn.Write([]byte("second!")); err != nil {
 		t.Fatalf("second Write error = %v", err)
 	}
 	if got := calls.Load(); got != 1 {
-		t.Fatalf("OnOutbound ran %d times while the first call was still running", got)
+		t.Fatalf("OnWrite ran %d times while the first call was still running", got)
 	}
 	close(release)
 	if err := <-firstDone; err != nil {
 		t.Fatalf("first Write error = %v", err)
 	}
 	if got := reported.Load(); got != int64(len("first")+len("second!")) {
-		t.Fatalf("OnOutbound reported %d bytes, want %d", got, len("first")+len("second!"))
+		t.Fatalf("OnWrite reported %d bytes, want %d", got, len("first")+len("second!"))
 	}
 
 	// Many senders at once: the reports never overlap and add up to what was sent.
@@ -1269,16 +1269,16 @@ func TestStdUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	}
 	wg.Wait()
 	if n := overlap.Load(); n != 0 {
-		t.Fatalf("OnOutbound overlapped %d times for one UDP connection", n)
+		t.Fatalf("OnWrite overlapped %d times for one UDP connection", n)
 	}
 	if want := int64(len("first")+len("second!")) + sent.Load(); reported.Load() != want {
-		t.Fatalf("OnOutbound reported %d bytes, want %d", reported.Load(), want)
+		t.Fatalf("OnWrite reported %d bytes, want %d", reported.Load(), want)
 	}
 }
 
-// A UDP server's OnData runs inside the peer's inbound callback scope, so the
+// A UDP server's OnRead runs inside the peer's inbound callback scope, so the
 // inbound methods work there, race-enabled builds included.
-func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
+func TestStdUDPServerOnInboundHasInboundAccess(t *testing.T) {
 	started := make(chan net.Addr, 1)
 	got := make(chan string, 1)
 	events := &Events{}
@@ -1290,7 +1290,7 @@ func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
 			}
 		}
 	}
-	funcs(events).Data = func(c Conn) error {
+	funcs(events).Read = func(c Conn) error {
 		buf := make([]byte, c.InboundBuffered())
 		n, err := c.Read(buf)
 		got <- string(buf[:n])
@@ -1320,10 +1320,10 @@ func TestStdUDPServerOnDataHasInboundAccess(t *testing.T) {
 	select {
 	case s := <-got:
 		if s != "datagram" {
-			t.Fatalf("OnData read %q, want %q", s, "datagram")
+			t.Fatalf("OnRead read %q, want %q", s, "datagram")
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("OnData did not run for the datagram")
+		t.Fatal("OnRead did not run for the datagram")
 	}
 }
 
@@ -1340,7 +1340,7 @@ func TestStdHeldReadDeadlineAgreesWithTheSocket(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if consume.Load() {
 				_, _ = c.Discard(-1)
 			}
@@ -1411,7 +1411,7 @@ func TestStdHeldDeadlineExpiryAndClearAreOrdered(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(_ Conn, err error) { closed <- err },
 	})
 	client, server := serveInboundTest(t, events)
@@ -1462,7 +1462,7 @@ func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(_ Conn, err error) { closed <- err },
 	})
 	client, server := serveInboundTest(t, events)
@@ -1481,16 +1481,16 @@ func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 	}
 }
 
-// Every Wake delivered before OnOpen has run gets its own OnData after OnOpen,
+// Every Wake delivered before OnOpen has run gets its own OnRead after OnOpen,
 // as a Wake does once the connection is open: none is merged into another.
 // The Wakes are delivered first and the read goroutine's open runs after, the
 // order a Dial that returns before its read goroutine starts allows.
-func TestStdWakesBeforeOnOpenEachRunOnData(t *testing.T) {
+func TestStdWakesBeforeOnOpenEachRunOnInbound(t *testing.T) {
 	const wakes = 3
 	var seq []string
 	events := withFuncs(&Events{}, FuncHandler{
 		Open: func(Conn) { seq = append(seq, "open") },
-		Data: func(Conn) error { seq = append(seq, "data"); return nil },
+		Read: func(Conn) error { seq = append(seq, "data"); return nil },
 	})
 	conn := &fdConn{}
 	conn.events = events
@@ -1666,7 +1666,7 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 	result := make(chan error, 1)
 	var calls atomic.Int32
 	funcs(ev).Start = func(*Events) { close(started) }
-	funcs(ev).Data = func(conn Conn) error {
+	funcs(ev).Read = func(conn Conn) error {
 		if calls.Add(1) != 1 {
 			return nil
 		}
@@ -1710,10 +1710,10 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 	select {
 	case err := <-result:
 		if err != nil {
-			t.Fatalf("DialContext from OnData stalled behind queued Wake: %v", err)
+			t.Fatalf("DialContext from OnRead stalled behind queued Wake: %v", err)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("OnData failed to return")
+		t.Fatal("OnRead failed to return")
 	}
 }
 
@@ -1732,7 +1732,7 @@ func TestStdUDPListenerCloseDuringDatagramFlood(t *testing.T) {
 				}
 			}
 		}
-		funcs(events).Data = func(c Conn) error { return nil }
+		funcs(events).Read = func(c Conn) error { return nil }
 		serveDone := make(chan error, 1)
 		go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
 		addr := <-started
@@ -1781,7 +1781,7 @@ func TestStdUDPChildClosedBeforeOpenGetsOnClose(t *testing.T) {
 	}
 	funcs(events).Open = func(c Conn) { opens.Add(1) }
 	funcs(events).Close = func(c Conn, err error) { closes.Add(1) }
-	funcs(events).Data = func(c Conn) error { return nil }
+	funcs(events).Read = func(c Conn) error { return nil }
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve("udp://127.0.0.1:0") }()
 	addr := <-started
@@ -1921,7 +1921,7 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 		}
 	}
 	events.Handler = FuncHandler{Open: count, Close: func(c Conn, _ error) { count(c) }}
-	events.Use(LayerFunc(func(LayerContext) LayerConn { return PassThrough{} }))
+	events.Use(LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} }))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })

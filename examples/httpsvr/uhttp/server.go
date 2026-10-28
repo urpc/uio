@@ -31,7 +31,7 @@ func ListenAndServe(addr string, handler http.Handler) error {
 		Open: func(c uio.Conn) {
 			c.SetUserdata(NewHttpConn(c, handler))
 		},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			hConn := c.Userdata().(*HttpConn)
 			return hConn.ServeHTTP()
 		},

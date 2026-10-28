@@ -102,7 +102,7 @@ func newCollectEcho(target int64) *collectEcho {
 
 func (e *collectEcho) OnOpen(uio.Conn) {}
 
-func (e *collectEcho) OnData(c uio.Conn) error {
+func (e *collectEcho) OnRead(c uio.Conn) error {
 	chunk := c.PeekChunk()
 	n := len(chunk)
 	e.mu.Lock()
@@ -123,6 +123,7 @@ func (e *collectEcho) OnData(c uio.Conn) error {
 	return nil
 }
 
+func (e *collectEcho) OnTimer(uio.Conn) error        { return nil }
 func (e *collectEcho) OnClose(_ uio.Conn, err error) { e.closed <- err }
 
 func (e *collectEcho) payload() []byte {
@@ -306,7 +307,7 @@ func TestInteropMutualTLS(t *testing.T) {
 		calls := 0
 		events := startClient(t, uio.FuncHandler{
 			Open:  func(uio.Conn) { calls++ },
-			Data:  func(uio.Conn) error { return nil },
+			Read:  func(uio.Conn) error { return nil },
 			Close: func(uio.Conn, error) { calls++ },
 		}, Client(&tls.Config{
 			ServerName: "localhost", RootCAs: pool,
@@ -327,7 +328,7 @@ func TestInteropMutualTLS(t *testing.T) {
 		closed := make(chan error, 1)
 		events := startClient(t, uio.FuncHandler{
 			Open:  func(uio.Conn) {},
-			Data:  func(uio.Conn) error { return nil },
+			Read:  func(uio.Conn) error { return nil },
 			Close: func(_ uio.Conn, err error) { closed <- err },
 		}, Client(&tls.Config{
 			ServerName: "localhost", RootCAs: pool,
@@ -505,7 +506,7 @@ func (e *countingEcho) OnOpen(uio.Conn) {
 	e.mu.Unlock()
 }
 
-func (e *countingEcho) OnData(c uio.Conn) error {
+func (e *countingEcho) OnRead(c uio.Conn) error {
 	chunk := c.PeekChunk()
 	n := len(chunk)
 	_, err := c.Write(chunk)
@@ -513,6 +514,7 @@ func (e *countingEcho) OnData(c uio.Conn) error {
 	return err
 }
 
+func (e *countingEcho) OnTimer(uio.Conn) error  { return nil }
 func (e *countingEcho) OnClose(uio.Conn, error) {}
 
 func (e *countingEcho) count() int {

@@ -180,7 +180,7 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 					}
 				}()
 			},
-			Data: func(conn Conn) error {
+			Read: func(conn Conn) error {
 				n, _ := conn.Discard(conn.InboundBuffered())
 				received.Add(int64(n))
 				return nil
@@ -309,7 +309,7 @@ func TestSlowOnOpenDoesNotStallTheLoop(t *testing.T) {
 				<-release // the second accepted connection's OnOpen blocks
 			}
 		},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},
@@ -360,7 +360,7 @@ func TestWakeBeforeOnOpenRunsAfterIt(t *testing.T) {
 				note("open")
 			}
 		},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if c.Userdata() == "dialed" {
 				note("data")
 				select {
@@ -474,7 +474,7 @@ func TestUDPChildReadDeadlineClosesOnlyThatChild(t *testing.T) {
 		Pollers: 1,
 	}, FuncHandler{
 		Start: func(*Events) { close(started) },
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			payload := c.Peek(make([]byte, c.InboundBuffered()))
 			if string(payload) == "expire" {
 				if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
@@ -565,7 +565,7 @@ func TestUDPChildGetsOnCloseAfterOnOpen(t *testing.T) {
 	}, FuncHandler{
 		Start: func(*Events) { close(started) },
 		Open:  func(Conn) { opened <- struct{}{} },
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			return c.Close()
 		},

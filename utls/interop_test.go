@@ -201,7 +201,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
 		counting := uio.FuncHandler{
 			Open:  func(uio.Conn) { callbacks++ },
-			Data:  func(uio.Conn) error { return nil },
+			Read:  func(uio.Conn) error { return nil },
 			Close: func(uio.Conn, error) { callbacks++ },
 		}
 		events.Handler = counting

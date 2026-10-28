@@ -52,7 +52,7 @@ func TestCloseWriteFollowsQueuedOutput(t *testing.T) {
 				t.Errorf("CloseWrite: %v", err)
 			}
 		},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			mu.Lock()
 			defer mu.Unlock()
 			_, err := c.WriteTo(&got)
@@ -99,7 +99,7 @@ func TestWritesAfterCloseWriteAreRefused(t *testing.T) {
 	events := withFuncs(&Events{
 		Pollers: 1,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			if err := c.CloseWrite(); err != nil {
 				results <- err
@@ -157,7 +157,7 @@ func TestAllowHalfOpenKeepsWritingAfterPeerEOF(t *testing.T) {
 		Pollers:       1,
 		AllowHalfOpen: true,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			buf := make([]byte, 4096)
 			for {
 				n, err := c.Read(buf)
@@ -206,7 +206,7 @@ func TestPeerEOFClosesWithoutAllowHalfOpen(t *testing.T) {
 	events := withFuncs(&Events{
 		Pollers: 1,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if _, err := c.Read(make([]byte, 64)); err == io.EOF {
 				sawEOF.Store(true)
 			}
@@ -284,7 +284,7 @@ func TestHalfCloseThroughARelay(t *testing.T) {
 		}
 		return nil
 	}
-	funcs(events).Data = forward
+	funcs(events).Read = forward
 	funcs(events).Close = func(Conn, error) { closes.Add(1) }
 	client, in := serveInboundTest(t, events)
 	inLeg := &leg{}
@@ -329,7 +329,7 @@ func TestAllowHalfOpenNoticesAResetAfterEOF(t *testing.T) {
 		Pollers:       1,
 		AllowHalfOpen: true,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if _, err := c.Read(make([]byte, 64)); err == io.EOF {
 				close(eof)
 			}
@@ -448,7 +448,7 @@ func TestCloseWriteAfterReserveOutbound(t *testing.T) {
 	events := withFuncs(&Events{
 		Pollers: 1,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			dst, err := c.ReserveOutbound(len(want))
 			if errors.Is(err, ErrReserveUnsupported) {
@@ -487,7 +487,7 @@ func TestAllowHalfOpenEOFBehindHeldReads(t *testing.T) {
 		MaxInboundBuffered: limit,
 		AllowHalfOpen:      true,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if !consume.Load() {
 				return nil
 			}
@@ -555,7 +555,7 @@ func TestHalfOpenKeepsUnconsumedBytesAfterBothHalvesShut(t *testing.T) {
 						_ = c.CloseWrite()
 					}
 				},
-				Data: func(c Conn) error {
+				Read: func(c Conn) error {
 					if !consume.Load() {
 						return nil
 					}

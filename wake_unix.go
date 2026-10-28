@@ -37,6 +37,15 @@ import (
 // isClosing after the arm.
 type wakeState struct {
 	entry *timewheel.Entry[*fdConn]
+	// mu holds the wheel's arm and the mirror — armed, due and period — as
+	// one step, so a setter and a consuming turn can never see the pair
+	// split: a due published with a stale period would consume the timer as
+	// a one-shot and stop an interval forever. Only conns that arm a wake
+	// timer pay for any of this. The user callback never runs under mu.
+	mu     sync.Mutex
+	armed  bool
+	due    int64 // unix nanos; 0 is a legal deadline, so armed says whether one is set
+	period int64
 }
 
 // SetWakeDeadline arms the connection's wake timer for when; see the Conn
@@ -49,7 +58,7 @@ func (conn *fdConn) SetWakeDeadline(when time.Time) error {
 		conn.cancelWakeTimer()
 		return nil
 	}
-	conn.loop.wakeWheel().Arm(conn.wakeEntry(), when, 0)
+	conn.armWake(when, 0)
 	if conn.isClosing() {
 		conn.cancelWakeTimer()
 	}
@@ -67,34 +76,87 @@ func (conn *fdConn) SetWakeInterval(interval time.Duration) error {
 		conn.cancelWakeTimer()
 		return nil
 	}
-	conn.loop.wakeWheel().Arm(conn.wakeEntry(), time.Now().Add(interval), interval)
+	conn.armWake(time.Now().Add(interval), interval)
 	if conn.isClosing() {
 		conn.cancelWakeTimer()
 	}
 	return nil
 }
 
-// wakeEntry returns the connection's wheel entry, allocated on first use
+// wakeState returns the connection's wake state, allocated on first use
 // under submitMu so two setters cannot allocate two.
-func (conn *fdConn) wakeEntry() *timewheel.Entry[*fdConn] {
+func (conn *fdConn) wakeState() *wakeState {
 	conn.submitMu.Lock()
-	if conn.wake == nil {
-		conn.wake = &wakeState{entry: &timewheel.Entry[*fdConn]{Val: conn}}
+	defer conn.submitMu.Unlock()
+	if w := conn.wake.Load(); w != nil {
+		return w
 	}
-	entry := conn.wake.entry
-	conn.submitMu.Unlock()
-	return entry
+	w := &wakeState{entry: &timewheel.Entry[*fdConn]{Val: conn}}
+	conn.wake.Store(w)
+	return w
+}
+
+// fireWakeTimer runs the connection's own timer callback when its deadline
+// passed, computing due against the clock like a stack's takeDue does: an
+// earlier wake or read runs it just the same. It costs nothing without an
+// OnTimer. skipRead reports a close the timer callback made, which asked for
+// no further callbacks on the connection.
+func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
+	if conn.events.cb.onTimer == nil {
+		return false, nil
+	}
+	wake := conn.wake.Load()
+	if wake == nil {
+		return false, nil
+	}
+	wake.mu.Lock()
+	if !wake.armed {
+		wake.mu.Unlock()
+		return false, nil
+	}
+	now := time.Now().UnixNano()
+	if now < wake.due {
+		wake.mu.Unlock()
+		return false, nil
+	}
+	if wake.period > 0 {
+		// Skip the missed periods arithmetically: a tight interval backed up
+		// behind a long stall must not loop them off one by one.
+		wake.due += ((now-wake.due)/wake.period + 1) * wake.period
+	} else {
+		wake.armed = false
+	}
+	wake.mu.Unlock()
+	if conn.isClosing() {
+		return false, nil
+	}
+	if err := conn.events.cb.onTimer(conn); err != nil {
+		return true, err
+	}
+	return conn.isClosing(), nil
+}
+
+// armWake arms the wheel and sets the mirror as one step, so a concurrent
+// setter or a consuming turn cannot split them.
+func (conn *fdConn) armWake(when time.Time, every time.Duration) {
+	w := conn.wakeState()
+	w.mu.Lock()
+	conn.loop.wakeWheel().Arm(w.entry, when, every)
+	w.armed, w.due, w.period = true, when.UnixNano(), int64(every)
+	w.mu.Unlock()
 }
 
 // cancelWakeTimer removes the entry from its wheel; the close path calls it
 // once the connection's last flush has left, beside stopDeadlines.
 func (conn *fdConn) cancelWakeTimer() {
-	conn.submitMu.Lock()
-	wake := conn.wake
-	conn.submitMu.Unlock()
-	if wake != nil && conn.loop != nil {
-		conn.loop.wakeWheel().Cancel(wake.entry)
+	wake := conn.wake.Load()
+	if wake == nil || conn.loop == nil {
+		return
 	}
+	wake.mu.Lock()
+	wake.armed = false
+	conn.loop.wakeWheel().Cancel(wake.entry)
+	wake.mu.Unlock()
 }
 
 // expireWakeTimers collects the wheel's due deadlines and Wakes each

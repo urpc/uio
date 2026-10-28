@@ -78,7 +78,7 @@ func TestWriteTurnSendsBesideBlockedCallback(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		select {
 		case entered <- struct{}{}:
 		default:
@@ -258,7 +258,7 @@ func TestReserveOutboundIsNeverSentUnfilled(t *testing.T) {
 	var reserved, fallback atomic.Int64
 	var replySeq uint32
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		n := conn.InboundBuffered()
 		_, _ = conn.Discard(n)
 		for range n {
@@ -342,7 +342,7 @@ func TestReserveOutboundIsNeverSentUnfilled(t *testing.T) {
 func TestPartialReplySendKeepsLaterWritesBehind(t *testing.T) {
 	const replies, recordSize = 16, 1000
 	events := &Events{Pollers: 1, MaxBufferSize: 16 << 10}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		for seq := range uint32(replies) {
 			dst, err := conn.ReserveOutbound(recordSize)
@@ -428,7 +428,7 @@ func writeFromOtherGoroutine(t *testing.T, conn Conn, data []byte) {
 // everything the round writes or reserves after that write.
 func TestReservedRepliesPrecedeLaterWrites(t *testing.T) {
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		reserve := func(tag byte) error {
 			dst, err := conn.ReserveOutbound(1)
@@ -474,7 +474,7 @@ func TestReservedRepliesPrecedeLaterWrites(t *testing.T) {
 func TestReservedRepliesBehindQueuedOutput(t *testing.T) {
 	const backlog = 256 << 10
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		// The peer reads nothing yet, so most of this stays queued.
 		writeFromOtherGoroutine(t, conn, bytes.Repeat([]byte{'Q'}, backlog))
@@ -616,7 +616,7 @@ func TestRefusedDirectSendKeepsAWritableEdge(t *testing.T) {
 // writes belongs behind them, not inside the space.
 func TestReserveAfterExternalWriteKeepsOrder(t *testing.T) {
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(conn.InboundBuffered())
 		reserve := func(tag byte) error {
 			dst, err := conn.ReserveOutbound(1)
@@ -678,7 +678,7 @@ func TestWriteTurnResumesReadsAfterBlockedSend(t *testing.T) {
 	const total = 1 << 20
 	replies := make(chan []byte, 1024)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 16 << 10, MaxBufferSize: 4 << 10}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		replies <- buf
@@ -740,7 +740,7 @@ func TestWriteTurnResumesReadsUnderOutboundLimit(t *testing.T) {
 		}
 	}
 	funcs(events).Open = func(conn Conn) { opened <- conn }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		replies <- buf
@@ -844,7 +844,7 @@ func (e *recoveringExecutor) SubmitBatch(tasks []IOTask) int {
 	return len(tasks)
 }
 
-// An OnOutbound that panics during a flush, on a write turn or on the
+// An OnWrite that panics during a flush, on a write turn or on the
 // connection's own turn, gives the write claim back: later output is still
 // sent, and Close and Serve return.
 func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
@@ -866,14 +866,14 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 				}
 			}
 			funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				_, _ = conn.Discard(-1)
 				_, err := conn.Write([]byte("r"))
 				return err
 			}
-			funcs(events).Outbound = func(Conn, int) {
+			funcs(events).BytesWritten = func(Conn, int) {
 				if armed.CompareAndSwap(true, false) {
-					panic("OnOutbound panics once")
+					panic("OnWrite panics once")
 				}
 			}
 			serveDone := make(chan error, 1)
@@ -904,7 +904,7 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 			}
 			for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
 				if time.Now().After(deadline) {
-					t.Fatal("OnOutbound did not panic")
+					t.Fatal("OnWrite did not panic")
 				}
 				time.Sleep(time.Millisecond)
 			}
@@ -928,7 +928,7 @@ func TestPanicInOnOutboundReleasesTheWriteClaim(t *testing.T) {
 }
 
 // A flush the socket refused part of, on a write turn or on the connection's
-// own turn, still arms writable interest when the OnOutbound it then runs
+// own turn, still arms writable interest when the OnWrite it then runs
 // panics: the rest of the output is sent once the peer reads.
 func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 	for _, fromWriteTurn := range []bool{true, false} {
@@ -955,12 +955,12 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 				}
 			}
 			funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				_, _ = conn.Discard(-1)
 				_, err := conn.Write(payload)
 				return err
 			}
-			funcs(events).Outbound = func(c Conn, _ int) {
+			funcs(events).BytesWritten = func(c Conn, _ int) {
 				if armed.CompareAndSwap(true, false) {
 					conn := c.(*fdConn)
 					// A writable edge may clear the blocked flag once the
@@ -969,7 +969,7 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 					state := conn.writeState.Load()
 					blockedAtPanic.Store(state&(writeBlockedFlag|writeEdgeFlag) != 0)
 					ownerAtPanic.Store(conn.directOwner())
-					panic("OnOutbound panics once")
+					panic("OnWrite panics once")
 				}
 			}
 			serveDone := make(chan error, 1)
@@ -1019,15 +1019,15 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 			}
 			for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
 				if time.Now().After(deadline) {
-					t.Fatal("OnOutbound did not panic")
+					t.Fatal("OnWrite did not panic")
 				}
 				time.Sleep(time.Millisecond)
 			}
 			if !blockedAtPanic.Load() {
-				t.Fatal("the flush that ran OnOutbound was not refused by the socket")
+				t.Fatal("the flush that ran OnWrite was not refused by the socket")
 			}
 			if ownerAtPanic.Load() == fromWriteTurn {
-				t.Fatalf("OnOutbound ran on the wrong turn: connection turn = %v", ownerAtPanic.Load())
+				t.Fatalf("OnWrite ran on the wrong turn: connection turn = %v", ownerAtPanic.Load())
 			}
 			_ = client.SetReadDeadline(time.Now().Add(5 * time.Second))
 			got := make([]byte, total)
@@ -1042,7 +1042,7 @@ func TestPanicAfterBlockedFlushKeepsSending(t *testing.T) {
 	}
 }
 
-// A read round that yielded is redelivered even when OnOutbound panics in the
+// A read round that yielded is redelivered even when OnWrite panics in the
 // turn's final flush: bytes already in the socket bring no new edge.
 func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	executor := &recoveringExecutor{}
@@ -1057,7 +1057,7 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 		}
 	}
 	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
 		if _, err := conn.Write(buf); err != nil {
@@ -1065,10 +1065,10 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 		}
 		return conn.YieldRead()
 	}
-	funcs(events).Outbound = func(c Conn, _ int) {
+	funcs(events).BytesWritten = func(c Conn, _ int) {
 		if armed.CompareAndSwap(true, false) {
 			stalledAtPanic.Store(c.(*fdConn).readStalled())
-			panic("OnOutbound panics once")
+			panic("OnWrite panics once")
 		}
 	}
 	serveDone := make(chan error, 1)
@@ -1105,18 +1105,18 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	// echo can arrive before the executor has counted the recovery.
 	for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
 		if time.Now().After(deadline) {
-			t.Fatal("OnOutbound did not panic after a yielded read")
+			t.Fatal("OnWrite did not panic after a yielded read")
 		}
 		time.Sleep(time.Millisecond)
 	}
 	if !stalledAtPanic.Load() {
-		t.Fatal("OnOutbound panicked before the yielded read had stalled")
+		t.Fatal("OnWrite panicked before the yielded read had stalled")
 	}
 }
 
-// OnOutbound runs inside the flush that reports the bytes. A Write it makes is
+// OnWrite runs inside the flush that reports the bytes. A Write it makes is
 // queued and sent by a later flush, and a Flush it calls returns at once,
-// never sending from the same call stack, which would call OnOutbound again inside itself: a callback that
+// never sending from the same call stack, which would call OnWrite again inside itself: a callback that
 // writes more whenever output drains must not nest without bound or deadlock
 // on its own lock. This holds whether the connection's turn took the claim
 // for the flush or keeps it for a reservation.
@@ -1131,7 +1131,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 			var depth, maxDepth, count atomic.Int32
 			var mu sync.Mutex
 			events := &Events{Pollers: 1}
-			funcs(events).Data = func(c Conn) error {
+			funcs(events).Read = func(c Conn) error {
 				_, _ = c.Discard(-1)
 				if reserve {
 					dst, err := c.ReserveOutbound(1)
@@ -1143,7 +1143,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 				_, err := c.Write([]byte("a"))
 				return err
 			}
-			funcs(events).Outbound = func(c Conn, n int) {
+			funcs(events).BytesWritten = func(c Conn, n int) {
 				mu.Lock() // deadlocks if the callback re-enters itself
 				defer mu.Unlock()
 				if d := depth.Add(1); d > maxDepth.Load() {
@@ -1161,7 +1161,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 			}
 			for deadline := time.Now().Add(10 * time.Second); count.Load() < total; {
 				if time.Now().After(deadline) {
-					t.Fatalf("OnOutbound ran %d of %d times", count.Load(), total)
+					t.Fatalf("OnWrite ran %d of %d times", count.Load(), total)
 				}
 				buf := make([]byte, 64<<10)
 				if _, err := unix.Read(testConn.peer, buf); err != nil {
@@ -1171,7 +1171,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 				}
 			}
 			if d := maxDepth.Load(); d != 1 {
-				t.Fatalf("OnOutbound nested %d deep", d)
+				t.Fatalf("OnWrite nested %d deep", d)
 			}
 		})
 	}
@@ -1179,7 +1179,7 @@ func TestOnOutboundWritesDoNotReenterIt(t *testing.T) {
 
 // A Write made while the connection's turn keeps the claim for a reservation
 // it already flushed is queued for the turn's flush, never sent directly: sent
-// directly, OnOutbound would run inside that send and a Write it makes would
+// directly, OnWrite would run inside that send and a Write it makes would
 // call it again.
 func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
 	var armed atomic.Bool
@@ -1202,7 +1202,7 @@ func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	funcs(events).Outbound = func(c Conn, n int) {
+	funcs(events).BytesWritten = func(c Conn, n int) {
 		if !armed.Load() {
 			return
 		}
@@ -1225,7 +1225,7 @@ func TestOnOutboundDoesNotReenterAfterAFlushedReservation(t *testing.T) {
 		t.Fatalf("peer received %q", got)
 	}
 	if d := maxDepth.Load(); d > 1 {
-		t.Fatalf("OnOutbound nested %d deep", d)
+		t.Fatalf("OnWrite nested %d deep", d)
 	}
 }
 
@@ -1489,7 +1489,7 @@ func TestRefusedWriteTurnClosesTheConnection(t *testing.T) {
 func TestRefusedReservationReleasesTheWriteClaim(t *testing.T) {
 	result := make(chan error, 1)
 	events := &Events{Pollers: 1, MaxOutboundBuffered: 1024}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		_, err := conn.ReserveOutbound(4096)
 		if fdc := conn.(*fdConn); err == nil || fdc.writeClaimed() {
@@ -1533,7 +1533,7 @@ func TestCloseNeverWritesReusedDescriptor(t *testing.T) {
 		}
 	}
 	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		n, _ := conn.Discard(-1)
 		strayInbound.Add(int64(n))
 		return nil
@@ -1632,7 +1632,7 @@ func TestWriteBeforeOpenWaitsForOnOpen(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		openReturned.Store(true)
 	}
-	funcs(events).Outbound = func(Conn, int) {
+	funcs(events).BytesWritten = func(Conn, int) {
 		if !openReturned.Load() {
 			earlySend.Store(true)
 		}
@@ -1671,7 +1671,7 @@ func TestWriteBeforeOpenWaitsForOnOpen(t *testing.T) {
 	}
 }
 
-// Serve returns only after every write turn has finished: no OnOutbound runs
+// Serve returns only after every write turn has finished: no OnWrite runs
 // afterwards.
 func TestServeJoinsWriteTurns(t *testing.T) {
 	opened := make(chan Conn, 1)
@@ -1686,7 +1686,7 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 		}
 	}
 	funcs(events).Open = func(conn Conn) { opened <- conn }
-	funcs(events).Outbound = func(Conn, int) {
+	funcs(events).BytesWritten = func(Conn, int) {
 		if stopped.Load() {
 			lateOutbound.Add(1)
 		}
@@ -1732,7 +1732,7 @@ func TestServeJoinsWriteTurns(t *testing.T) {
 	producers.Wait()
 	time.Sleep(20 * time.Millisecond)
 	if n := lateOutbound.Load(); n != 0 {
-		t.Fatalf("%d OnOutbound calls after Serve returned", n)
+		t.Fatalf("%d OnWrite calls after Serve returned", n)
 	}
 }
 
@@ -1769,7 +1769,7 @@ func TestWritevTakesVectorsLongerThanOneSyscall(t *testing.T) {
 					writev(conn)
 				}
 			}
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				_, _ = conn.Discard(conn.InboundBuffered())
 				if callback == "OnData" {
 					writev(conn)
@@ -1844,7 +1844,7 @@ func TestCorkedRoundWritesLeaveTogetherAtRoundEnd(t *testing.T) {
 				_, err := conn.WriteOwned(owned)
 				return err
 			}
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				_, _ = conn.Discard(conn.InboundBuffered())
 				if err := ownedWrite(conn, "one"); err != nil {
 					return err
@@ -1948,7 +1948,7 @@ func runBidirectionalLimitTransfer(t *testing.T, raw [2]net.Conn, limit int) {
 			// neither reads while the other is still filling.
 			<-releaseOpen
 		}
-		funcs(ev).Data = func(conn Conn) error {
+		funcs(ev).Read = func(conn Conn) error {
 			n, _ := conn.Discard(conn.InboundBuffered())
 			received[i].Add(int64(n))
 			return nil
@@ -2108,7 +2108,7 @@ func TestHalfOpenCloseTakesNoExtraTurn(t *testing.T) {
 		executor := &countingExecutor{}
 		closed := make(chan struct{})
 		events := &Events{Pollers: 1, Executor: executor, AllowHalfOpen: halfOpen}
-		funcs(events).Data = func(c Conn) error {
+		funcs(events).Read = func(c Conn) error {
 			if _, err := c.WriteTo(c); err != nil {
 				return err
 			}
@@ -2153,7 +2153,7 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 		}
 		ev.acceptor.mux.Unlock()
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		select {
 		case peer <- conn:

@@ -32,7 +32,7 @@ func main() {
 		Open: func(c uio.Conn) {
 			fmt.Println("connection opened:", c.RemoteAddr())
 		},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},

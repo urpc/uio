@@ -8,13 +8,13 @@
 //
 //	events.Use(utls.Server(config))
 //
-// Nothing costs a goroutine. The handshake runs as a coroutine that OnData
+// Nothing costs a goroutine. The handshake runs as a coroutine that OnRead
 // resumes with the bytes that arrive: when crypto/tls asks its transport
 // for more than the round carried, the transport hands control back and the
 // next round goes on from there, so the rounds the executor already
 // serializes carry the handshake between them. The executor's goroutines
 // passing the rounds on to each other must not be locked to OS threads.
-// Records after the handshake are decrypted in OnData, straight from the
+// Records after the handshake are decrypted in OnRead, straight from the
 // bytes the round read; a record that arrives across several rounds stays
 // cut in crypto/tls's buffer until it is whole.
 //
@@ -147,6 +147,6 @@ func Client(config *Config, opts ...Option) uio.Layer {
 }
 
 // Attach starts TLS on one connection.
-func (m *tlsLayer) Attach(ctx uio.LayerContext) uio.LayerConn {
+func (m *tlsLayer) Attach(ctx uio.LayerContext) uio.LayerHandler {
 	return &conn{tlsLayer: m, ctx: ctx}
 }

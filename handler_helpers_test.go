@@ -6,13 +6,14 @@ package uio
 // time, some after the callbacks were resolved, install it through funcs.
 type liveFuncs struct{ fh *FuncHandler }
 
-func (l *liveFuncs) OnOpen(c Conn)                     { l.fh.OnOpen(c) }
-func (l *liveFuncs) OnData(c Conn) error               { return l.fh.OnData(c) }
-func (l *liveFuncs) OnClose(c Conn, err error)         { l.fh.OnClose(c, err) }
-func (l *liveFuncs) OnInbound(c Conn, readBytes int)   { l.fh.OnInbound(c, readBytes) }
-func (l *liveFuncs) OnOutbound(c Conn, writeBytes int) { l.fh.OnOutbound(c, writeBytes) }
-func (l *liveFuncs) OnStart(ev *Events)                { l.fh.OnStart(ev) }
-func (l *liveFuncs) OnStop(ev *Events)                 { l.fh.OnStop(ev) }
+func (l *liveFuncs) OnOpen(c Conn)                { l.fh.OnOpen(c) }
+func (l *liveFuncs) OnRead(c Conn) error          { return l.fh.OnRead(c) }
+func (l *liveFuncs) OnTimer(c Conn) error         { return l.fh.OnTimer(c) }
+func (l *liveFuncs) OnClose(c Conn, err error)    { l.fh.OnClose(c, err) }
+func (l *liveFuncs) OnBytesRead(c Conn, n int)    { l.fh.OnBytesRead(c, n) }
+func (l *liveFuncs) OnBytesWritten(c Conn, n int) { l.fh.OnBytesWritten(c, n) }
+func (l *liveFuncs) OnStart(ev *Events)           { l.fh.OnStart(ev) }
+func (l *liveFuncs) OnStop(ev *Events)            { l.fh.OnStop(ev) }
 
 // funcs returns the FuncHandler holding ev's callbacks in these tests. The
 // first call installs it, keeping any FuncHandler withFuncs installed, as

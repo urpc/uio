@@ -12,24 +12,38 @@ import (
 	"time"
 )
 
-// wakeRecorder counts OnData turns and records when they ran.
+// wakeRecorder counts read turns and timer fires, and records when they ran.
 type wakeRecorder struct {
 	mu     sync.Mutex
 	times  []time.Time
+	timers []time.Time
 	opened atomic.Int32
 	closed atomic.Int32
 }
 
 func (r *wakeRecorder) OnOpen(Conn) { r.opened.Add(1) }
 
-func (r *wakeRecorder) OnData(Conn) error {
+func (r *wakeRecorder) OnRead(Conn) error {
 	r.mu.Lock()
 	r.times = append(r.times, time.Now())
 	r.mu.Unlock()
 	return nil
 }
 
+func (r *wakeRecorder) OnTimer(Conn) error {
+	r.mu.Lock()
+	r.timers = append(r.timers, time.Now())
+	r.mu.Unlock()
+	return nil
+}
+
 func (r *wakeRecorder) OnClose(Conn, error) { r.closed.Add(1) }
+
+func (r *wakeRecorder) timerFires() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.timers)
+}
 
 func (r *wakeRecorder) fires() int {
 	r.mu.Lock()
@@ -61,7 +75,7 @@ func dialWake(t *testing.T) (*wakeRecorder, Conn) {
 	<-started
 	sinkStarted := make(chan struct{})
 	sink := &Events{Pollers: 1, Handler: FuncHandler{
-		Open: func(Conn) {}, Data: func(Conn) error { return nil }, Close: func(Conn, error) {},
+		Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(Conn, error) {},
 	}, Hooks: FuncHandler{Start: func(*Events) { close(sinkStarted) }}}
 	sinkDone := make(chan error, 1)
 	go func() { sinkDone <- sink.Serve() }()
@@ -287,7 +301,7 @@ func TestWakeUDPChildFiresInServerTurn(t *testing.T) {
 	rec := &record{}
 	events := &Events{Pollers: 1, Handler: FuncHandler{
 		Open:  func(Conn) { rec.mu.Lock(); rec.opens++; rec.mu.Unlock() },
-		Data:  func(Conn) error { rec.mu.Lock(); rec.fires++; rec.mu.Unlock(); return nil },
+		Read:  func(Conn) error { rec.mu.Lock(); rec.fires++; rec.mu.Unlock(); return nil },
 		Close: func(Conn, error) {},
 	}}
 	started := make(chan struct{})

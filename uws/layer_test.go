@@ -42,7 +42,7 @@ func newStreamPeer(echo bool) *streamPeer {
 
 func (p *streamPeer) OnOpen(c uio.Conn) { p.opened <- c }
 
-func (p *streamPeer) OnData(c uio.Conn) error {
+func (p *streamPeer) OnRead(c uio.Conn) error {
 	chunk := c.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
@@ -63,6 +63,7 @@ func (p *streamPeer) OnData(c uio.Conn) error {
 	return nil
 }
 
+func (p *streamPeer) OnTimer(uio.Conn) error        { return nil }
 func (p *streamPeer) OnClose(_ uio.Conn, err error) { p.closed <- err }
 
 // waitRead waits until the peer read n bytes and returns them.
@@ -180,34 +181,34 @@ func TestServerLayerTalksToADialer(t *testing.T) {
 // xorLayer stands for any layer above or below the WebSocket one.
 type xorLayer struct{ uio.PassThrough }
 
-func (xorLayer) OnInbound(ctx uio.LayerContext) error {
-	lower := ctx.Lower()
+func (xorLayer) OnRead(ctx uio.LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
-	out := ctx.Space(len(chunk))[:len(chunk)]
+	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
 	for i, b := range chunk {
 		out[i] = b ^ 0x5a
 	}
-	ctx.Commit(len(chunk))
+	ctx.Up().Commit(len(chunk))
 	_, err := lower.Discard(len(chunk))
 	return err
 }
 
-func (xorLayer) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+func (xorLayer) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	out := make([]byte, len(p))
 	for i, b := range p {
 		out[i] = b ^ 0x5a
 	}
-	if _, err := ctx.Write(out); err != nil {
+	if _, err := ctx.Down().Write(out); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
 func xorLayerOf() uio.Layer {
-	return uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return xorLayer{} })
+	return uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return xorLayer{} })
 }
 
 // TLS, WebSocket and a layer of the application's, stacked on both ends,
@@ -454,7 +455,7 @@ type holdingPeer struct {
 
 func (h *holdingPeer) OnOpen(c uio.Conn) { h.conn <- c }
 
-func (h *holdingPeer) OnData(c uio.Conn) error {
+func (h *holdingPeer) OnRead(c uio.Conn) error {
 	select {
 	case <-h.release:
 	default:
@@ -469,6 +470,7 @@ func (h *holdingPeer) OnData(c uio.Conn) error {
 	return nil
 }
 
+func (h *holdingPeer) OnTimer(uio.Conn) error  { return nil }
 func (h *holdingPeer) OnClose(uio.Conn, error) {}
 
 // An abort from above never passes for a normal close: its Close frame says
@@ -550,28 +552,28 @@ func TestServerLayerKeepsUserdataAuthorizeLeaves(t *testing.T) {
 // WebSocket one that sends more bytes than it is given.
 type doubling struct{ uio.PassThrough }
 
-func (doubling) OnInbound(ctx uio.LayerContext) error {
-	lower := ctx.Lower()
+func (doubling) OnRead(ctx uio.LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	pairs := len(chunk) / 2
 	if pairs == 0 {
 		return nil
 	}
-	out := ctx.Space(pairs)[:pairs]
+	out := ctx.Up().Reserve(pairs)[:pairs]
 	for i := range out {
 		out[i] = chunk[2*i]
 	}
-	ctx.Commit(pairs)
+	ctx.Up().Commit(pairs)
 	_, err := lower.Discard(2 * pairs)
 	return err
 }
 
-func (doubling) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+func (doubling) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	out := make([]byte, 2*len(p))
 	for i, b := range p {
 		out[2*i], out[2*i+1] = b, b
 	}
-	if _, err := ctx.Write(out); err != nil {
+	if _, err := ctx.Down().Write(out); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -589,10 +591,10 @@ func TestLayerCloseAnswerKeepsTheBacklog(t *testing.T) {
 				_, _ = c.Write(make([]byte, size))
 			}
 		},
-		Data:  func(c uio.Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
+		Read:  func(c uio.Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
 		Close: func(uio.Conn, error) {},
 	}
-	_, addr := layerEvents(t, writer, true, uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return doubling{} }), ServerLayer(LayerOptions{}))
+	_, addr := layerEvents(t, writer, true, uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return doubling{} }), ServerLayer(LayerOptions{}))
 
 	peer, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -642,7 +644,7 @@ func TestClientLayerOverAHoldingLayer(t *testing.T) {
 	addr := startEchoServer(t, robustEchoHandler{})
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return &holdUntilFlush{} }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &holdUntilFlush{} }),
 		ClientLayer("ws://"+addr+"/", LayerOptions{}))
 	conn := dialLayer(t, client, addr)
 	if _, err := conn.Write([]byte("held, then flushed")); err != nil {
@@ -661,7 +663,7 @@ type holdUntilFlush struct {
 	held []byte
 }
 
-func (h *holdUntilFlush) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
+func (h *holdUntilFlush) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 	h.mu.Lock()
 	h.held = append(h.held, p...)
 	h.mu.Unlock()
@@ -682,7 +684,7 @@ func (h *holdUntilFlush) Flush(ctx uio.LayerContext) error {
 	if len(held) == 0 {
 		return nil
 	}
-	_, err := ctx.Write(held)
+	_, err := ctx.Down().Write(held)
 	return err
 }
 
@@ -728,14 +730,14 @@ func TestLayerPingFollowsTheWire(t *testing.T) {
 	gate := &sendGate{}
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return gate }),
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return doubling{} }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return doubling{} }),
 		ClientLayer("ws://"+listener.Addr().String()+"/", LayerOptions{Options: Options{
 			HeartbeatInterval: 100 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
 	conn := dialLayer(t, client, listener.Addr().String())
-	ws, ok := uio.FindLayer[*wsLayerConn](conn)
+	ws, ok := uio.FindLayer[*wsLayerHandler](conn)
 	if !ok {
 		t.Fatal("no WebSocket layer")
 	}
@@ -794,10 +796,10 @@ func (g *sendGate) OnOpen(ctx uio.LayerContext) {
 	g.mu.Lock()
 	g.ctx = ctx
 	g.mu.Unlock()
-	ctx.Open()
+	ctx.Up().Open()
 }
 
-func (g *sendGate) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+func (g *sendGate) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	g.mu.Lock()
 	if g.closed {
 		g.queue = append(g.queue, p...)
@@ -805,7 +807,7 @@ func (g *sendGate) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
 		return len(p), nil
 	}
 	g.mu.Unlock()
-	return ctx.Write(p)
+	return ctx.Down().Write(p)
 }
 
 func (g *sendGate) OutboundHeld(uio.LayerContext) int { return g.held() }
@@ -828,7 +830,7 @@ func (g *sendGate) release(n int) {
 	g.queue = g.queue[n:]
 	ctx := g.ctx
 	g.mu.Unlock()
-	_, _ = ctx.Write(out)
+	_, _ = ctx.Down().Write(out)
 }
 
 // The same over TLS, whose handshake went out before the WebSocket layer
@@ -868,14 +870,14 @@ func TestLayerPingFollowsTheWireOverTLS(t *testing.T) {
 	gate := &sendGate{}
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return gate }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
 		utls.Client(clientTLS),
 		ClientLayer("wss://"+listener.Addr().String()+"/", LayerOptions{Options: Options{
 			HeartbeatInterval: 100 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
 	conn := dialLayer(t, client, listener.Addr().String())
-	ws, ok := uio.FindLayer[*wsLayerConn](conn)
+	ws, ok := uio.FindLayer[*wsLayerHandler](conn)
 	if !ok {
 		t.Fatal("no WebSocket layer")
 	}
@@ -933,9 +935,9 @@ func TestPingBelowAHoldingLayer(t *testing.T) {
 			HeartbeatInterval: 50 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}),
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return gate }))
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }))
 	conn := dialLayer(t, client, addr)
-	ws, ok := uio.FindLayer[*wsLayerConn](conn)
+	ws, ok := uio.FindLayer[*wsLayerHandler](conn)
 	if !ok {
 		t.Fatal("no WebSocket layer")
 	}
@@ -972,7 +974,7 @@ func TestPingBelowAHoldingLayer(t *testing.T) {
 }
 
 func passThroughLayerOf() uio.Layer {
-	return uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return uio.PassThrough{} })
+	return uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return uio.PassThrough{} })
 }
 
 // A layer below that sends fewer bytes than it holds puts the Ping's wire
@@ -983,13 +985,13 @@ func TestPingBelowAShrinkingLayer(t *testing.T) {
 	gate := &sendGate{}
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return gate }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
 		ClientLayer("ws://"+addr+"/", LayerOptions{Options: Options{
 			HeartbeatInterval: 50 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
 	conn := dialLayer(t, client, addr)
-	ws, ok := uio.FindLayer[*wsLayerConn](conn)
+	ws, ok := uio.FindLayer[*wsLayerHandler](conn)
 	if !ok {
 		t.Fatal("no WebSocket layer")
 	}
@@ -1031,7 +1033,7 @@ func (g *sendGate) releaseHalf() {
 	g.queue = nil
 	ctx := g.ctx
 	g.mu.Unlock()
-	_, _ = ctx.Write(out)
+	_, _ = ctx.Down().Write(out)
 }
 
 // A write from above that the WebSocket layer splits at MaxMessageSize goes
@@ -1040,7 +1042,7 @@ func TestLayerSplitWritesStayWhole(t *testing.T) {
 	sink := &payloadSink{}
 	conn := &Conn{raw: sink, config: testServerConfig(&Server{Options: Options{MaxMessageSize: 1, MaxFramePayload: 1}})}
 	conn.opened.Store(true)
-	w := &wsLayerConn{}
+	w := &wsLayerHandler{}
 	w.conn.Store(conn)
 	start := make(chan struct{})
 	var wg sync.WaitGroup
@@ -1049,7 +1051,7 @@ func TestLayerSplitWritesStayWhole(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			if n, err := w.OnOutbound(nil, bytes.Repeat([]byte{letter}, 2000)); n != 2000 || err != nil {
+			if n, err := w.OnWrite(nil, bytes.Repeat([]byte{letter}, 2000)); n != 2000 || err != nil {
 				t.Errorf("OnOutbound = %d, %v", n, err)
 			}
 		}()
@@ -1145,7 +1147,7 @@ func TestLayerHeartbeatWhileTheLayerAboveHolds(t *testing.T) {
 	}()
 	closed := make(chan error, 1)
 	idle := uio.FuncHandler{
-		Data:  func(uio.Conn) error { return nil }, // reads nothing
+		Read:  func(uio.Conn) error { return nil }, // reads nothing
 		Close: func(_ uio.Conn, err error) { closed <- err },
 	}
 	heartbeat := LayerOptions{Options: Options{

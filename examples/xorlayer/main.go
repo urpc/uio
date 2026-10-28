@@ -50,7 +50,7 @@ import (
 // It is the Layer: configured once, it builds one xorConn per connection.
 type xorLayer struct{ key byte }
 
-func (l xorLayer) Attach(uio.LayerContext) uio.LayerConn { return &xorConn{key: l.key} }
+func (l xorLayer) Attach(uio.LayerContext) uio.LayerHandler { return &xorConn{key: l.key} }
 
 // xorConn is the layer on one connection. PassThrough gives it the callbacks
 // it does not change — OnOpen opens the layer above at once, OnTimer and
@@ -60,32 +60,32 @@ type xorConn struct {
 	key byte
 }
 
-// OnInbound runs when bytes arrived from below: it XORs them straight into
+// OnRead runs when bytes arrived from below: it XORs them straight into
 // the space the layer above reads from, and consumes them below.
-func (x *xorConn) OnInbound(ctx uio.LayerContext) error {
-	lower := ctx.Lower()
+func (x *xorConn) OnRead(ctx uio.LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
-	out := ctx.Space(len(chunk))[:len(chunk)]
+	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
 	for i, b := range chunk {
 		out[i] = b ^ x.key
 	}
-	ctx.Commit(len(chunk)) // hand the plaintext up
+	ctx.Up().Commit(len(chunk)) // hand the plaintext up
 	_, err := lower.Discard(len(chunk))
 	return err
 }
 
-// OnOutbound runs when the layer above writes: it XORs the bytes and writes
+// OnWrite runs when the layer above writes: it XORs the bytes and writes
 // them below. p belongs to the writer, so the result goes in a buffer of its
 // own.
-func (x *xorConn) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+func (x *xorConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	out := make([]byte, len(p))
 	for i, b := range p {
 		out[i] = b ^ x.key
 	}
-	if _, err := ctx.Write(out); err != nil {
+	if _, err := ctx.Down().Write(out); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -94,23 +94,23 @@ func (x *xorConn) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
 // wiretap prints the bytes that cross it and changes none of them.
 type wiretap struct{ name string }
 
-func (w wiretap) Attach(uio.LayerContext) uio.LayerConn { return tapConn{name: w.name} }
+func (w wiretap) Attach(uio.LayerContext) uio.LayerHandler { return tapConn{name: w.name} }
 
 type tapConn struct {
 	uio.PassThrough
 	name string
 }
 
-func (t tapConn) OnInbound(ctx uio.LayerContext) error {
-	if chunk := ctx.Lower().PeekChunk(); len(chunk) > 0 {
+func (t tapConn) OnRead(ctx uio.LayerContext) error {
+	if chunk := ctx.Down().PeekChunk(); len(chunk) > 0 {
 		fmt.Printf("%-6s wire in   % x\n", t.name, chunk)
 	}
-	return t.PassThrough.OnInbound(ctx) // deliver them as they are
+	return t.PassThrough.OnRead(ctx) // deliver them as they are
 }
 
-func (t tapConn) OnOutbound(ctx uio.LayerContext, p []byte) (int, error) {
+func (t tapConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	fmt.Printf("%-6s wire out  % x\n", t.name, p)
-	return ctx.Write(p)
+	return ctx.Down().Write(p)
 }
 
 func main() {
@@ -124,7 +124,7 @@ func main() {
 	// The server echoes what its handler reads: plaintext, above the layers.
 	server := &uio.Events{Pollers: 1, Handler: uio.FuncHandler{
 		Open: func(uio.Conn) {},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			chunk := c.PeekChunk()
 			if len(chunk) == 0 {
 				return nil
@@ -150,7 +150,7 @@ func main() {
 	echoes := make(chan string, 1)
 	client := &uio.Events{Pollers: 1, Handler: uio.FuncHandler{
 		Open: func(uio.Conn) {},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			chunk := c.PeekChunk()
 			if len(chunk) == 0 {
 				return nil

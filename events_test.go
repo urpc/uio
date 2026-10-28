@@ -38,7 +38,7 @@ func TestAdoptTransfersTCPConnection(t *testing.T) {
 	received := make(chan string, 1)
 	funcs(events).Start = func(*Events) { close(started) }
 	funcs(events).Open = func(conn Conn) { opened <- conn }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		payload := make([]byte, conn.InboundBuffered())
 		_, err := conn.Read(payload)
 		if err == nil {
@@ -348,7 +348,7 @@ func TestServeAcceptsConnectionsOnAllAddresses(t *testing.T) {
 		}
 		started <- addrs
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, err := conn.WriteTo(conn)
 		return err
 	}

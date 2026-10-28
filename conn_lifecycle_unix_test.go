@@ -49,7 +49,7 @@ func TestStaleEventDuringAdmissionFoldsIntoTheOpenTurn(t *testing.T) {
 	gotData := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
 	funcs(events).Open = func(Conn) { enter("open"); inTurn.Add(-1) }
-	funcs(events).Data = func(c Conn) error {
+	funcs(events).Read = func(c Conn) error {
 		enter("data")
 		defer inTurn.Add(-1)
 		_, _ = c.Discard(-1)
@@ -145,7 +145,7 @@ func TestRecoveredOnOpenPanicStillWatchesTheSocket(t *testing.T) {
 	closed := make(chan struct{}, 1)
 	events := &Events{Pollers: 1, Executor: executor}
 	funcs(events).Open = func(Conn) { panic("OnOpen panics") }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		select {
 		case gotData <- struct{}{}:
@@ -223,7 +223,7 @@ func TestUDPSelfWakeDoesNotPinTheServerTurn(t *testing.T) {
 	firstData := make(chan struct{}, 1)
 	var callbacks atomic.Int32
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		if callbacks.Add(1) == 1 {
 			firstData <- struct{}{}
@@ -255,7 +255,7 @@ func TestUDPSelfWakeDoesNotPinTheServerTurn(t *testing.T) {
 	_ = events.Close(nil)
 }
 
-// OnOutbound calls for one UDP connection never overlap, though its datagrams
+// OnWrite calls for one UDP connection never overlap, though its datagrams
 // are sent both from its server's turn and from other goroutines; under -race
 // this also covers the send itself, whose destination address every send to
 // the peer shares.
@@ -269,11 +269,11 @@ func TestUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 		default:
 		}
 	}
-	funcs(events).Data = func(c Conn) error {
+	funcs(events).Read = func(c Conn) error {
 		_, _ = c.Write([]byte("reply"))
 		return nil
 	}
-	funcs(events).Outbound = func(c Conn, n int) {
+	funcs(events).BytesWritten = func(c Conn, n int) {
 		if in.Add(1) > 1 {
 			overlap.Add(1)
 		}
@@ -325,23 +325,23 @@ func TestUDPOnOutboundCallsDoNotOverlap(t *testing.T) {
 	}
 	wg.Wait()
 	if n := overlap.Load(); n != 0 {
-		t.Fatalf("OnOutbound overlapped %d times for one UDP connection", n)
+		t.Fatalf("OnWrite overlapped %d times for one UDP connection", n)
 	}
 	if calls.Load() == 0 {
-		t.Fatal("OnOutbound never ran")
+		t.Fatal("OnWrite never ran")
 	}
 }
 
-// Two UDP peers whose OnOutbound writes to the other, both written to from
+// Two UDP peers whose OnWrite writes to the other, both written to from
 // their own goroutines: reporting a datagram never waits for another
-// connection's OnOutbound, so the writers cannot deadlock.
+// connection's OnWrite, so the writers cannot deadlock.
 func TestUDPOnOutboundCrossWritesDoNotDeadlock(t *testing.T) {
 	opened := make(chan Conn, 2)
 	var mu sync.Mutex
 	other := map[Conn]Conn{}
 	events := &Events{Pollers: 1}
 	funcs(events).Open = func(c Conn) { opened <- c }
-	funcs(events).Outbound = func(c Conn, n int) {
+	funcs(events).BytesWritten = func(c Conn, n int) {
 		if n != 3 {
 			return
 		}
@@ -393,7 +393,7 @@ func TestUDPOnOutboundCrossWritesDoNotDeadlock(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatal("writers deadlocked in OnOutbound")
+		t.Fatal("writers deadlocked in OnWrite")
 	}
 }
 
@@ -583,7 +583,7 @@ func TestConnectedUDPCallbacksStayOnOwningLoop(t *testing.T) {
 		openStarted <- conn.LocalAddr().(*net.UDPAddr)
 		<-releaseOpen
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		switch callbacks.Add(1) {
 		case 1:
 			close(dataStarted)
@@ -705,7 +705,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 			tcpOpened <- fdc
 		}
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if conn.(*fdConn).isDatagram() {
 			udpCallbackGoid.Store(currentGoroutineID())
 			_, err := target.Load().Write([]byte("cross"))
@@ -719,7 +719,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 		_, _ = conn.Discard(-1)
 		return nil
 	}
-	funcs(events).Outbound = func(conn Conn, written int) {
+	funcs(events).BytesWritten = func(conn Conn, written int) {
 		if fdc := conn.(*fdConn); fdc == target.Load() && written > 0 {
 			sender := currentGoroutineID()
 			if sender == udpCallbackGoid.Load() {
@@ -802,7 +802,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	// The stream's bytes must leave through its own sender, never through a
 	// syscall made inside the UDP callback. The worker that ran the callback
 	// may run the stream's write turn afterwards, which is a turn of its own.
-	// OnOutbound follows the send, so it may still be on its way after the
+	// OnWrite follows the send, so it may still be on its way after the
 	// client has the bytes.
 	deadline := time.Now().Add(5 * time.Second)
 	for tcpSender.Load() == 0 && time.Now().Before(deadline) {

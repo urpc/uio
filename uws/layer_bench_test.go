@@ -34,7 +34,7 @@ func BenchmarkSocketEcho(b *testing.B) {
 			default:
 				events := &uio.Events{Pollers: 1, Handler: uio.FuncHandler{
 					Open: func(uio.Conn) {},
-					Data: func(c uio.Conn) error {
+					Read: func(c uio.Conn) error {
 						if chunk := c.PeekChunk(); len(chunk) > 0 {
 							if _, err := c.Write(chunk); err != nil {
 								return err

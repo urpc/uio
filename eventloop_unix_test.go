@@ -26,8 +26,8 @@ func startEchoEvents(t *testing.T, events *Events) string {
 			return
 		}
 	}
-	if funcs(events).Data == nil {
-		funcs(events).Data = func(conn Conn) error {
+	if funcs(events).Read == nil {
+		funcs(events).Read = func(conn Conn) error {
 			_, err := conn.WriteTo(conn)
 			return err
 		}
@@ -209,7 +209,7 @@ func TestDialedConnectionRunsOpenBeforeRead(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 2}, FuncHandler{Start: func(*Events) { close(started) }})
 	funcs(events).Open = func(conn Conn) { conn.SetUserdata(true) }
 	gotData := make(chan struct{}, 32)
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if conn.Userdata() == nil {
 			early.Add(1)
 		}
@@ -254,7 +254,7 @@ func TestAcceptedOpenTurnReadsAlreadySentBytes(t *testing.T) {
 	data := make(chan int64, 1)
 	events := &Events{Pollers: 1}
 	funcs(events).Open = func(Conn) { opened <- currentGoroutineID() }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		select {
 		case data <- currentGoroutineID():
 		default:

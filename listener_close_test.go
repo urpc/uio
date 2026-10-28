@@ -44,7 +44,7 @@ func waitBindable(t *testing.T, addr string, within time.Duration) {
 // Listener.Close of a UDP listener frees its address before returning, even
 // while its socket's turns are busy reading a peer's traffic.
 func TestUDPListenerCloseFreesAddress(t *testing.T) {
-	events := withFuncs(&Events{Pollers: 2}, FuncHandler{Data: func(c Conn) error {
+	events := withFuncs(&Events{Pollers: 2}, FuncHandler{Read: func(c Conn) error {
 		_, _ = c.Discard(-1)
 		return nil
 	}})
@@ -95,7 +95,7 @@ func TestUDPListenerCloseFromPeerCallback(t *testing.T) {
 	closed := make(chan error, 1)
 	returned := make(chan struct{})
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			_ = (*ln.Load()).Close()
 			close(returned)
@@ -147,7 +147,7 @@ func TestUDPListenerCloseInsideControl(t *testing.T) {
 			}
 			events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 				Open: func(c Conn) { opened <- c },
-				Data: func(c Conn) error {
+				Read: func(c Conn) error {
 					_, _ = c.Discard(-1)
 					if fromCallback {
 						closeInControl(c)
@@ -198,7 +198,7 @@ func TestUDPListenerCloseInsideControl(t *testing.T) {
 func TestUDPListenerCloseKeepsPeerSendsOffReusedDescriptor(t *testing.T) {
 	release := make(chan struct{})
 	holding := make(chan struct{}, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Data: func(c Conn) error {
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Read: func(c Conn) error {
 		_, _ = c.Discard(-1)
 		select {
 		case holding <- struct{}{}:
@@ -284,7 +284,7 @@ func TestUDPListenerDoubleCloseDuringControl(t *testing.T) {
 	inControl := make(chan struct{})
 	controlDone := make(chan struct{})
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			_ = c.Control(func(uintptr) {
 				close(inControl)

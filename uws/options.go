@@ -286,7 +286,7 @@ func (o Options) transportEvents() *uio.Events {
 	}
 }
 
-// framesPerDataRead bounds the frames one OnData round consumes: a full read
+// framesPerDataRead bounds the frames one OnInbound round consumes: a full read
 // of the configured buffer at six bytes per frame (the smallest a masked
 // client frame can be), never below the fairness floor.
 func (o Options) framesPerDataRead() int {

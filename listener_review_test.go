@@ -20,7 +20,7 @@ type closeRecorder struct {
 
 func (h *closeRecorder) events() *Events {
 	return withFuncs(&Events{Pollers: 2}, FuncHandler{
-		Data:  func(c Conn) error { _, _ = c.WriteTo(c); return nil },
+		Read:  func(c Conn) error { _, _ = c.WriteTo(c); return nil },
 		Close: func(_ Conn, err error) { h.mu.Lock(); h.closes = append(h.closes, err); h.mu.Unlock() },
 	})
 }
@@ -95,7 +95,7 @@ func TestDialedPeerOpensOnceBothSides(t *testing.T) {
 			var order []string
 			events := withFuncs(&Events{Pollers: 2}, FuncHandler{
 				Open: func(Conn) { mu.Lock(); order = append(order, "open"); mu.Unlock() },
-				Data: func(c Conn) error {
+				Read: func(c Conn) error {
 					mu.Lock()
 					order = append(order, "data")
 					mu.Unlock()
@@ -166,7 +166,7 @@ func TestMappedAndPlainPeerAreOneChild(t *testing.T) {
 	var remotes []string
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open: func(c Conn) { opens.Add(1); mu.Lock(); remotes = append(remotes, c.RemoteAddr().String()); mu.Unlock() },
-		Data: func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read: func(c Conn) error { _, _ = c.Discard(-1); return nil },
 	})
 	serveLoopback(t, events)
 	ln, err := events.Listen("udp://127.0.0.1:0", "mapped")
@@ -227,7 +227,7 @@ func TestNoCallbacksWhileOnStartRuns(t *testing.T) {
 	var callbacks atomic.Int32
 	events := withFuncs(&Events{Pollers: 2}, FuncHandler{
 		Open:  func(Conn) { callbacks.Add(1) },
-		Data:  func(c Conn) error { callbacks.Add(1); _, _ = c.Discard(-1); return nil },
+		Read:  func(c Conn) error { callbacks.Add(1); _, _ = c.Discard(-1); return nil },
 		Close: func(Conn, error) { callbacks.Add(1) },
 	})
 	lnOnce := make(chan Listener, 1)
@@ -289,7 +289,7 @@ func TestDialPeerRefusedWhileEventsCloses(t *testing.T) {
 	var opens, closes int
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open: func(Conn) { mu.Lock(); opens++; mu.Unlock() },
-		Data: func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read: func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(_ Conn, err error) {
 			// The peer's own Close reports a clean end; the teardown one of
 			// the shutdown causes.
@@ -353,7 +353,7 @@ func TestUnstartedListenerCloseCause(t *testing.T) {
 	var ln Listener
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open:  func(Conn) {},
-		Data:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(_ Conn, err error) { closed <- err },
 	})
 	funcs(events).Start = func(ev *Events) {
@@ -406,7 +406,7 @@ func TestUnstartedListenerCloseOrdersCallbacks(t *testing.T) {
 	cause := make(chan error, 1)
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open: func(Conn) { mu.Lock(); order = append(order, "open"); mu.Unlock() },
-		Data: func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read: func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(_ Conn, err error) {
 			mu.Lock()
 			order = append(order, "close")
@@ -502,7 +502,7 @@ func TestDialPeerRacingShutdownKeepsCallbacksInside(t *testing.T) {
 	var callbacks int
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open:  func(Conn) { mu.Lock(); callbacks++; mu.Unlock() },
-		Data:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(Conn, error) { mu.Lock(); callbacks++; mu.Unlock() },
 	})
 	_, done := serveLoopback(t, events)
@@ -551,7 +551,7 @@ func TestUnstartedListenerReleasedWhenCloseRacesShutdown(t *testing.T) {
 	var cause error
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open: func(Conn) { mu.Lock(); order = append(order, "open"); mu.Unlock() },
-		Data: func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read: func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(_ Conn, err error) {
 			mu.Lock()
 			order = append(order, "close")
@@ -626,7 +626,7 @@ func TestReplacedPeerKeepsItsCloseCause(t *testing.T) {
 	const rounds = 200
 	got := make(chan error, rounds*2)
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-		Data:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
+		Read:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
 		Close: func(_ Conn, err error) { got <- err },
 	})
 	_, done := serveLoopback(t, events)

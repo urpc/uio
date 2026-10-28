@@ -42,7 +42,7 @@ const stdWriteVecLimit = 16
 // fdConn uses one blocking reader and one blocking writer per stream. mux
 // protects producer admission and counters; writeMu protects the detached
 // batch while the writer performs blocking net.Conn writes; callbackMu keeps
-// OnData, Wake, and OnClose serialized for the connection.
+// OnRead, Wake, and OnClose serialized for the connection.
 // stdUDPState carries the datagram fields off the stream connections, which
 // are the vast majority: sock is the shared packet socket of a server's peers
 // or a connected client's socket, svr links a logical peer back to its
@@ -95,13 +95,13 @@ type fdConn struct {
 	writeBatch     bytebuf.CompositeBuffer
 	writeBytes     int
 	closing        atomic.Bool
-	callbackMu     sync.Mutex // serializes OnOpen, OnData, Wake, and OnClose
+	callbackMu     sync.Mutex // serializes OnOpen, OnRead, Wake, and OnClose
 	internal       bool       // framework-owned endpoint, not a user connection
 
 	// opened records that OnOpen has run, which a connection's read goroutine
 	// does first, closing or not; only an opened connection gets OnClose. wakesAfterOpen
 	// counts the Wakes that arrived before OnOpen, for the read goroutine to
-	// deliver right after it, one OnData each. Both are guarded by callbackMu.
+	// deliver right after it, one OnRead each. Both are guarded by callbackMu.
 	opened         bool
 	wakesAfterOpen int
 
@@ -128,6 +128,13 @@ type fdConn struct {
 	wakeAt    time.Time
 	wakeEvery time.Duration
 	wakeTimer *time.Timer
+	// wakeArmed/wakeDue/wakePeriod mirror the armed wake timer for the
+	// turn-time OnTimer routing, all under wakeMu as one record: expireWake
+	// consumes wakeAt before the turn runs, so the due check needs a state
+	// of its own, published and consumed whole. See fireWakeTimer.
+	wakeArmed  bool
+	wakeDue    int64
+	wakePeriod int64
 
 	// writeShut records a CloseWrite, guarded by mux: no more output is
 	// accepted, and the writer shuts the socket's writing half once what was
@@ -185,7 +192,7 @@ func (fc *fdConn) retainLifecycle() {
 // openOnReader runs OnOpen on the connection's read goroutine before its
 // first read, then starts the writer, so output written in OnOpen leaves after
 // it returns, as it did when OnOpen ran on the loop. Wakes that came first are
-// delivered right after, one OnData each. It reports whether the connection is
+// delivered right after, one OnRead each. It reports whether the connection is
 // still open. A connection closed before this goroutine ran still gets OnOpen
 // and then OnClose, as on the native backend: a Dial that returned it has
 // handed its caller a connection whose end only OnClose reports.
@@ -194,7 +201,7 @@ func (fc *fdConn) openOnReader() bool {
 	fc.ensureOpenLocked()
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
 		started := fc.beginInboundCallback()
-		err := fc.events.onData(fc)
+		err := fc.events.onRead(fc)
 		fc.endInboundCallback(started)
 		if err != nil {
 			fc.requestClose(err)
@@ -212,7 +219,7 @@ func (fc *fdConn) openOnReader() bool {
 // ensureOpenLocked claims the connection's first open and runs OnOpen; it
 // requires callbackMu. Whichever of a connection's openers reaches it first —
 // its reader, the goroutine of a DialPeer, a close catching it unopened —
-// runs OnOpen, exactly once, before any OnData or OnClose of it.
+// runs OnOpen, exactly once, before any OnRead or OnClose of it.
 func (fc *fdConn) ensureOpenLocked() {
 	if fc.opened {
 		return
@@ -391,6 +398,7 @@ func (fc *fdConn) armWake(when time.Time, every time.Duration) {
 	defer fc.wakeMu.Unlock()
 	fc.wakeGen++
 	fc.wakeAt, fc.wakeEvery = when, every
+	fc.wakeArmed, fc.wakeDue, fc.wakePeriod = true, when.UnixNano(), int64(every)
 	generation := fc.wakeGen
 	// A fresh timer each arm, never Reset: the callback carries this arm's
 	// generation, which Reset would leave stale in the old closure. A timer
@@ -407,8 +415,41 @@ func (fc *fdConn) armWake(when time.Time, every time.Duration) {
 }
 
 // clearWakeTimer disarms the timer.
+// fireWakeTimer runs the connection's own timer callback when its wake
+// deadline passed; see the Conn interface's OnTimer and the native
+// fireWakeTimer for skipRead's meaning.
+func (fc *fdConn) fireWakeTimer() (skipRead bool, err error) {
+	if fc.events.cb.onTimer == nil {
+		return false, nil
+	}
+	fc.wakeMu.Lock()
+	if !fc.wakeArmed {
+		fc.wakeMu.Unlock()
+		return false, nil
+	}
+	now := time.Now().UnixNano()
+	if now < fc.wakeDue {
+		fc.wakeMu.Unlock()
+		return false, nil
+	}
+	if fc.wakePeriod > 0 {
+		fc.wakeDue += ((now-fc.wakeDue)/fc.wakePeriod + 1) * fc.wakePeriod
+	} else {
+		fc.wakeArmed = false
+	}
+	fc.wakeMu.Unlock()
+	if fc.isClosing() {
+		return false, nil
+	}
+	if err := fc.events.cb.onTimer(fc); err != nil {
+		return true, err
+	}
+	return fc.isClosing(), nil
+}
+
 func (fc *fdConn) clearWakeTimer() {
 	fc.wakeMu.Lock()
+	fc.wakeArmed = false
 	defer fc.wakeMu.Unlock()
 	fc.wakeGen++
 	fc.wakeAt, fc.wakeEvery = time.Time{}, 0
@@ -419,7 +460,7 @@ func (fc *fdConn) clearWakeTimer() {
 }
 
 // expireWake is the timer's callback: still-armed, it Wakes the connection —
-// OnData with no socket read — and re-arms an interval.
+// OnRead with no socket read — and re-arms an interval.
 func (fc *fdConn) expireWake(generation uint64) {
 	fc.wakeMu.Lock()
 	if generation != fc.wakeGen || fc.wakeAt.IsZero() {
@@ -805,15 +846,15 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	return
 }
 
-// reportOutbound runs OnOutbound for a datagram send. Datagrams are sent on
+// reportOutbound runs OnBytesWritten for a datagram send. Datagrams are sent on
 // whichever goroutine writes them, so the calls for one connection go through
 // a claim: a sender adds its bytes and reports them itself if it takes the
 // claim, and otherwise leaves them to the holder, which reports until nothing
-// is pending, so the calls never overlap and a send made inside OnOutbound is
-// reported once that call returns. Nobody waits for the claim, so OnOutbound
+// is pending, so the calls never overlap and a send made inside OnBytesWritten is
+// reported once that call returns. Nobody waits for the claim, so OnBytesWritten
 // callbacks that write to each other cannot deadlock.
 func (fc *fdConn) reportOutbound(n int) {
-	if fc.events.cb.onOutbound == nil {
+	if fc.events.cb.onBytesWritten == nil {
 		return
 	}
 	udp := fc.udp
@@ -829,7 +870,7 @@ func (fc *fdConn) reportOutbound(n int) {
 }
 
 // drainOutboundReports reports pending bytes while holding the claim, and
-// releases it even when OnOutbound panics.
+// releases it even when OnBytesWritten panics.
 func (fc *fdConn) drainOutboundReports() {
 	udp := fc.udp
 	defer udp.outboundClaim.Store(false)
@@ -838,7 +879,7 @@ func (fc *fdConn) drainOutboundReports() {
 		if pending == 0 {
 			return
 		}
-		fc.events.cb.onOutbound(fc.events.observed(fc), int(pending))
+		fc.events.cb.onBytesWritten(fc.events.observed(fc), int(pending))
 	}
 }
 
@@ -1209,7 +1250,7 @@ func (fc *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 
 // closeOnLoop owns resource teardown and detaches UDP children. The user
 // callback is scheduled separately so a slow OnClose cannot block the logical
-// event loop or race an active OnData callback.
+// event loop or race an active OnRead callback.
 //
 // Closers arrive from several goroutines at once — a Listener.Close on its
 // caller's, Events.Close, a loop's close task — so fc.mux claims the close
@@ -1424,7 +1465,7 @@ func (fc *fdConn) deliverWake() {
 	}
 	started := fc.beginInboundCallback()
 	defer fc.endInboundCallback(started)
-	if err := fc.events.onData(fc); err != nil {
+	if err := fc.events.onRead(fc); err != nil {
 		fc.requestClose(err)
 		return
 	}
@@ -1525,7 +1566,7 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	return nil
 }
 
-// noteReadEnded runs under callbackMu after an OnData past the peer's end of
+// noteReadEnded runs under callbackMu after an OnRead past the peer's end of
 // stream. Once callbacks have consumed everything the peer sent, the reading
 // half is over and the connection closes if its writing half is shut too.
 func (fc *fdConn) noteReadEnded() {
@@ -1539,7 +1580,7 @@ func (fc *fdConn) noteReadEnded() {
 }
 
 // onReadEOF ends the read goroutine of a half-open connection whose peer shut
-// its writing half: OnData runs once more, so the application sees Read
+// its writing half: OnRead runs once more, so the application sees Read
 // report io.EOF, and the connection closes once its own writing half is shut
 // as well and callbacks consumed what the peer sent.
 func (fc *fdConn) onReadEOF() {
@@ -1550,7 +1591,7 @@ func (fc *fdConn) onReadEOF() {
 	}
 	fc.readEOF.Store(true)
 	started := fc.beginInboundCallback()
-	err := fc.events.onData(fc)
+	err := fc.events.onRead(fc)
 	fc.endInboundCallback(started)
 	if err == nil {
 		fc.noteReadEnded()
@@ -1608,7 +1649,7 @@ func (fc *fdConn) readUDPLoop() {
 
 		// fire data callback.
 		started := fc.beginInboundCallback()
-		if err = fc.events.onData(fc); nil != err {
+		if err = fc.events.onRead(fc); nil != err {
 			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
 			// close on error.
@@ -1647,7 +1688,7 @@ func (fc *fdConn) readLoop() {
 			fc.inboundTail = buffer[:n]
 			fc.events.onSocketBytesRead(fc, n)
 			started := fc.beginInboundCallback()
-			if callbackErr := fc.events.onData(fc); callbackErr != nil {
+			if callbackErr := fc.events.onRead(fc); callbackErr != nil {
 				fc.endInboundCallback(started)
 				fc.callbackMu.Unlock()
 				fc.events.closeConn(fc, callbackErr)
@@ -1824,7 +1865,7 @@ func (fc *fdConn) listenUDP() error {
 
 		// fire udp on-data event.
 		started := udpConn.beginInboundCallback()
-		err = fc.events.onData(udpConn)
+		err = fc.events.onRead(udpConn)
 
 		// drop unread udp packet.
 		_, _ = udpConn.Discard(-1)

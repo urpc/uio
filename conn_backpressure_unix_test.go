@@ -47,7 +47,7 @@ func startBackpressureServer(t *testing.T, onData func(conn Conn, n int) error) 
 		_ = unix.SetsockoptInt(int(conn.(*fdConn).fd), unix.SOL_SOCKET, unix.SO_SNDBUF, pinnedSocketBuffer)
 		opened <- conn.(*fdConn)
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		n, _ := conn.Discard(conn.InboundBuffered())
 		if n == 0 {
 			return nil
@@ -260,7 +260,7 @@ func TestRequestReplyRunsOneTurnPerRequest(t *testing.T) {
 	const rounds = 200
 	executor := &countingExecutor{}
 	events := &Events{Pollers: 1, Executor: executor}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		for conn.InboundBuffered() > 0 {
 			chunk := conn.PeekChunk()
 			if _, err := conn.Write(chunk); err != nil {

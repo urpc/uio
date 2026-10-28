@@ -82,7 +82,7 @@ func main() {
 		_ = up.Wake()
 	}
 
-	handler.Data = func(c uio.Conn) error {
+	handler.Read = func(c uio.Conn) error {
 		peer := peerOf(c)
 		if peer == nil {
 			return nil // the upstream is not up yet: hold
@@ -96,14 +96,14 @@ func main() {
 			}
 		}
 		// Pass the end of the stream on. Check it even when the peer was
-		// backed up: bytes left unconsumed reach OnData again anyway.
+		// backed up: bytes left unconsumed reach OnRead again anyway.
 		if _, err := c.Read(nil); err == io.EOF {
 			return peer.CloseWrite()
 		}
 		return nil
 	}
 
-	handler.Outbound = func(c uio.Conn, _ int) {
+	handler.BytesWritten = func(c uio.Conn, _ int) {
 		// The far leg may have stopped reading because this queue was full;
 		// wake it once enough of the queue has drained.
 		if c.OutboundBuffered() < *inbound/2 {

@@ -172,7 +172,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 			default:
 			}
 		},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			n := len(c.PeekChunk())
 			_, _ = c.Discard(n)
 			if serverCount.Add(int64(n)) >= int64(total) {
@@ -213,7 +213,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	}
 	client := uio.FuncHandler{
 		Open: func(uio.Conn) {},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			n := len(c.PeekChunk())
 			_, _ = c.Discard(n)
 			if clientCount.Add(int64(n)) >= int64(total) {
@@ -369,7 +369,7 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) ui
 			default:
 			}
 		},
-		Data:  func(uio.Conn) error { return nil },
+		Read:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
 	var serverLayers []uio.Layer
@@ -400,7 +400,7 @@ func memBaseline(t *testing.T, conns int, serverLayer, clientLayer uio.Layer) ui
 	}
 	clientEvents.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) {},
-		Data:  func(uio.Conn) error { return nil },
+		Read:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) {},
 	}
 	clientEvents.Use(clientLayers...)

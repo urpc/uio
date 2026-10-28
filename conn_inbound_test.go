@@ -127,7 +127,7 @@ func TestInboundLimitHoldsReadsInsteadOfClosing(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			buffered.Store(int64(c.InboundBuffered()))
 			return nil
 		},
@@ -163,7 +163,7 @@ func TestInboundLimitResumesAfterWakeConsumes(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if !consume.Load() {
 				return nil
 			}
@@ -244,7 +244,7 @@ func TestInboundLimitBoundsARelayToASlowReader(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}
-	funcs(events).Data = func(c Conn) error {
+	funcs(events).Read = func(c Conn) error {
 		out, _ := relayOut.Load().(Conn)
 		if c.Userdata() != nil || out == nil {
 			return nil // the outbound leg's replies, or not dialed yet
@@ -257,7 +257,7 @@ func TestInboundLimitBoundsARelayToASlowReader(t *testing.T) {
 		note(&peakOutbound, out.OutboundBuffered())
 		return err
 	}
-	funcs(events).Outbound = func(c Conn, _ int) {
+	funcs(events).BytesWritten = func(c Conn, _ int) {
 		if c.Userdata() == nil || c.OutboundBuffered() >= limit/2 {
 			return
 		}
@@ -321,7 +321,7 @@ func TestInboundLimitWithReserveInbound(t *testing.T) {
 		MaxBufferSize:      1 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			var header [4]byte
 			for {
 				h := c.Peek(header[:])
@@ -398,7 +398,7 @@ func TestInboundLimitCloseWhileHeld(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(_ Conn, err error) { closed <- err },
 	})
 	client, server := serveInboundTest(t, events)
@@ -426,7 +426,7 @@ func TestInboundLimitHangupBehindHeldReads(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if consume.Load() {
 				n, _ := c.Discard(-1)
 				received.Add(int64(n))
@@ -484,7 +484,7 @@ func TestInboundLimitDeadlineWhileHeld(t *testing.T) {
 						MaxBufferSize:      4 << 10,
 						MaxInboundBuffered: limit,
 					}, FuncHandler{
-						Data:  func(Conn) error { return nil },
+						Read:  func(Conn) error { return nil },
 						Close: func(_ Conn, err error) { closed <- err },
 					})
 					client, server := serveInboundTest(t, events)
@@ -548,7 +548,7 @@ func TestInboundLimitDeadlineChangeKeepsReadsHeld(t *testing.T) {
 		MaxBufferSize:      4 << 10,
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			buffered.Store(int64(c.InboundBuffered()))
 			return nil
 		},
@@ -593,7 +593,7 @@ func TestInboundLimitDeadlineEdgeValuesWhileHeld(t *testing.T) {
 				MaxBufferSize:      4 << 10,
 				MaxInboundBuffered: limit,
 			}, FuncHandler{
-				Data:  func(Conn) error { return nil },
+				Read:  func(Conn) error { return nil },
 				Close: func(_ Conn, err error) { closed <- err },
 			})
 			client, server := serveInboundTest(t, events)
@@ -760,7 +760,7 @@ func startPacketServer(tb testing.TB, decoder *packetDecoder) net.Conn {
 		Pollers:       1,
 		MaxBufferSize: 64 << 10,
 	}, FuncHandler{
-		Data: decoder.onData,
+		Read: decoder.onData,
 	})
 	addr, done := serveLoopback(tb, server)
 	client, err := net.Dial("tcp", addr)

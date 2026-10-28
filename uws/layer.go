@@ -162,16 +162,16 @@ type wsLayer struct {
 	err    error       // the options' fault, which fails every connection
 }
 
-func (l *wsLayer) Attach(ctx uio.LayerContext) uio.LayerConn {
-	return &wsLayerConn{layer: l, ctx: ctx}
+func (l *wsLayer) Attach(ctx uio.LayerContext) uio.LayerHandler {
+	return &wsLayerHandler{layer: l, ctx: ctx}
 }
 
-// wsLayerConn is the protocol engine on one connection of a stack: a Conn
+// wsLayerHandler is the protocol engine on one connection of a stack: a Conn
 // whose transport is the connection below, and whose Handler hands up.
-type wsLayerConn struct {
+type wsLayerHandler struct {
 	layer *wsLayer
 	ctx   uio.LayerContext
-	// conn is set as the layer opens; OnSent, which runs wherever the socket
+	// conn is set as the layer opens; OnWireSent, which runs wherever the socket
 	// sends, may come first — for what the layers below sent to open.
 	conn atomic.Pointer[Conn]
 	// writeMu keeps one write from above whole: the messages a large write
@@ -180,18 +180,18 @@ type wsLayerConn struct {
 }
 
 var (
-	_ uio.LayerConn      = (*wsLayerConn)(nil)
-	_ uio.SendObserver   = (*wsLayerConn)(nil)
-	_ uio.GracefulCloser = (*wsLayerConn)(nil)
+	_ uio.LayerHandler        = (*wsLayerHandler)(nil)
+	_ uio.WireCounterObserver = (*wsLayerHandler)(nil)
+	_ uio.GracefulCloser      = (*wsLayerHandler)(nil)
 )
 
-func (w *wsLayerConn) OnOpen(ctx uio.LayerContext) {
+func (w *wsLayerHandler) OnOpen(ctx uio.LayerContext) {
 	if err := w.layer.err; err != nil {
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 		return
 	}
 	config := w.layer.config
-	conn := &Conn{raw: ctx.Lower(), config: config, handler: layerSink{w}}
+	conn := &Conn{raw: ctx.Down(), config: config, handler: layerSink{w}}
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
@@ -203,38 +203,38 @@ func (w *wsLayerConn) OnOpen(ctx uio.LayerContext) {
 	}
 	keyBytes := make([]byte, 16)
 	if _, err := rand.Read(keyBytes); err != nil {
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 		return
 	}
 	key := base64.StdEncoding.EncodeToString(keyBytes)
 	request, err := handshake.BuildClientRequest(w.layer.target, key, config.subprotocols, config.clientExtensions(), w.layer.header)
 	if err != nil {
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 		return
 	}
 	conn.handshake.Store(&handshakeState{clientKey: key})
 	conn.startHandshakeTimer(config.handshakeTimeout)
 	// The request is counted like any frame, so a close waits for it.
 	conn.trackOutbound(len(request))
-	n, err := ctx.Lower().Write(request)
+	n, err := ctx.Down().Write(request)
 	if err == nil && n != len(request) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
 		conn.rollbackOutbound(len(request) - n)
 		if !errors.Is(err, net.ErrClosed) {
-			_ = ctx.CloseWith(err)
+			_ = ctx.Down().CloseWith(err)
 		}
 	}
 }
 
-func (w *wsLayerConn) OnInbound(ctx uio.LayerContext) error {
+func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 	conn := w.conn.Load()
 	if conn == nil {
 		return nil
 	}
-	if conn.opened.Load() && ctx.HeldAbove() >= layerDeliverBound {
-		ctx.Stall() // the layer above's next read runs the turn again
+	if conn.opened.Load() && ctx.Up().Buffered() >= layerDeliverBound {
+		ctx.Up().Yield() // the layer above's next read runs the turn again
 		return nil
 	}
 	err := conn.readAvailable()
@@ -244,7 +244,7 @@ func (w *wsLayerConn) OnInbound(ctx uio.LayerContext) error {
 	if err != nil {
 		return err
 	}
-	if _, end := ctx.Lower().Read(nil); end == io.EOF && !conn.closed.Load() {
+	if _, end := ctx.Down().Read(nil); end == io.EOF && !conn.closed.Load() {
 		// The stream below ended without the peer's Close: an abnormal end,
 		// unless this end's Close went out and waits for the transport.
 		cause := io.ErrUnexpectedEOF
@@ -256,9 +256,9 @@ func (w *wsLayerConn) OnInbound(ctx uio.LayerContext) error {
 	return nil
 }
 
-// OnOutbound sends what the layer above writes as Binary messages, one per
+// OnWrite sends what the layer above writes as Binary messages, one per
 // MaxMessageSize.
-func (w *wsLayerConn) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
+func (w *wsLayerHandler) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -282,17 +282,17 @@ func (w *wsLayerConn) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
 	}
 }
 
-// OnTimer runs the heartbeat, which OnInbound runs too: a turn skips
-// OnInbound while the layer above has not read what it holds, and a peer
+// OnTimer runs the heartbeat, which OnRead runs too: a turn skips
+// OnRead while the layer above has not read what it holds, and a peer
 // gone meanwhile must still be found out.
-func (w *wsLayerConn) OnTimer(uio.LayerContext) error {
+func (w *wsLayerHandler) OnTimer(uio.LayerContext) error {
 	if conn := w.conn.Load(); conn != nil {
 		conn.heartbeatTick(time.Now())
 	}
 	return nil
 }
 
-func (w *wsLayerConn) OnSent(_ uio.LayerContext, n int) {
+func (w *wsLayerHandler) OnWireSent(_ uio.LayerContext, n int) {
 	conn := w.conn.Load()
 	if conn == nil {
 		return
@@ -306,7 +306,7 @@ func (w *wsLayerConn) OnSent(_ uio.LayerContext, n int) {
 
 // CloseGracefully sends the peer a Close as the layer above closes: 1000 for
 // a graceful close, 1011 for an abort.
-func (w *wsLayerConn) CloseGracefully(_ uio.LayerContext, cause error) {
+func (w *wsLayerHandler) CloseGracefully(_ uio.LayerContext, cause error) {
 	conn := w.conn.Load()
 	if conn == nil || !conn.opened.Load() {
 		return
@@ -318,7 +318,7 @@ func (w *wsLayerConn) CloseGracefully(_ uio.LayerContext, cause error) {
 	_ = conn.Close(code, "")
 }
 
-func (w *wsLayerConn) OnClose(uio.LayerContext, error) {
+func (w *wsLayerHandler) OnClose(uio.LayerContext, error) {
 	conn := w.conn.Load()
 	if conn == nil {
 		return
@@ -334,7 +334,7 @@ func (w *wsLayerConn) OnClose(uio.LayerContext, error) {
 }
 
 // Subprotocol reports the subprotocol the handshake chose, if any.
-func (w *wsLayerConn) Subprotocol() string {
+func (w *wsLayerHandler) Subprotocol() string {
 	if conn := w.conn.Load(); conn != nil {
 		return conn.Subprotocol()
 	}
@@ -343,15 +343,15 @@ func (w *wsLayerConn) Subprotocol() string {
 
 // layerSink is the Handler of a layer's engine: it opens the layers above
 // and hands them what arrives.
-type layerSink struct{ w *wsLayerConn }
+type layerSink struct{ w *wsLayerHandler }
 
 func (s layerSink) OnOpen(c *Conn) {
 	if c.userData != nil {
-		s.w.ctx.Lower().SetUserdata(c.userData) // what Authorize returned
+		s.w.ctx.Down().SetUserdata(c.userData) // what Authorize returned
 	}
-	s.w.ctx.Open()
+	s.w.ctx.Up().Open()
 }
 
-func (s layerSink) OnMessage(_ *Conn, m Message) { s.w.ctx.Deliver(m.Payload) }
+func (s layerSink) OnMessage(_ *Conn, m Message) { s.w.ctx.Up().Write(m.Payload) }
 
 func (s layerSink) OnClose(*Conn, CloseEvent) {}

@@ -63,7 +63,7 @@ type conn struct {
 }
 
 var (
-	_ uio.LayerConn                        = (*conn)(nil)
+	_ uio.LayerHandler                     = (*conn)(nil)
 	_ uio.CloseWriter                      = (*conn)(nil)
 	_ uio.GracefulCloser                   = (*conn)(nil)
 	_ interface{ State() ConnectionState } = (*conn)(nil)
@@ -103,7 +103,7 @@ func (c *conn) settle(ctx uio.LayerContext) {
 	c.resume, c.stop, c.yield = nil, nil, nil
 	if err := c.tls.Handshake(); err != nil { // the settled result
 		c.mu.Unlock()
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 		return
 	}
 	c.ready = true
@@ -111,10 +111,10 @@ func (c *conn) settle(ctx uio.LayerContext) {
 	_ = ctx.SetTimer(time.Time{}) // the handshake's bound
 	// What arrived with the last flight may hold records already.
 	if err := c.pump(ctx); err != nil {
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 		return
 	}
-	ctx.Open()
+	ctx.Up().Open()
 }
 
 func (c *conn) handshakeTimeout() time.Duration {
@@ -135,11 +135,11 @@ func handshake(c *conn) func(func(struct{}) bool) {
 	}
 }
 
-// OnInbound is a turn: the handshake's coroutine runs on what arrived until
+// OnRead is a turn: the handshake's coroutine runs on what arrived until
 // it settles, and from then on the turn's bytes are decrypted and delivered,
 // as far as the staging bound leaves room.
-func (c *conn) OnInbound(ctx uio.LayerContext) error {
-	lower := ctx.Lower()
+func (c *conn) OnRead(ctx uio.LayerContext) error {
+	lower := ctx.Down()
 	c.mu.Lock()
 	if c.resume != nil {
 		// Take no more than the staging bound unread: the handshake reads
@@ -167,11 +167,11 @@ func (c *conn) OnInbound(ctx uio.LayerContext) error {
 	if !ready {
 		return nil
 	}
-	if ctx.HeldAbove() >= c.stagingBound() {
+	if ctx.Up().Buffered() >= c.stagingBound() {
 		// A full staging leaves what arrived below unread, so the pause
 		// travels to the wire; the read above that makes room runs the turn
 		// that takes it.
-		ctx.Stall()
+		ctx.Up().Yield()
 		return nil
 	}
 	chunk := lower.PeekChunk()
@@ -181,7 +181,7 @@ func (c *conn) OnInbound(ctx uio.LayerContext) error {
 	c.noteLowerEndLocked(lower)
 	c.mu.Unlock()
 	if err := c.pump(ctx); err != nil {
-		_ = ctx.CloseWith(err)
+		_ = ctx.Down().CloseWith(err)
 	}
 	return nil
 }
@@ -191,7 +191,7 @@ func (c *conn) OnInbound(ctx uio.LayerContext) error {
 func (c *conn) pump(ctx uio.LayerContext) error {
 	bound := c.stagingBound()
 	for {
-		if ctx.HeldAbove() >= bound {
+		if ctx.Up().Buffered() >= bound {
 			// Work left for a later turn — ciphertext still to read, or the end
 			// of the stream below still to read out — needs the read above
 			// that makes room to run that turn.
@@ -199,7 +199,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			waiting := c.readAt < len(c.pending) || (c.lowerEnded && !c.readEnded)
 			c.mu.Unlock()
 			if waiting {
-				ctx.Stall()
+				ctx.Up().Yield()
 			}
 			return nil
 		}
@@ -212,9 +212,9 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			return nil
 		}
 		c.mu.Unlock()
-		n, err := c.tls.Read(ctx.Space(readBufferSize)[:readBufferSize])
+		n, err := c.tls.Read(ctx.Up().Reserve(readBufferSize)[:readBufferSize])
 		if n > 0 {
-			ctx.Commit(n)
+			ctx.Up().Commit(n)
 		}
 		c.mu.Lock()
 		c.compactLocked()
@@ -227,7 +227,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 				c.mu.Lock()
 				c.readEnded = true
 				c.mu.Unlock()
-				ctx.End()
+				ctx.Up().End()
 				return nil
 			}
 			return err
@@ -271,8 +271,8 @@ func (c *conn) OnClose(uio.LayerContext, error) {
 	}
 }
 
-// OnOutbound encrypts what the layer above writes, from any goroutine.
-func (c *conn) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
+// OnWrite encrypts what the layer above writes, from any goroutine.
+func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 	engine, err := c.engine()
 	if err != nil {
 		return 0, err
@@ -298,7 +298,7 @@ func (c *conn) CloseWrite(ctx uio.LayerContext) error {
 	if err := engine.CloseWrite(); err != nil {
 		return err
 	}
-	return ctx.Lower().CloseWrite()
+	return ctx.Down().CloseWrite()
 }
 
 // State reports what the handshake settled on; before it settles, the zero

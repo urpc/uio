@@ -50,7 +50,7 @@ func TestReadReachesHangupQueuedBehindData(t *testing.T) {
 			var received bytes.Buffer
 			var yielded atomic.Bool
 			funcs(events).Start = func(*Events) { close(started) }
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				mu.Lock()
 				_, err := conn.WriteTo(&received)
 				mu.Unlock()
@@ -119,7 +119,7 @@ func TestHalfClosedPeerGetsReplyThenEndOfStream(t *testing.T) {
 	events := &Events{Pollers: 1}
 	started := make(chan struct{})
 	funcs(events).Start = func(*Events) { close(started) }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if conn.InboundBuffered() < len(request) {
 			return nil
 		}
@@ -176,7 +176,7 @@ func TestAcceptedPeersThatWriteAndCloseAreClosed(t *testing.T) {
 			return
 		}
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, err := conn.Discard(conn.InboundBuffered())
 		return err
 	}
@@ -237,7 +237,7 @@ func TestDialedConnectionsToAServerThatAnswersAndClosesAreClosed(t *testing.T) {
 	started := make(chan struct{})
 	var closed atomic.Int64
 	funcs(events).Start = func(*Events) { close(started) }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, err := conn.Discard(conn.InboundBuffered())
 		return err
 	}
@@ -349,7 +349,7 @@ func TestPausedReadRedeliveredWhileWriteBlocked(t *testing.T) {
 				}
 			}
 			funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				n, _ := conn.Discard(conn.InboundBuffered())
 				if n == 0 {
 					return nil

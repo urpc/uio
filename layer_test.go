@@ -21,7 +21,7 @@ const layerWait = 5 * time.Second
 // mapBytes transforms every byte with f both ways: the shape of a protocol
 // that changes the wire's bytes. It writes only what it transforms.
 func mapBytes(key byte, f func(b, k byte) byte) Layer {
-	return LayerFunc(func(LayerContext) LayerConn {
+	return LayerFunc(func(LayerContext) LayerHandler {
 		return &mapLayer{key: key, f: f}
 	})
 }
@@ -32,23 +32,23 @@ type mapLayer struct {
 	f   func(b, k byte) byte
 }
 
-func (m *mapLayer) OnInbound(ctx LayerContext) error {
-	lower := ctx.Lower()
+func (m *mapLayer) OnRead(ctx LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
 	// Transform straight into the delivery space: no buffer of the layer's own.
-	out := ctx.Space(len(chunk))[:len(chunk)]
+	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
 	for i, b := range chunk {
 		out[i] = m.f(b, m.key)
 	}
-	ctx.Commit(len(chunk))
+	ctx.Up().Commit(len(chunk))
 	_, err := lower.Discard(len(chunk))
 	return err
 }
 
-func (m *mapLayer) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (m *mapLayer) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	// An owned buffer the socket keeps: one copy.
 	owned := AcquireBuffer(len(p))
 	owned.Write(p)
@@ -56,7 +56,7 @@ func (m *mapLayer) OnOutbound(ctx LayerContext, p []byte) (int, error) {
 	for i := range bytes {
 		bytes[i] = m.f(bytes[i], m.key)
 	}
-	if _, err := ctx.Lower().WriteOwned(owned); err != nil {
+	if _, err := ctx.Down().WriteOwned(owned); err != nil {
 		if errors.Is(err, ErrOutboundOverflow) {
 			ReleaseBuffer(owned)
 		}
@@ -77,7 +77,7 @@ func newLayerEcho() *layerEcho {
 
 func (e *layerEcho) OnOpen(c Conn) { e.opened <- c }
 
-func (e *layerEcho) OnData(c Conn) error {
+func (e *layerEcho) OnRead(c Conn) error {
 	payload := append([]byte(nil), c.PeekChunk()...)
 	_, _ = c.Discard(len(payload))
 	e.read <- payload
@@ -85,6 +85,7 @@ func (e *layerEcho) OnData(c Conn) error {
 	return err
 }
 
+func (e *layerEcho) OnTimer(Conn) error  { return nil }
 func (e *layerEcho) OnClose(Conn, error) {}
 
 func layerWaitFor[T any](t *testing.T, c chan T, what string) T {
@@ -160,7 +161,7 @@ func dialLayered(t *testing.T, serverAddr string, use func(*Events)) *Events {
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open: func(Conn) {},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, _ = c.Discard(c.InboundBuffered())
 			return nil
 		},
@@ -231,11 +232,11 @@ func TestUseFailedDialReportsWithoutCallbacks(t *testing.T) {
 
 	var calls int32
 	events := dialLayered(t, silent.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return refuseLayer{cause: refused} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return refuseLayer{cause: refused} }))
 	})
 	events.Handler = FuncHandler{
 		Open:  func(Conn) { atomic.AddInt32(&calls, 1) },
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(Conn, error) { atomic.AddInt32(&calls, 1) },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -268,11 +269,11 @@ func TestUseCanceledDialRunsNoCallbacks(t *testing.T) {
 
 	var calls int32
 	events := dialLayered(t, silent.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return neverOpens{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return neverOpens{} }))
 	})
 	events.Handler = FuncHandler{
 		Open:  func(Conn) { atomic.AddInt32(&calls, 1) },
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(Conn, error) { atomic.AddInt32(&calls, 1) },
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
@@ -323,7 +324,7 @@ type refuseLayer struct {
 	cause error
 }
 
-func (r refuseLayer) OnOpen(ctx LayerContext) { _ = ctx.CloseWith(r.cause) }
+func (r refuseLayer) OnOpen(ctx LayerContext) { _ = ctx.Down().CloseWith(r.cause) }
 
 // neverOpens negotiates forever: it never opens the layers above.
 type neverOpens struct{ PassThrough }
@@ -335,10 +336,10 @@ func (neverOpens) OnOpen(LayerContext) {}
 // replaces another, as the single slot all of them once shared did.
 func TestEveryLayerHasItsOwnTimer(t *testing.T) {
 	var lowerFired, upperFired, handlerFired atomic.Int32
-	lower := LayerFunc(func(LayerContext) LayerConn {
+	lower := LayerFunc(func(LayerContext) LayerHandler {
 		return &timerLayer{after: 200 * time.Millisecond, fired: &lowerFired}
 	})
-	upper := LayerFunc(func(LayerContext) LayerConn {
+	upper := LayerFunc(func(LayerContext) LayerHandler {
 		return &timerLayer{after: 30 * time.Millisecond, fired: &upperFired}
 	})
 	started := make(chan struct{})
@@ -346,7 +347,7 @@ func TestEveryLayerHasItsOwnTimer(t *testing.T) {
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open: func(c Conn) { _ = c.SetWakeDeadline(time.Now().Add(80 * time.Millisecond)) },
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			if len(c.PeekChunk()) == 0 {
 				handlerFired.Add(1)
 			}
@@ -384,7 +385,7 @@ type timerLayer struct {
 
 func (l *timerLayer) OnOpen(ctx LayerContext) {
 	_ = ctx.SetTimer(time.Now().Add(l.after))
-	ctx.Open()
+	ctx.Up().Open()
 }
 
 func (l *timerLayer) OnTimer(LayerContext) error {
@@ -395,19 +396,19 @@ func (l *timerLayer) OnTimer(LayerContext) error {
 // passThroughLayer is a layer that changes nothing.
 type passThroughLayer struct{}
 
-func (passThroughLayer) Attach(LayerContext) LayerConn { return PassThrough{} }
+func (passThroughLayer) Attach(LayerContext) LayerHandler { return PassThrough{} }
 
 // A turn that delivers nothing still reaches the Handler: a wake through a
 // stack of layers that pass nothing up arrives all the same.
 func TestEmptyTurnsReachTheHandler(t *testing.T) {
-	quiet := LayerFunc(func(LayerContext) LayerConn { return &holdBack{} })
+	quiet := LayerFunc(func(LayerContext) LayerHandler { return &holdBack{} })
 	turns := make(chan struct{}, 8)
 	started := make(chan struct{})
 	events := &Events{Pollers: 1}
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open: func(Conn) {},
-		Data: func(Conn) error {
+		Read: func(Conn) error {
 			select {
 			case turns <- struct{}{}:
 			default:
@@ -437,8 +438,8 @@ func TestEmptyTurnsReachTheHandler(t *testing.T) {
 // holdBack swallows everything below: it never delivers.
 type holdBack struct{ PassThrough }
 
-func (*holdBack) OnInbound(ctx LayerContext) error {
-	lower := ctx.Lower()
+func (*holdBack) OnRead(ctx LayerContext) error {
+	lower := ctx.Down()
 	_, err := lower.Discard(len(lower.PeekChunk()))
 	return err
 }
@@ -447,13 +448,13 @@ func (*holdBack) OnInbound(ctx LayerContext) error {
 // layer sets there the Handler reads.
 func TestUserdataIsTheConnectionsThroughEveryLayer(t *testing.T) {
 	seen := make(chan any, 2)
-	marker := LayerFunc(func(LayerContext) LayerConn { return &userdataLayer{seen: seen} })
+	marker := LayerFunc(func(LayerContext) LayerHandler { return &userdataLayer{seen: seen} })
 	started := make(chan struct{})
 	events := &Events{Pollers: 1}
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open:  func(c Conn) { seen <- c.Userdata() },
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(Conn, error) {},
 	}
 	events.Use(marker, passThroughLayer{})
@@ -487,8 +488,8 @@ type userdataLayer struct {
 }
 
 func (u *userdataLayer) OnOpen(ctx LayerContext) {
-	u.seen <- ctx.Lower().Userdata()
-	ctx.Open()
+	u.seen <- ctx.Down().Userdata()
+	ctx.Up().Open()
 }
 
 // A connection ends once, top down: the Handler first, then every layer.
@@ -505,14 +506,14 @@ func TestCloseReachesEveryLayerOnce(t *testing.T) {
 		mu.Unlock()
 	}
 	layer := func(name string) Layer {
-		return LayerFunc(func(LayerContext) LayerConn { return &closeLayer{name: name, record: record} })
+		return LayerFunc(func(LayerContext) LayerHandler { return &closeLayer{name: name, record: record} })
 	}
 	started := make(chan struct{})
 	events := &Events{Pollers: 1}
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open:  func(Conn) {},
-		Data:  func(Conn) error { return nil },
+		Read:  func(Conn) error { return nil },
 		Close: func(Conn, error) { record("handler") },
 	}
 	events.Use(layer("bottom"), layer("top"))
@@ -597,7 +598,7 @@ func TestOneChunkLayerDrainsEverythingBelow(t *testing.T) {
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
 		Open: func(Conn) {},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			n, _ := c.Discard(len(c.PeekChunk()))
 			if read.Add(int64(n)) >= total {
 				select {
@@ -609,7 +610,7 @@ func TestOneChunkLayerDrainsEverythingBelow(t *testing.T) {
 		},
 		Close: func(Conn, error) {},
 	}
-	events.Use(LayerFunc(func(LayerContext) LayerConn { return &tinyChunks{} }))
+	events.Use(LayerFunc(func(LayerContext) LayerHandler { return &tinyChunks{} }))
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
@@ -641,8 +642,8 @@ func TestOneChunkLayerDrainsEverythingBelow(t *testing.T) {
 // protocol takes what arrived.
 type tinyChunks struct{ PassThrough }
 
-func (*tinyChunks) OnInbound(ctx LayerContext) error {
-	lower := ctx.Lower()
+func (*tinyChunks) OnRead(ctx LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) > 1<<10 {
 		chunk = chunk[:1<<10]
@@ -650,7 +651,7 @@ func (*tinyChunks) OnInbound(ctx LayerContext) error {
 	if len(chunk) == 0 {
 		return nil
 	}
-	ctx.Deliver(chunk)
+	ctx.Up().Write(chunk)
 	_, err := lower.Discard(len(chunk))
 	return err
 }
@@ -723,7 +724,7 @@ func TestOutboundLimitAdmitsAtTheTopOfTheStack(t *testing.T) {
 			defer c.Close()
 		}
 	}()
-	twice := LayerFunc(func(LayerContext) LayerConn { return writeTwice{} })
+	twice := LayerFunc(func(LayerContext) LayerHandler { return writeTwice{} })
 	events := dialLayered(t, silent.Addr().String(), func(ev *Events) {
 		ev.MaxOutboundBuffered = 64 << 10
 		ev.Use(twice, passThroughLayer{})
@@ -759,12 +760,12 @@ func TestOutboundLimitAdmitsAtTheTopOfTheStack(t *testing.T) {
 // writeTwice writes what it is given in two halves.
 type writeTwice struct{ PassThrough }
 
-func (writeTwice) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (writeTwice) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	half := len(p) / 2
-	if _, err := ctx.Write(p[:half]); err != nil {
+	if _, err := ctx.Down().Write(p[:half]); err != nil {
 		return 0, err
 	}
-	if _, err := ctx.Write(p[half:]); err != nil {
+	if _, err := ctx.Down().Write(p[half:]); err != nil {
 		return half, err
 	}
 	return len(p), nil
@@ -773,16 +774,16 @@ func (writeTwice) OnOutbound(ctx LayerContext, p []byte) (int, error) {
 // A layer that observes sends hears every byte the socket sent, counted on
 // the wire — its own and those of the layers above — whether or not an
 // Observer listens, and an Observer still hears them all as well.
-func TestSendObserverHearsTheWire(t *testing.T) {
+func TestWireCounterObserverHearsTheWire(t *testing.T) {
 	for _, withObserver := range []bool{false, true} {
 		t.Run(map[bool]string{false: "alone", true: "beside an Observer"}[withObserver], func(t *testing.T) {
 			addr, echo := serveLayered(t, nil)
 			var heard, observed atomic.Int64
-			counter := LayerFunc(func(LayerContext) LayerConn { return &sendCounter{heard: &heard} })
+			counter := LayerFunc(func(LayerContext) LayerHandler { return &sendCounter{heard: &heard} })
 			events := dialLayered(t, addr, func(ev *Events) {
 				ev.Use(counter, mapBytes(0x00, xor))
 				if withObserver {
-					ev.Observer = FuncHandler{Outbound: func(_ Conn, n int) { observed.Add(int64(n)) }}
+					ev.Observer = FuncHandler{BytesWritten: func(_ Conn, n int) { observed.Add(int64(n)) }}
 				}
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -826,14 +827,14 @@ type sendCounter struct {
 	heard *atomic.Int64
 }
 
-func (s *sendCounter) OnSent(_ LayerContext, n int) { s.heard.Add(int64(n)) }
+func (s *sendCounter) OnWireSent(_ LayerContext, n int) { s.heard.Add(int64(n)) }
 
 // A goodbye reaches the peer behind everything queued before it: the socket
 // closes once its queue emptied, not as the close is asked for, on either
 // backend. A peer that reads nothing more holds the close for the goodbye
 // timeout at most.
 func TestGoodbyeLeavesBeforeTheSocketCloses(t *testing.T) {
-	goodbye := LayerFunc(func(LayerContext) LayerConn { return sayGoodbye{} })
+	goodbye := LayerFunc(func(LayerContext) LayerHandler { return sayGoodbye{} })
 	run := func(t *testing.T, read bool) {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -860,7 +861,7 @@ func TestGoodbyeLeavesBeforeTheSocketCloses(t *testing.T) {
 		events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
 			ev.Handler = FuncHandler{
 				Open:  func(Conn) {},
-				Data:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
+				Read:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
 				Close: func(_ Conn, err error) { closed <- err },
 			}
 			ev.Use(goodbye)
@@ -910,7 +911,7 @@ func TestGoodbyeLeavesBeforeTheSocketCloses(t *testing.T) {
 // sayGoodbye writes "bye" as the layer above closes.
 type sayGoodbye struct{ PassThrough }
 
-func (sayGoodbye) CloseGracefully(ctx LayerContext, _ error) { _, _ = ctx.Write([]byte("bye")) }
+func (sayGoodbye) CloseGracefully(ctx LayerContext, _ error) { _, _ = ctx.Down().Write([]byte("bye")) }
 
 // A close with an error aborts: the goodbye is written, but the socket does
 // not wait for a peer that reads nothing.
@@ -931,10 +932,10 @@ func TestAbortDoesNotWaitForTheGoodbye(t *testing.T) {
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
 		ev.Handler = FuncHandler{
 			Open:  func(Conn) {},
-			Data:  func(Conn) error { return nil },
+			Read:  func(Conn) error { return nil },
 			Close: func(_ Conn, err error) { closed <- err },
 		}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return sayGoodbye{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return sayGoodbye{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1011,10 +1012,10 @@ func TestDialGivingUpMidOpenRunsNoCallbacks(t *testing.T) {
 	events := dialLayered(t, addr, func(ev *Events) {
 		ev.Handler = FuncHandler{
 			Open:  func(Conn) { calls.Add(1) },
-			Data:  func(Conn) error { return nil },
+			Read:  func(Conn) error { return nil },
 			Close: func(Conn, error) { calls.Add(1) },
 		}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return slowOpen{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return slowOpen{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
@@ -1032,7 +1033,7 @@ type slowOpen struct{ PassThrough }
 
 func (slowOpen) OnOpen(ctx LayerContext) {
 	time.Sleep(100 * time.Millisecond)
-	ctx.Open()
+	ctx.Up().Open()
 }
 
 // While a graceful close waits for its queue, what the peer sends is
@@ -1066,7 +1067,7 @@ func TestLingeringCloseDiscardsWhatArrives(t *testing.T) {
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
 		ev.Handler = FuncHandler{
 			Open:  func(Conn) {},
-			Data:  func(Conn) error { return nil },
+			Read:  func(Conn) error { return nil },
 			Close: func(_ Conn, err error) { closed <- err },
 		}
 		ev.Use(passThroughLayer{})
@@ -1123,7 +1124,7 @@ func TestEndOfStreamPassesThroughLayers(t *testing.T) {
 		var read []byte
 		ev.Handler = FuncHandler{
 			Open: func(Conn) {},
-			Data: func(c Conn) error {
+			Read: func(c Conn) error {
 				buf := make([]byte, 64)
 				for {
 					n, err := c.Read(buf)
@@ -1161,7 +1162,7 @@ func TestEndOfStreamPassesThroughLayers(t *testing.T) {
 func TestCloseWriteNeedsTheLayersSupport(t *testing.T) {
 	addr, _ := serveLayered(t, nil)
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(passThroughLayer{}, LayerFunc(func(LayerContext) LayerConn { return &framing{} }))
+		ev.Use(passThroughLayer{}, LayerFunc(func(LayerContext) LayerHandler { return &framing{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1174,14 +1175,14 @@ func TestCloseWriteNeedsTheLayersSupport(t *testing.T) {
 	}
 }
 
-// framing is a layer that implements LayerConn without PassThrough.
+// framing is a layer that implements LayerHandler without PassThrough.
 type framing struct{}
 
-func (*framing) OnOpen(ctx LayerContext)                            { ctx.Open() }
-func (*framing) OnInbound(LayerContext) error                       { return nil }
-func (*framing) OnOutbound(ctx LayerContext, p []byte) (int, error) { return ctx.Write(p) }
-func (*framing) OnTimer(LayerContext) error                         { return nil }
-func (*framing) OnClose(LayerContext, error)                        {}
+func (*framing) OnOpen(ctx LayerContext)                         { ctx.Up().Open() }
+func (*framing) OnRead(LayerContext) error                       { return nil }
+func (*framing) OnWrite(ctx LayerContext, p []byte) (int, error) { return ctx.Down().Write(p) }
+func (*framing) OnTimer(LayerContext) error                      { return nil }
+func (*framing) OnClose(LayerContext, error)                     {}
 
 // FindLayer looks down the whole stack; what a layer holds counts as queued.
 func TestFindLayerAndHeldOutput(t *testing.T) {
@@ -1189,7 +1190,7 @@ func TestFindLayerAndHeldOutput(t *testing.T) {
 	holder := &holdsOutput{}
 	events := dialLayered(t, addr, func(ev *Events) {
 		ev.MaxOutboundBuffered = 100
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return holder }), passThroughLayer{})
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return holder }), passThroughLayer{})
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1260,7 +1261,7 @@ func TestLingerWaitsForASlowPeer(t *testing.T) {
 		}
 	}()
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return sayGoodbye{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return sayGoodbye{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1308,7 +1309,7 @@ func TestOutboundLimitHoldsForConcurrentWriters(t *testing.T) {
 	}()
 	events := dialLayered(t, silent.Addr().String(), func(ev *Events) {
 		ev.MaxOutboundBuffered = limit
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return slowEncode{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return slowEncode{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1366,13 +1367,13 @@ func TestOutboundLimitHoldsForConcurrentWriters(t *testing.T) {
 // encryption does, and adds no bytes.
 type slowEncode struct{ PassThrough }
 
-func (slowEncode) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (slowEncode) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	time.Sleep(200 * time.Microsecond)
-	return ctx.Write(p)
+	return ctx.Down().Write(p)
 }
 
 // Discard(-1) drops everything a layer delivered, as the socket's does —
-// FuncHandler's default OnData calls it — and leaves the connection whole for
+// FuncHandler's default OnRead calls it — and leaves the connection whole for
 // what arrives next.
 func TestDiscardAllThroughALayer(t *testing.T) {
 	for _, defaulted := range []bool{false, true} {
@@ -1397,7 +1398,7 @@ func TestDiscardAllThroughALayer(t *testing.T) {
 		reads := make(chan string, 4)
 		var handler FuncHandler
 		if defaulted {
-			// No Data: the default discards everything, and the reply below
+			// No Read: the default discards everything, and the reply below
 			// shows the connection still works.
 			handler = FuncHandler{Open: func(c Conn) {
 				go func() { <-time.After(100 * time.Millisecond); _, _ = c.Write([]byte("alive")); _ = c.Close() }()
@@ -1405,7 +1406,7 @@ func TestDiscardAllThroughALayer(t *testing.T) {
 		} else {
 			handler = FuncHandler{
 				Open: func(Conn) {},
-				Data: func(c Conn) error {
+				Read: func(c Conn) error {
 					if chunk := c.PeekChunk(); len(chunk) > 0 {
 						reads <- string(chunk)
 						_, _ = c.Discard(-1)
@@ -1469,7 +1470,7 @@ func TestInboundLimitCoversTheStack(t *testing.T) {
 		ev.MaxInboundBuffered = limit
 		ev.Handler = FuncHandler{
 			Open: func(Conn) {},
-			Data: func(c Conn) error {
+			Read: func(c Conn) error {
 				if held := int64(c.InboundBuffered()); held > most.Load() {
 					most.Store(held)
 				}
@@ -1509,8 +1510,8 @@ func TestInboundLimitCoversTheStack(t *testing.T) {
 func TestHeldOutputIsFlushedAtTheTurnsEnd(t *testing.T) {
 	addr, echo := serveLayered(t, nil)
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return &holdUntilFlush{} }),
-			LayerFunc(func(LayerContext) LayerConn { return greeter{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} }),
+			LayerFunc(func(LayerContext) LayerHandler { return greeter{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1530,7 +1531,7 @@ type holdUntilFlush struct {
 	counted atomic.Int64 // held, and what a flush is writing below
 }
 
-func (h *holdUntilFlush) OnOutbound(_ LayerContext, p []byte) (int, error) {
+func (h *holdUntilFlush) OnWrite(_ LayerContext, p []byte) (int, error) {
 	h.mu.Lock()
 	h.held = append(h.held, p...)
 	h.counted.Add(int64(len(p)))
@@ -1548,7 +1549,7 @@ func (h *holdUntilFlush) Flush(ctx LayerContext) error {
 	if len(held) == 0 {
 		return nil
 	}
-	_, err := ctx.Write(held)
+	_, err := ctx.Down().Write(held)
 	h.counted.Add(-int64(len(held)))
 	return err
 }
@@ -1558,8 +1559,8 @@ func (h *holdUntilFlush) Flush(ctx LayerContext) error {
 type greeter struct{ PassThrough }
 
 func (greeter) OnOpen(ctx LayerContext) {
-	_, _ = ctx.Write([]byte("hello"))
-	ctx.Open()
+	_, _ = ctx.Down().Write([]byte("hello"))
+	ctx.Up().Open()
 }
 
 // An Events with layers refuses packet connections.
@@ -1606,9 +1607,9 @@ func TestTimerArmedBeforeOpenFiresAfter(t *testing.T) {
 	fired := make(chan time.Time, 1)
 	var turns atomic.Int64
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Handler = FuncHandler{Open: func(Conn) {}, Data: func(Conn) error { turns.Add(1); return nil }, Close: func(Conn, error) {}}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return &openLate{} }),
-			LayerFunc(func(ctx LayerContext) LayerConn {
+		ev.Handler = FuncHandler{Open: func(Conn) {}, Read: func(Conn) error { turns.Add(1); return nil }, Close: func(Conn, error) {}}
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &openLate{} }),
+			LayerFunc(func(ctx LayerContext) LayerHandler {
 				_ = ctx.SetTimer(time.Now().Add(10 * time.Millisecond)) // before it opens
 				return &earlyTimer{fired: fired}
 			}))
@@ -1633,7 +1634,7 @@ type openLate struct{ PassThrough }
 
 func (*openLate) OnOpen(ctx LayerContext) { _ = ctx.SetTimer(time.Now().Add(150 * time.Millisecond)) }
 func (*openLate) OnTimer(ctx LayerContext) error {
-	ctx.Open()
+	ctx.Up().Open()
 	return nil
 }
 
@@ -1668,8 +1669,8 @@ func TestConcurrentClosesSayGoodbyeOnce(t *testing.T) {
 		got <- all
 	}()
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return sayGoodbye{} }),
-			LayerFunc(func(LayerContext) LayerConn { return sayGoodbye{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return sayGoodbye{} }),
+			LayerFunc(func(LayerContext) LayerHandler { return sayGoodbye{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1688,9 +1689,9 @@ func TestConcurrentClosesSayGoodbyeOnce(t *testing.T) {
 	}
 }
 
-// An abort in the Handler's OnData drops what the layers hold: the turn
+// An abort in the Handler's OnRead drops what the layers hold: the turn
 // that aborted flushes nothing more.
-func TestAbortInOnDataFlushesNothing(t *testing.T) {
+func TestAbortInOnInboundFlushesNothing(t *testing.T) {
 	addr, _ := serveLayered(t, nil)
 	holder := &countingHold{}
 	aborted := make(chan struct{})
@@ -1702,7 +1703,7 @@ func TestAbortInOnDataFlushesNothing(t *testing.T) {
 					_ = c.Wake()
 				}()
 			},
-			Data: func(c Conn) error {
+			Read: func(c Conn) error {
 				select {
 				case <-aborted:
 					return nil
@@ -1715,7 +1716,7 @@ func TestAbortInOnDataFlushesNothing(t *testing.T) {
 			},
 			Close: func(Conn, error) {},
 		}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return holder }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return holder }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1744,7 +1745,7 @@ func (h *countingHold) Flush(ctx LayerContext) error {
 	return h.holdUntilFlush.Flush(ctx)
 }
 
-// A layer that closes the connection in OnInbound ends the turn there: the
+// A layer that closes the connection in OnRead ends the turn there: the
 // layers above and the Handler do not run on what it delivered.
 func TestCloseFromALayerEndsTheTurn(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -1765,7 +1766,7 @@ func TestCloseFromALayerEndsTheTurn(t *testing.T) {
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
 		ev.Handler = FuncHandler{
 			Open: func(Conn) {},
-			Data: func(c Conn) error {
+			Read: func(c Conn) error {
 				if chunk := c.PeekChunk(); len(chunk) > 0 {
 					seen <- string(chunk)
 					_, _ = c.Discard(len(chunk))
@@ -1774,7 +1775,7 @@ func TestCloseFromALayerEndsTheTurn(t *testing.T) {
 			},
 			Close: func(_ Conn, err error) { closed <- err },
 		}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return deliverThenClose{} }), passThroughLayer{})
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return deliverThenClose{} }), passThroughLayer{})
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1792,15 +1793,15 @@ func TestCloseFromALayerEndsTheTurn(t *testing.T) {
 // deliverThenClose hands up what arrives and closes the connection.
 type deliverThenClose struct{ PassThrough }
 
-func (deliverThenClose) OnInbound(ctx LayerContext) error {
-	lower := ctx.Lower()
+func (deliverThenClose) OnRead(ctx LayerContext) error {
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
-	ctx.Deliver(chunk)
+	ctx.Up().Write(chunk)
 	_, _ = lower.Discard(len(chunk))
-	return ctx.CloseWith(io.EOF)
+	return ctx.Down().CloseWith(io.EOF)
 }
 
 // A close as the stack opens — the Handler aborting in its OnOpen — flushes
@@ -1817,10 +1818,10 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 					holder.aborting.Store(true)
 					_ = c.CloseWith(errors.New("abort"))
 				},
-				Data:  func(Conn) error { return nil },
+				Read:  func(Conn) error { return nil },
 				Close: func(_ Conn, err error) { closed <- err },
 			}
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return holder }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return holder }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -1834,9 +1835,9 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 		addr, _ := serveLayered(t, nil)
 		var opened atomic.Int32
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Handler = FuncHandler{Open: func(Conn) {}, Data: func(Conn) error { return nil }, Close: func(Conn, error) {}}
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return closeThenOpen{} }),
-				LayerFunc(func(LayerContext) LayerConn { return &countOpens{n: &opened} }))
+			ev.Handler = FuncHandler{Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(Conn, error) {}}
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return closeThenOpen{} }),
+				LayerFunc(func(LayerContext) LayerHandler { return &countOpens{n: &opened} }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -1854,8 +1855,8 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 type closeThenOpen struct{ PassThrough }
 
 func (closeThenOpen) OnOpen(ctx LayerContext) {
-	_ = ctx.CloseWith(errors.New("refused"))
-	ctx.Open()
+	_ = ctx.Down().CloseWith(errors.New("refused"))
+	ctx.Up().Open()
 }
 
 type countOpens struct {
@@ -1865,7 +1866,7 @@ type countOpens struct {
 
 func (c *countOpens) OnOpen(ctx LayerContext) {
 	c.n.Add(1)
-	ctx.Open()
+	ctx.Up().Open()
 }
 
 // A layer that closes the connection having read only part of what waits
@@ -1887,8 +1888,8 @@ func TestCloseInOnInboundEndsItsCalls(t *testing.T) {
 	closer := &byteThenClose{}
 	closed := make(chan error, 1)
 	events := dialLayered(t, listener.Addr().String(), func(ev *Events) {
-		ev.Handler = FuncHandler{Open: func(Conn) {}, Data: func(Conn) error { return nil }, Close: func(_ Conn, err error) { closed <- err }}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return closer }))
+		ev.Handler = FuncHandler{Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(_ Conn, err error) { closed <- err }}
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return closer }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -1897,7 +1898,7 @@ func TestCloseInOnInboundEndsItsCalls(t *testing.T) {
 	}
 	layerWaitFor(t, closed, "the close")
 	if n := closer.after.Load(); n != 0 {
-		t.Fatalf("OnInbound ran %d times after the layer closed the connection", n)
+		t.Fatalf("OnRead ran %d times after the layer closed the connection", n)
 	}
 }
 
@@ -1908,17 +1909,17 @@ type byteThenClose struct {
 	after  atomic.Int32
 }
 
-func (b *byteThenClose) OnInbound(ctx LayerContext) error {
+func (b *byteThenClose) OnRead(ctx LayerContext) error {
 	if b.closed.Load() {
 		b.after.Add(1)
 	}
-	lower := ctx.Lower()
+	lower := ctx.Down()
 	if len(lower.PeekChunk()) == 0 {
 		return nil
 	}
 	_, _ = lower.Discard(1)
 	b.closed.Store(true)
-	return ctx.CloseWith(io.EOF)
+	return ctx.Down().CloseWith(io.EOF)
 }
 
 // A reader that always leaves a little unread — a partial header, the start
@@ -1930,16 +1931,17 @@ func TestPartialReadsDoNotRetainWhatWasRead(t *testing.T) {
 		t.Run(map[bool]string{false: "Deliver", true: "Space and Commit"}[space], func(t *testing.T) {
 			s := &stack{inLimit: 1024}
 			l := &layerNode{stack: s}
+			l.up = layerUp{l}
 			s.layers = []*layerNode{l}
 			ctx := layerCtx{l}
-			ctx.Deliver([]byte{1})
+			ctx.Up().Write([]byte{1})
 			chunk := make([]byte, 8)
 			for range 20000 {
 				if space {
-					copy(ctx.Space(len(chunk)), chunk)
-					ctx.Commit(len(chunk))
+					copy(ctx.Up().Reserve(len(chunk)), chunk)
+					ctx.Up().Commit(len(chunk))
 				} else {
-					ctx.Deliver(chunk)
+					ctx.Up().Write(chunk)
 				}
 				if _, err := l.Discard(l.held() - 1); err != nil {
 					t.Fatal(err)
@@ -1962,8 +1964,8 @@ func TestAdoptReturnsTheTopConnection(t *testing.T) {
 	addr, echo := serveLayered(t, nil)
 	opened := make(chan Conn, 1)
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Handler = FuncHandler{Open: func(c Conn) { opened <- c }, Data: func(c Conn) error { _, _ = c.Discard(-1); return nil }, Close: func(Conn, error) {}}
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return upperCase{} }))
+		ev.Handler = FuncHandler{Open: func(c Conn) { opened <- c }, Read: func(c Conn) error { _, _ = c.Discard(-1); return nil }, Close: func(Conn, error) {}}
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return upperCase{} }))
 	})
 	raw, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -1987,7 +1989,7 @@ func TestAdoptReturnsTheTopConnection(t *testing.T) {
 	}
 
 	refusing := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return refuseLayer{cause: errors.New("refused")} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return refuseLayer{cause: errors.New("refused")} }))
 	})
 	raw, err = net.Dial("tcp", addr)
 	if err != nil {
@@ -2001,8 +2003,8 @@ func TestAdoptReturnsTheTopConnection(t *testing.T) {
 // upperCase writes everything upper-cased.
 type upperCase struct{ PassThrough }
 
-func (upperCase) OnOutbound(ctx LayerContext, p []byte) (int, error) {
-	if _, err := ctx.Write(bytes.ToUpper(p)); err != nil {
+func (upperCase) OnWrite(ctx LayerContext, p []byte) (int, error) {
+	if _, err := ctx.Down().Write(bytes.ToUpper(p)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -2084,9 +2086,9 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		}()
 		return listener.Addr().String(), got
 	}
-	holder := func() Layer { return LayerFunc(func(LayerContext) LayerConn { return &holdUntilFlush{} }) }
+	holder := func() Layer { return LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} }) }
 
-	for _, where := range []string{"OnOpen", "OnData"} {
+	for _, where := range []string{"OnOpen", "OnRead"} {
 		for _, layers := range []int{1, 2} {
 			t.Run(fmt.Sprintf("%s, %d buffering layers", where, layers), func(t *testing.T) {
 				addr, got := peerReads(t)
@@ -2102,7 +2104,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 						handler.Open = writeAndEnd
 					} else {
 						handler.Open = func(c Conn) { _ = c.Wake() }
-						handler.Data = func(c Conn) error {
+						handler.Read = func(c Conn) error {
 							if c.Userdata() == nil {
 								c.SetUserdata(true)
 								writeAndEnd(c)
@@ -2156,7 +2158,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		addr, _ := peerReads(t)
 		failing := &failingFlush{cause: errors.New("flush refused")}
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return failing }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return failing }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -2174,7 +2176,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		addr, got := peerReads(t)
 		window := &sendWindow{}
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return window }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return window }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -2228,10 +2230,10 @@ func (w *sendWindow) OnOpen(ctx LayerContext) {
 	w.mu.Lock()
 	w.ctx = ctx
 	w.mu.Unlock()
-	ctx.Open()
+	ctx.Up().Open()
 }
 
-func (w *sendWindow) OnOutbound(_ LayerContext, p []byte) (int, error) {
+func (w *sendWindow) OnWrite(_ LayerContext, p []byte) (int, error) {
 	w.mu.Lock()
 	w.held = append(w.held, p...)
 	w.counted.Add(int64(len(p)))
@@ -2248,7 +2250,7 @@ func (w *sendWindow) release() {
 	held, ctx := w.held, w.ctx
 	w.held = nil
 	w.mu.Unlock()
-	_, _ = ctx.Write(held)
+	_, _ = ctx.Down().Write(held)
 	w.counted.Add(-int64(len(held)))
 	_ = ctx.Wake()
 }
@@ -2261,10 +2263,10 @@ type gatedHold struct {
 	proceed chan struct{}
 }
 
-func (g *gatedHold) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (g *gatedHold) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	g.entered <- struct{}{}
 	<-g.proceed
-	return g.holdUntilFlush.OnOutbound(ctx, p)
+	return g.holdUntilFlush.OnWrite(ctx, p)
 }
 
 // A CloseWrite beside writes from other goroutines ends the stream after
@@ -2298,7 +2300,7 @@ func TestCloseWriteBesideWrites(t *testing.T) {
 		addr, got := peerReads(t)
 		gate := &gatedHold{entered: make(chan struct{}, 1), proceed: make(chan struct{})}
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return gate }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return gate }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -2328,7 +2330,7 @@ func TestCloseWriteBesideWrites(t *testing.T) {
 		for round := range 20 {
 			addr, got := peerReads(t)
 			events := dialLayered(t, addr, func(ev *Events) {
-				ev.Use(LayerFunc(func(LayerContext) LayerConn { return &holdUntilFlush{} }))
+				ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} }))
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
@@ -2404,7 +2406,7 @@ type windowFlush struct {
 	shutFirst bool
 }
 
-func (w *windowFlush) OnOutbound(_ LayerContext, p []byte) (int, error) {
+func (w *windowFlush) OnWrite(_ LayerContext, p []byte) (int, error) {
 	w.mu.Lock()
 	w.held = append(w.held, p...)
 	w.counted.Add(int64(len(p)))
@@ -2427,7 +2429,7 @@ func (w *windowFlush) Flush(ctx LayerContext) error {
 	if len(held) == 0 {
 		return nil
 	}
-	_, err := ctx.Write(held)
+	_, err := ctx.Down().Write(held)
 	w.counted.Add(-int64(len(held)))
 	return err
 }
@@ -2470,7 +2472,7 @@ func TestCloseWriteAfterFlushSendsHeld(t *testing.T) {
 					},
 					Close: func(Conn, error) {},
 				}
-				ev.Use(LayerFunc(func(LayerContext) LayerConn { return window }))
+				ev.Use(LayerFunc(func(LayerContext) LayerHandler { return window }))
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			defer cancel()
@@ -2512,15 +2514,15 @@ func (l *endedLayer) lateCall() {
 	}
 }
 
-func (l *endedLayer) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (l *endedLayer) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	l.lateCall()
-	return ctx.Write(p)
+	return ctx.Down().Write(p)
 }
 func (l *endedLayer) OutboundHeld(LayerContext) int { l.lateCall(); return 0 }
 func (l *endedLayer) Flush(LayerContext) error      { l.lateCall(); return nil }
 func (l *endedLayer) CloseWrite(ctx LayerContext) error {
 	l.lateCall()
-	return ctx.Lower().CloseWrite()
+	return ctx.Down().CloseWrite()
 }
 func (l *endedLayer) CloseGracefully(LayerContext, error) { l.lateCall() }
 func (l *endedLayer) OnClose(LayerContext, error)         { l.ended.Store(true) }
@@ -2547,7 +2549,7 @@ func TestNoLayerCallsAfterOnClose(t *testing.T) {
 			events := dialLayered(t, addr, func(ev *Events) {
 				ev.Handler = FuncHandler{Close: func(Conn, error) { close(closed) }}
 				for _, layer := range layers {
-					ev.Use(LayerFunc(func(LayerContext) LayerConn { return layer }))
+					ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
 				}
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
@@ -2640,7 +2642,7 @@ type guardedWindow struct {
 	counted atomic.Int64
 }
 
-func (w *guardedWindow) OnOutbound(_ LayerContext, p []byte) (int, error) {
+func (w *guardedWindow) OnWrite(_ LayerContext, p []byte) (int, error) {
 	w.dataMu.Lock()
 	w.held = append(w.held, p...)
 	w.counted.Add(int64(len(p)))
@@ -2662,19 +2664,19 @@ func (w *guardedWindow) Flush(ctx LayerContext) error {
 	w.held = nil
 	w.dataMu.Unlock()
 	if len(held) > 0 {
-		_, err := ctx.Write(held)
+		_, err := ctx.Down().Write(held)
 		w.counted.Add(-int64(len(held)))
 		if err != nil {
 			return err
 		}
 	}
-	return ctx.Lower().Flush()
+	return ctx.Down().Flush()
 }
 
 func (w *guardedWindow) CloseWrite(ctx LayerContext) error {
 	entered := w.guard.enter()
 	defer w.guard.exit(entered)
-	return ctx.Lower().CloseWrite()
+	return ctx.Down().CloseWrite()
 }
 
 // lockedWriter keeps its lock while it writes below, as crypto/tls keeps its
@@ -2684,20 +2686,20 @@ type lockedWriter struct {
 	guard reentryGuard
 }
 
-func (w *lockedWriter) OnOutbound(ctx LayerContext, p []byte) (int, error) {
+func (w *lockedWriter) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	entered := w.guard.enter()
 	defer w.guard.exit(entered)
-	return ctx.Write(p)
+	return ctx.Down().Write(p)
 }
 
-// sentWriter writes once, from OnSent, after its first send.
+// sentWriter writes once, from OnWireSent, after its first send.
 type sentWriter struct {
 	PassThrough
 	once sync.Once
 }
 
-func (s *sentWriter) OnSent(ctx LayerContext, _ int) {
-	s.once.Do(func() { _, _ = ctx.Write([]byte("!")) })
+func (s *sentWriter) OnWireSent(ctx LayerContext, _ int) {
+	s.once.Do(func() { _, _ = ctx.Down().Write([]byte("!")) })
 }
 
 // selfCloser holds output to flush, takes its lock to flush it, and closes
@@ -2713,14 +2715,14 @@ func (s *selfCloser) Flush(LayerContext) error {
 	return nil
 }
 
-func (s *selfCloser) OnInbound(ctx LayerContext) error {
-	if !bytes.Contains(ctx.Lower().PeekChunk(), []byte("bye")) {
-		return s.PassThrough.OnInbound(ctx)
+func (s *selfCloser) OnRead(ctx LayerContext) error {
+	if !bytes.Contains(ctx.Down().PeekChunk(), []byte("bye")) {
+		return s.PassThrough.OnRead(ctx)
 	}
 	entered := s.guard.enter()
 	defer s.guard.exit(entered)
-	_, _ = ctx.Lower().Discard(-1)
-	_ = ctx.CloseWith(nil)
+	_, _ = ctx.Down().Discard(-1)
+	_ = ctx.Down().CloseWith(nil)
 	return nil
 }
 
@@ -2769,7 +2771,7 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 		window := &guardedWindow{}
 		ended := make(chan error, 1)
 		conn := dial(t, addr, func(ev *Events) {
-			ev.Use(passThroughLayer{}, LayerFunc(func(LayerContext) LayerConn { return window }))
+			ev.Use(passThroughLayer{}, LayerFunc(func(LayerContext) LayerHandler { return window }))
 			ev.Handler = FuncHandler{
 				Open: func(c Conn) {
 					_, err := c.Write([]byte("hello"))
@@ -2803,8 +2805,8 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 		locked := &lockedWriter{}
 		wrote := make(chan error, 1)
 		conn := dial(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return locked }),
-				LayerFunc(func(LayerContext) LayerConn { return &sentWriter{} }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return locked }),
+				LayerFunc(func(LayerContext) LayerHandler { return &sentWriter{} }))
 			ev.Handler = FuncHandler{
 				// On a turn, where the socket sends at once and reports
 				// inside the write.
@@ -2827,7 +2829,7 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 			t.Fatalf("the peer read %q, %v; want hi!", out.read, out.err)
 		}
 		if n := locked.guard.reentered.Load(); n != 0 {
-			t.Fatalf("OnSent wrote into the layer %d times inside its own write", n)
+			t.Fatalf("OnWireSent wrote into the layer %d times inside its own write", n)
 		}
 	})
 
@@ -2835,7 +2837,7 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 		addr, got := peer(t, "bye")
 		closer := &selfCloser{}
 		dial(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return closer }), passThroughLayer{})
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return closer }), passThroughLayer{})
 		})
 		if out := layerWaitFor(t, got, "the peer's read"); out.err != nil {
 			t.Fatalf("the peer's read failed: %v; want the end", out.err)
@@ -2846,47 +2848,47 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 	})
 }
 
-// sentCounter counts OnSent calls, and those made once the stack was
+// sentCounter counts OnWireSent calls, and those made once the stack was
 // closing.
 type sentCounter struct {
 	PassThrough
 	calls, closing atomic.Int32
 }
 
-func (s *sentCounter) OnSent(ctx LayerContext, _ int) {
+func (s *sentCounter) OnWireSent(ctx LayerContext, _ int) {
 	s.calls.Add(1)
 	if ctx.(layerCtx).l.stack.closing.Load() {
 		s.closing.Add(1)
 	}
 }
 
-// writeOnSent writes once from OnSent, into a layer below that holds it
+// writeOnSent writes once from OnWireSent, into a layer below that holds it
 // until a flush.
 type writeOnSent struct {
 	PassThrough
 	armed atomic.Bool
 }
 
-func (w *writeOnSent) OnSent(ctx LayerContext, _ int) {
+func (w *writeOnSent) OnWireSent(ctx LayerContext, _ int) {
 	if w.armed.CompareAndSwap(true, false) {
-		_, _ = ctx.Write([]byte("X"))
+		_, _ = ctx.Down().Write([]byte("X"))
 	}
 }
 
 // closesOnQ closes the connection gracefully, itself, as it reads 'q'.
 type closesOnQ struct{ PassThrough }
 
-func (closesOnQ) OnInbound(ctx LayerContext) error {
-	if bytes.Contains(ctx.Lower().PeekChunk(), []byte("q")) {
-		_, _ = ctx.Lower().Discard(-1)
-		return ctx.CloseWith(nil)
+func (closesOnQ) OnRead(ctx LayerContext) error {
+	if bytes.Contains(ctx.Down().PeekChunk(), []byte("q")) {
+		_, _ = ctx.Down().Discard(-1)
+		return ctx.Down().CloseWith(nil)
 	}
-	return PassThrough{}.OnInbound(ctx)
+	return PassThrough{}.OnRead(ctx)
 }
 
 // What waits for a turn — send reports, a close's linger — keeps to the
 // layers' contract: nothing reaches them once the connection is closing,
-// what OnSent writes is flushed, and a layer closing the connection itself
+// what OnWireSent writes is flushed, and a layer closing the connection itself
 // waits only for what lies below it.
 func TestTurnWorkKeepsTheContract(t *testing.T) {
 	type outcome struct {
@@ -2928,12 +2930,12 @@ func TestTurnWorkKeepsTheContract(t *testing.T) {
 		return conn
 	}
 
-	t.Run("no OnSent while closing", func(t *testing.T) {
+	t.Run("no OnWireSent while closing", func(t *testing.T) {
 		const size = 8 << 20
 		addr, got := peer(t, "", 100*time.Millisecond)
 		counter := &sentCounter{}
 		conn := dial(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return counter }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return counter }))
 		})
 		if _, err := conn.Write(make([]byte, size)); err != nil {
 			t.Fatal(err)
@@ -2943,17 +2945,17 @@ func TestTurnWorkKeepsTheContract(t *testing.T) {
 			t.Fatalf("the peer read %d bytes, %v; want %d", len(out.read), out.err, size)
 		}
 		if n := counter.closing.Load(); n != 0 {
-			t.Fatalf("OnSent ran %d times on a closing connection", n)
+			t.Fatalf("OnWireSent ran %d times on a closing connection", n)
 		}
 	})
 
-	t.Run("what OnSent writes is flushed", func(t *testing.T) {
+	t.Run("what OnWireSent writes is flushed", func(t *testing.T) {
 		addr, got := peer(t, "", 0)
 		writer := &writeOnSent{}
 		writer.armed.Store(true)
 		conn := dial(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return &holdUntilFlush{} }),
-				LayerFunc(func(LayerContext) LayerConn { return writer }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} }),
+				LayerFunc(func(LayerContext) LayerHandler { return writer }))
 		})
 		if _, err := conn.Write([]byte("data")); err != nil {
 			t.Fatal(err)
@@ -2994,8 +2996,8 @@ func TestTurnWorkKeepsTheContract(t *testing.T) {
 		}()
 		addr := listener.Addr().String()
 		conn := dial(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return closesOnQ{} }),
-				LayerFunc(func(LayerContext) LayerConn { return &holdUntilFlush{} }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return closesOnQ{} }),
+				LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} }))
 		})
 		// Held above the layer that closes: dropped with the close, which
 		// waits for nothing it cannot send.
@@ -3026,26 +3028,26 @@ func (p *closingProbe) lateCall(ctx LayerContext) {
 	}
 }
 
-func (p *closingProbe) OnSent(ctx LayerContext, _ int) { p.lateCall(ctx) }
-func (p *closingProbe) Flush(ctx LayerContext) error   { p.lateCall(ctx); return nil }
-func (p *closingProbe) OnTimer(ctx LayerContext) error { p.lateCall(ctx); return nil }
+func (p *closingProbe) OnWireSent(ctx LayerContext, _ int) { p.lateCall(ctx) }
+func (p *closingProbe) Flush(ctx LayerContext) error       { p.lateCall(ctx); return nil }
+func (p *closingProbe) OnTimer(ctx LayerContext) error     { p.lateCall(ctx); return nil }
 func (p *closingProbe) CloseWrite(ctx LayerContext) error {
 	p.lateCall(ctx)
-	return ctx.Lower().CloseWrite()
+	return ctx.Down().CloseWrite()
 }
-func (p *closingProbe) OnOutbound(ctx LayerContext, b []byte) (int, error) {
+func (p *closingProbe) OnWrite(ctx LayerContext, b []byte) (int, error) {
 	p.lateCall(ctx)
-	return ctx.Write(b)
+	return ctx.Down().Write(b)
 }
 
-// closesFromSent closes the connection gracefully from its first OnSent.
+// closesFromSent closes the connection gracefully from its first OnWireSent.
 type closesFromSent struct {
 	PassThrough
 	once sync.Once
 }
 
-func (c *closesFromSent) OnSent(ctx LayerContext, _ int) {
-	c.once.Do(func() { _ = ctx.CloseWith(nil) })
+func (c *closesFromSent) OnWireSent(ctx LayerContext, _ int) {
+	c.once.Do(func() { _ = ctx.Down().CloseWith(nil) })
 }
 
 // closesFromFlush closes the connection gracefully from a flush once armed.
@@ -3056,12 +3058,12 @@ type closesFromFlush struct {
 
 func (c *closesFromFlush) Flush(ctx LayerContext) error {
 	if c.armed.CompareAndSwap(true, false) {
-		_ = ctx.CloseWith(nil)
+		_ = ctx.Down().CloseWith(nil)
 	}
 	return nil
 }
 
-// A layer that closes the connection from OnSent or Flush is the last layer
+// A layer that closes the connection from OnWireSent or Flush is the last layer
 // called: the rest hear nothing more but OnClose, and writes from above are
 // refused.
 func TestCloseFromALayerCallbackStopsTheRest(t *testing.T) {
@@ -3082,14 +3084,14 @@ func TestCloseFromALayerCallbackStopsTheRest(t *testing.T) {
 		late := make(chan error, 1)
 		addr := listener.Addr().String()
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return below }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return below }))
 			ev.Use(layers(above)...)
 			ev.Handler = FuncHandler{
 				Open: func(c Conn) {
 					arm()
 					_, _ = c.Write([]byte("hello"))
 				},
-				Data: func(c Conn) error {
+				Read: func(c Conn) error {
 					_, err := c.Write([]byte("late"))
 					select {
 					case late <- err:
@@ -3116,11 +3118,11 @@ func TestCloseFromALayerCallbackStopsTheRest(t *testing.T) {
 			}
 		}
 	}
-	t.Run("from OnSent", func(t *testing.T) {
+	t.Run("from OnWireSent", func(t *testing.T) {
 		run(t, func(above *closingProbe) []Layer {
 			return []Layer{
-				LayerFunc(func(LayerContext) LayerConn { return &closesFromSent{} }),
-				LayerFunc(func(LayerContext) LayerConn { return above }),
+				LayerFunc(func(LayerContext) LayerHandler { return &closesFromSent{} }),
+				LayerFunc(func(LayerContext) LayerHandler { return above }),
 			}
 		}, func() {})
 	})
@@ -3128,8 +3130,8 @@ func TestCloseFromALayerCallbackStopsTheRest(t *testing.T) {
 		closer := &closesFromFlush{}
 		run(t, func(above *closingProbe) []Layer {
 			return []Layer{
-				LayerFunc(func(LayerContext) LayerConn { return closer }),
-				LayerFunc(func(LayerContext) LayerConn { return above }),
+				LayerFunc(func(LayerContext) LayerHandler { return closer }),
+				LayerFunc(func(LayerContext) LayerHandler { return above }),
 			}
 		}, func() { closer.armed.Store(true) })
 	})
@@ -3149,7 +3151,7 @@ func (peerAnswersGoodbye) CloseGracefully(ctx LayerContext, _ error) {
 func TestCloseSucceedsWhenTheGoodbyeIsAnswered(t *testing.T) {
 	addr, _ := serveLayered(t, nil)
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return peerAnswersGoodbye{} }))
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return peerAnswersGoodbye{} }))
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
@@ -3166,7 +3168,7 @@ func TestCloseSucceedsWhenTheGoodbyeIsAnswered(t *testing.T) {
 }
 
 // splitWriter writes each write below in two pieces, holding nothing once
-// OnOutbound returns — a framing layer writing a header and a body — and
+// OnWrite returns — a framing layer writing a header and a body — and
 // stops between them until let through.
 type splitWriter struct {
 	PassThrough
@@ -3174,14 +3176,14 @@ type splitWriter struct {
 	proceed chan struct{}
 }
 
-func (s *splitWriter) OnOutbound(ctx LayerContext, p []byte) (int, error) {
-	n, err := ctx.Write(p[:2])
+func (s *splitWriter) OnWrite(ctx LayerContext, p []byte) (int, error) {
+	n, err := ctx.Down().Write(p[:2])
 	if err != nil {
 		return n, err
 	}
 	s.entered <- struct{}{}
 	<-s.proceed
-	m, err := ctx.Write(p[2:])
+	m, err := ctx.Down().Write(p[2:])
 	return n + m, err
 }
 
@@ -3193,7 +3195,7 @@ type closesInShutFlush struct {
 
 func (c *closesInShutFlush) Flush(ctx LayerContext) error {
 	if c.armed.CompareAndSwap(true, false) {
-		return ctx.CloseWith(nil)
+		return ctx.Down().CloseWith(nil)
 	}
 	c.lateCall(ctx)
 	return nil
@@ -3228,7 +3230,7 @@ func TestCloseWriteInFlightAndClosing(t *testing.T) {
 		split := &splitWriter{entered: make(chan struct{}, 1), proceed: make(chan struct{})}
 		addr := listener.Addr().String()
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return split }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return split }))
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
@@ -3274,7 +3276,7 @@ func TestCloseWriteInFlightAndClosing(t *testing.T) {
 		closed := make(chan struct{})
 		addr := listener.Addr().String()
 		events := dialLayered(t, addr, func(ev *Events) {
-			ev.Use(LayerFunc(func(LayerContext) LayerConn { return layer }))
+			ev.Use(LayerFunc(func(LayerContext) LayerHandler { return layer }))
 			ev.Handler = FuncHandler{
 				Open: func(c Conn) {
 					layer.armed.Store(true)

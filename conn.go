@@ -44,7 +44,7 @@ type Conn interface {
 	RemoteAddr() net.Addr
 
 	// Userdata returns user-defined connection data. It may be read from any
-	// callback, OnOutbound included, and from other goroutines.
+	// callback, OnBytesWritten included, and from other goroutines.
 	Userdata() any
 
 	// SetUserdata replaces user-defined connection data, from any goroutine.
@@ -117,8 +117,9 @@ type Conn interface {
 	//
 	// Peek, PeekChunk, Discard, InboundBuffered, Read, WriteTo and the slices
 	// they return read the connection's inbound buffer: call them only from
-	// inside the current invocation of this connection's OnOpen, OnInbound,
-	// OnData or OnClose callback — never from OnOutbound, never from another
+	// inside the current invocation of this connection's OnOpen, OnRead,
+	// OnTimer, OnBytesRead or OnClose callback — never from OnBytesWritten, never from
+	// another
 	// goroutine, and never after the callback returned. The slices are
 	// borrowed from the buffer, and any call that consumes inbound data —
 	// Read, WriteTo, Discard — or the callback's return may invalidate them
@@ -211,23 +212,22 @@ type Conn interface {
 	// bytes to it and returns.
 	Flush() error
 
-	// Wake schedules one OnData callback after previously submitted tasks.
+	// Wake schedules one OnRead callback after previously submitted tasks.
 	Wake() error
 
-	// SetWakeDeadline schedules one OnData callback for the connection at
-	// when, within one scheduler tick of it, carrying no data: the timed
-	// form of Wake. The turn may run for any reason — data arriving, an
-	// earlier Wake — and may arrive with bytes already buffered, so a
-	// callback cannot tell what woke it and must check its own clocks every
-	// time it runs. A connection whose reads are held (see
-	// MaxInboundBuffered) runs the turn anyway — consuming what it holds is
-	// what a held connection's wake is for — and its socket reads resume
-	// once the callback consumes below the limit. A zero time cancels the
-	// pending timer, and arming again replaces whatever was armed. Safe from
-	// any goroutine.
+	// SetWakeDeadline schedules one OnTimer callback for the connection at
+	// when, within one scheduler tick of it: the timed form of Wake. The
+	// timer turn runs OnTimer and then OnRead, which may find bytes already
+	// buffered. Due is computed against the clock, so a wake or a read that
+	// arrives first runs the timer just the same, once. A connection whose
+	// reads are held (see MaxInboundBuffered) runs the turn anyway —
+	// consuming what it holds is what a held connection's wake is for — and
+	// its socket reads resume once the callback consumes below the limit. A
+	// zero time cancels the pending timer, and arming again replaces
+	// whatever was armed. Safe from any goroutine.
 	SetWakeDeadline(when time.Time) error
 
-	// SetWakeInterval schedules OnData callbacks for the connection every
+	// SetWakeInterval schedules OnTimer callbacks for the connection every
 	// interval, the repeating form of SetWakeDeadline, until cancelled by a
 	// zero or negative interval or replaced by either setter. The native
 	// scheduler coarsens time into slots of a few milliseconds; an interval
@@ -239,7 +239,7 @@ type Conn interface {
 	SetWakeInterval(interval time.Duration) error
 
 	// YieldRead ends the current read round and schedules remaining buffered or
-	// socket data for a later OnData callback. It may only be called from a
+	// socket data for a later OnRead callback. It may only be called from a
 	// connection callback.
 	YieldRead() error
 
@@ -372,7 +372,7 @@ func remoteAddrFrom(addr net.Addr) netip.AddrPort {
 // Userdata is published atomically: a layer under a protocol writes before
 // the protocol's callbacks map the connection — TLS handshake records retire
 // beside the WebSocket open that names its connection — so a value read by
-// OnOutbound may be replaced in those callbacks, and the swap is one pointer,
+// OnBytesWritten may be replaced in those callbacks, and the swap is one pointer,
 // never a torn interface. The read is a pointer chase more than a field was;
 // SetUserdata boxes its value, once per set.
 func (fc *commonConn) Userdata() any {

@@ -224,7 +224,7 @@ type ioTaskBenchmarkRunner struct {
 func newIOTaskBenchmarkRunner(batch int, scheduler ioBenchmarkScheduler) *ioTaskBenchmarkRunner {
 	runner := &ioTaskBenchmarkRunner{scheduler: scheduler}
 	events := &Events{}
-	funcs(events).Data = func(Conn) error { runner.active.Load().Done(); return nil }
+	funcs(events).Read = func(Conn) error { runner.active.Load().Done(); return nil }
 	runner.connections = make([]*fdConn, batch)
 	runner.tasks = make([]IOTask, batch)
 	for index := range runner.connections {

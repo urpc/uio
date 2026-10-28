@@ -968,7 +968,7 @@ type scriptedYieldConn struct{ *scriptedConn }
 
 func (raw *scriptedYieldConn) YieldRead() error { return raw.Wake() }
 
-func TestOnDataPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
+func TestOnInboundPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		client bool
@@ -1016,7 +1016,7 @@ func TestOnDataPropagatesUnrelatedErrorWhileClosing(t *testing.T) {
 	}
 }
 
-func TestOnDataPropagatesFailedProtocolClose(t *testing.T) {
+func TestOnInboundPropagatesFailedProtocolClose(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		client bool
@@ -1052,7 +1052,7 @@ func TestOnDataPropagatesFailedProtocolClose(t *testing.T) {
 	}
 }
 
-func TestOnDataLeavesOwnedProtocolCloseToTransport(t *testing.T) {
+func TestOnInboundLeavesOwnedProtocolCloseToTransport(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		client bool

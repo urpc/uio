@@ -41,7 +41,7 @@ func main() {
 	events.ReusePort = *reusePort
 
 	events.Handler = uio.FuncHandler{
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},

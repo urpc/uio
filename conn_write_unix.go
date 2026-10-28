@@ -276,7 +276,7 @@ func (conn *fdConn) sendScratch(holder *readBuffer) error {
 		out.Reset()
 	}
 	if sent > 0 {
-		// OnOutbound runs here as in a flush; see flushOnLoop.
+		// OnBytesWritten runs here as in a flush; see flushOnLoop.
 		conn.turn |= turnFlushing
 		_, _ = conn.retireFlush(sent, nil)
 		conn.turn &^= turnFlushing
@@ -318,7 +318,7 @@ func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
 // sendUDPOutside sends one datagram from outside the connection's turn. A
 // datagram is never queued, so the send happens here, holding the descriptor
 // owner's submitMu, which keeps the socket from closing under the syscall;
-// OnOutbound and a failure's close run after the lock is released. The lock
+// OnBytesWritten and a failure's close run after the lock is released. The lock
 // also orders the send before a later CloseWith.
 func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 	if limit := conn.events.socketLimit(); limit > 0 && len(data) > limit {
@@ -410,8 +410,8 @@ func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
 
 // claimDirectSend reports whether the turn may send directly, holding the
 // claim it took for that. A claim the turn keeps for a reservation, or holds
-// for its own flush while OnOutbound runs, is never lent to a direct send: the
-// bytes are queued and that flush sends them, so OnOutbound never runs inside
+// for its own flush while OnBytesWritten runs, is never lent to a direct send: the
+// bytes are queued and that flush sends them, so OnBytesWritten never runs inside
 // itself. Once it holds the claim the turn must also find nothing queued:
 // another sender may have left part of its output there and released the
 // claim between the turn's check and its taking it, and those bytes go first.
@@ -494,7 +494,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	// Only the unsent suffix must survive after Write returns.
 	conn.queueDirectSuffix(bytebuf.CloneBuffer(remaining))
 	conn.setWriteBlocked(written == 0)
-	// Reported once the suffix is accounted, so OnOutbound never observes a
+	// Reported once the suffix is accounted, so OnBytesWritten never observes a
 	// transient empty queue in the middle of this write.
 	conn.events.onSocketBytesWrite(conn, written)
 	return len(data), nil
@@ -715,15 +715,15 @@ func (conn *fdConn) finishDatagram(data []byte, written int, err error) (int, er
 	return written, nil
 }
 
-// reportOutbound runs OnOutbound for a datagram send. Datagrams are sent on
+// reportOutbound runs OnBytesWritten for a datagram send. Datagrams are sent on
 // whichever goroutine writes them, so the calls for one connection go through
 // a claim, as a stream's sends do: a sender adds its bytes and reports them
 // itself if it takes the claim, and otherwise leaves them to the holder, which
 // reports until nothing is pending, so the calls never overlap and a send made
-// inside OnOutbound is reported once that call returns. Nobody waits for the
-// claim, so OnOutbound callbacks that write to each other cannot deadlock.
+// inside OnBytesWritten is reported once that call returns. Nobody waits for the
+// claim, so OnBytesWritten callbacks that write to each other cannot deadlock.
 func (conn *fdConn) reportOutbound(n int) {
-	if n <= 0 || conn.events.cb.onOutbound == nil {
+	if n <= 0 || conn.events.cb.onBytesWritten == nil {
 		return
 	}
 	udp := conn.udp
@@ -739,7 +739,7 @@ func (conn *fdConn) reportOutbound(n int) {
 }
 
 // drainOutbound reports pending bytes while holding the claim, and releases it
-// even when OnOutbound panics.
+// even when OnBytesWritten panics.
 func (conn *fdConn) drainOutbound() {
 	udp := conn.udp
 	defer udp.outboundClaim.Store(false)
@@ -748,7 +748,7 @@ func (conn *fdConn) drainOutbound() {
 		if pending == 0 {
 			return
 		}
-		conn.events.cb.onOutbound(conn.events.observed(conn), int(pending))
+		conn.events.cb.onBytesWritten(conn.events.observed(conn), int(pending))
 	}
 }
 
@@ -811,7 +811,7 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 		return 0, nil
 	}
 	conn.handOverScratch()
-	// OnOutbound runs inside the flush, so the turn marks it: a Write that
+	// OnBytesWritten runs inside the flush, so the turn marks it: a Write that
 	// callback makes is queued rather than sent, and a flush it starts returns
 	// at once, so the callback never runs inside itself. A claim taken here
 	// is marked too, so the turn's cleanup releases it if the callback panics.

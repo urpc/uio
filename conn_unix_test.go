@@ -272,7 +272,7 @@ func TestCallbacksStaySerializedAndCallbackCloseIsOrdered(t *testing.T) {
 		sequence = append(sequence, "open")
 		mu.Unlock()
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		mu.Lock()
 		sequence = append(sequence, "data")
 		mu.Unlock()
@@ -313,7 +313,7 @@ func TestCallbacksStaySerializedAndCallbackCloseIsOrdered(t *testing.T) {
 func TestDialAllowedFromConnectionCallback(t *testing.T) {
 	dialResult := make(chan error, 1)
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		dialed, err := events.Dial("tcp://127.0.0.1:1", nil)
 		if dialed != nil {
 			_ = dialed.Close()
@@ -351,7 +351,7 @@ func TestConnectionTaskSlowCallbackDoesNotBlockOtherConnection(t *testing.T) {
 	fastDone := make(chan struct{}, 1)
 	var slow atomic.Pointer[fdConn]
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		fdc := conn.(*fdConn)
 		if slow.Load() == fdc {
 			select {
@@ -412,7 +412,7 @@ func TestConnectionTaskUsesExternalExecutor(t *testing.T) {
 	events := &Events{Pollers: 1, Executor: nativeTaskExecutor{}}
 	opened := make(chan struct{}, 1)
 	funcs(events).Open = func(Conn) { opened <- struct{}{} }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		data := conn.PeekChunk()
 		_, err := conn.Write(data)
 		_, _ = conn.Discard(-1)
@@ -438,7 +438,7 @@ func TestConnectionTaskUsesBatchExecutorFastPath(t *testing.T) {
 	processed := make(chan struct{}, 1)
 	events := &Events{Pollers: 1, Executor: executor}
 	funcs(events).Open = func(Conn) { opened <- struct{}{} }
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		processed <- struct{}{}
 		return nil
@@ -474,7 +474,7 @@ func TestBatchExecutorPartialRejection(t *testing.T) {
 	woken := make(chan Conn, 1)
 	closed := make(chan Conn, 1)
 	events := withFuncs(&Events{}, FuncHandler{
-		Data:  func(conn Conn) error { woken <- conn; return nil },
+		Read:  func(conn Conn) error { woken <- conn; return nil },
 		Close: func(conn Conn, _ error) { closed <- conn },
 	})
 	pool := newIOTaskPool(executor)
@@ -532,7 +532,7 @@ func TestConnectionTaskHandoffPublishesNewOwnerAfterPreviousTask(t *testing.T) {
 			owner <- false
 		}
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		<-executor.firstDone
 		fdc := conn.(*fdConn)
 		owner <- fdc.ioOwner.Load() == currentGoroutineID()
@@ -654,7 +654,7 @@ func TestExternalExecutorShutdownWaitsForConnectionTask(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	events := &Events{Pollers: 1, Executor: nativeTaskExecutor{}}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		close(started)
 		<-release
 		_, _ = conn.Discard(-1)
@@ -692,7 +692,7 @@ func TestNilShutdownCauseClosesBlockedConnectionTask(t *testing.T) {
 	release := make(chan struct{})
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		close(started)
 		<-release
 		_, _ = conn.Discard(-1)
@@ -729,7 +729,7 @@ func TestShutdownRetainsTaskErrorAfterNilCloseRequest(t *testing.T) {
 	closed := make(chan error, 1)
 	wantErr := errors.New("callback failed during shutdown")
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		close(started)
 		<-release
 		_, _ = conn.Discard(-1)
@@ -770,7 +770,7 @@ func TestShutdownWaitsForRunningTask(t *testing.T) {
 	release := make(chan struct{})
 	closed := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		close(started)
 		<-release
 		_, _ = conn.Discard(-1)
@@ -819,7 +819,7 @@ func TestDeferredTransportCauseSurvivesShutdownHandoff(t *testing.T) {
 	closed := make(chan error, 1)
 	wantErr := errors.New("transport failed")
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		close(started)
 		<-release
 		_, _ = conn.Discard(-1)
@@ -866,7 +866,7 @@ func TestConnectionTaskStopsReadingWhileCallbackIsBlocked(t *testing.T) {
 	release := make(chan struct{})
 	var calls atomic.Int32
 	events := &Events{Pollers: 1, MaxBufferSize: 4}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
@@ -905,7 +905,7 @@ func TestConnectionTaskRedeliversReadAfterRoundBudget(t *testing.T) {
 	var received atomic.Int64
 	done := make(chan struct{}, 1)
 	events := &Events{Pollers: 1, MaxBufferSize: 4096}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		n := conn.InboundBuffered()
 		if _, err := conn.Discard(-1); err != nil {
 			return err
@@ -944,7 +944,7 @@ func TestConnectionTaskRedeliversReadAfterRoundBudget(t *testing.T) {
 func TestExternalWriteCopiesAndWakePreservesOrder(t *testing.T) {
 	woke := make(chan struct{}, 1)
 	events := &Events{Pollers: 1}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, err := conn.WriteString("second")
 		woke <- struct{}{}
 		return err
@@ -1013,7 +1013,7 @@ func TestFlushTaskIsAWriteBarrier(t *testing.T) {
 	outbound := make(chan int, 4)
 	events := &Events{Pollers: 1}
 	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn); <-releaseOpen }
-	funcs(events).Outbound = func(_ Conn, written int) { outbound <- written }
+	funcs(events).BytesWritten = func(_ Conn, written int) { outbound <- written }
 	testConn, registered := startTestConnection(t, events)
 	conn := <-opened
 	if _, err := conn.Write([]byte("A")); err != nil {
@@ -1033,7 +1033,7 @@ func TestFlushTaskIsAWriteBarrier(t *testing.T) {
 		t.Fatalf("peer received %q", got)
 	}
 	if got := <-outbound; got != 2 {
-		t.Fatalf("OnOutbound bytes = %d, want batched 2", got)
+		t.Fatalf("OnWrite bytes = %d, want batched 2", got)
 	}
 }
 
@@ -1051,13 +1051,13 @@ func TestCallbackThresholdBatchesWithoutTasks(t *testing.T) {
 			t.Error(err)
 		}
 	}
-	funcs(events).Outbound = func(_ Conn, written int) { outbound <- written }
+	funcs(events).BytesWritten = func(_ Conn, written int) { outbound <- written }
 	testConn := newTestConnection(t, events)
 	if got := string(readPeer(t, testConn.peer, 3)); got != "abc" {
 		t.Fatalf("peer received %q", got)
 	}
 	if written := <-outbound; written != 3 {
-		t.Fatalf("OnOutbound bytes = %d", written)
+		t.Fatalf("OnWrite bytes = %d", written)
 	}
 	select {
 	case extra := <-outbound:
@@ -1085,7 +1085,7 @@ func TestReadEventFlushesCallbacksAsOneBatch(t *testing.T) {
 				MaxOutboundBuffered:    test.maxOutboundBuffered,
 				WriteBufferedThreshold: 16,
 			}
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				if _, err := conn.Discard(-1); err != nil {
 					return err
 				}
@@ -1097,7 +1097,7 @@ func TestReadEventFlushesCallbacksAsOneBatch(t *testing.T) {
 				}
 				return nil
 			}
-			funcs(events).Outbound = func(_ Conn, written int) { outbound <- written }
+			funcs(events).BytesWritten = func(_ Conn, written int) { outbound <- written }
 			testConn := newTestConnection(t, events)
 			if _, err := unix.Write(testConn.peer, []byte("12345678")); err != nil {
 				t.Fatal(err)
@@ -1109,15 +1109,15 @@ func TestReadEventFlushesCallbacksAsOneBatch(t *testing.T) {
 				select {
 				case got := <-outbound:
 					if got != want {
-						t.Fatalf("OnOutbound bytes = %d, want %d", got, want)
+						t.Fatalf("OnWrite bytes = %d, want %d", got, want)
 					}
 				case <-time.After(time.Second):
-					t.Fatal("timed out waiting for OnOutbound")
+					t.Fatal("timed out waiting for OnWrite")
 				}
 			}
 			select {
 			case extra := <-outbound:
-				t.Fatalf("unexpected extra OnOutbound call for %d bytes", extra)
+				t.Fatalf("unexpected extra OnWrite call for %d bytes", extra)
 			default:
 			}
 		})
@@ -1176,7 +1176,7 @@ func TestSameLoopCrossConnectionBufferedWritesFlushTarget(t *testing.T) {
 				conn.loop = loop
 			}
 			callbackErr := make(chan error, 1)
-			funcs(events).Data = func(conn Conn) error {
+			funcs(events).Read = func(conn Conn) error {
 				if conn != source {
 					_, _ = conn.Discard(-1)
 					return nil
@@ -1254,7 +1254,7 @@ func TestSameLoopCrossConnectionPartialWriteFlushesSuffix(t *testing.T) {
 		payload[index] = byte(index)
 	}
 	callbackErr := make(chan error, 1)
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if conn != source {
 			_, _ = conn.Discard(-1)
 			return nil
@@ -1458,7 +1458,7 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 			dialOpenOnce.Do(func() { close(dialOpened) })
 		}
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		if conn.Userdata() != "dial" {
 			_, err := conn.WriteTo(conn)
 			return err
@@ -1539,7 +1539,7 @@ func TestInboundLimitHoldsTheReadRound(t *testing.T) {
 		MaxBufferSize:      4,
 		MaxInboundBuffered: 8,
 	}, FuncHandler{
-		Data: func(Conn) error { calls.Add(1); return nil },
+		Read: func(Conn) error { calls.Add(1); return nil },
 	})
 	testConn := newTestConnection(t, events)
 	if _, err := unix.Write(testConn.peer, []byte("0123456789abcdef")); err != nil {
@@ -1571,7 +1571,7 @@ func TestInboundLimitHeldReadIgnoresEdges(t *testing.T) {
 		MaxBufferSize:      4,
 		MaxInboundBuffered: 8,
 	}, FuncHandler{
-		Data: func(Conn) error { calls.Add(1); return nil },
+		Read: func(Conn) error { calls.Add(1); return nil },
 	})
 	testConn := newTestConnection(t, events)
 	if _, err := unix.Write(testConn.peer, []byte("0123456789abcdef")); err != nil {
@@ -1607,7 +1607,7 @@ func TestEventsCloseFromCallbackDoesNotDeadlock(t *testing.T) {
 		}
 		events.acceptor.mux.Unlock()
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		_, _ = conn.Discard(-1)
 		if err := events.Close(shutdownErr); err != nil {
 			return err
@@ -1667,7 +1667,7 @@ func TestUDPChildCloseDoesNotCloseSharedServer(t *testing.T) {
 		}
 		events.acceptor.mux.Unlock()
 	}
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		data := make([]byte, conn.InboundBuffered())
 		n, _ := conn.Read(data)
 		if string(data[:n]) == "close" {
@@ -1734,7 +1734,7 @@ func TestUDPChildCloseDoesNotCloseSharedServer(t *testing.T) {
 func TestReadRoundCorksRepliesToOneFlush(t *testing.T) {
 	events := &Events{Pollers: 1, MaxBufferSize: 4}
 	outbound := make(chan int, 8)
-	funcs(events).Data = func(conn Conn) error {
+	funcs(events).Read = func(conn Conn) error {
 		data := conn.PeekChunk()
 		if _, err := conn.Write(data); err != nil {
 			return err
@@ -1742,7 +1742,7 @@ func TestReadRoundCorksRepliesToOneFlush(t *testing.T) {
 		_, err := conn.Discard(-1)
 		return err
 	}
-	funcs(events).Outbound = func(_ Conn, written int) { outbound <- written }
+	funcs(events).BytesWritten = func(_ Conn, written int) { outbound <- written }
 	testConn := newTestConnection(t, events)
 	if _, err := unix.Write(testConn.peer, []byte("12345678")); err != nil {
 		t.Fatal(err)
@@ -1755,7 +1755,7 @@ func TestReadRoundCorksRepliesToOneFlush(t *testing.T) {
 	select {
 	case written := <-outbound:
 		if written != 8 {
-			t.Fatalf("first OnOutbound = %d bytes, want the corked 8", written)
+			t.Fatalf("first OnWrite = %d bytes, want the corked 8", written)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for the corked flush")
@@ -1839,7 +1839,7 @@ func TestExistingUDPPeerPacketDoesNotAllocate(t *testing.T) {
 	var opened, packets int
 	events := withFuncs(&Events{}, FuncHandler{
 		Open: func(Conn) { opened++ },
-		Data: func(Conn) error {
+		Read: func(Conn) error {
 			packets++
 			return nil
 		},
@@ -1903,7 +1903,7 @@ func TestExistingUDPPeerReceiveDoesNotAllocate(t *testing.T) {
 	events := withFuncs(&Events{
 		MaxBufferSize: 64,
 	}, FuncHandler{
-		Data: func(Conn) error {
+		Read: func(Conn) error {
 			packets++
 			return nil
 		},
@@ -1960,7 +1960,7 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	events := withFuncs(&Events{
 		MaxBufferSize: 64,
 	}, FuncHandler{
-		Data: func(Conn) error {
+		Read: func(Conn) error {
 			packets++
 			return nil
 		},
@@ -2405,17 +2405,17 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 	conn := &fdConn{}
 	conn.events = events
 	conn.inboundTail = []byte("discard")
-	if err := events.onData(conn); err != nil || conn.InboundBuffered() != 0 {
+	if err := events.onRead(conn); err != nil || conn.InboundBuffered() != 0 {
 		t.Fatalf("default OnData = %v, buffered %d", err, conn.InboundBuffered())
 	}
 	wantErr := errors.New("handler")
-	funcs(events).Data = func(Conn) error { return wantErr }
-	if err := events.onData(conn); !errors.Is(err, wantErr) {
+	funcs(events).Read = func(Conn) error { return wantErr }
+	if err := events.onRead(conn); !errors.Is(err, wantErr) {
 		t.Fatalf("OnData error = %v", err)
 	}
 	var inbound, outbound int
-	funcs(events).Inbound = func(Conn, int) { inbound++ }
-	funcs(events).Outbound = func(Conn, int) { outbound++ }
+	funcs(events).BytesRead = func(Conn, int) { inbound++ }
+	funcs(events).BytesWritten = func(Conn, int) { outbound++ }
 	events.onSocketBytesRead(conn, 0)
 	events.onSocketBytesRead(conn, 1)
 	events.onSocketBytesWrite(conn, 0)
@@ -2668,17 +2668,17 @@ func TestUnixClosedAndCallbackStateBranches(t *testing.T) {
 
 	conn.close.phase.Store(closeRequested)
 	conn.inboundTail = []byte("discard")
-	err := conn.fireOnData()
+	err := conn.fireOnRead()
 	started := conn.beginInboundCallback()
 	buffered := conn.InboundBuffered()
 	conn.endInboundCallback(started)
 	if err != nil || buffered != 0 {
-		t.Fatalf("default fireOnData = %v, buffered %d", err, buffered)
+		t.Fatalf("default fireOnRead = %v, buffered %d", err, buffered)
 	}
 	wantErr := errors.New("callback")
-	funcs(events).Data = func(Conn) error { return wantErr }
-	if err := conn.fireOnData(); !errors.Is(err, wantErr) {
-		t.Fatalf("callback fireOnData error = %v", err)
+	funcs(events).Read = func(Conn) error { return wantErr }
+	if err := conn.fireOnRead(); !errors.Is(err, wantErr) {
+		t.Fatalf("callback fireOnRead error = %v", err)
 	}
 	if err := conn.Wake(); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed Wake error = %v", err)

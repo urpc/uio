@@ -231,8 +231,8 @@ func TestRefusedWritesScheduleNoTurns(t *testing.T) {
 	var once sync.Once
 	addr := listener.Addr().String()
 	events := dialLayered(t, addr, func(ev *Events) {
-		ev.Use(LayerFunc(func(LayerContext) LayerConn { return &windowFlush{} }))
-		ev.Observer = FuncHandler{Inbound: func(Conn, int) {
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return &windowFlush{} }))
+		ev.Observer = FuncHandler{BytesRead: func(Conn, int) {
 			once.Do(func() { close(busy) })
 			<-release
 		}}

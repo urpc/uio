@@ -96,7 +96,7 @@ type fdConn struct {
 	deadlines *deadlineState // allocated by the first nonzero deadline
 	// wake is the connection's wake timer on its loop's wheel, allocated by
 	// the first SetWakeDeadline or SetWakeInterval.
-	wake *wakeState
+	wake atomic.Pointer[wakeState]
 
 	// scratch is the read round's reply space while the turn reads: what the
 	// round's callbacks reserve is laid out in it and leaves in one send when
@@ -193,7 +193,7 @@ const (
 	// callback fills after the reservation returns.
 	writeTurnHeldFlag
 	// writeTurnFlushFlag marks a claim the connection's turn took for one
-	// flush, so the turn's cleanup releases it if OnOutbound panics there.
+	// flush, so the turn's cleanup releases it if OnBytesWritten panics there.
 	writeTurnFlushFlag
 	// writeCloseWaitFlag asks the claim holder to hand a deferred close back to
 	// the connection's turn when it releases the claim.
@@ -226,9 +226,9 @@ const (
 const (
 	// turnCorked batches a read round's replies until the round ends.
 	turnCorked uint8 = 1 << iota
-	// turnFlushing marks the turn inside its own flush, where OnOutbound
+	// turnFlushing marks the turn inside its own flush, where OnBytesWritten
 	// runs: a Write the callback makes is queued rather than sent, and a
-	// flush it starts returns at once, so OnOutbound never runs inside itself.
+	// flush it starts returns at once, so OnBytesWritten never runs inside itself.
 	turnFlushing
 	// turnHangup records a hangup the poller reported, for the rest of the
 	// connection's life: the end of stream or error behind the bytes still
@@ -511,12 +511,12 @@ const maxWriteFlushes = 8
 
 // runWriteTurn sends output from other goroutines while the connection's turn
 // reads. It holds the write claim and one of its loop's turn counts, which
-// shutdown joins. It never runs callbacks other than OnOutbound.
+// shutdown joins. It never runs callbacks other than OnBytesWritten.
 func (conn *fdConn) runWriteTurn() {
 	handedOn := false
 	defer func() {
 		// Every exit but the hand-on ends the turn here, including a panic in
-		// OnOutbound, which runs after a flush may have left the socket
+		// OnBytesWritten, which runs after a flush may have left the socket
 		// blocked: the claim and the count go back and writable interest is
 		// armed whether or not the flush returned.
 		if !handedOn {
@@ -727,7 +727,7 @@ func (conn *fdConn) shutWrite() {
 }
 
 // onReadEOF handles a peer that shut its writing half. Without half-open it
-// ends the connection as before. With it, reads stop, OnData runs once more so
+// ends the connection as before. With it, reads stop, OnRead runs once more so
 // the application sees Read report io.EOF, and the connection closes once its
 // own writing half is shut as well and callbacks consumed what the peer sent.
 func (conn *fdConn) onReadEOF() error {
@@ -736,7 +736,7 @@ func (conn *fdConn) onReadEOF() error {
 	}
 	conn.flags.Or(readEOFFlag)
 	conn.inboundTail = nil
-	if err := conn.fireOnData(); err != nil {
+	if err := conn.fireOnRead(); err != nil {
 		return err
 	}
 	conn.closeIfEnded()
@@ -1211,7 +1211,7 @@ func (conn *fdConn) runIOTask() {
 	}
 	if events&ioEventWake != 0 && !conn.isClosing() && !conn.readStalled() {
 		conn.turn |= turnCorked
-		if err := conn.fireOnData(); err != nil {
+		if err := conn.fireOnRead(); err != nil {
 			conn.requestClose(err)
 		}
 		conn.turn &^= turnCorked
@@ -1518,20 +1518,22 @@ func (conn *fdConn) fireOnOpen() {
 	}
 }
 
-// fireOnData establishes the inbound-access scope around application code.
+// fireOnRead establishes the inbound-access scope around application code.
 // Unread stream bytes remain available to a later callback; unread UDP bytes
 // are discarded by the datagram caller because packet lifetime is one turn.
-func (conn *fdConn) fireOnData() error {
+func (conn *fdConn) fireOnRead() error {
 	var err error
-	if callback := conn.events.cb.onData; callback != nil {
-		started := conn.beginInboundCallback()
-		err = callback(conn)
-		conn.endInboundCallback(started)
-	} else {
-		started := conn.beginInboundCallback()
-		_, _ = conn.Discard(-1)
-		conn.endInboundCallback(started)
+	started := conn.beginInboundCallback()
+	var skipRead bool
+	skipRead, err = conn.fireWakeTimer()
+	if err == nil && !skipRead {
+		if callback := conn.events.cb.onRead; callback != nil {
+			err = callback(conn)
+		} else {
+			_, _ = conn.Discard(-1)
+		}
 	}
+	conn.endInboundCallback(started)
 	if err != nil {
 		return err
 	}
@@ -1578,7 +1580,7 @@ func (conn *fdConn) ReserveInbound(n int) error {
 }
 
 // onRead drains an edge-triggered stream with bounded work per task. The
-// borrowed read buffer is exposed directly during OnData; only a callback that
+// borrowed read buffer is exposed directly during OnRead; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
 	holder := conn.events.readPool.Get()
@@ -1620,14 +1622,14 @@ func (conn *fdConn) readRound(buffer []byte) error {
 		// inboundTail aliases the pooled read buffer. Unconsumed bytes are copied
 		// into inbound before the buffer is reused by the next syscall.
 		conn.inboundTail = buffer[:n]
-		if conn.events.cb.onInbound != nil {
+		if conn.events.cb.onBytesRead != nil {
 			conn.events.onSocketBytesRead(conn, n)
 		}
 		if conn.isClosing() {
 			conn.inboundTail = nil
 			return nil
 		}
-		if err = conn.fireOnData(); err != nil {
+		if err = conn.fireOnRead(); err != nil {
 			return err
 		}
 		if conn.isClosing() {
@@ -1740,7 +1742,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 	}
 	packetConn.inboundTail = packet
 	packetConn.events.onSocketBytesRead(packetConn, len(packet))
-	err := packetConn.fireOnData()
+	err := packetConn.fireOnRead()
 	started := packetConn.beginInboundCallback()
 	_, _ = packetConn.Discard(-1)
 	packetConn.endInboundCallback(started)
@@ -1846,7 +1848,7 @@ func (server *fdConn) queuePeer(child *fdConn, wake bool) {
 }
 
 // settlePeers runs in a UDP server's turn and handles the children queued for
-// it: a closing child is released and gets OnClose, and a woken one OnData.
+// it: a closing child is released and gets OnClose, and a woken one OnRead.
 // Children queued meanwhile set ioEventPeers again for the next turn.
 //
 // Children are taken one at a time, and ioEventPeers stays set while more are
@@ -1892,7 +1894,7 @@ func (server *fdConn) settlePeers() {
 				child.deliverClose(finalErr)
 			}
 		} else if !child.isClosing() {
-			if err := child.fireOnData(); err != nil {
+			if err := child.fireOnRead(); err != nil {
 				child.requestClose(err)
 			}
 		}
@@ -2019,7 +2021,7 @@ func (conn *fdConn) teardown(cause error) (error, bool) {
 		flushed := false
 		defer func() {
 			if !flushed {
-				// OnOutbound panicked in the close flush. The connection is
+				// OnBytesWritten panicked in the close flush. The connection is
 				// released already, so nothing else would close it: finish
 				// here, and leave OnClose to its next turn.
 				conn.scheduleCloseCallback(conn.releaseResources(cause, nil))

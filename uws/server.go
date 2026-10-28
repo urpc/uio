@@ -97,13 +97,13 @@ func (s *Server) Serve(addrs ...string) error {
 				hook()
 			}
 		},
-		Open:     s.onOpen,
-		Data:     s.onData,
-		Close:    s.onClose,
-		Outbound: s.onOutbound,
+		Open:         s.onOpen,
+		Read:         s.onData,
+		Close:        s.onClose,
+		BytesWritten: s.onOutbound,
 	}
 	if s.config.observeTraffic {
-		handler.Inbound = s.onInbound
+		handler.BytesRead = s.onInbound
 	}
 	events.Handler = handler
 	if opts.TLSConfig != nil {

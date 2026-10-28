@@ -275,11 +275,11 @@ func (d *Dialer) start(ctx context.Context) error {
 				}
 				d.publishStartResult(nil)
 			},
-			Open:     d.onOpen,
-			Data:     d.onData,
-			Close:    d.onClose,
-			Outbound: d.onOutbound,
-			Inbound:  d.onInbound,
+			Open:         d.onOpen,
+			Read:         d.onData,
+			Close:        d.onClose,
+			BytesWritten: d.onOutbound,
+			BytesRead:    d.onInbound,
 		}
 		events.Handler = handler
 		if opts.TLSConfig != nil {

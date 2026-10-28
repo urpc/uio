@@ -17,9 +17,11 @@
 package uio
 
 // Handler receives the callbacks of every connection an Events serves or
-// dials, set as Events.Handler. Lifecycle and data callbacks are serialized
-// per connection, while callbacks for different connections may run
-// concurrently. FuncHandler adapts plain functions to it.
+// dials, set as Events.Handler. It is LayerHandler without OnWrite — the
+// top of a stack, whose outbound is the Write method it calls. Lifecycle
+// and data callbacks are serialized per connection, while callbacks for
+// different connections may run concurrently. FuncHandler adapts plain
+// functions to it.
 type Handler interface {
 	// OnOpen fires first for every connection, in the connection's first
 	// turn, also for one closed before that turn ran: OnClose follows, and
@@ -28,12 +30,22 @@ type Handler interface {
 	// returns, in the same turn.
 	OnOpen(c Conn)
 
-	// OnData fires when inbound data is available. Inbound access methods are
-	// valid only for this callback invocation. An error closes the connection.
-	OnData(c Conn) error
+	// OnRead fires on a turn once the connection opened, with inbound data
+	// available or none: a Wake runs one too, so it may arrive with nothing
+	// to read. Inbound access methods are valid only for this callback
+	// invocation. An error closes the connection. A layer hears the same
+	// moment as its OnRead; here, at the top of the stack, outbound is not a
+	// callback but Write, a method the Handler calls — which is why there is
+	// no OnWrite next to it.
+	OnRead(c Conn) error
+
+	// OnTimer fires on the turn the connection's own timer came due — the
+	// one SetWakeDeadline and SetWakeInterval arm — before OnRead in the same
+	// turn. An error closes the connection.
+	OnTimer(c Conn) error
 
 	// OnClose is the final callback for a connection and never overlaps its
-	// OnOpen or OnData callback; only a connection that got OnOpen gets it.
+	// OnOpen or OnRead callback; only a connection that got OnOpen gets it.
 	// Close only requests the close: the connection is released, and OnClose
 	// runs, once the callback that closed it has returned.
 	OnClose(c Conn, err error)
@@ -41,24 +53,28 @@ type Handler interface {
 
 // TrafficObserver, set as Events.Observer, is told the bytes each connection
 // reads and writes. Both callbacks are observation only: they report I/O that
-// just happened.
+// just happened. They are named for the bytes they count: OnRead and
+// OnWrite name the data path's callbacks — LayerHandler.OnRead and
+// OnWrite, and the Handler's OnRead — not its byte totals, which is why
+// the counts here carry Bytes in their names.
 type TrafficObserver interface {
-	// OnInbound reports bytes read from the socket before OnData and shares
-	// its inbound-access scope.
-	OnInbound(c Conn, readBytes int)
+	// OnBytesRead reports bytes read from the socket before OnRead and
+	// shares its inbound-access scope.
+	OnBytesRead(c Conn, n int)
 
-	// OnOutbound reports bytes successfully written to the socket. It may run
-	// on a backend writer goroutine or a native write turn, concurrently with
-	// the connection's other callbacks, and does not grant inbound-buffer
+	// OnBytesWritten reports bytes successfully written to the socket. It may
+	// run on a backend writer goroutine or a native write turn, concurrently
+	// with the connection's other callbacks, and does not grant inbound-buffer
 	// access. The final flush of a closing native connection reports from the
 	// goroutine that releases it, which during shutdown is the one returning
 	// from Serve. Calls for one connection never overlap each other: on the
-	// native backend a Write made inside OnOutbound is queued and sent after it
-	// returns. A UDP connection's datagrams leave on the goroutines that write
-	// them, and OnOutbound may report several of them, on any one of those
-	// goroutines, after its send. With layers installed it may run inside a
-	// layer's write below, so it must not write to or close the connection.
-	OnOutbound(c Conn, writeBytes int)
+	// native backend a Write made inside OnBytesWritten is queued and sent
+	// after it returns. A UDP connection's datagrams leave on the goroutines
+	// that write them, and OnBytesWritten may report several of them, on any
+	// one of those goroutines, after its send. With layers installed it may run
+	// inside a layer's write below, so it must not write to or close the
+	// connection.
+	OnBytesWritten(c Conn, n int)
 }
 
 // ServeHooks, set as Events.Hooks, runs code around Serve.
@@ -73,16 +89,18 @@ type ServeHooks interface {
 
 // FuncHandler adapts plain functions to Handler, TrafficObserver and
 // ServeHooks; set the value as whichever of Events.Handler, Observer and Hooks
-// its fields fill. A nil field is a callback not set: a nil Data discards what
-// each connection reads, and a nil Inbound or Outbound reports nothing.
+// its fields fill. A nil field is a callback not set: a nil Read discards
+// what each connection reads, a nil Timer never fires, and a nil BytesRead or
+// BytesWritten reports nothing.
 type FuncHandler struct {
-	Open     func(c Conn)
-	Data     func(c Conn) error
-	Close    func(c Conn, err error)
-	Inbound  func(c Conn, readBytes int)
-	Outbound func(c Conn, writeBytes int)
-	Start    func(ev *Events)
-	Stop     func(ev *Events)
+	Open         func(c Conn)
+	Read         func(c Conn) error
+	Timer        func(c Conn) error
+	Close        func(c Conn, err error)
+	BytesRead    func(c Conn, n int)
+	BytesWritten func(c Conn, n int)
+	Start        func(ev *Events)
+	Stop         func(ev *Events)
 }
 
 func (h FuncHandler) OnOpen(c Conn) {
@@ -91,11 +109,18 @@ func (h FuncHandler) OnOpen(c Conn) {
 	}
 }
 
-func (h FuncHandler) OnData(c Conn) error {
-	if h.Data != nil {
-		return h.Data(c)
+func (h FuncHandler) OnRead(c Conn) error {
+	if h.Read != nil {
+		return h.Read(c)
 	}
 	_, _ = c.Discard(-1)
+	return nil
+}
+
+func (h FuncHandler) OnTimer(c Conn) error {
+	if h.Timer != nil {
+		return h.Timer(c)
+	}
 	return nil
 }
 
@@ -105,15 +130,15 @@ func (h FuncHandler) OnClose(c Conn, err error) {
 	}
 }
 
-func (h FuncHandler) OnInbound(c Conn, readBytes int) {
-	if h.Inbound != nil {
-		h.Inbound(c, readBytes)
+func (h FuncHandler) OnBytesRead(c Conn, n int) {
+	if h.BytesRead != nil {
+		h.BytesRead(c, n)
 	}
 }
 
-func (h FuncHandler) OnOutbound(c Conn, writeBytes int) {
-	if h.Outbound != nil {
-		h.Outbound(c, writeBytes)
+func (h FuncHandler) OnBytesWritten(c Conn, n int) {
+	if h.BytesWritten != nil {
+		h.BytesWritten(c, n)
 	}
 }
 
@@ -146,30 +171,31 @@ func asFuncs(v any) (*FuncHandler, bool) {
 // FuncHandler contributes its fields themselves, so an unset one stays nil
 // instead of becoming a call that does nothing.
 type callbacks struct {
-	onOpen     func(c Conn)
-	onData     func(c Conn) error
-	onClose    func(c Conn, err error)
-	onInbound  func(c Conn, readBytes int)
-	onOutbound func(c Conn, writeBytes int)
-	onStart    func(ev *Events)
-	onStop     func(ev *Events)
+	onOpen         func(c Conn)
+	onRead         func(c Conn) error
+	onTimer        func(c Conn) error
+	onClose        func(c Conn, err error)
+	onBytesRead    func(c Conn, n int)
+	onBytesWritten func(c Conn, n int)
+	onStart        func(ev *Events)
+	onStop         func(ev *Events)
 }
 
 func resolveCallbacks(handler Handler, observer TrafficObserver, hooks ServeHooks) callbacks {
 	var cb callbacks
 	if fh, ok := asFuncs(handler); ok {
 		if fh != nil {
-			cb.onOpen, cb.onData, cb.onClose = fh.Open, fh.Data, fh.Close
+			cb.onOpen, cb.onRead, cb.onTimer, cb.onClose = fh.Open, fh.Read, fh.Timer, fh.Close
 		}
 	} else if handler != nil {
-		cb.onOpen, cb.onData, cb.onClose = handler.OnOpen, handler.OnData, handler.OnClose
+		cb.onOpen, cb.onRead, cb.onTimer, cb.onClose = handler.OnOpen, handler.OnRead, handler.OnTimer, handler.OnClose
 	}
 	if fh, ok := asFuncs(observer); ok {
 		if fh != nil {
-			cb.onInbound, cb.onOutbound = fh.Inbound, fh.Outbound
+			cb.onBytesRead, cb.onBytesWritten = fh.BytesRead, fh.BytesWritten
 		}
 	} else if observer != nil {
-		cb.onInbound, cb.onOutbound = observer.OnInbound, observer.OnOutbound
+		cb.onBytesRead, cb.onBytesWritten = observer.OnBytesRead, observer.OnBytesWritten
 	}
 	if fh, ok := asFuncs(hooks); ok {
 		if fh != nil {

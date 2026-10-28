@@ -27,7 +27,7 @@ func (h *listenEcho) events() *Events {
 			h.opened = append(h.opened, c.Userdata())
 			h.mu.Unlock()
 		},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},

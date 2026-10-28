@@ -38,26 +38,26 @@ import (
 // A protocol that opens several streams over one connection — HTTP/2, QUIC —
 // runs as the Handler, over a connection the layer below it made.
 //
-// Attach runs once per connection and returns that connection's [LayerConn];
+// Attach runs once per connection and returns that connection's [LayerHandler];
 // the [LayerContext] it receives is the connection's place in the stack: the
-// layer reads what arrived with LayerContext.Lower, hands the layer above
-// what that became with LayerContext.Deliver, and writes down with
-// LayerContext.Write. The layer above — the next layer or the Handler — gets
+// layer reads what arrived with Down, hands the layer above
+// what that became with Up().Write, and writes down with
+// Down().Write. The layer above — the next layer or the Handler — gets
 // a [Conn] UIO builds over this one: its reads are what this layer
-// delivered, its writes reach this layer's OnOutbound, and everything else is
+// delivered, its writes reach this layer's OnWrite, and everything else is
 // the connection's own, passed through.
 //
 // What UIO guarantees every layer, so that none has to remember it:
 //
 //   - Every turn reaches the layers above, whether or not anything was
 //     delivered, so their timers and wakes work through any stack.
-//   - Each layer has a timer of its own, [LayerContext.SetTimer], and the
+//   - Each layer has a timer of its own, [SetTimer], and the
 //     Handler's [Conn.SetWakeDeadline] is a slot of its own too: no layer
 //     replaces another's.
-//   - OnOpen, OnInbound, OnTimer, OnSent and OnClose run on the
+//   - OnOpen, OnRead, OnTimer, OnWireSent and OnClose run on the
 //     connection's turns, which never overlap one another or the callbacks
 //     of the layers above. The rest run on the goroutine that called for
-//     them, and may overlap the turns and one another: OnOutbound on the
+//     them, and may overlap the turns and one another: OnWrite on the
 //     writer's, CloseGracefully and CloseWrite on the one closing the
 //     connection, OutboundHeld on a writer's and Flush on a turn's or the
 //     caller of Flush. State they share with the turns needs a lock.
@@ -65,11 +65,14 @@ import (
 //     the layer above through its LayerContext — never from below or from
 //     inside another layer's callback: a layer may hold its lock while it
 //     writes, flushes or closes below, and nothing calls it back meanwhile.
-//     Send reports, which can come inside a write, reach the layers on a
-//     turn; an end CloseWrite leaves waiting is passed down on one.
+//     LayerUp.Open is the one exception, by design: it opens the layers
+//     above right there, whose first writes descend through this layer's
+//     OnWrite before Open returns, so Open is called without a lock OnWrite
+//     takes. Send reports, which can come inside a write, reach the layers
+//     on a turn; an end CloseWrite leaves waiting is passed down on one.
 //   - Once the connection is closing — any layer, or the Handler, closed
 //     it — or ended, UIO starts no call into a layer, checking again after
-//     every callback, so a layer that closes from OnSent or Flush is the
+//     every callback, so a layer that closes from OnWireSent or Flush is the
 //     last called: a write, flush or close that comes after returns
 //     net.ErrClosed, and only OnClose follows. A call already under way on
 //     another goroutine may still overlap.
@@ -85,35 +88,35 @@ import (
 //     a failed handshake — ends without a Handler callback, and a dial
 //     reports its cause instead.
 //   - The end of a stream travels up: a layer whose peer ended its stream
-//     calls LayerContext.End, and the layer above reads io.EOF once it has
+//     calls Up().End, and the layer above reads io.EOF once it has
 //     read the rest.
 type Layer interface {
 	// Attach builds the layer's state for one connection. The LayerContext
 	// stays valid until the connection's OnClose.
-	Attach(ctx LayerContext) LayerConn
+	Attach(ctx LayerContext) LayerHandler
 }
 
-// LayerConn is a layer's instance on one connection: the callbacks UIO runs
+// LayerHandler is a layer's instance on one connection: the callbacks UIO runs
 // as the connection's bytes and events pass through the layer.
-type LayerConn interface {
+type LayerHandler interface {
 	// OnOpen runs once the layers below opened: the place to start a
-	// handshake. The layers above open when LayerContext.Open is called, here
+	// handshake. The layers above open when Up().Open is called, here
 	// or on a later turn; a layer that negotiates nothing calls it here.
 	OnOpen(ctx LayerContext)
 
-	// OnInbound runs on a turn once the layer opened: bytes from below may
-	// have arrived, or none. It reads them from LayerContext.Lower, consumes
+	// OnRead runs on a turn once the layer opened: bytes from below may
+	// have arrived, or none. It reads them from Down, consumes
 	// them with Discard, and hands up what they became with
-	// LayerContext.Deliver. It may take one chunk at a time: while it consumes
+	// Up().Write. It may take one chunk at a time: while it consumes
 	// and bytes still wait below, the turn calls it again. The bottom layer is
 	// not called at all while the stack holds MaxInboundBuffered unread, until
 	// a read above makes room; the layers above it go on moving what the stack
 	// already holds up.
-	OnInbound(ctx LayerContext) error
+	OnRead(ctx LayerContext) error
 
-	// OnOutbound runs for what the layer above writes, on the writer's
+	// OnWrite runs for what the layer above writes, on the writer's
 	// goroutine and possibly beside other writers: it transforms p, writes
-	// the result with LayerContext.Write, and reports how much of p it took.
+	// the result with Down().Write, and reports how much of p it took.
 	// p is the writer's again once it returns; one call carries one write
 	// whole, a Writev's segments joined. What it writes below is never
 	// refused for the queue's size: the Handler's writes are checked against
@@ -121,16 +124,16 @@ type LayerConn interface {
 	// output of its own — a send window — may refuse a write with
 	// ErrOutboundOverflow, taking none of it. It runs only once the layer
 	// opened the layers above.
-	OnOutbound(ctx LayerContext, p []byte) (int, error)
+	OnWrite(ctx LayerContext, p []byte) (int, error)
 
-	// OnTimer runs on the turn the layer's timer came due, before OnInbound.
+	// OnTimer runs on the turn the layer's timer came due, before OnRead.
 	OnTimer(ctx LayerContext) error
 
 	// OnClose runs once, as the connection ends, whichever end closed it.
 	OnClose(ctx LayerContext, cause error)
 }
 
-// CloseWriter is implemented by a LayerConn that can end one direction of
+// CloseWriter is implemented by a LayerHandler that can end one direction of
 // its stream — a TLS close_notify sent before the socket's writing half
 // shuts. It runs when the layer above calls CloseWrite. A layer without it
 // does not support CloseWrite: a protocol that frames its bytes cannot leave
@@ -144,7 +147,7 @@ type CloseWriter interface {
 	CloseWrite(ctx LayerContext) error
 }
 
-// GracefulCloser is implemented by a LayerConn with a goodbye to send —
+// GracefulCloser is implemented by a LayerHandler with a goodbye to send —
 // a TLS close_notify, a WebSocket Close — when the layer above closes the
 // connection. It runs before the close passes to the layer below, with the
 // close's cause: nil, io.EOF or io.ErrUnexpectedEOF for a graceful close —
@@ -159,7 +162,9 @@ type CloseWriter interface {
 // meanwhile, and what arrives is discarded. An abort closes at once. A layer
 // that closes the connection itself, through its LayerContext, ends it for
 // the layers above too: what they hold is dropped, and the close waits only
-// for what lies below; the layer flushes its own output before it closes.
+// for what lies below. UIO does not flush such a layer on its way — the close
+// passes down, flushing each layer below — so the layer sends what it holds
+// itself, with Down().Flush, before it closes.
 type GracefulCloser interface {
 	CloseGracefully(ctx LayerContext, cause error)
 }
@@ -171,10 +176,11 @@ const LingerTimeout = 5 * time.Second
 // lingerTimeout is LingerTimeout, which tests shorten.
 var lingerTimeout = LingerTimeout
 
-// SendObserver is implemented by a LayerConn that follows what the socket
-// sends: a protocol whose state moves as its output leaves — a ping whose
-// timeout starts once it is on the wire, a close that waits for its frame to
-// go. OnSent reports n bytes the socket sent since the last call, counted on
+// WireCounterObserver watches the [WireCounter] every layered Conn shares:
+// OnWireSent is its WireSent moving, pushed. A protocol whose state moves as
+// its output leaves — a ping whose timeout starts once it is on the wire, a
+// close that waits for its frame to go — implements it instead of polling.
+// OnWireSent reports n bytes the socket sent since the last call, counted on
 // the wire: below every layer, so a layer under which others add or remove
 // bytes cannot match n to its own. What it can rely on is the queue: once
 // Lower's OutboundBuffered is zero, everything it wrote left. It runs on the
@@ -182,13 +188,21 @@ var lingerTimeout = LingerTimeout
 // report asks for — as the turn ends, possibly more than once before that
 // turn ends, and may write: the socket may report a
 // send inside the write that made it, where no layer can be called.
-type SendObserver interface {
-	OnSent(ctx LayerContext, n int)
+//
+// There is no observing the wire the other way, because a layer never needs
+// to be told what arrived: it reads what reached it itself, from Lower, on
+// its own OnRead, so inbound has no hidden progress to report. Outbound
+// does: what a layer wrote below leaves later, transformed by layers it
+// cannot see, and only the socket knows when.
+type WireCounterObserver interface {
+	OnWireSent(ctx LayerContext, n int)
 }
 
-// OutboundHolder is implemented by a LayerConn that holds output of its own
-// before writing it below — a send window, a compressor's buffer. The bytes
-// it holds count in the OutboundBuffered of the connection above it, in the
+// OutboundHolder is implemented by a LayerHandler that cannot always write
+// below at once — a send window waiting for its peer, a compressor gathering
+// a block, a gate holding bytes back — and answers for the bytes it took and
+// still holds: OutboundHeld reports how many. They count in the
+// OutboundBuffered of the connection above it, in the
 // MaxOutboundBuffered check, in what a graceful close waits for, and in what
 // CloseWrite sends before the end: a byte counts until its write below has
 // returned. OutboundHeld runs on writers' goroutines and in send reports,
@@ -201,7 +215,7 @@ type OutboundHolder interface {
 	OutboundHeld(ctx LayerContext) int
 }
 
-// Flusher is implemented by a LayerConn that holds output it can send now.
+// Flusher is implemented by a LayerHandler that holds output it can send now.
 // UIO flushes it at the end of every turn — top down, so what one layer
 // flushes reaches the next — and as a graceful close from above passes it,
 // after its goodbye; it also runs when the layer above calls Flush, before
@@ -225,7 +239,8 @@ type Flusher interface {
 // bytes down as it is read counts them twice, and bytes a layer holds count
 // as they are, though it may send fewer. So a target may never be reached;
 // once the Conn's OutboundBuffered is zero, everything written to it left,
-// whatever WireSent says.
+// whatever WireSent says. A LayerHandler that would rather be told than poll
+// implements [WireCounterObserver]: OnWireSent is WireSent's change, pushed.
 type WireCounter interface {
 	WireQueued() uint64
 	WireSent() uint64
@@ -235,63 +250,70 @@ type WireCounter interface {
 // Handler's, share one bit mask.
 const maxLayers = 63
 
-// LayerContext is a layer's handle on its place in one connection's stack.
+// LayerContext is a layer's handle on its place in one connection's stack:
+// a small hub with two faces. Down is the connection below, Up the layer
+// above's input — everything the layer does goes through one of them.
 type LayerContext interface {
-	// Lower is the connection below: the socket, for the first layer
+	// Down is the connection below: the socket, for the first layer
 	// installed; the one the layer below built, for the others. Its inbound
 	// methods — Peek, PeekChunk, Discard, Read — are this layer's to call, in
-	// OnInbound and OnTimer; its writes, options and addressing at any time.
+	// OnRead and OnTimer; its writes, options and addressing at any time.
 	// Its Userdata is the connection's, and its SetWakeDeadline arms this
 	// layer's own timer, as SetTimer does.
-	Lower() Conn
+	Down() LayerDown
 
-	// Deliver hands p up to the layer above, after what it has not read
-	// yet; it copies p. Call it in OnInbound or OnTimer.
-	Deliver(p []byte)
+	// Up is the layer above's input: write to it, end it, open it.
+	Up() LayerUp
 
-	// Space returns at least n bytes of room past what is delivered, for the
-	// layer to fill in place — decrypting straight into it — and Commit
-	// delivers the first n of them. Call both in OnInbound or OnTimer.
-	Space(n int) []byte
-	Commit(n int)
+	// SetTimer arms this layer's own timer for when; a zero time stops it.
+	// Down's SetWakeDeadline and SetWakeInterval arm the same timer.
+	SetTimer(when time.Time) error
 
-	// HeldAbove is how many delivered bytes the layer above has not read.
-	HeldAbove() int
+	// Wake runs a turn of the connection.
+	Wake() error
+}
+
+// LayerDown is the connection below a layer — the socket for the first
+// layer installed, the one the layer below built for the others. It is Conn
+// under the stack-facing name.
+type LayerDown = Conn
+
+// LayerUp is the layer above's input, as the layer below writes to it. Write
+// always takes all of p and never fails. A layer may hold the Up it got.
+// Its methods run in OnRead or OnTimer, on the connection's turn, whose pass
+// then carries what they wrote up through the layers above; a call made
+// anywhere else races the turn.
+type LayerUp interface {
+	io.Writer
 
 	// End tells the layer above the stream ended: once it read what was
-	// delivered, its Read reports io.EOF. A layer calls it when its peer ended
+	// written, its Read reports io.EOF. A layer calls it when its peer ended
 	// its stream — the socket's end, a TLS close_notify. At the top of the
 	// stack, an Events without AllowHalfOpen closes the connection with
-	// io.EOF once the Handler's OnData has run; with it, the Handler may go on
-	// writing and end its own half with CloseWrite. Call it in OnInbound or
+	// io.EOF once the Handler's OnRead has run; with it, the Handler may go on
+	// writing and end its own half with CloseWrite. Call it in OnRead or
 	// OnTimer.
 	End()
-
-	// Stall tells UIO the layer stopped short of what it could deliver — its
-	// bound was reached, with bytes waiting below or in its own buffers — so
-	// the next read above runs a turn to take the rest. A layer that delivers
-	// everything it is given never needs it.
-	Stall()
-
-	// Write sends p down, through the layer below. MaxOutboundBuffered never
-	// refuses it: the stack checks the Handler's writes before they reach
-	// any layer.
-	Write(p []byte) (int, error)
 
 	// Open opens the layers above, once the layer's negotiation settled — at
 	// once from OnOpen if it has none. A dial returns once the top layer
 	// opened. Call it on the connection's turn.
 	Open()
 
-	// CloseWith closes the connection with cause, through the layer below.
-	CloseWith(cause error) error
+	// Reserve returns at least n bytes of room past what is written, for the
+	// layer to fill in place — decrypting straight into it — and Commit
+	// delivers the first n of them. Call both in OnRead or OnTimer.
+	Reserve(n int) []byte
+	Commit(n int)
 
-	// SetTimer arms this layer's own timer for when; a zero time stops it.
-	// Lower's SetWakeDeadline and SetWakeInterval arm the same timer.
-	SetTimer(when time.Time) error
+	// Buffered is how many written bytes the layer above has not read.
+	Buffered() int
 
-	// Wake runs a turn of the connection.
-	Wake() error
+	// Yield tells UIO the layer stopped short of what it could write up —
+	// its bound was reached, with bytes waiting below or in its own buffers —
+	// so the next read above runs a turn to take the rest. A layer that
+	// writes up everything it is given never needs it.
+	Yield()
 }
 
 // Use stacks layers under the Handler, the first installed closest to the
@@ -320,34 +342,34 @@ func (ev *Events) Use(layers ...Layer) *Events {
 }
 
 // LayerFunc is a layer written as the function its Attach runs.
-type LayerFunc func(ctx LayerContext) LayerConn
+type LayerFunc func(ctx LayerContext) LayerHandler
 
 // Attach calls f.
-func (f LayerFunc) Attach(ctx LayerContext) LayerConn { return f(ctx) }
+func (f LayerFunc) Attach(ctx LayerContext) LayerHandler { return f(ctx) }
 
-// PassThrough is a LayerConn that changes nothing: it opens at once,
+// PassThrough is a LayerHandler that changes nothing: it opens at once,
 // delivers what arrives, passes the end of the stream up, writes what is
-// written and passes CloseWrite down. Embed it in a layer's LayerConn to
+// written and passes CloseWrite down. Embed it in a layer's LayerHandler to
 // write only what that layer transforms.
 type PassThrough struct{}
 
 var _ CloseWriter = PassThrough{}
 
 // OnOpen opens the layers above at once.
-func (PassThrough) OnOpen(ctx LayerContext) { ctx.Open() }
+func (PassThrough) OnOpen(ctx LayerContext) { ctx.Up().Open() }
 
-// OnInbound delivers what arrived as it is, and the end of the stream after
+// OnRead delivers what arrived as it is, and the end of the stream after
 // it.
-func (PassThrough) OnInbound(ctx LayerContext) error {
-	lower := ctx.Lower()
+func (PassThrough) OnRead(ctx LayerContext) error {
+	lower := ctx.Down()
 	if chunk := lower.PeekChunk(); len(chunk) > 0 {
-		ctx.Deliver(chunk)
+		_, _ = ctx.Up().Write(chunk)
 		if _, err := lower.Discard(len(chunk)); err != nil {
 			return err
 		}
 	}
 	if lowerEnded(lower) {
-		ctx.End()
+		ctx.Up().End()
 	}
 	return nil
 }
@@ -363,11 +385,11 @@ func lowerEnded(lower Conn) bool {
 	return err == io.EOF
 }
 
-// OnOutbound writes what is written as it is.
-func (PassThrough) OnOutbound(ctx LayerContext, p []byte) (int, error) { return ctx.Write(p) }
+// OnWrite writes what is written as it is.
+func (PassThrough) OnWrite(ctx LayerContext, p []byte) (int, error) { return ctx.Down().Write(p) }
 
 // CloseWrite passes CloseWrite to the layer below.
-func (PassThrough) CloseWrite(ctx LayerContext) error { return ctx.Lower().CloseWrite() }
+func (PassThrough) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
 
 // OnTimer does nothing.
 func (PassThrough) OnTimer(LayerContext) error { return nil }
@@ -412,19 +434,22 @@ func (h *stackDriver) OnOpen(socket Conn) {
 	c := &stack{top: h.top, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen}
 	held := socket.Userdata()
 	if probe, ok := held.(*dialProbe); ok {
-		c.probe, held = probe, probe.user
+		c.probe.Store(probe)
+		held = probe.user
 	}
 	c.userdata.Store(&held)
 	c.layers = make([]*layerNode, len(h.layers))
 	var below Conn = socketLower{Conn: socket, stack: c}
 	for i := range h.layers {
-		c.layers[i] = &layerNode{stack: c, index: i, lower: below}
-		below = c.layers[i]
+		node := &layerNode{stack: c, index: i, lower: below}
+		node.up = layerUp{node}
+		c.layers[i] = node
+		below = node
 	}
 	socket.SetUserdata(c)
 	for i, layer := range h.layers {
 		c.layers[i].conn = layer.Attach(layerCtx{c.layers[i]})
-		if _, ok := c.layers[i].conn.(SendObserver); ok {
+		if _, ok := c.layers[i].conn.(WireCounterObserver); ok {
 			c.sends = append(c.sends, c.layers[i])
 		}
 		if _, ok := c.layers[i].conn.(OutboundHolder); ok {
@@ -444,12 +469,17 @@ func (h *stackDriver) OnOpen(socket Conn) {
 	}
 }
 
-func (h *stackDriver) OnData(socket Conn) error {
+func (h *stackDriver) OnRead(socket Conn) error {
 	if c, ok := socket.Userdata().(*stack); ok {
 		return c.turn()
 	}
 	return nil
 }
+
+// OnTimer does nothing: with layers, the stack's own timer table drives the
+// turn, and run dispatches the Handler's slot to the Handler itself. The
+// socket-level mirror the stack aims at is therefore already accounted for.
+func (h *stackDriver) OnTimer(socket Conn) error { return nil }
 
 func (h *stackDriver) OnClose(socket Conn, err error) {
 	switch held := socket.Userdata().(type) {
@@ -468,7 +498,7 @@ type stack struct {
 	top      Handler
 	socket   Conn
 	layers   []*layerNode
-	probe    *dialProbe   // a dial waiting for the stack to open, until it does
+	probe    atomic.Pointer[dialProbe] // a dial waiting for the stack to open, until it does
 	limit    int          // MaxOutboundBuffered; see reserve
 	reserved atomic.Int64 // bytes admitted at the top, not yet queued below
 	halfOpen bool         // AllowHalfOpen
@@ -499,6 +529,9 @@ type stack struct {
 	inTurn      atomic.Bool
 	turnAsked   atomic.Bool
 	sentPending atomic.Int64
+	// upPending marks a layer that wrote up in OnWireSent: the turn running
+	// has delivered already, so settle asks for the one that carries it.
+	upPending atomic.Bool
 
 	// closing is set as a close reaches the socket from the layers: a turn
 	// that is running stops there, and flushes nothing more — a graceful close
@@ -564,6 +597,15 @@ func (c *stack) turn() error {
 	c.inTurn.Store(true)
 	defer c.inTurn.Store(false) // a panic an Executor recovers leaves none set
 	err := c.run()
+	if err != nil && !gracefulCause(err) {
+		// A layer failed: the connection closes, and nothing reaches a layer
+		// after it — no send report, no flush of what it held. The close goes
+		// through the stack, so it is closing from here on and a writer is
+		// refused; the core's close follows this turn, and OnClose with it.
+		c.inTurn.Store(false)
+		_ = c.closeSocket(err)
+		return err
+	}
 	if flushErr := c.finishTurn(); err == nil {
 		err = flushErr
 	}
@@ -571,13 +613,13 @@ func (c *stack) turn() error {
 }
 
 // over reports a stack no layer is called on any more: one that ended, or
-// one that is closing. A layer's callback can end it — a close from OnSent,
+// one that is closing. A layer's callback can end it — a close from OnWireSent,
 // a protocol error — so every call into a layer is followed by this check
 // before the next.
 func (c *stack) over() bool { return c.ended.Load() || c.closing.Load() }
 
 // finishTurn ends a turn: the layers hear what was sent, then flush what
-// they hold — what OnSent wrote too — unless the connection is closing, an
+// they hold — what OnWireSent wrote too — unless the connection is closing, an
 // abort dropping it and a graceful close having flushed already. A flush
 // can send, and the socket report it right away, inside the flush: the loop
 // takes each report on the turn it ended, so what the layers write for it
@@ -614,7 +656,7 @@ func (c *stack) finishTurn() error {
 // settle does, as a turn ends, what waits for one: ends CloseWrite left
 // waiting for output to go below, and a lingering close's look at the queue.
 // Send reports that came after the turn's own delivery — during its flush —
-// get a turn of their own, which delivers them and then flushes what OnSent
+// get a turn of their own, which delivers them and then flushes what OnWireSent
 // writes. It runs only where no layer is in a callback — the framework never
 // calls a layer from inside another's — so a layer holding its own lock
 // while it writes or flushes below is never called back. Once the
@@ -628,7 +670,7 @@ func (c *stack) settle() {
 		}
 		return
 	}
-	if c.sentPending.Load() > 0 {
+	if c.sentPending.Load() > 0 || c.upPending.Swap(false) {
 		c.requestTurn()
 	}
 	c.finishShuts()
@@ -700,8 +742,16 @@ func (c *stack) run() error {
 	if !c.topOpen.Load() {
 		return nil
 	}
+	if due&(1<<uint(len(c.layers))) != 0 {
+		if err := c.top.OnTimer(c.topConn()); err != nil {
+			return err
+		}
+		if c.closing.Load() {
+			return nil
+		}
+	}
 	top := c.layers[len(c.layers)-1]
-	if err := c.top.OnData(top); err != nil {
+	if err := c.top.OnRead(top); err != nil {
 		return err
 	}
 	if top.ended && !c.halfOpen {
@@ -710,7 +760,7 @@ func (c *stack) run() error {
 	return nil
 }
 
-// inbound runs a layer's OnInbound until it takes nothing more: the bytes
+// inbound runs a layer's OnRead until it takes nothing more: the bytes
 // below may sit in several chunks, and a layer reads one at a time, so it is
 // called again while what waits below shrinks. It stops once nothing waits,
 // the layer took nothing, or it stalled at its bound.
@@ -723,7 +773,7 @@ func (c *stack) inbound(layer *layerNode) error {
 			return nil
 		}
 		before := layer.waitingBelow()
-		if err := layer.conn.OnInbound(layerCtx{layer}); err != nil {
+		if err := layer.conn.OnRead(layerCtx{layer}); err != nil {
 			return err
 		}
 		if c.ended.Load() || c.closing.Load() || layer.stalled.Load() {
@@ -790,13 +840,21 @@ func (c *stack) openLayer(i int) {
 	if c.topOpen.Load() {
 		return
 	}
-	if probe := c.probe; probe != nil {
-		c.probe = nil
+	if probe := c.probe.Swap(nil); probe != nil {
 		if !probe.settle(c.topConn()) {
 			return // the dial gave up and closes the connection
 		}
+		// The dial has its connection from here on: it may close it, or
+		// arm its timer, before this turn goes on.
+		if c.over() {
+			return // closed under the dial: the Handler never hears of it
+		}
 	}
+	// Open before aiming, so a timer the dial armed in between — the slot it
+	// aimed at was not open yet, and aimLocked skipped it — is aimed now; a
+	// timer armed after this sees the slot open and aims itself.
 	c.topOpen.Store(true)
+	c.reaim()
 	c.top.OnOpen(c.topConn())
 }
 
@@ -816,8 +874,13 @@ func (c *stack) closed(err error) {
 		layer := c.layers[i]
 		layer.conn.OnClose(layerCtx{layer}, err)
 	}
-	if probe := c.probe; probe != nil {
-		c.probe = nil
+	// The callbacks have read what they will; an app holding the closed Conn
+	// must not keep the delivered buffers alive with it.
+	for _, layer := range c.layers {
+		layer.delivered = nil
+		layer.at = 0
+	}
+	if probe := c.probe.Swap(nil); probe != nil {
 		probe.fail(err)
 	}
 }
@@ -826,23 +889,29 @@ func (c *stack) closed(err error) {
 func (c *stack) topConn() Conn { return c.layers[len(c.layers)-1] }
 
 // sent passes the socket's report of n bytes sent to the layers that
-// observe sends.
+// observe sends. A layer that writes up in OnWireSent marks the write to
+// wait for a turn: this one is running, and its pass has already delivered,
+// so the turn asked for carries the bytes to the layer above.
 func (c *stack) sent(n int) {
 	for _, layer := range c.sends {
 		if c.over() {
 			return // a layer below ended the connection: the rest hear nothing
 		}
-		layer.conn.(SendObserver).OnSent(layerCtx{layer}, n)
+		held := layer.held()
+		layer.conn.(WireCounterObserver).OnWireSent(layerCtx{layer}, n)
+		if layer.held() != held {
+			c.upPending.Store(true)
+		}
 	}
 }
 
-// stackSent wraps the Observer's OnOutbound, if any, so a stack's send
+// stackSent wraps the Observer's OnBytesWritten, if any, so a stack's send
 // reports reach its layers, and a lingering close learns the queue moved.
 //
-// A send report can run inside the write that made it — a layer's OnOutbound
+// A send report can run inside the write that made it — a layer's OnWrite
 // writing below while it holds a lock, crypto/tls its record lock — so it
 // calls no layer: it counts the bytes, for WireSent at once and for the
-// layers' OnSent on the next turn's end, and asks for that turn. A lingering
+// layers' OnWireSent on the next turn's end, and asks for that turn. A lingering
 // close needs no layer, only the queue's size.
 func stackSent(next func(Conn, int)) func(Conn, int) {
 	return func(conn Conn, n int) {
@@ -1110,7 +1179,8 @@ type layerNode struct {
 	stack *stack
 	index int
 	lower Conn
-	conn  LayerConn // the layer's instance on this connection
+	conn  LayerHandler // the layer's instance on this connection
+	up    LayerUp      // the face the layer writes up, cached to allocate nothing
 
 	opened  atomic.Bool // the layer's OnOpen ran; set on a turn
 	ended   bool        // the layer ended its stream up; only turns touch it
@@ -1119,13 +1189,14 @@ type layerNode struct {
 	// writeShut is set as the layer above ends its writing half: writes into
 	// the layer are refused from then on. shutPending marks the end not yet
 	// passed below, shutFlushed its flush made, and writers counts the
-	// writes in flight into the top layer, which the end waits for; see
-	// shutDown.
+	// writes in flight into the layer — the Handler's through the top, a
+	// layer's own through every layer it writes below — which the end waits
+	// for; see shutDown.
 	writeShut   atomic.Bool
 	shutPending atomic.Bool
 	shutFlushed atomic.Bool
 	writers     atomic.Int32
-	stalled     atomic.Bool // the layer stopped short; see LayerContext.Stall
+	stalled     atomic.Bool // the layer stopped short; see LayerUp.Yield
 
 	// delivered is what the layer handed up that the layer above has not
 	// read, from at on; only the connection's turns touch it.
@@ -1140,23 +1211,51 @@ type layerCtx struct{ l *layerNode }
 
 var (
 	_ LayerContext = layerCtx{}
+	_ LayerUp      = layerUp{}
 	_ Conn         = (*layerNode)(nil)
 	_ WireCounter  = (*layerNode)(nil)
 )
 
-func (lc layerCtx) Lower() Conn { return lc.l.lower }
+func (lc layerCtx) Down() LayerDown { return lc.l.lower }
 
-func (lc layerCtx) Deliver(p []byte) {
-	if len(p) == 0 {
-		return
-	}
-	l := lc.l
-	l.compact()
-	l.delivered = append(l.delivered, p...)
+// Up returns the node's cached face, so writing up allocates nothing.
+func (lc layerCtx) Up() LayerUp { return lc.l.up }
+
+func (lc layerCtx) SetTimer(when time.Time) error {
+	return lc.l.stack.setTimer(lc.l.index, when, 0)
 }
 
-func (lc layerCtx) Space(n int) []byte {
-	l := lc.l
+func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
+
+// layerUp is the layer above's input, as the layer below writes to it.
+type layerUp struct{ l *layerNode }
+
+func (u layerUp) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	l := u.l
+	l.compact()
+	l.delivered = append(l.delivered, p...)
+	return len(p), nil
+}
+
+func (u layerUp) End() { u.l.ended = true }
+
+// Open frees the layers above to open — which happens right here: the next
+// layer's OnOpen runs before Open returns, on this turn, so a dial settles
+// in one pass and what the layers above write at once lines up behind what
+// this layer already sent. It is the one call from a callback that may run
+// this layer's OnWrite again before the callback returns — the layer above's
+// first writes descend through it on this same goroutine — so call Open
+// without a lock OnWrite takes.
+func (u layerUp) Open() {
+	u.l.openUp.Store(true)
+	u.l.stack.openLayer(u.l.index + 1)
+}
+
+func (u layerUp) Reserve(n int) []byte {
+	l := u.l
 	l.compact()
 	if spare := cap(l.delivered) - len(l.delivered); spare < n {
 		// Grow by doubling, as append does: a layer that commits a little at
@@ -1168,31 +1267,14 @@ func (lc layerCtx) Space(n int) []byte {
 	return l.delivered[len(l.delivered):cap(l.delivered)]
 }
 
-func (lc layerCtx) Commit(n int) {
-	l := lc.l
+func (u layerUp) Commit(n int) {
+	l := u.l
 	l.delivered = l.delivered[:len(l.delivered)+n]
 }
 
-func (lc layerCtx) HeldAbove() int { return len(lc.l.delivered) - lc.l.at }
+func (u layerUp) Buffered() int { return len(u.l.delivered) - u.l.at }
 
-func (lc layerCtx) Stall() { lc.l.stalled.Store(true) }
-
-func (lc layerCtx) End() { lc.l.ended = true }
-
-func (lc layerCtx) Write(p []byte) (int, error) { return lc.l.lower.Write(p) }
-
-func (lc layerCtx) Open() {
-	lc.l.openUp.Store(true)
-	lc.l.stack.openLayer(lc.l.index + 1)
-}
-
-func (lc layerCtx) CloseWith(cause error) error { return lc.l.lower.CloseWith(cause) }
-
-func (lc layerCtx) SetTimer(when time.Time) error {
-	return lc.l.stack.setTimer(lc.l.index, when, 0)
-}
-
-func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
+func (u layerUp) Yield() { u.l.stalled.Store(true) }
 
 // waitingBelow is what the layer can still read from the one below: the
 // socket's buffered bytes for the first layer, the delivered bytes of the
@@ -1224,7 +1306,7 @@ func (l *layerNode) reclaim() {
 // compact moves what the layer above has not read to the front before the
 // layer delivers more, so a reader that always leaves a little unread — a
 // partial header, the start of a message — does not keep everything read
-// before it alive. It runs as the layer delivers, on its OnInbound or
+// before it alive. It runs as the layer delivers, on its OnRead or
 // OnTimer, when no slice the layer above was lent is in use any more.
 func (l *layerNode) compact() {
 	if l.at == 0 {
@@ -1466,7 +1548,7 @@ func (l *layerNode) Write(p []byte) (int, error) {
 	if err := l.enter(len(p)); err != nil {
 		return 0, err
 	}
-	n, err := l.conn.OnOutbound(layerCtx{l}, p)
+	n, err := l.conn.OnWrite(layerCtx{l}, p)
 	l.leave(len(p))
 	return n, err
 }
@@ -1482,7 +1564,7 @@ func (l *layerNode) Writev(vec [][]byte) (int, error) {
 	var n int
 	var err error
 	if len(vec) == 1 {
-		n, err = l.conn.OnOutbound(layerCtx{l}, vec[0])
+		n, err = l.conn.OnWrite(layerCtx{l}, vec[0])
 	} else {
 		// One write whole, as the socket's Writev is: segments passed one by
 		// one would interleave with another writer's.
@@ -1490,7 +1572,7 @@ func (l *layerNode) Writev(vec [][]byte) (int, error) {
 		for _, segment := range vec {
 			_, _ = joined.Write(segment)
 		}
-		n, err = l.conn.OnOutbound(layerCtx{l}, joined.Bytes())
+		n, err = l.conn.OnWrite(layerCtx{l}, joined.Bytes())
 		ReleaseBuffer(joined)
 	}
 	l.leave(size)
@@ -1500,13 +1582,12 @@ func (l *layerNode) Writev(vec [][]byte) (int, error) {
 // enter checks that a write may enter the layer — it opened the layers above
 // and is not closing — and, at the top of the stack, reserves its room; leave
 // returns the room once the write is through.
+//
+// The write is counted at every layer, not only the top: a layer writing
+// below from its OnRead passes through the layer below it, and a CloseWrite
+// reaching that layer must not pass under a write still in flight — the top's
+// count covers the Handler's writes only.
 func (l *layerNode) enter(n int) error {
-	if !l.isTop() {
-		if l.refuses() {
-			return net.ErrClosed
-		}
-		return nil
-	}
 	if l.refuses() {
 		return net.ErrClosed // refused before it counts: it asks for no turn
 	}
@@ -1517,9 +1598,11 @@ func (l *layerNode) enter(n int) error {
 		l.exit()
 		return net.ErrClosed
 	}
-	if err := l.stack.reserve(n); err != nil {
-		l.exit()
-		return err
+	if l.isTop() {
+		if err := l.stack.reserve(n); err != nil {
+			l.exit()
+			return err
+		}
 	}
 	return nil
 }
@@ -1534,12 +1617,12 @@ func (l *layerNode) refuses() bool {
 func (l *layerNode) leave(n int) {
 	if l.isTop() {
 		l.stack.release(n)
-		l.exit()
 	}
+	l.exit()
 }
 
-// exit ends a write into the top layer; the last one out asks a turn to
-// pass on an end that waited for it.
+// exit ends a write into the layer; the last one out asks a turn to pass on
+// an end that waited for it.
 func (l *layerNode) exit() {
 	if l.writers.Add(-1) == 0 && l.shutPending.Load() {
 		l.stack.requestTurn()
@@ -1670,12 +1753,14 @@ func (c *stack) finishShuts() {
 			continue
 		}
 		if done, err := l.shutDown(); done && err != nil && !errors.Is(err, net.ErrClosed) {
-			_ = c.socket.CloseWith(err)
+			// Through closeSocket, so the stack is closing from here on and
+			// no layer is called again while the socket's close comes up.
+			_ = c.closeSocket(err)
 		}
 	}
 }
 
-// LayerOf returns the LayerConn of the layer that built conn
+// LayerOf returns the LayerHandler of the layer that built conn
 // — the connection a layer hands up — so the layer above can ask it what it
 // negotiated, a TLS layer's connection state:
 //
@@ -1683,14 +1768,14 @@ func (c *stack) finishShuts() {
 //
 // It returns nil for a connection no layer built. FindLayer looks further
 // down.
-func LayerOf(conn Conn) LayerConn {
+func LayerOf(conn Conn) LayerHandler {
 	if l, ok := conn.(*layerNode); ok {
 		return l.conn
 	}
 	return nil
 }
 
-// FindLayer returns the first LayerConn of type T below conn, from the layer
+// FindLayer returns the first LayerHandler of type T below conn, from the layer
 // that built conn down to the socket — the TLS state under a WebSocket layer:
 //
 //	tls, ok := uio.FindLayer[interface{ State() tls.ConnectionState }](conn)

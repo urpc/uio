@@ -45,7 +45,7 @@ type connConfig struct {
 	shortReadLimit  int
 	maxOutbound     int // MaxOutboundBuffered
 	batchBlockSize  int
-	// maxFramesPerDataEvent bounds the frames one OnData round consumes: at
+	// maxFramesPerDataEvent bounds the frames one OnInbound round consumes: at
 	// least minFramesPerDataEvent and always enough for one full read of the
 	// configured buffer, so a chunk of tiny frames never leaves a backlog.
 	maxFramesPerDataEvent int

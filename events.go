@@ -52,7 +52,7 @@ type IOTask interface {
 // references it retains after SubmitBatch returns. Submit false means the task
 // was not run; a short SubmitBatch result means the rejected suffix was not run.
 // Rejection closes the affected connection, and what a refused turn still
-// owes — OnClose, and OnOutbound for the close's final flush — runs on UIO's
+// owes — OnClose, and OnBytesWritten for the close's final flush — runs on UIO's
 // own goroutines, a few at a time, or inline on the rejecting goroutine when
 // the executor also refuses that cleanup. A connection whose first turn is
 // refused never got OnOpen, so it closes without OnClose too, and the Dial or
@@ -153,7 +153,7 @@ type Events struct {
 	// MaxInboundBuffered bounds payload read but not yet consumed. Once
 	// callbacks leave this much unconsumed, the connection stops reading its
 	// socket, so TCP flow control slows the peer instead of the buffer
-	// growing; a Wake whose OnData consumes below the limit reads again. The
+	// growing; a Wake whose OnRead consumes below the limit reads again. The
 	// buffer exceeds the limit by at most one read. A ReserveInbound larger
 	// than the limit returns ErrInboundOverflow. Zero disables the limit.
 	//
@@ -165,7 +165,7 @@ type Events struct {
 	MaxInboundBuffered int
 
 	// AllowHalfOpen keeps a stream connection open after its peer shuts its
-	// writing half. OnData then runs once more, Read reports io.EOF once the
+	// writing half. OnRead then runs once more, Read reports io.EOF once the
 	// buffered bytes are consumed, and the connection can still write; it
 	// closes once its own writing half is shut too, by CloseWrite, and Read
 	// reports io.EOF, or when it is closed. Bytes left unconsumed, say for a
@@ -318,7 +318,7 @@ func (ev *Events) initConfig() error {
 	}
 	ev.cb = resolveCallbacks(ev.stackHandler(ev.Handler), ev.Observer, ev.Hooks)
 	if len(ev.use) > 0 {
-		ev.cb.onOutbound = stackSent(ev.cb.onOutbound)
+		ev.cb.onBytesWritten = stackSent(ev.cb.onBytesWritten)
 	}
 
 	if ev.Pollers <= 0 {
@@ -338,9 +338,16 @@ func (ev *Events) initConfig() error {
 	return nil
 }
 
-func (ev *Events) onData(fdc *fdConn) error {
-	if onData := ev.cb.onData; onData != nil {
-		return onData(fdc)
+func (ev *Events) onRead(fdc *fdConn) error {
+	skipRead, err := fdc.fireWakeTimer()
+	if err != nil {
+		return err
+	}
+	if skipRead {
+		return nil // the timer callback closed: no read callback follows
+	}
+	if onRead := ev.cb.onRead; onRead != nil {
+		return onRead(fdc)
 	}
 	// Without a data callback the received bytes are discarded.
 	started := fdc.beginInboundCallback()
@@ -350,7 +357,7 @@ func (ev *Events) onData(fdc *fdConn) error {
 }
 
 func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
-	if onInbound := ev.cb.onInbound; readBytes > 0 && onInbound != nil {
+	if onInbound := ev.cb.onBytesRead; readBytes > 0 && onInbound != nil {
 		started := fdc.beginInboundCallback()
 		onInbound(ev.observed(fdc), readBytes)
 		fdc.endInboundCallback(started)
@@ -360,13 +367,13 @@ func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 // onSocketBytesWrite stays small enough to inline into every send path, so a
 // connection nobody observes pays a nil check and no call.
 func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
-	if writeBytes > 0 && ev.cb.onOutbound != nil {
+	if writeBytes > 0 && ev.cb.onBytesWritten != nil {
 		ev.reportBytesWritten(fdc, writeBytes)
 	}
 }
 
 func (ev *Events) reportBytesWritten(fdc *fdConn, writeBytes int) {
-	ev.cb.onOutbound(ev.observed(fdc), writeBytes)
+	ev.cb.onBytesWritten(ev.observed(fdc), writeBytes)
 }
 
 // closeCounter counts closes Serve waits for. Unlike a sync.WaitGroup, a close

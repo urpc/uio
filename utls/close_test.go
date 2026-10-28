@@ -44,7 +44,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 			_ = c.SetReadBuffer(32 << 10) // the staging bound, not the kernel's
 			top.Store(&c)
 		},
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			select {
 			case <-release:
 				_, _ = c.Discard(c.InboundBuffered())
@@ -200,7 +200,7 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
 	events.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) {},
-		Data:  func(uio.Conn) error { return nil },
+		Read:  func(uio.Conn) error { return nil },
 		Close: func(_ uio.Conn, err error) { closed <- err },
 	}
 	events.Use(Client(clientConfig))
@@ -288,7 +288,7 @@ func TestDialCanceledMidHandshake(t *testing.T) {
 	events := &uio.Events{Pollers: 1, Hooks: uio.FuncHandler{Start: func(*uio.Events) { close(started) }}}
 	events.Handler = uio.FuncHandler{
 		Open:  func(uio.Conn) { mu.Lock(); calls++; mu.Unlock() },
-		Data:  func(uio.Conn) error { return nil },
+		Read:  func(uio.Conn) error { return nil },
 		Close: func(uio.Conn, error) { mu.Lock(); calls++; mu.Unlock() },
 	}
 	events.Use(Client(&tls.Config{InsecureSkipVerify: true}))
@@ -325,7 +325,7 @@ func TestCloseNotifyEndsTheStream(t *testing.T) {
 			opened := make(chan uio.Conn, 1)
 			top := uio.FuncHandler{
 				Open: func(c uio.Conn) { opened <- c },
-				Data: func(c uio.Conn) error {
+				Read: func(c uio.Conn) error {
 					buf := make([]byte, 64)
 					for {
 						n, err := c.Read(buf)
@@ -384,7 +384,7 @@ func TestHandshakeOverAHoldingLayer(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn, client := dialTLS(t,
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return &holdUntilFlush{} }),
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &holdUntilFlush{} }),
 		Client(clientConfig), "tcp://"+listener.Addr().String())
 	if _, err := conn.Write([]byte("through the hold")); err != nil {
 		t.Fatal(err)
@@ -402,7 +402,7 @@ type holdUntilFlush struct {
 	held []byte
 }
 
-func (h *holdUntilFlush) OnOutbound(_ uio.LayerContext, p []byte) (int, error) {
+func (h *holdUntilFlush) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 	h.mu.Lock()
 	h.held = append(h.held, p...)
 	h.mu.Unlock()
@@ -423,7 +423,7 @@ func (h *holdUntilFlush) Flush(ctx uio.LayerContext) error {
 	if len(held) == 0 {
 		return nil
 	}
-	_, err := ctx.Write(held)
+	_, err := ctx.Down().Write(held)
 	return err
 }
 
@@ -552,7 +552,7 @@ func TestEndBelowWithoutCloseNotify(t *testing.T) {
 			}()
 			ended := make(chan error, 4)
 			handler := uio.FuncHandler{
-				Data: func(c uio.Conn) error {
+				Read: func(c uio.Conn) error {
 					if _, err := c.Read(nil); err != nil {
 						ended <- err
 					}
@@ -602,7 +602,7 @@ func TestStateDuringAHandshake(t *testing.T) {
 	}()
 	attached := make(chan *conn, 1)
 	layer := Client(clientConfig)
-	events := serveTLS(t, uio.FuncHandler{}, uio.LayerFunc(func(ctx uio.LayerContext) uio.LayerConn {
+	events := serveTLS(t, uio.FuncHandler{}, uio.LayerFunc(func(ctx uio.LayerContext) uio.LayerHandler {
 		c := layer.Attach(ctx).(*conn)
 		attached <- c
 		return c
@@ -664,7 +664,7 @@ func TestEndBelowAtTheStagingBound(t *testing.T) {
 	read := make(chan int, 8)
 	handler := uio.FuncHandler{
 		Open: func(uio.Conn) { below.active.Store(true); close(opened) },
-		Data: func(c uio.Conn) error {
+		Read: func(c uio.Conn) error {
 			if n, _ := c.Discard(-1); n > 0 {
 				read <- n
 			}
@@ -676,7 +676,7 @@ func TestEndBelowAtTheStagingBound(t *testing.T) {
 		Close: func(_ uio.Conn, err error) { ended <- err },
 	}
 	events := serveTLSWith(t, handler, func(ev *uio.Events) { ev.AllowHalfOpen = true },
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return below }), Client(clientConfig))
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return below }), Client(clientConfig))
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
 	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
@@ -698,18 +698,18 @@ type endWithTheLast struct {
 	held   []byte
 }
 
-func (e *endWithTheLast) OnInbound(ctx uio.LayerContext) error {
+func (e *endWithTheLast) OnRead(ctx uio.LayerContext) error {
 	if !e.active.Load() {
-		return e.PassThrough.OnInbound(ctx)
+		return e.PassThrough.OnRead(ctx)
 	}
-	lower := ctx.Lower()
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	e.held = append(e.held, chunk...)
 	_, _ = lower.Discard(len(chunk))
 	if _, err := lower.Read(nil); err == io.EOF {
-		ctx.Deliver(e.held)
+		ctx.Up().Write(e.held)
 		e.held = nil
-		ctx.End()
+		ctx.Up().End()
 	}
 	return nil
 }

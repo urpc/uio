@@ -25,7 +25,7 @@ func newPeerReporter() *peerReporter {
 func (r *peerReporter) handler() FuncHandler {
 	return FuncHandler{
 		Open: func(Conn) { r.events <- "open" },
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			buffer := make([]byte, 2048)
 			r.payloads <- append(buffer[:0], c.Peek(buffer)...)
 			_, _ = c.Discard(-1)
@@ -273,7 +273,7 @@ func TestListenerDialPeerMappedAddress(t *testing.T) {
 func TestListenerDialPeerConcurrent(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 2}, FuncHandler{
 		Open: func(Conn) {},
-		Data: func(c Conn) error {
+		Read: func(c Conn) error {
 			_, err := c.WriteTo(c)
 			return err
 		},

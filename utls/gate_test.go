@@ -7,7 +7,7 @@ import (
 // gate is a layer that runs a one-round handshake before it opens: both
 // sides send HELLO?, answer with HELLO!, and open on the answer. It is a
 // layer with a handshake under the TLS one.
-var gate uio.Layer = uio.LayerFunc(func(uio.LayerContext) uio.LayerConn { return &gateLayer{} })
+var gate uio.Layer = uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &gateLayer{} })
 
 type gateLayer struct {
 	uio.PassThrough
@@ -16,14 +16,14 @@ type gateLayer struct {
 }
 
 func (g *gateLayer) OnOpen(ctx uio.LayerContext) {
-	_, _ = ctx.Write([]byte("HELLO?"))
+	_, _ = ctx.Down().Write([]byte("HELLO?"))
 }
 
-func (g *gateLayer) OnInbound(ctx uio.LayerContext) error {
+func (g *gateLayer) OnRead(ctx uio.LayerContext) error {
 	if g.ready {
-		return g.PassThrough.OnInbound(ctx)
+		return g.PassThrough.OnRead(ctx)
 	}
-	lower := ctx.Lower()
+	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	g.pending = append(g.pending, chunk...)
 	_, _ = lower.Discard(len(chunk))
@@ -31,7 +31,7 @@ func (g *gateLayer) OnInbound(ctx uio.LayerContext) error {
 		switch string(g.pending[:len("HELLO?")]) {
 		case "HELLO?":
 			g.pending = g.pending[len("HELLO?"):]
-			_, _ = ctx.Write([]byte("HELLO!"))
+			_, _ = ctx.Down().Write([]byte("HELLO!"))
 		case "HELLO!":
 			g.pending = g.pending[len("HELLO!"):]
 			g.ready = true
@@ -40,9 +40,9 @@ func (g *gateLayer) OnInbound(ctx uio.LayerContext) error {
 		}
 	}
 	if g.ready {
-		ctx.Deliver(g.pending)
+		ctx.Up().Write(g.pending)
 		g.pending = nil
-		ctx.Open()
+		ctx.Up().Open()
 	}
 	return nil
 }

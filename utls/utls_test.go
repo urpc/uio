@@ -79,7 +79,7 @@ func newEcho() *echo {
 
 func (e *echo) OnOpen(c uio.Conn) { e.opened <- c }
 
-func (e *echo) OnData(c uio.Conn) error {
+func (e *echo) OnRead(c uio.Conn) error {
 	payload := append([]byte(nil), c.PeekChunk()...)
 	if len(payload) == 0 {
 		return nil // a turn without data: a wake, a timer
@@ -90,6 +90,7 @@ func (e *echo) OnData(c uio.Conn) error {
 	return err
 }
 
+func (e *echo) OnTimer(uio.Conn) error      { return nil }
 func (e *echo) OnClose(c uio.Conn, _ error) { e.closed <- c }
 
 func wait[T any](t *testing.T, c chan T, what string) T {
@@ -170,7 +171,7 @@ func newRecord() *record {
 
 func (r *record) OnOpen(c uio.Conn) { r.opened <- c }
 
-func (r *record) OnData(c uio.Conn) error {
+func (r *record) OnRead(c uio.Conn) error {
 	payload := append([]byte(nil), c.PeekChunk()...)
 	if len(payload) == 0 {
 		if turn := r.turn.Load(); turn != nil {
@@ -186,6 +187,7 @@ func (r *record) OnData(c uio.Conn) error {
 	return nil
 }
 
+func (r *record) OnTimer(uio.Conn) error        { return nil }
 func (r *record) OnClose(_ uio.Conn, err error) { r.closed <- err }
 
 // dialTLS dials addr through a stack of its own with the layers installed,

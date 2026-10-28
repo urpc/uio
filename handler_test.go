@@ -11,25 +11,28 @@ import (
 // A FuncHandler contributes its fields themselves, so an unset one stays nil
 // and the hot paths skip it; an unset Observer or Hooks contributes nothing.
 func TestResolveCallbacksKeepsUnsetCallbacksNil(t *testing.T) {
-	fh := FuncHandler{Data: func(Conn) error { return nil }}
+	fh := FuncHandler{Read: func(Conn) error { return nil }, BytesRead: func(Conn, int) {}}
 	cb := resolveCallbacks(fh, fh, nil)
-	if cb.onData == nil {
-		t.Fatal("a set Data was not resolved")
+	if cb.onRead == nil {
+		t.Fatal("a set Inbound was not resolved")
 	}
-	if cb.onOpen != nil || cb.onClose != nil || cb.onInbound != nil || cb.onOutbound != nil {
+	if cb.onBytesRead == nil {
+		t.Fatal("a set BytesRead was not resolved")
+	}
+	if cb.onOpen != nil || cb.onClose != nil || cb.onBytesWritten != nil {
 		t.Fatal("unset FuncHandler fields resolved to callbacks")
 	}
 	if cb.onStart != nil || cb.onStop != nil {
 		t.Fatal("hooks resolved without Hooks set")
 	}
 	// A pointer to a FuncHandler resolves like the value.
-	if cb := resolveCallbacks(&fh, &fh, nil); cb.onData == nil || cb.onOpen != nil || cb.onInbound != nil {
+	if cb := resolveCallbacks(&fh, &fh, nil); cb.onRead == nil || cb.onOpen != nil || cb.onBytesRead == nil {
 		t.Fatal("a pointer to a FuncHandler resolved differently from the value")
 	}
 	var nilFuncs *FuncHandler
 	for _, cb := range []callbacks{resolveCallbacks(nil, nil, nil), resolveCallbacks(nilFuncs, nilFuncs, nilFuncs)} {
-		if cb.onOpen != nil || cb.onData != nil || cb.onClose != nil || cb.onInbound != nil ||
-			cb.onOutbound != nil || cb.onStart != nil || cb.onStop != nil {
+		if cb.onOpen != nil || cb.onRead != nil || cb.onClose != nil ||
+			cb.onBytesRead != nil || cb.onBytesWritten != nil || cb.onStart != nil || cb.onStop != nil {
 			t.Fatal("no configuration resolved to callbacks")
 		}
 	}
@@ -38,16 +41,17 @@ func TestResolveCallbacksKeepsUnsetCallbacksNil(t *testing.T) {
 type echoHandler struct{ opened, closed atomic.Int32 }
 
 func (h *echoHandler) OnOpen(Conn) { h.opened.Add(1) }
-func (h *echoHandler) OnData(c Conn) error {
+func (h *echoHandler) OnRead(c Conn) error {
 	_, err := c.WriteTo(c)
 	return err
 }
+func (h *echoHandler) OnTimer(Conn) error  { return nil }
 func (h *echoHandler) OnClose(Conn, error) { h.closed.Add(1) }
 
 type byteCounter struct{ in, out atomic.Int64 }
 
-func (b *byteCounter) OnInbound(_ Conn, n int)  { b.in.Add(int64(n)) }
-func (b *byteCounter) OnOutbound(_ Conn, n int) { b.out.Add(int64(n)) }
+func (b *byteCounter) OnBytesRead(_ Conn, n int)    { b.in.Add(int64(n)) }
+func (b *byteCounter) OnBytesWritten(_ Conn, n int) { b.out.Add(int64(n)) }
 
 type startStop struct {
 	addr    chan string
