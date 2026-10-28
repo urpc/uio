@@ -443,16 +443,18 @@ func (h *stackDriver) OnOpen(socket Conn) {
 	}
 	socket.SetUserdata(c)
 	for i, layer := range h.layers {
-		c.layers[i].conn = layer.Attach(layerCtx{c.layers[i]})
-		if _, ok := c.layers[i].conn.(WireCounterObserver); ok {
-			c.sends = append(c.sends, c.layers[i])
+		node := c.layers[i]
+		node.conn = layer.Attach(layerCtx{node})
+		node.ops = opsOf(node.conn)
+		if node.ops.wireSent != nil {
+			c.sends = append(c.sends, node)
 		}
-		if _, ok := c.layers[i].conn.(OutboundHolder); ok {
+		if node.ops.held != nil {
 			c.holders = true
 		}
 	}
 	for i := len(c.layers) - 1; i >= 0; i-- {
-		if _, ok := c.layers[i].conn.(Flusher); ok {
+		if c.layers[i].ops.flush != nil {
 			c.flushers = append(c.flushers, c.layers[i])
 		}
 	}
@@ -768,7 +770,7 @@ func (c *stack) flushHeld() error {
 		if c.over() {
 			return nil
 		}
-		if err := layer.conn.(Flusher).Flush(layerCtx{layer}); err != nil {
+		if err := layer.ops.flush(layerCtx{layer}); err != nil {
 			return err
 		}
 	}
@@ -894,7 +896,7 @@ func (c *stack) openUpTo() {
 	for !c.over() {
 		if c.openedCount < len(c.layers) {
 			i := c.openedCount
-			if i > 0 && !c.layers[i-1].openUp.Load() {
+			if i > 0 && !c.layers[i-1].openUp() {
 				return // the layer below has not opened the layers above it
 			}
 			layer := c.layers[i]
@@ -907,7 +909,7 @@ func (c *stack) openUpTo() {
 		if c.topOpen.Load() {
 			return
 		}
-		if !c.layers[len(c.layers)-1].openUp.Load() {
+		if !c.layers[len(c.layers)-1].openUp() {
 			return // the top layer has not opened the layers above it
 		}
 		if probe := c.probe.Load(); probe != nil && probe.claimed.Load() {
@@ -970,7 +972,7 @@ func (c *stack) sent(n int) {
 			return // a layer below ended the connection: the rest hear nothing
 		}
 		held := layer.held()
-		layer.conn.(WireCounterObserver).OnWireSent(layerCtx{layer}, n)
+		layer.ops.wireSent(layerCtx{layer}, n)
 		if layer.held() != held {
 			c.upPending.Store(true)
 		}
@@ -1182,6 +1184,39 @@ func (c *stack) stopTimers() {
 	c.timerMu.Unlock()
 }
 
+// layerOps is the set of optional interfaces a LayerHandler implements,
+// resolved once when the stack attaches it: the close and flush paths read
+// the table instead of asserting at every call, and a layer without a
+// capability costs one nil check.
+type layerOps struct {
+	graceful    func(LayerContext, error) // GracefulCloser
+	closeWriter func(LayerContext) error  // CloseWriter
+	flush       func(LayerContext) error  // Flusher
+	held        func(LayerContext) int    // OutboundHolder
+	wireSent    func(LayerContext, int)   // WireCounterObserver
+}
+
+// opsOf resolves a LayerHandler's optional interfaces.
+func opsOf(h LayerHandler) layerOps {
+	var ops layerOps
+	if graceful, ok := h.(GracefulCloser); ok {
+		ops.graceful = graceful.CloseGracefully
+	}
+	if closeWriter, ok := h.(CloseWriter); ok {
+		ops.closeWriter = closeWriter.CloseWrite
+	}
+	if flusher, ok := h.(Flusher); ok {
+		ops.flush = flusher.Flush
+	}
+	if holder, ok := h.(OutboundHolder); ok {
+		ops.held = holder.OutboundHeld
+	}
+	if observer, ok := h.(WireCounterObserver); ok {
+		ops.wireSent = observer.OnWireSent
+	}
+	return ops
+}
+
 // layerNode is one layer of one connection: the state the layer works
 // on, and the Conn the layer above reads and writes through.
 type layerNode struct {
@@ -1191,17 +1226,18 @@ type layerNode struct {
 	conn  LayerHandler // the layer's instance on this connection
 	up    LayerUp      // the face the layer writes up, cached to allocate nothing
 
-	opened  atomic.Bool // the layer's OnOpen ran; set on a turn
-	ended   bool        // the layer ended its stream up; only turns touch it
-	openUp  atomic.Bool // the layer opened the layers above it
+	ops    layerOps
+	opened atomic.Bool // the layer's OnOpen ran; set on a turn
+	ended  bool        // the layer ended its stream up; only turns touch it
+	// gate packs the two facts a write is admitted by: openUp, the layer
+	// opened the layers above it, and writeShut, its writing half ended. One
+	// load on the write path admits or refuses.
+	gate    atomic.Uint32
 	closing atomic.Bool // this layer's close walk began; see CloseWith
-	// writeShut is set as the layer above ends its writing half: writes into
-	// the layer are refused from then on. shutPending marks the end not yet
-	// passed below, shutFlushed its flush made, and writers counts the
-	// writes in flight into the layer — the Handler's through the top, a
-	// layer's own through every layer it writes below — which the end waits
-	// for; see shutDown.
-	writeShut   atomic.Bool
+	// shutPending marks a CloseWrite end not yet passed below, shutFlushed
+	// its flush made, and writers counts the writes in flight into the layer —
+	// the Handler's through the top, a layer's own through every layer it
+	// writes below — which the end waits for; see shutDown.
 	shutPending atomic.Bool
 	shutFlushed atomic.Bool
 	writers     atomic.Int32
@@ -1211,6 +1247,30 @@ type layerNode struct {
 	// read, from at on; only the connection's turns touch it.
 	delivered []byte
 	at        int
+}
+
+// The two facts a write into a layer is admitted by; see layerNode.gate.
+const (
+	gateOpenUp uint32 = 1 << iota // the layer opened the layers above it
+	gateWriteShut                 // the layer above ended its writing half
+)
+
+func (l *layerNode) openUp() bool { return l.gate.Load()&gateOpenUp != 0 }
+
+func (l *layerNode) markOpenUp() { l.gate.Or(gateOpenUp) }
+
+// markWriteShut ends the layer's writing half, reporting whether this call
+// ended it: a second CloseWrite does nothing.
+func (l *layerNode) markWriteShut() bool {
+	for {
+		gate := l.gate.Load()
+		if gate&gateWriteShut != 0 {
+			return false
+		}
+		if l.gate.CompareAndSwap(gate, gate|gateWriteShut) {
+			return true
+		}
+	}
 }
 
 // layerCtx is the LayerContext a layer holds: layerNode's methods as seen
@@ -1259,7 +1319,7 @@ func (u layerUp) End() { u.l.ended = true }
 // first writes descend through it on this same goroutine — so call Open
 // without a lock OnWrite takes.
 func (u layerUp) Open() {
-	u.l.openUp.Store(true)
+	u.l.markOpenUp()
 }
 
 func (u layerUp) Reserve(n int) []byte {
@@ -1452,8 +1512,8 @@ func (l *layerNode) WireQueued() uint64 {
 	held := 0
 	if l.stack.holders && !l.stack.closedStack() {
 		for _, below := range l.stack.layers[:l.index+1] {
-			if holder, ok := below.conn.(OutboundHolder); ok {
-				held += holder.OutboundHeld(layerCtx{below})
+			if below.ops.held != nil {
+				held += below.ops.held(layerCtx{below})
 			}
 		}
 	}
@@ -1509,8 +1569,8 @@ func (l *layerNode) Read(b []byte) (int, error) {
 // holds, if it holds any, and what the layers below and the socket queue.
 func (l *layerNode) OutboundBuffered() int {
 	queued := l.lower.OutboundBuffered()
-	if holder, ok := l.conn.(OutboundHolder); ok && !l.stack.closedStack() {
-		queued += holder.OutboundHeld(layerCtx{l})
+	if l.ops.held != nil && !l.stack.closedStack() {
+		queued += l.ops.held(layerCtx{l})
 	}
 	return queued
 }
@@ -1521,8 +1581,8 @@ func (l *layerNode) Flush() error {
 		return net.ErrClosed
 	}
 	var err error
-	if flusher, ok := l.conn.(Flusher); ok {
-		err = flusher.Flush(layerCtx{l})
+	if l.ops.flush != nil {
+		err = l.ops.flush(layerCtx{l})
 	}
 	if err == nil && !l.stack.over() {
 		err = l.lower.Flush()
@@ -1628,7 +1688,9 @@ func (l *layerNode) enter(n int) error {
 // a write racing the close is refused at once, not when the walk reaches its
 // layer.
 func (l *layerNode) refuses() bool {
-	return !l.openUp.Load() || l.writeShut.Load() || !l.stack.mayWriteDown(l.index)
+	// One load: either the layer opened the layers above it and its writing
+	// half is open, or the write is refused.
+	return l.gate.Load() != gateOpenUp || !l.stack.mayWriteDown(l.index)
 }
 
 func (l *layerNode) leave(n int) {
@@ -1700,11 +1762,11 @@ func (l *layerNode) CloseWith(err error) error {
 // nothing above them.
 func (l *layerNode) closeWalk(err error) error {
 	c := l.stack
-	if graceful, ok := l.conn.(GracefulCloser); ok && l.openUp.Load() {
-		graceful.CloseGracefully(layerCtx{l}, err)
+	if l.ops.graceful != nil && l.openUp() {
+		l.ops.graceful(layerCtx{l}, err)
 	}
-	if flusher, ok := l.conn.(Flusher); ok && gracefulCause(err) && l.opened.Load() && !c.closedStack() {
-		_ = flusher.Flush(layerCtx{l})
+	if l.ops.flush != nil && gracefulCause(err) && l.opened.Load() && !c.closedStack() {
+		_ = l.ops.flush(layerCtx{l})
 	}
 	below, ok := l.lower.(*layerNode)
 	if !ok {
@@ -1732,13 +1794,13 @@ func (l *layerNode) CloseGracefully(cause error) error {
 // goes below before the end does. A layer with no way to end one direction
 // does not support it. Calling it again does nothing.
 func (l *layerNode) CloseWrite() error {
-	if _, ok := l.conn.(CloseWriter); !ok {
+	if l.ops.closeWriter == nil {
 		return errUnsupported
 	}
 	if l.stack.over() {
 		return net.ErrClosed
 	}
-	if !l.writeShut.CompareAndSwap(false, true) {
+	if !l.markWriteShut() {
 		return nil
 	}
 	l.stack.shutsPending.Add(1)
@@ -1759,8 +1821,8 @@ func (l *layerNode) shutDown() (bool, error) {
 			return true, net.ErrClosed
 		}
 		ctx := layerCtx{l}
-		if flusher, ok := l.conn.(Flusher); ok && !l.shutFlushed.Swap(true) {
-			if err := flusher.Flush(ctx); err != nil {
+		if l.ops.flush != nil && !l.shutFlushed.Swap(true) {
+			if err := l.ops.flush(ctx); err != nil {
 				l.stack.shutsPending.Add(-1)
 				return true, err
 			}
@@ -1771,18 +1833,18 @@ func (l *layerNode) shutDown() (bool, error) {
 				return true, net.ErrClosed
 			}
 		}
-		if holder, ok := l.conn.(OutboundHolder); ok && holder.OutboundHeld(ctx) > 0 {
+		if l.ops.held != nil && l.ops.held(ctx) > 0 {
 			// Held bytes the layer cannot send yet: published again
 			// before the look that may see them gone, so a report of
 			// their leaving finds the end either way.
 			l.shutPending.Store(true)
-			if holder.OutboundHeld(ctx) > 0 {
+			if l.ops.held(ctx) > 0 {
 				return false, nil
 			}
 			continue
 		}
 		l.stack.shutsPending.Add(-1)
-		return true, l.conn.(CloseWriter).CloseWrite(ctx)
+		return true, l.ops.closeWriter(ctx)
 	}
 	return false, nil
 }
