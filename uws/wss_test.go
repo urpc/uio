@@ -580,3 +580,66 @@ func (c *countingClient) OnClose(_ *Conn, e CloseEvent) {
 	default:
 	}
 }
+
+// startPlain serves an echoing plain ws server and returns its address.
+func startPlain(t *testing.T) string {
+	t.Helper()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Handler: newWSSRecorder()})
+	})
+	t.Cleanup(func() {
+		_ = server.Close(nil)
+		<-serveDone
+	})
+	return addr
+}
+
+// One Dialer speaks both schemes: the URL decides this connection's chain — a
+// TLS layer for wss://, the layer that changes nothing for ws:// — so the
+// choice is per dial, not per Dialer.
+func TestDialerMixedSchemes(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	wssAddr := startWSS(t, serverTLS)
+	plainAddr := startPlain(t)
+
+	client := newWSSRecorder()
+	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+
+	if err := dialer.Dial(ctx, "wss://"+wssAddr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	waitMessage := func(want string) {
+		t.Helper()
+		deadline := time.After(testIOTimeout())
+		for {
+			select {
+			case got := <-client.got:
+				if got == want {
+					return
+				}
+			case <-deadline:
+				t.Fatalf("no %q echo within %v", want, testIOTimeout())
+			}
+		}
+	}
+	secure := wssWait(t, client.opened, "the wss connection")
+	if err := secure.SendText("secure"); err != nil {
+		t.Fatal(err)
+	}
+	waitMessage("secure")
+
+	// The same Dialer, in the clear this time.
+	if err := dialer.Dial(ctx, "ws://"+plainAddr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	clear := wssWait(t, client.opened, "the ws connection")
+	if err := clear.SendText("clear"); err != nil {
+		t.Fatal(err)
+	}
+	waitMessage("clear")
+	_ = secure.Close(1000, "done")
+	_ = clear.Close(1000, "done")
+}

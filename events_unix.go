@@ -56,15 +56,15 @@ func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, err
 // DialContext does: once the whole stack opened, with the top layer's
 // connection — the one the Handler holds — and a stack that fails before
 // that reports its error; see AdoptContext to bound the wait.
-func (ev *Events) Adopt(conn net.Conn, userdata any) (Conn, error) {
-	return ev.AdoptContext(context.Background(), conn, userdata)
+func (ev *Events) Adopt(conn net.Conn, userdata any, opts ...DialOption) (Conn, error) {
+	return ev.AdoptContext(context.Background(), conn, userdata, opts...)
 }
 
 // AdoptContext is Adopt with ctx bounding the wait for the layers to open; a
 // stack still opening when ctx ends is closed, and AdoptContext reports the
 // cause. Without layers there is nothing to wait for. With them, like
 // DialContext, it cannot be called on an event loop goroutine.
-func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any) (Conn, error) {
+func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any, opts ...DialOption) (Conn, error) {
 	if conn == nil {
 		return nil, ErrUnsupported
 	}
@@ -77,6 +77,11 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any)
 		return nil, ErrDialOnEventLoop
 	}
 	if err := ev.refusePacket(conn.LocalAddr().Network()); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	override, err := ev.dialLayers(dialConfigFor(opts), conn.LocalAddr().Network())
+	if err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -104,6 +109,9 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any)
 	}
 	fdc.setRemoteAddr(remoteAddr)
 	probe, marked := ev.dialMarker(userdata)
+	if probe != nil {
+		probe.layers = override
+	}
 	fdc.SetUserdata(marked)
 	fdc.loop = ev.selectLoop()
 	if err = ev.addConnContext(ctx, fdc); err != nil {
@@ -146,7 +154,12 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 		address = u.Path
 	}
 
-	dialer, err := netDialerFor(u.Scheme, dialConfigFor(opts))
+	config := dialConfigFor(opts)
+	override, err := ev.dialLayers(config, u.Scheme)
+	if err != nil {
+		return nil, err
+	}
+	dialer, err := netDialerFor(u.Scheme, config)
 	if err != nil {
 		return nil, err
 	}
@@ -174,6 +187,9 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 	}
 
 	probe, marked := ev.dialMarker(userdata)
+	if probe != nil {
+		probe.layers = override
+	}
 	fdc := &fdConn{}
 	fdc.fd = int32(nfd)
 	fdc.SetUserdata(marked)

@@ -107,7 +107,7 @@ func (s *Server) Serve(addrs ...string) error {
 	}
 	events.Handler = handler
 	if opts.TLSConfig != nil {
-		events.Use(newTLSLayer(opts.TLSConfig, opts, true))
+		events.Use(serverTLSLayer(opts.TLSConfig, opts))
 	}
 	events.Observer, events.Hooks = handler, handler
 	s.closeMu.Unlock()

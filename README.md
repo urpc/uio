@@ -220,6 +220,13 @@ connection's own. A layer writes none of that.
 
 ### One connection through the stack
 
+A dial or an adoption can bring its own chain for that connection alone —
+`DialContext(ctx, addr, nil, uio.WithLayers(tls))` — which is how one client
+speaks several schemes: a wss:// dial brings the TLS layer, a ws:// dial
+`WithLayers(PassThroughLayer)`. The Events still needs layers of its own
+(`Use`), since that is what installs the stack each connection's chain runs
+on.
+
 `events.Use(kcp, tls, trace)` creates one `LayerHandler` for each connection. The
 first installed layer is closest to the wire; the Handler sees the top layer.
 The whole path is:

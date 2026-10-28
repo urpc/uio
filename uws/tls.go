@@ -23,49 +23,27 @@ import (
 	"github.com/urpc/uio/utls"
 )
 
-// tlsLayer is the layer TLSConfig installs. One transport carries
-// connections that need TLS and connections that do not — a Dialer's ws://
-// and wss:// dials, a Server's own accepts and the plain HTTP/1.1 upgrades
-// ServeHTTP adopts — so each connection picks TLS or nothing as it attaches,
-// by what it carries.
-type tlsLayer struct {
-	config  *tls.Config
-	options []utls.Option
-	server  uio.Layer // a Server's accepts
-	client  uio.Layer // a Dialer's wss:// dials, when the Config names its server
+// tlsOptions carries Options' handshake bound onto the TLS layers.
+func tlsOptions(opts Options) []utls.Option {
+	if opts.HandshakeTimeout <= 0 {
+		return nil
+	}
+	return []utls.Option{utls.HandshakeTimeout(opts.HandshakeTimeout)}
 }
 
-func newTLSLayer(config *tls.Config, opts Options, server bool) *tlsLayer {
-	layer := &tlsLayer{config: config}
-	if opts.HandshakeTimeout > 0 {
-		layer.options = append(layer.options, utls.HandshakeTimeout(opts.HandshakeTimeout))
-	}
-	if server {
-		layer.server = utls.Server(config, layer.options...)
-	} else if config.ServerName != "" {
-		layer.client = utls.Client(config, layer.options...)
-	}
-	return layer
+// serverTLSLayer is what TLSConfig installs on a Server: its listener's
+// accepted connections speak TLS.
+func serverTLSLayer(config *tls.Config, opts Options) uio.Layer {
+	return utls.Server(config, tlsOptions(opts)...)
 }
 
-func (l *tlsLayer) Attach(ctx uio.LayerContext) uio.LayerHandler {
-	switch held := ctx.Down().Userdata().(type) {
-	case *dialSetup:
-		if !held.secure {
-			return uio.PassThrough{}
-		}
-		if l.client != nil {
-			return l.client.Attach(ctx)
-		}
-		// The Config names no server: verify the one the URL dialed.
-		config := l.config.Clone()
-		config.ServerName = held.serverName
-		return utls.Client(config, l.options...).Attach(ctx)
-	case *Conn:
-		return uio.PassThrough{} // adopted from net/http, in the clear
+// clientTLSLayer is the layer one wss:// dial brings; host is the name the
+// dial verifies, unless the Config names its server.
+func clientTLSLayer(config *tls.Config, opts Options, host string) uio.Layer {
+	if config.ServerName == "" {
+		cloned := config.Clone()
+		cloned.ServerName = host
+		config = cloned
 	}
-	if l.server != nil {
-		return l.server.Attach(ctx)
-	}
-	return uio.PassThrough{}
+	return utls.Client(config, tlsOptions(opts)...)
 }

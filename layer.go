@@ -19,6 +19,7 @@ package uio
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -446,6 +447,10 @@ type LayerFunc func(ctx LayerContext) LayerHandler
 // Attach calls f.
 func (f LayerFunc) Attach(ctx LayerContext) LayerHandler { return f(ctx) }
 
+// PassThroughLayer is the layer that changes nothing: a WithLayers override
+// that names no layers runs it, so a stack always has a layer.
+var PassThroughLayer Layer = LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} })
+
 // PassThrough is a LayerHandler that changes nothing: it opens at once,
 // delivers what arrives, passes the end of the stream up, writes what is
 // written and passes CloseWrite down. Embed it in a layer's LayerHandler to
@@ -531,17 +536,21 @@ func (h *stackDriver) OnOpen(socket Conn) {
 		c.probe.Store(probe)
 		held = probe.user
 	}
+	layers := h.layers
+	if probe := c.probe.Load(); probe != nil && probe.layers != nil {
+		layers = probe.layers
+	}
 	c.userdata.Store(&held)
-	c.layers = make([]*layerNode, len(h.layers))
+	c.layers = make([]*layerNode, len(layers))
 	var below Conn = socketLower{Conn: socket, stack: c}
-	for i := range h.layers {
+	for i := range layers {
 		node := &layerNode{stack: c, index: i, lower: below}
 		node.up = layerUp{node}
 		c.layers[i] = node
 		below = node
 	}
 	socket.SetUserdata(c)
-	for i, layer := range h.layers {
+	for i, layer := range layers {
 		node := c.layers[i]
 		node.conn = layer.Attach(layerCtx{node})
 		node.ops = opsOf(node.conn)
@@ -2178,13 +2187,46 @@ func (ev *Events) refusePacket(network string) error {
 	if len(ev.use) == 0 {
 		return nil
 	}
-	switch {
-	case strings.HasPrefix(network, "udp"), strings.HasPrefix(network, "ip"),
-		network == "unixgram", network == "unixpacket":
+	if packetNetwork(network) {
 		return ErrLayersNeedStream
 	}
 	return nil
 }
+
+// packetNetwork reports a network whose connections carry messages, not a
+// byte stream.
+func packetNetwork(network string) bool {
+	switch {
+	case strings.HasPrefix(network, "udp"), strings.HasPrefix(network, "ip"),
+		network == "unixgram", network == "unixpacket":
+		return true
+	}
+	return false
+}
+
+// dialLayers checks the chain a dial or an adoption brings against the
+// Events, and reports it — nil when the connection takes the Events' chain.
+func (ev *Events) dialLayers(config DialConfig, network string) ([]Layer, error) {
+	if !config.hasLayers {
+		return nil, nil
+	}
+	if packetNetwork(network) {
+		return nil, ErrLayersNeedStream
+	}
+	if len(ev.use) == 0 {
+		return nil, ErrLayersWithoutStack
+	}
+	if len(config.layers) > maxLayers {
+		return nil, fmt.Errorf("uio: %d layers in this connection's chain, at most %d", len(config.layers), maxLayers)
+	}
+	return config.layers, nil
+}
+
+// ErrLayersWithoutStack reports a dial or adoption asking for its own chain
+// on an Events with no layers: Serve resolved the plain callbacks, so no
+// stack exists to run them. Use any layer — PassThroughLayer changes nothing
+// — to install the stack the override needs.
+var ErrLayersWithoutStack = errors.New("uio: a connection's own layers need the Events to have layers")
 
 // socketLimit is the MaxOutboundBuffered the socket enforces: none once
 // layers run, where the stack's top enforces it instead; see stack.admit.
@@ -2225,6 +2267,7 @@ func (ev *Events) dialMarker(userdata any) (*dialProbe, any) {
 // gives up on it first. Whichever claims it first decides.
 type dialProbe struct {
 	user    any
+	layers  []Layer // this connection's own chain; nil takes the Events'
 	claimed atomic.Bool
 	done    chan struct{} // closed once, with conn or err in place
 	conn    Conn

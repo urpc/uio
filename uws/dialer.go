@@ -143,12 +143,19 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		handler:  handler,
 		key:      key,
 	}
-	if target.Scheme == "wss" {
-		setup.secure, setup.serverName = true, target.Hostname()
-	}
 	setup.conn = d.newClientConn(nil, setup)
 	setup.request = request
-	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup)
+	// The stack is this connection's own: TLS only when the URL asked for
+	// it, and only a Dialer given a Config can speak it.
+	var dopts []uio.DialOption
+	if d.Options.TLSConfig != nil {
+		var chain []uio.Layer
+		if target.Scheme == "wss" {
+			chain = append(chain, clientTLSLayer(d.Options.TLSConfig, d.Options, target.Hostname()))
+		}
+		dopts = append(dopts, uio.WithLayers(chain...))
+	}
+	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup, dopts...)
 	if err != nil {
 		cause := context.Cause(attemptCtx)
 		if deadline, ok := attemptCtx.Deadline(); cause == nil && ok && !time.Now().Before(deadline) {
@@ -283,7 +290,9 @@ func (d *Dialer) start(ctx context.Context) error {
 		}
 		events.Handler = handler
 		if opts.TLSConfig != nil {
-			events.Use(newTLSLayer(opts.TLSConfig, opts, false))
+			// The stack every dial's own chain runs on: a wss:// dial brings
+			// its TLS layer, a ws:// dial the layer that changes nothing.
+			events.Use(uio.PassThroughLayer)
 		}
 		events.Observer, events.Hooks = handler, handler
 		go func() {
@@ -532,8 +541,6 @@ type dialSetup struct {
 	conn       *Conn
 	attachOnce sync.Once
 	request    []byte // the upgrade request, sent once the layers settle
-	secure     bool   // a wss:// dial: TLSConfig's layer runs TLS
-	serverName string // the host a wss:// dial verifies, when TLSConfig names none
 }
 
 func (setup *dialSetup) attach(raw uio.Conn) {

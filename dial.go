@@ -42,6 +42,11 @@ type DialConfig struct {
 	// created and before LocalAddr binds it or it connects — as net.Dialer's
 	// Control does, so a bind-time option such as SO_REUSEPORT can be set.
 	Control SocketControl
+
+	// layers is this connection's own chain; only WithLayers sets it.
+	// hasLayers tells an override, of one layer or none, from no override.
+	layers    []Layer
+	hasLayers bool
 }
 
 // DialOption configures one dial; see WithLocalAddr and WithDialControl.
@@ -50,6 +55,28 @@ type DialOption func(*DialConfig)
 // WithLocalAddr binds the dial's socket to addr; see DialConfig.LocalAddr.
 func WithLocalAddr(addr string) DialOption {
 	return func(config *DialConfig) { config.LocalAddr = addr }
+}
+
+// WithLayers runs this dial or adoption with its own chain instead of the
+// Events' Use chain — the layers given, in install order, the first closest
+// to the wire, for this connection alone. It is how one client serves several
+// schemes: a wss:// dial brings its TLS layer, a ws:// dial
+// WithLayers(PassThroughLayer) — or nothing, which stands for the same.
+//
+// The Events must have layers installed — its Serve resolves the stack that
+// runs them — and a packet connection carries none: both are refused before
+// the socket moves. Adopt and AdoptContext honor it; the other options shape
+// a dial's socket and do not apply to an adoption.
+func WithLayers(layers ...Layer) DialOption {
+	return func(config *DialConfig) {
+		config.layers = append([]Layer(nil), layers...)
+		if len(config.layers) == 0 {
+			// A stack always has a layer: an override of none is the layer
+			// that changes nothing.
+			config.layers = []Layer{PassThroughLayer}
+		}
+		config.hasLayers = true
+	}
 }
 
 // WithDialControl runs control on the dialing socket before it connects; see

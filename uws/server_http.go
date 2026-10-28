@@ -108,7 +108,14 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	wsConn := s.newConnection(nil)
 	wsConn.userData = userdata
 	wsConn.handshake.Store(&handshakeState{upgrade: upgrade})
-	_, err = s.events.Adopt(tcpConn, wsConn)
+	// A handoff is HTTP/1.1 plaintext (ServeHTTP refuses TLS requests):
+	// when the Server's own accepts speak TLS, this connection's chain
+	// leaves it out.
+	var opts []uio.DialOption
+	if s.Options.TLSConfig != nil {
+		opts = append(opts, uio.WithLayers(uio.PassThroughLayer))
+	}
+	_, err = s.events.Adopt(tcpConn, wsConn, opts...)
 	if err != nil {
 		return
 	}
