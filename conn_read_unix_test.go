@@ -85,7 +85,7 @@ func TestReadReachesHangupQueuedBehindData(t *testing.T) {
 				t.Fatal(err)
 			}
 			waitReadHangupQueued(t, server)
-			if _, err := events.Adopt(server, nil); err != nil {
+			if _, err := events.Adopt(server); err != nil {
 				t.Fatal(err)
 			}
 
@@ -146,7 +146,7 @@ func TestHalfClosedPeerGetsReplyThenEndOfStream(t *testing.T) {
 		t.Fatal(err)
 	}
 	waitReadHangupQueued(t, server)
-	if _, err := events.Adopt(server, nil); err != nil {
+	if _, err := events.Adopt(server); err != nil {
 		t.Fatal(err)
 	}
 	if err := client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
@@ -251,7 +251,7 @@ func TestDialedConnectionsToAServerThatAnswersAndClosesAreClosed(t *testing.T) {
 	<-started
 
 	for range dials {
-		if _, err = events.Dial("tcp://"+listener.Addr().String(), nil); err != nil {
+		if _, err = events.Dial("tcp://" + listener.Addr().String()); err != nil {
 			t.Fatal(err)
 		}
 	}

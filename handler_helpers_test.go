@@ -51,3 +51,14 @@ func withFuncs(ev *Events, fh FuncHandler) *Events {
 	ev.cb = resolveCallbacks(fh, fh, fh)
 	return ev
 }
+
+// signal delivers v to ch without blocking. A callback that signals must
+// never hold up the turn that runs it or the lifecycle that joins it: an
+// event nobody is left to read — an extra connection's open or close, one
+// arriving after the test failed — is dropped.
+func signal[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
+}

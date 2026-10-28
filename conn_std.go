@@ -100,12 +100,16 @@ type fdConn struct {
 
 	// A graceful close refuses writes and waits, bounded, for the writer to
 	// drain what was accepted — this backend's queue — before the close it
-	// asked for. draining is set once; drainCause, drainWait and drainTimer
-	// are guarded by mux and live only while it is set.
-	draining   atomic.Bool
-	drainCause error
-	drainWait  time.Duration
-	drainTimer *time.Timer
+	// asked for. draining is set once and stays set until enqueueClose
+	// publishes closing under mux: admission checks read both under the same
+	// lock, so no write can slip through between the drain ending and the
+	// close beginning. drainEnding marks the end already claimed; drainCause,
+	// drainWait, drainTimer and drainEnding are guarded by mux.
+	draining    atomic.Bool
+	drainEnding bool
+	drainCause  error
+	drainWait   time.Duration
+	drainTimer  *time.Timer
 
 	// opened records that OnOpen has run, which a connection's read goroutine
 	// does first, closing or not; only an opened connection gets OnClose. wakesAfterOpen
@@ -126,6 +130,14 @@ type fdConn struct {
 	readResume   chan struct{}
 	deadlineMu   sync.Mutex
 	readDeadline time.Time
+	// A write deadline is a connection liveness bound: one that passes
+	// closes the connection even with no write in flight — the Go poller's
+	// socket deadline alone would never fire on an idle connection, while the
+	// native backend closes. writeGeneration makes a replaced timer harmless.
+	// Guarded by deadlineMu.
+	writeDeadline   time.Time
+	writeGeneration uint64
+	writeTimer      *time.Timer
 
 	// wake is the connection's wake timer on the stdio backend, where no
 	// event loop carries a wheel: one runtime timer per armed connection,
@@ -680,8 +692,29 @@ func (fc *fdConn) applyDeadline(kind deadlineKind, deadline time.Time) error {
 	default:
 		err = target.SetWriteDeadline(deadline)
 	}
-	if err != nil || kind == deadlineWrite || fc.conn == nil {
+	if err != nil {
 		return err
+	}
+	if kind == deadlineWrite || kind == deadlineBoth {
+		fc.writeDeadline = deadline
+		fc.writeGeneration++
+		generation := fc.writeGeneration
+		if fc.writeTimer != nil {
+			fc.writeTimer.Stop()
+			fc.writeTimer = nil
+		}
+		if !deadline.IsZero() {
+			fc.writeTimer = time.AfterFunc(time.Until(deadline), func() { fc.expireWriteDeadline(generation) })
+		}
+		if kind == deadlineWrite {
+			return nil
+		}
+	}
+	if fc.conn == nil {
+		// A connected datagram connection has no held read to wake: its
+		// reads block on the socket, which carries the deadline itself. The
+		// timer above is what keeps an idle write deadline live for it.
+		return nil
 	}
 	if readDeadlineNotedForTest != nil {
 		readDeadlineNotedForTest()
@@ -935,7 +968,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 			}
 		}
 		fc.mux.Lock()
-		if fc.isClosing() || fc.writeShut {
+		if fc.isClosing() || fc.draining.Load() || fc.writeShut {
 			fc.mux.Unlock()
 			releaseStdBuffers(owned)
 			return 0, net.ErrClosed
@@ -956,7 +989,7 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		return total, nil
 	}
 	fc.mux.Lock()
-	if fc.isClosing() || fc.writeShut {
+	if fc.isClosing() || fc.draining.Load() || fc.writeShut {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -1193,10 +1226,16 @@ func (fc *fdConn) CloseGracefully(cause error) error {
 // finishDrain ends a graceful close's wait — its queue drained, or the bound
 // arrived — closing as it asked. Any goroutine may call it.
 func (fc *fdConn) finishDrain() {
-	if !fc.draining.Swap(false) {
+	fc.mux.Lock()
+	if !fc.draining.Load() || fc.drainEnding {
+		fc.mux.Unlock()
 		return
 	}
-	fc.mux.Lock()
+	// Claim the end; draining stays set. Clearing it here would reopen
+	// admission for the instant before closing is published — writers and
+	// the close publish both take mux, so publishing closing first keeps
+	// that instant from existing.
+	fc.drainEnding = true
 	cause := fc.drainCause
 	fc.drainCause = nil
 	if fc.drainTimer != nil {
@@ -1229,6 +1268,10 @@ func (fc *fdConn) enqueueClose(err error) error {
 	// still be counted when it hands the close on.
 	fc.events().callbackWG.Add(1)
 	fc.closing.Store(true)
+	// The drain, if one ran, is over: closing is published under the
+	// admission lock, so clearing draining here cannot reopen the window
+	// finishDrain guards.
+	fc.draining.Store(false)
 	if fc.udp != nil && fc.internal {
 		fc.udp.closingPeers = fc.udp.peers
 		fc.udp.peers = nil
@@ -1354,7 +1397,33 @@ func (fc *fdConn) writeToPeer(b []byte, addr netip.AddrPort) (int, error) {
 // rest find the connection closed and return without touching anything. The
 // reason publishes before the closed flag: a reader that sees closed observes
 // err without further synchronization.
+// expireWriteDeadline runs on the write deadline's timer: a deadline that
+// passed closes the connection, write in flight or not, as the native
+// backend's does. The generation and the wall clock are both rechecked, since
+// a setter may have replaced or cleared the deadline as the timer fired.
+func (fc *fdConn) expireWriteDeadline(generation uint64) {
+	fc.deadlineMu.Lock()
+	deadline, current := fc.writeDeadline, fc.writeGeneration
+	fc.deadlineMu.Unlock()
+	if fc.isClosing() || generation != current || deadline.IsZero() || time.Now().Before(deadline) {
+		return
+	}
+	fc.requestClose(fmt.Errorf("uio: %s deadline: %w", deadlineName(deadlineWrite), os.ErrDeadlineExceeded))
+}
+
+// stopWriteDeadline disarms the write deadline's timer as the connection
+// closes, so a far deadline does not outlive it.
+func (fc *fdConn) stopWriteDeadline() {
+	fc.deadlineMu.Lock()
+	if fc.writeTimer != nil {
+		fc.writeTimer.Stop()
+		fc.writeTimer = nil
+	}
+	fc.deadlineMu.Unlock()
+}
+
 func (fc *fdConn) closeOnLoop(err error) {
+	fc.stopWriteDeadline()
 	fc.mux.Lock()
 	if atomic.LoadInt32(&fc.closed) == 1 {
 		fc.mux.Unlock()

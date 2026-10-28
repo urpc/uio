@@ -19,6 +19,12 @@ import (
 
 const testWait = 10 * time.Second
 
+// cleanupWait bounds a cleanup's join of Serve. Looser than testWait on
+// purpose: the join itself is milliseconds of work, but a heavily loaded
+// host adds linger expiries and scheduling delay on the connections being
+// torn down, and the property is that Serve returns — not how fast.
+const cleanupWait = 30 * time.Second
+
 // testCertificate makes a self-signed certificate for the TLS the tests run.
 func testCertificate(t *testing.T) (tls.Certificate, *x509.CertPool) {
 	t.Helper()
@@ -119,22 +125,22 @@ type layeredEvents struct {
 	layers []uio.Layer
 }
 
-func (e *layeredEvents) Listen(addr string, userdata any, opts ...uio.ListenOption) (uio.Listener, error) {
+func (e *layeredEvents) Listen(addr string, opts ...uio.ListenOption) (uio.Listener, error) {
 	if len(e.layers) > 0 {
 		opts = append([]uio.ListenOption{uio.WithLayers(e.layers...)}, opts...)
 	}
-	return e.Events.Listen(addr, userdata, opts...)
+	return e.Events.Listen(addr, opts...)
 }
 
-func (e *layeredEvents) Dial(addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
-	return e.DialContext(context.Background(), addr, userdata, opts...)
+func (e *layeredEvents) Dial(addr string, opts ...uio.DialOption) (uio.Conn, error) {
+	return e.DialContext(context.Background(), addr, opts...)
 }
 
-func (e *layeredEvents) DialContext(ctx context.Context, addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+func (e *layeredEvents) DialContext(ctx context.Context, addr string, opts ...uio.DialOption) (uio.Conn, error) {
 	if len(e.layers) > 0 {
 		opts = append([]uio.DialOption{uio.WithLayers(e.layers...)}, opts...)
 	}
-	return e.Events.DialContext(ctx, addr, userdata, opts...)
+	return e.Events.DialContext(ctx, addr, opts...)
 }
 
 func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers ...uio.Layer) *layeredEvents {
@@ -152,7 +158,7 @@ func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers
 		_ = events.Close(nil)
 		select {
 		case <-done:
-		case <-time.After(testWait):
+		case <-time.After(cleanupWait):
 			t.Error("Serve did not return")
 		}
 	})
@@ -168,7 +174,7 @@ func serveTLSWith(t *testing.T, top uio.Handler, setup func(*uio.Events), layers
 func listenTLS(t *testing.T, top uio.Handler, layers ...uio.Layer) (string, *layeredEvents) {
 	t.Helper()
 	events := serveTLS(t, top, layers...)
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -242,7 +248,7 @@ func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, addr, nil, uio.WithLayers(chain...))
+	conn, err := events.DialContext(ctx, addr, uio.WithLayers(chain...))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,7 +262,7 @@ func TestTLSEchoBothSides(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -328,4 +334,13 @@ func TestEmptyTurnReachesHandlerAbove(t *testing.T) {
 		t.Fatal(err)
 	}
 	wait(t, turns, "the empty turn the wake timer runs")
+}
+
+// signal delivers v to ch without blocking: a callback that signals must not
+// hold up the turn that runs it or the lifecycle that joins it.
+func signal[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
 }

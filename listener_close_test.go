@@ -49,7 +49,7 @@ func TestUDPListenerCloseFreesAddress(t *testing.T) {
 		return nil
 	}})
 	serveClosing(t, events)
-	ln, err := events.Listen("udp4://127.0.0.1:0", nil)
+	ln, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +79,7 @@ func TestUDPListenerCloseFreesAddress(t *testing.T) {
 		if err := ln.Close(); err != nil {
 			t.Fatalf("round %d: Close: %v", i, err)
 		}
-		if ln, err = events.Listen("udp4://"+addr, nil); err != nil {
+		if ln, err = events.Listen("udp4://" + addr); err != nil {
 			t.Fatalf("round %d: Listen right after Close: %v", i, err)
 		}
 	}
@@ -101,10 +101,10 @@ func TestUDPListenerCloseFromPeerCallback(t *testing.T) {
 			close(returned)
 			return nil
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	serveClosing(t, events)
-	l, err := events.Listen("udp4://127.0.0.1:0", nil)
+	l, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,15 @@ func TestUDPListenerCloseInsideControl(t *testing.T) {
 				controlled <- c.Control(func(uintptr) { _ = (*ln.Load()).Close() })
 			}
 			events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-				Open: func(c Conn) { opened <- c },
+				Open: func(c Conn) {
+					// A signal, not a hand-off: an unexpected second
+					// connection must not block a callback the lifecycle
+					// joins.
+					select {
+					case opened <- c:
+					default:
+					}
+				},
 				Read: func(c Conn) error {
 					_, _ = c.Discard(-1)
 					if fromCallback {
@@ -156,7 +164,7 @@ func TestUDPListenerCloseInsideControl(t *testing.T) {
 				},
 			})
 			serveClosing(t, events)
-			l, err := events.Listen("udp4://127.0.0.1:0", nil)
+			l, err := events.Listen("udp4://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -222,7 +230,7 @@ func TestUDPListenerCloseKeepsPeerSendsOffReusedDescriptor(t *testing.T) {
 	defer remote.Close()
 	remoteAddr := remote.LocalAddr().(*net.UDPAddr).AddrPort()
 
-	ln, err := events.Listen("udp4://127.0.0.1:0", nil)
+	ln, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,7 +251,7 @@ func TestUDPListenerCloseKeepsPeerSendsOffReusedDescriptor(t *testing.T) {
 	// New sockets, one of them likely on the closed socket's number.
 	var others []Listener
 	for range 8 {
-		other, err := events.Listen("udp4://127.0.0.1:0", nil)
+		other, err := events.Listen("udp4://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -297,7 +305,7 @@ func TestUDPListenerDoubleCloseDuringControl(t *testing.T) {
 		},
 	})
 	serveClosing(t, events)
-	l, err := events.Listen("udp4://127.0.0.1:0", nil)
+	l, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

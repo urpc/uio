@@ -317,7 +317,7 @@ func TestDialAllowedFromConnectionCallback(t *testing.T) {
 	dialResult := make(chan error, 1)
 	events := &Events{Pollers: 1}
 	funcs(events).Read = func(conn Conn) error {
-		dialed, err := events.Dial("tcp://127.0.0.1:1", nil)
+		dialed, err := events.Dial("tcp://127.0.0.1:1")
 		if dialed != nil {
 			_ = dialed.Close()
 		}
@@ -478,7 +478,7 @@ func TestBatchExecutorPartialRejection(t *testing.T) {
 	closed := make(chan Conn, 1)
 	events := withFuncs(&Events{}, FuncHandler{
 		Read:  func(conn Conn) error { woken <- conn; return nil },
-		Close: func(conn Conn, _ error) { closed <- conn },
+		Close: func(conn Conn, _ error) { signal(closed, conn) },
 	})
 	pool := newIOTaskPool(executor)
 	loop := &eventLoop{ioPool: pool}
@@ -618,7 +618,7 @@ func TestRejectedIOTaskReleasesScheduleBeforeClose(t *testing.T) {
 func TestRejectedTaskWaitsForPublishedCloseCause(t *testing.T) {
 	closed := make(chan error, 1)
 	wantErr := errors.New("close cause")
-	events := withFuncs(&Events{}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
+	events := withFuncs(&Events{}, FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }})
 	loop := &eventLoop{ioIdle: make(chan struct{})}
 	conn := &fdConn{commonConn: commonConn{loop: loop}}
 	conn.entry = events.plainEntry()
@@ -1392,7 +1392,7 @@ func TestConcurrentWriteAndCloseDoesNotLoseAcceptedData(t *testing.T) {
 
 func TestDeadlineClearAndExpire(t *testing.T) {
 	closed := make(chan error, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }})
 	testConn := newTestConnection(t, events)
 	if err := testConn.conn.SetReadDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
 		t.Fatal(err)
@@ -1421,7 +1421,7 @@ func TestDeadlineClearAndExpire(t *testing.T) {
 func TestUDPChildReportsUnflushedBytes(t *testing.T) {
 	cause := errors.New("closed")
 	closed := make(chan error, 1)
-	events := withFuncs(&Events{}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
+	events := withFuncs(&Events{}, FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }})
 	server := &fdConn{udp: &unixUDPState{peers: make(map[socket.UDPAddress]*fdConn)}}
 	server.entry = events.plainEntry()
 	child := &fdConn{udp: &unixUDPState{server: server}}
@@ -1493,7 +1493,7 @@ func TestServeDialAndShutdownLifecycle(t *testing.T) {
 		t.Fatal("server did not start")
 	}
 
-	dialed, err := events.DialContext(context.Background(), "tcp://"+address, "dial")
+	dialed, err := events.DialContext(context.Background(), "tcp://"+address, WithUserdata("dial"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2371,7 +2371,7 @@ func TestRejectedExternalWriteDoesNotAllocate(t *testing.T) {
 
 func TestUnixDeadlineAndClosedOperations(t *testing.T) {
 	closed := make(chan error, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }})
 	testConn := newTestConnection(t, events)
 	if err := testConn.conn.SetReadBuffer(4096); err != nil {
 		t.Fatal(err)
@@ -2544,17 +2544,17 @@ func TestEventLoopInterestAndRegistrationErrors(t *testing.T) {
 
 func TestUnixDialFailureAndResourceCleanup(t *testing.T) {
 	events := &Events{}
-	if _, err := events.Dial("tcp://127.0.0.1:1", nil); !errors.Is(err, net.ErrClosed) {
+	if _, err := events.Dial("tcp://127.0.0.1:1"); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("unready Dial error = %v", err)
 	}
 	events.ready.Store(true)
 	dialCtx, cancelDial := context.WithCancel(context.Background())
 	cancelDial()
-	if _, err := events.DialContext(dialCtx, "tcp://127.0.0.1:1", nil); !errors.Is(err, context.Canceled) {
+	if _, err := events.DialContext(dialCtx, "tcp://127.0.0.1:1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled DialContext error = %v", err)
 	}
 	for _, address := range []string{"%", "unsupported://address", "tcp://127.0.0.1:0"} {
-		if conn, err := events.Dial(address, nil); err == nil {
+		if conn, err := events.Dial(address); err == nil {
 			_ = conn.Close()
 			t.Fatalf("Dial %q unexpectedly succeeded", address)
 		}
@@ -2573,7 +2573,7 @@ func TestUnixDialFailureAndResourceCleanup(t *testing.T) {
 		}
 		accepted <- err
 	}()
-	if conn, err := events.Dial("tcp://"+listener.Addr().String(), "context"); conn != nil || !errors.Is(err, net.ErrClosed) {
+	if conn, err := events.Dial("tcp://"+listener.Addr().String(), WithUserdata("context")); conn != nil || !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Dial without a worker = %v, %v", conn, err)
 	}
 	if err := <-accepted; err != nil {
@@ -2581,7 +2581,7 @@ func TestUnixDialFailureAndResourceCleanup(t *testing.T) {
 	}
 
 	events.closing.Store(true)
-	if _, err := events.Dial("tcp://127.0.0.1:1", nil); !errors.Is(err, net.ErrClosed) {
+	if _, err := events.Dial("tcp://127.0.0.1:1"); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closing Dial error = %v", err)
 	}
 }
@@ -2609,7 +2609,7 @@ func TestDialBeforeReadyDoesNotReadLoopState(t *testing.T) {
 	}()
 	<-started
 	for range 10000 {
-		if _, err := events.Dial("tcp://127.0.0.1:1", nil); !errors.Is(err, net.ErrClosed) {
+		if _, err := events.Dial("tcp://127.0.0.1:1"); !errors.Is(err, net.ErrClosed) {
 			close(stop)
 			<-done
 			t.Fatalf("Dial before ready error = %v", err)

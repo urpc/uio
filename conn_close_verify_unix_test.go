@@ -85,7 +85,7 @@ func TestSelfCloseIsNotReentrant(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -133,11 +133,11 @@ func TestCloseModeSurvivesTheWalk(t *testing.T) {
 	}()
 	events := dialLayered(t, listener.Addr().String(), []Layer{PassThroughLayer}, func(ev *Events) {
 
-		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { closed <- err }}
+		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,11 +221,11 @@ func TestCallbackErrorSaysGoodbye(t *testing.T) {
 	closed := make(chan error, 1)
 	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return below }), LayerFunc(func(LayerContext) LayerHandler { return erroringLayer{} })}, func(ev *Events) {
 
-		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { closed <- err }}
+		ev.Handler = FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -257,7 +257,7 @@ func TestDialReportsCloseFromOnOpen(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err == nil {
 		_ = conn.Close()
 		t.Fatal("the dial returned a connection its Handler closed")
@@ -287,7 +287,7 @@ func TestShortOnWriteIsErrShortWrite(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func TestPassThroughEmbeddingHasNoCloseWrite(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -366,7 +366,7 @@ func TestReceiptSentWriteReachesTheHandler(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

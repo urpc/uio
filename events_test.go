@@ -65,7 +65,7 @@ func TestAdoptTransfersTCPConnection(t *testing.T) {
 	client, server := tcpConnectionPair(t)
 	defer client.Close()
 	const userdata = "adopted"
-	adopted, err := events.Adopt(server, userdata)
+	adopted, err := events.Adopt(server, WithUserdata(userdata))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +94,7 @@ func TestAdoptTransfersTCPConnection(t *testing.T) {
 func TestAdoptClosesConnectionWhenEventsNotServing(t *testing.T) {
 	client, server := tcpConnectionPair(t)
 	defer client.Close()
-	if conn, err := (&Events{}).Adopt(server, nil); conn != nil || !errors.Is(err, net.ErrClosed) {
+	if conn, err := (&Events{}).Adopt(server); conn != nil || !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Adopt() = %v, %v; want nil, net.ErrClosed", conn, err)
 	}
 	expectPeerClosed(t, client)
@@ -164,7 +164,7 @@ func TestDialRejectsAnotherEventsLoop(t *testing.T) {
 	defer activeEventLoops.Delete(owner)
 	events := &Events{}
 	events.ready.Store(true)
-	if _, err := events.DialContext(context.Background(), "tcp://127.0.0.1:1", nil); !errors.Is(err, ErrDialOnEventLoop) {
+	if _, err := events.DialContext(context.Background(), "tcp://127.0.0.1:1"); !errors.Is(err, ErrDialOnEventLoop) {
 		t.Fatalf("DialContext from another Events loop = %v, want ErrDialOnEventLoop", err)
 	}
 }
@@ -306,7 +306,7 @@ func TestDialContextCancellationBeforeNetworkDial(t *testing.T) {
 	cause := errors.New("dial canceled")
 	ctx, cancel := context.WithCancelCause(context.Background())
 	cancel(cause)
-	conn, err := events.DialContext(ctx, "tcp://127.0.0.1:1", nil)
+	conn, err := events.DialContext(ctx, "tcp://127.0.0.1:1")
 	if conn != nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("DialContext() = %v, %v; want nil, cancellation", conn, err)
 	}

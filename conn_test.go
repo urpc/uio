@@ -213,7 +213,7 @@ func TestBidirectionalBulkTransferBetweenPeers(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("event loops did not start")
 	}
-	if _, err := client.Dial("tcp://"+addr, nil); err != nil {
+	if _, err := client.Dial("tcp://" + addr); err != nil {
 		t.Fatal(err)
 	}
 
@@ -286,7 +286,7 @@ func TestDialFromOnOpen(t *testing.T) {
 		if c.Userdata() != nil {
 			return // the dialed connection's own OnOpen
 		}
-		dialed, err := events.Dial("tcp://"+target.Addr().String(), "dialed")
+		dialed, err := events.Dial("tcp://"+target.Addr().String(), WithUserdata("dialed"))
 		if dialed != nil {
 			_ = dialed.Close()
 		}
@@ -391,7 +391,7 @@ func TestWakeBeforeOnOpenRunsAfterIt(t *testing.T) {
 			time.Sleep(2 * time.Second)
 		}
 	}()
-	dialed, err := events.Dial("tcp://"+target.Addr().String(), "dialed")
+	dialed, err := events.Dial("tcp://"+target.Addr().String(), WithUserdata("dialed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -449,7 +449,7 @@ func TestCloseBeforeOnOpenSkipsOnClose(t *testing.T) {
 	})
 	serveInboundTest(t, events)
 	for range 200 {
-		c, err := events.Dial("tcp://"+target.Addr().String(), "dialed")
+		c, err := events.Dial("tcp://"+target.Addr().String(), WithUserdata("dialed"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -491,7 +491,7 @@ func TestUDPChildReadDeadlineClosesOnlyThatChild(t *testing.T) {
 			_, err := c.WriteTo(c)
 			return err
 		},
-		Close: func(c Conn, err error) { closed <- closeEvent{c.RemoteAddr().String(), err} },
+		Close: func(c Conn, err error) { signal(closed, closeEvent{c.RemoteAddr().String(), err}) },
 	})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("udp://" + addr) }()
@@ -571,12 +571,12 @@ func TestUDPChildGetsOnCloseAfterOnOpen(t *testing.T) {
 		Pollers: 1,
 	}, FuncHandler{
 		Start: func(*Events) { close(started) },
-		Open:  func(Conn) { opened <- struct{}{} },
+		Open:  func(Conn) { signal(opened, struct{}{}) },
 		Read: func(c Conn) error {
 			_, _ = c.Discard(-1)
 			return c.Close()
 		},
-		Close: func(Conn, error) { closed <- struct{}{} },
+		Close: func(Conn, error) { signal(closed, struct{}{}) },
 	})
 	done := make(chan error, 1)
 	go func() { done <- events.Serve("udp://" + addr) }()

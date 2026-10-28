@@ -56,7 +56,7 @@ type LayerOptions struct {
 // ServerLayer runs the server side of the WebSocket protocol as a uio.Layer,
 // for a stack of your own:
 //
-//	listener, err := events.Listen(addr, nil,
+//	listener, err := events.Listen(addr,
 //		uio.WithLayers(tls, uws.ServerLayer(opts), tunnel))
 //
 // It answers the upgrade request, and opens the layers above once the
@@ -187,6 +187,7 @@ type wsLayerHandler struct {
 var (
 	_ uio.LayerHandler        = (*wsLayerHandler)(nil)
 	_ uio.WireCounterObserver = (*wsLayerHandler)(nil)
+	_ uio.ReceiptObserver     = (*wsLayerHandler)(nil)
 	_ uio.GracefulCloser      = (*wsLayerHandler)(nil)
 )
 
@@ -196,7 +197,8 @@ func (w *wsLayerHandler) OnOpen(ctx uio.LayerContext) {
 		return
 	}
 	config := w.layer.config
-	conn := &Conn{raw: ctx.Down(), config: config, handler: layerSink{w}}
+	conn := &Conn{config: config, handler: layerSink{w}}
+	conn.setRaw(ctx.Down())
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
@@ -322,6 +324,14 @@ func (w *wsLayerHandler) OnWireSent(_ uio.LayerContext, n int) {
 		conn.tryCloseTransport()
 	}
 	conn.resumeReadsAfterDrain()
+}
+
+// OnSent hears the wire pass a tracked write: the Close frame or the
+// heartbeat Ping, whose receipt the connection waits on.
+func (w *wsLayerHandler) OnSent(_ uio.LayerContext, r uio.SendReceipt) {
+	if conn := w.conn.Load(); conn != nil {
+		conn.receiptSent(r)
+	}
 }
 
 // CloseGracefully sends the peer a Close as the layer above closes: 1000 for

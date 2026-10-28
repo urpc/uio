@@ -123,7 +123,7 @@ func TestCloseGracefullyDrainsQueuedOutput(t *testing.T) {
 func TestCloseGracefullyExpiresToUnflushed(t *testing.T) {
 	saved := lingerTimeout
 	lingerTimeout = 150 * time.Millisecond
-	defer func() { lingerTimeout = saved }()
+	t.Cleanup(func() { lingerTimeout = saved })
 
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
@@ -172,7 +172,7 @@ func TestCloseGracefullyExpiresToUnflushed(t *testing.T) {
 func TestCloseWithCutsADrainShort(t *testing.T) {
 	saved := lingerTimeout
 	lingerTimeout = 10 * time.Second
-	defer func() { lingerTimeout = saved }()
+	t.Cleanup(func() { lingerTimeout = saved })
 
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
@@ -211,7 +211,7 @@ func TestCloseWithCutsADrainShort(t *testing.T) {
 func TestCloseGracefullyWithEmptyQueueClosesAtOnce(t *testing.T) {
 	saved := lingerTimeout
 	lingerTimeout = 10 * time.Second // waiting out the bound must not look at-once
-	defer func() { lingerTimeout = saved }()
+	t.Cleanup(func() { lingerTimeout = saved })
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
 	funcs(events).Read = func(Conn) error { return nil }

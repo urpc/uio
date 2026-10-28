@@ -281,9 +281,8 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 
 // listenGroup adds addr while Serve runs: it records its listeners and starts
 // accepting on them at once.
-func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
-	cfg := listenConfigFor(opts)
-	group, err := ld.bindGroup(addr, cfg.Control)
+func (ld *acceptor) listenGroup(addr string, cfg listenConfig) (Listener, error) {
+	group, err := ld.bindGroup(addr, cfg.control)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +301,7 @@ func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) 
 	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	if err = ld.addGroupLocked(group, userdata); err != nil {
+	if err = ld.addGroupLocked(group, cfg.userdata); err != nil {
 		return nil, err
 	}
 	// Added during OnStart, the listeners start with the rest once it has
@@ -468,19 +467,19 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	if ld.events != nil {
 		l.entry = ld.events.plainEntry()
 	}
-	listenConfig := netListenConfigFor(reusePort, control)
+	lnConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {
 	case "tcp", "tcp4", "tcp6":
 		l.addr = u.Host
-		l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Host)
+		l.ln, err = lnConfig.Listen(context.Background(), u.Scheme, u.Host)
 	case "udp", "udp4", "udp6":
 		l.addr = u.Host
-		l.udp, err = listenConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
+		l.udp, err = lnConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
 	case "unix", "unixgram", "unixpacket":
 		if err = os.RemoveAll(u.Path); nil == err || os.IsNotExist(err) {
 			l.addr = u.Path
-			l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Path)
+			l.ln, err = lnConfig.Listen(context.Background(), u.Scheme, u.Path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", u.Scheme)

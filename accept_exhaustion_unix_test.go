@@ -61,7 +61,7 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 	opened := make(chan Conn, waiting+1)
 	started := make(chan startState, 1)
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-		Open: func(c Conn) { opened <- c },
+		Open: func(c Conn) { signal(opened, c) },
 		Start: func(ev *Events) {
 			// Nothing is accepted until OnStart returns: the clients wait in
 			// the backlog, and the first accept finds no descriptor left.

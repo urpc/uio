@@ -58,9 +58,9 @@ func benchEcho(b *testing.B, layers int, observed bool) {
 	var listener Listener
 	var err error
 	if len(chain) > 0 {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil, WithLayers(chain...))
+		listener, err = events.Listen("tcp://127.0.0.1:0", WithLayers(chain...))
 	} else {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+		listener, err = events.Listen("tcp://127.0.0.1:0")
 	}
 	if err != nil {
 		b.Fatal(err)
@@ -138,9 +138,9 @@ func benchPipelined(b *testing.B, layers int) {
 	var listener Listener
 	var err error
 	if len(chain) > 0 {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil, WithLayers(chain...))
+		listener, err = events.Listen("tcp://127.0.0.1:0", WithLayers(chain...))
 	} else {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+		listener, err = events.Listen("tcp://127.0.0.1:0")
 	}
 	if err != nil {
 		b.Fatal(err)

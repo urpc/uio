@@ -621,7 +621,7 @@ func TestConnectedUDPCallbacksStayOnOwningLoop(t *testing.T) {
 	}
 	dialed := make(chan dialResult, 1)
 	go func() {
-		conn, err := events.DialContext(context.Background(), "udp://"+remote.LocalAddr().String(), nil)
+		conn, err := events.DialContext(context.Background(), "udp://"+remote.LocalAddr().String())
 		dialed <- dialResult{conn: conn, err: err}
 	}()
 	var local *net.UDPAddr
@@ -763,7 +763,7 @@ func TestUDPCallbackQueuesWriteToSameLoopStream(t *testing.T) {
 	}
 	target.Store(tcpConn)
 
-	udpConn, err := events.Dial("udp://"+udpServer.LocalAddr().String(), nil)
+	udpConn, err := events.Dial("udp://" + udpServer.LocalAddr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -932,7 +932,7 @@ func TestShutdownJoinsPendingWake(t *testing.T) {
 
 	client, server := tcpConnectionPair(t)
 	defer client.Close()
-	if _, err := ev.Adopt(server, nil); err != nil {
+	if _, err := ev.Adopt(server); err != nil {
 		t.Fatal(err)
 	}
 	conn := <-opened
@@ -1094,7 +1094,7 @@ func TestServeReturnsWithUDPAddressFree(t *testing.T) {
 		var addr string
 		events := &Events{Pollers: 1}
 		events.Hooks = FuncHandler{Start: func(ev *Events) {
-			listener, err := ev.Listen("udp4://127.0.0.1:0", nil)
+			listener, err := ev.Listen("udp4://127.0.0.1:0")
 			if err != nil {
 				t.Error(err)
 			} else {
@@ -1128,7 +1128,7 @@ func TestServeWaitsForAListenerCloseUnderWay(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- events.Serve() }()
 	<-started
-	listener, err := events.Listen("udp4://127.0.0.1:0", nil)
+	listener, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

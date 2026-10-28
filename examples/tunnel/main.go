@@ -67,7 +67,7 @@ func main() {
 		}
 		client := &leg{}
 		c.SetUserdata(client)
-		up, err := events.Dial("tcp://"+*upstream, &leg{})
+		up, err := events.Dial("tcp://"+*upstream, uio.WithUserdata(&leg{}))
 		if err != nil {
 			fmt.Println("dial", *upstream, "failed:", err)
 			// A failed dial reaches the client as a reset, as a proxy would.

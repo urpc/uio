@@ -94,6 +94,21 @@ func (d *Dialer) Dial(ctx context.Context, addr string, userdata any) error {
 	return d.dialWithHandler(ctx, addr, userdata, nil)
 }
 
+// dialHost is the authority a dial reaches: the URL's host and port, with
+// the scheme's default port — 80 for ws, 443 for wss — when the URL names
+// none. The request's Host header keeps the URL's own authority, where an
+// omitted default port stays omitted.
+func dialHost(target *url.URL) string {
+	if target.Port() != "" {
+		return target.Host
+	}
+	port := "80"
+	if target.Scheme == "wss" {
+		port = "443"
+	}
+	return net.JoinHostPort(target.Hostname(), port)
+}
+
 // dialWithHandler runs Dial's setup; a non-nil handler replaces the dialer's
 // frozen one on this connection only, which is how DialClient installs its
 // internal callbacks.
@@ -160,7 +175,7 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 		}
 		dopts = append(dopts, uio.WithLayers(chain...))
 	}
-	raw, err := d.events.DialContext(attemptCtx, "tcp://"+target.Host, setup, dopts...)
+	raw, err := d.events.DialContext(attemptCtx, "tcp://"+dialHost(target), append(dopts, uio.WithUserdata(setup))...)
 	if err != nil {
 		cause := context.Cause(attemptCtx)
 		if deadline, ok := attemptCtx.Deadline(); cause == nil && ok && !time.Now().Before(deadline) {
@@ -292,6 +307,7 @@ func (d *Dialer) start(ctx context.Context) error {
 			Close:        d.onClose,
 			BytesWritten: d.onOutbound,
 			BytesRead:    d.onInbound,
+			Sent:         d.onSentReceipt,
 		}
 		events.Handler = handler
 		events.Observer, events.Hooks = handler, handler
@@ -430,11 +446,11 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		handler = setup.handler
 	}
 	conn := &Conn{
-		raw:      raw,
 		config:   config,
 		handler:  handler,
 		userData: setup.userdata,
 	}
+	conn.setRaw(raw)
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
@@ -463,6 +479,14 @@ func (d *Dialer) onInbound(raw uio.Conn, n int) {
 		if observer, ok := conn.handler.(TrafficObserver); ok {
 			observer.OnInbound(conn, n)
 		}
+	}
+}
+
+// onSentReceipt hears the receipts of the Handler's own tracked writes over a
+// layer chain: the Close frame and the heartbeat Ping the connection waits on.
+func (d *Dialer) onSentReceipt(raw uio.Conn, r uio.SendReceipt) {
+	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
+		conn.receiptSent(r)
 	}
 }
 
@@ -545,6 +569,6 @@ type dialSetup struct {
 
 func (setup *dialSetup) attach(raw uio.Conn) {
 	setup.attachOnce.Do(func() {
-		setup.conn.raw = raw
+		setup.conn.setRaw(raw)
 	})
 }

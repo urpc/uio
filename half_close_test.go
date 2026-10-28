@@ -58,7 +58,7 @@ func TestCloseWriteFollowsQueuedOutput(t *testing.T) {
 			_, err := c.WriteTo(&got)
 			return err
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, _ := serveInboundTest(t, events)
 	time.Sleep(50 * time.Millisecond) // let the output back up behind the FIN
@@ -173,7 +173,7 @@ func TestAllowHalfOpenKeepsWritingAfterPeerEOF(t *testing.T) {
 				}
 			}
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, _ := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("request")); err != nil {
@@ -212,7 +212,7 @@ func TestPeerEOFClosesWithoutAllowHalfOpen(t *testing.T) {
 			}
 			return nil
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, _ := serveInboundTest(t, events)
 	if _, err := client.Write([]byte("bye")); err != nil {
@@ -291,7 +291,7 @@ func TestHalfCloseThroughARelay(t *testing.T) {
 	in.SetUserdata(inLeg)
 	outLeg := &leg{}
 	outLeg.peer.Store(in)
-	out, err := events.Dial("tcp://"+sinkLn.Addr().String(), outLeg)
+	out, err := events.Dial("tcp://"+sinkLn.Addr().String(), WithUserdata(outLeg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,7 +335,7 @@ func TestAllowHalfOpenNoticesAResetAfterEOF(t *testing.T) {
 			}
 			return nil
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	tcp := client.(*net.TCPConn)
@@ -504,7 +504,7 @@ func TestAllowHalfOpenEOFBehindHeldReads(t *testing.T) {
 				}
 			}
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	const total = 256 << 10
@@ -572,7 +572,7 @@ func TestHalfOpenKeepsUnconsumedBytesAfterBothHalvesShut(t *testing.T) {
 						}
 					}
 				},
-				Close: func(_ Conn, err error) { closed <- err },
+				Close: func(_ Conn, err error) { signal(closed, err) },
 			})
 			client, server := serveInboundTest(t, events)
 			if closeWriteFirst {
@@ -639,7 +639,7 @@ func TestCloseWriteUnsupportedOnUDP(t *testing.T) {
 		_ = events.Close(nil)
 		<-done
 	})
-	conn, err := events.Dial("udp://"+addr, nil)
+	conn, err := events.Dial("udp://" + addr)
 	if err != nil {
 		t.Fatal(err)
 	}

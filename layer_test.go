@@ -119,9 +119,9 @@ func serveLayered(t *testing.T, layers []Layer, setup func(*Events)) (string, *l
 	var listener Listener
 	var err error
 	if len(layers) > 0 {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil, WithLayers(layers...))
+		listener, err = events.Listen("tcp://127.0.0.1:0", WithLayers(layers...))
 	} else {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+		listener, err = events.Listen("tcp://127.0.0.1:0")
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -172,30 +172,30 @@ func (e *layeredEvents) dialOptions(opts []DialOption) []DialOption {
 	return append([]DialOption{WithLayers(e.layers...)}, opts...)
 }
 
-func (e *layeredEvents) Dial(addr string, userdata any, opts ...DialOption) (Conn, error) {
-	return e.Events.Dial(addr, userdata, e.dialOptions(opts)...)
+func (e *layeredEvents) Dial(addr string, opts ...DialOption) (Conn, error) {
+	return e.Events.Dial(addr, e.dialOptions(opts)...)
 }
 
-func (e *layeredEvents) DialContext(ctx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {
-	return e.Events.DialContext(ctx, addr, userdata, e.dialOptions(opts)...)
+func (e *layeredEvents) DialContext(ctx context.Context, addr string, opts ...DialOption) (Conn, error) {
+	return e.Events.DialContext(ctx, addr, e.dialOptions(opts)...)
 }
 
-func (e *layeredEvents) Listen(addr string, userdata any, opts ...ListenOption) (Listener, error) {
+func (e *layeredEvents) Listen(addr string, opts ...ListenOption) (Listener, error) {
 	if len(e.layers) == 0 {
-		return e.Events.Listen(addr, userdata, opts...)
+		return e.Events.Listen(addr, opts...)
 	}
-	return e.Events.Listen(addr, userdata, append([]ListenOption{WithLayers(e.layers...)}, opts...)...)
+	return e.Events.Listen(addr, append([]ListenOption{WithLayers(e.layers...)}, opts...)...)
 }
 
-func (e *layeredEvents) Adopt(conn net.Conn, userdata any, opts ...AdoptOption) (Conn, error) {
-	return e.AdoptContext(context.Background(), conn, userdata, opts...)
+func (e *layeredEvents) Adopt(conn net.Conn, opts ...AdoptOption) (Conn, error) {
+	return e.AdoptContext(context.Background(), conn, opts...)
 }
 
-func (e *layeredEvents) AdoptContext(ctx context.Context, conn net.Conn, userdata any, opts ...AdoptOption) (Conn, error) {
+func (e *layeredEvents) AdoptContext(ctx context.Context, conn net.Conn, opts ...AdoptOption) (Conn, error) {
 	if len(e.layers) == 0 {
-		return e.Events.AdoptContext(ctx, conn, userdata, opts...)
+		return e.Events.AdoptContext(ctx, conn, opts...)
 	}
-	return e.Events.AdoptContext(ctx, conn, userdata, append([]AdoptOption{WithLayers(e.layers...)}, opts...)...)
+	return e.Events.AdoptContext(ctx, conn, append([]AdoptOption{WithLayers(e.layers...)}, opts...)...)
 }
 
 func dialLayered(t *testing.T, serverAddr string, layers []Layer, setup func(*Events)) *layeredEvents {
@@ -235,7 +235,7 @@ func TestUseLayersDialedConnections(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, "dial-userdata")
+	conn, err := events.DialContext(ctx, "tcp://"+addr, WithUserdata("dial-userdata"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -285,7 +285,7 @@ func TestUseFailedDialReportsWithoutCallbacks(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String())
 	if !errors.Is(err, refused) {
 		t.Fatalf("DialContext error = %v, want the layer's refusal", err)
 	}
@@ -322,7 +322,7 @@ func TestUseCanceledDialRunsNoCallbacks(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String())
 	if err == nil {
 		t.Fatal("a canceled dial reported no error")
 	}
@@ -375,7 +375,7 @@ func TestEveryLayerHasItsOwnTimer(t *testing.T) {
 	addr, _ := serveLayered(t, []Layer{passThroughLayer{}, passThroughLayer{}}, func(ev *Events) {})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(lower, upper)); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(lower, upper)); err != nil {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(layerWait)
@@ -436,7 +436,7 @@ func TestEmptyTurnsReachTheHandler(t *testing.T) {
 	addr, _ := serveLayered(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(quiet, quiet))
+	conn, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(quiet, quiet))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestUserdataIsTheConnectionsThroughEveryLayer(t *testing.T) {
 	events := &Events{Pollers: 1}
 	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
 	events.Handler = FuncHandler{
-		Open:  func(c Conn) { seen <- c.Userdata() },
+		Open:  func(c Conn) { signal(seen, c.Userdata()) },
 		Read:  func(Conn) error { return nil },
 		Close: func(Conn, error) {},
 	}
@@ -475,7 +475,7 @@ func TestUserdataIsTheConnectionsThroughEveryLayer(t *testing.T) {
 	addr, _ := serveLayered(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, "dialed", WithLayers(marker, passThroughLayer{}))
+	conn, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(marker, passThroughLayer{}), WithUserdata("dialed"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ func TestCloseReachesEveryLayerOnce(t *testing.T) {
 	addr, _ := serveLayered(t, nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(layer("bottom"), layer("top")))
+	conn, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(layer("bottom"), layer("top")))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -563,7 +563,7 @@ func TestConcurrentWritesThroughALayer(t *testing.T) {
 	events := dialLayered(t, addr, []Layer{mapBytes(key, xor)}, func(ev *Events) {})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -623,7 +623,7 @@ func TestOneChunkLayerDrainsEverythingBelow(t *testing.T) {
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +688,7 @@ func TestLayerWriteOwnedOverflowKeepsTheBuffer(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -739,7 +739,7 @@ func TestOutboundLimitAdmitsAtTheTopOfTheStack(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -796,7 +796,7 @@ func TestWireCounterObserverHearsTheWire(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			defer cancel()
-			conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+			conn, err := events.DialContext(ctx, "tcp://"+addr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -870,13 +870,13 @@ func TestGoodbyeLeavesBeforeTheSocketCloses(t *testing.T) {
 			ev.Handler = FuncHandler{
 				Open:  func(Conn) {},
 				Read:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
-				Close: func(_ Conn, err error) { closed <- err },
+				Close: func(_ Conn, err error) { signal(closed, err) },
 			}
 
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+		conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -911,7 +911,7 @@ func TestGoodbyeLeavesBeforeTheSocketCloses(t *testing.T) {
 	t.Run("peer reads nothing", func(t *testing.T) {
 		saved := lingerTimeout
 		lingerTimeout = 200 * time.Millisecond
-		defer func() { lingerTimeout = saved }()
+		t.Cleanup(func() { lingerTimeout = saved })
 		run(t, false)
 	})
 }
@@ -941,13 +941,13 @@ func TestAbortDoesNotWaitForTheGoodbye(t *testing.T) {
 		ev.Handler = FuncHandler{
 			Open:  func(Conn) {},
 			Read:  func(Conn) error { return nil },
-			Close: func(_ Conn, err error) { closed <- err },
+			Close: func(_ Conn, err error) { signal(closed, err) },
 		}
 
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -976,7 +976,7 @@ func TestWritevThroughALayerIsWhole(t *testing.T) {
 	events := dialLayered(t, addr, []Layer{passThroughLayer{}}, func(ev *Events) {})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1027,7 +1027,7 @@ func TestDialGivingUpMidOpenRunsNoCallbacks(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := events.DialContext(ctx, "tcp://"+addr); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("DialContext = %v, want the deadline", err)
 	}
 	time.Sleep(200 * time.Millisecond) // the slow open finishes meanwhile
@@ -1050,7 +1050,7 @@ func (slowOpen) OnOpen(ctx LayerContext) {
 func TestLingeringCloseDiscardsWhatArrives(t *testing.T) {
 	saved := lingerTimeout
 	lingerTimeout = time.Second
-	defer func() { lingerTimeout = saved }()
+	t.Cleanup(func() { lingerTimeout = saved })
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1076,13 +1076,13 @@ func TestLingeringCloseDiscardsWhatArrives(t *testing.T) {
 		ev.Handler = FuncHandler{
 			Open:  func(Conn) {},
 			Read:  func(Conn) error { return nil },
-			Close: func(_ Conn, err error) { closed <- err },
+			Close: func(_ Conn, err error) { signal(closed, err) },
 		}
 
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1154,7 +1154,7 @@ func TestEndOfStreamPassesThroughLayers(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(layerWaitFor(t, ended, "io.EOF above the layers")); got != "last words" {
@@ -1174,7 +1174,7 @@ func TestCloseWriteNeedsTheLayersSupport(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1202,7 +1202,7 @@ func TestFindLayerAndHeldOutput(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1241,7 +1241,7 @@ func TestLingerWaitsForASlowPeer(t *testing.T) {
 	}
 	saved := lingerTimeout
 	lingerTimeout = 150 * time.Millisecond
-	defer func() { lingerTimeout = saved }()
+	t.Cleanup(func() { lingerTimeout = saved })
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -1275,7 +1275,7 @@ func TestLingerWaitsForASlowPeer(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1323,7 +1323,7 @@ func TestOutboundLimitHoldsForConcurrentWriters(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+silent.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1431,7 +1431,7 @@ func TestDiscardAllThroughALayer(t *testing.T) {
 
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
-		conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+		conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 		cancel()
 		if err != nil {
 			t.Fatal(err)
@@ -1496,7 +1496,7 @@ func TestInboundLimitCoversTheStack(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1524,7 +1524,7 @@ func TestHeldOutputIsFlushedAtTheTurnsEnd(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+addr); err != nil {
 		t.Fatal(err)
 	}
 	if got := string(layerWaitFor(t, echo.read, "the greeting")); got != "hello" {
@@ -1577,12 +1577,12 @@ func (greeter) OnOpen(ctx LayerContext) {
 // An Events with layers refuses packet connections.
 func TestLayersRefusePacketConnections(t *testing.T) {
 	events := dialLayered(t, "", []Layer{passThroughLayer{}}, func(ev *Events) {})
-	if _, err := events.Listen("udp://127.0.0.1:0", nil); !errors.Is(err, ErrLayersNeedStream) {
+	if _, err := events.Listen("udp://127.0.0.1:0"); !errors.Is(err, ErrLayersNeedStream) {
 		t.Fatalf("Listen udp = %v, want ErrLayersNeedStream", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "udp://127.0.0.1:9", nil); !errors.Is(err, ErrLayersNeedStream) {
+	if _, err := events.DialContext(ctx, "udp://127.0.0.1:9"); !errors.Is(err, ErrLayersNeedStream) {
 		t.Fatalf("DialContext udp = %v, want ErrLayersNeedStream", err)
 	}
 	packet, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -1594,7 +1594,7 @@ func TestLayersRefusePacketConnections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := events.Adopt(udp, nil); !errors.Is(err, ErrLayersNeedStream) {
+	if _, err := events.Adopt(udp); !errors.Is(err, ErrLayersNeedStream) {
 		t.Fatalf("Adopt udp = %v, want ErrLayersNeedStream", err)
 	}
 }
@@ -1612,7 +1612,7 @@ func TestTooManyLayers(t *testing.T) {
 	for i := range chain {
 		chain[i] = PassThroughLayer
 	}
-	if _, err := events.Listen("tcp://127.0.0.1:0", nil, WithLayers(chain...)); err == nil || !strings.Contains(err.Error(), "at most") {
+	if _, err := events.Listen("tcp://127.0.0.1:0", WithLayers(chain...)); err == nil || !strings.Contains(err.Error(), "at most") {
 		t.Fatalf("Listen = %v, want the layer cap refused", err)
 	}
 	if _, err := events.Dialer(WithLayers(chain...)); err == nil || !strings.Contains(err.Error(), "at most") {
@@ -1636,7 +1636,7 @@ func TestTimerArmedBeforeOpenFiresAfter(t *testing.T) {
 	began := time.Now()
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+addr); err != nil {
 		t.Fatal(err)
 	}
 	at := layerWaitFor(t, fired, "the early timer")
@@ -1692,7 +1692,7 @@ func TestConcurrentClosesSayGoodbyeOnce(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1738,7 +1738,7 @@ func TestAbortInOnInboundFlushesNothing(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+addr); err != nil {
 		t.Fatal(err)
 	}
 	layerWaitFor(t, aborted, "the abort")
@@ -1791,13 +1791,13 @@ func TestCloseFromALayerEndsTheTurn(t *testing.T) {
 				}
 				return nil
 			},
-			Close: func(_ Conn, err error) { closed <- err },
+			Close: func(_ Conn, err error) { signal(closed, err) },
 		}
 
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	layerWaitFor(t, closed, "the close")
@@ -1837,13 +1837,13 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 					_ = c.CloseWith(errors.New("abort"))
 				},
 				Read:  func(Conn) error { return nil },
-				Close: func(_ Conn, err error) { closed <- err },
+				Close: func(_ Conn, err error) { signal(closed, err) },
 			}
 
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		_, _ = events.DialContext(ctx, "tcp://"+addr, nil)
+		_, _ = events.DialContext(ctx, "tcp://"+addr)
 		layerWaitFor(t, closed, "the close")
 		if n := holder.flushedAfter.Load(); n != 0 {
 			t.Fatalf("the held output was flushed %d times after the abort", n)
@@ -1858,7 +1858,7 @@ func TestCloseAsTheStackOpens(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+addr); err == nil {
 			t.Fatal("a dial through a layer that closed as it opened succeeded")
 		}
 		if n := opened.Load(); n != 0 {
@@ -1905,12 +1905,12 @@ func TestCloseInOnInboundEndsItsCalls(t *testing.T) {
 	closer := &byteThenClose{}
 	closed := make(chan error, 1)
 	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return closer })}, func(ev *Events) {
-		ev.Handler = FuncHandler{Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(_ Conn, err error) { closed <- err }}
+		ev.Handler = FuncHandler{Open: func(Conn) {}, Read: func(Conn) error { return nil }, Close: func(_ Conn, err error) { signal(closed, err) }}
 
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	layerWaitFor(t, closed, "the close")
@@ -1981,14 +1981,14 @@ func TestAdoptReturnsTheTopConnection(t *testing.T) {
 	addr, echo := serveLayered(t, nil, nil)
 	opened := make(chan Conn, 1)
 	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return upperCase{} })}, func(ev *Events) {
-		ev.Handler = FuncHandler{Open: func(c Conn) { opened <- c }, Read: func(c Conn) error { _, _ = c.Discard(-1); return nil }, Close: func(Conn, error) {}}
+		ev.Handler = FuncHandler{Open: func(c Conn) { signal(opened, c) }, Read: func(c Conn) error { _, _ = c.Discard(-1); return nil }, Close: func(Conn, error) {}}
 
 	})
 	raw, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := events.Adopt(raw, "adopted")
+	conn, err := events.Adopt(raw, WithUserdata("adopted"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2012,7 +2012,7 @@ func TestAdoptReturnsTheTopConnection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := refusing.Adopt(raw, nil); err == nil || err.Error() != "refused" {
+	if _, err := refusing.Adopt(raw); err == nil || err.Error() != "refused" {
 		t.Fatalf("Adopt through a refusing layer = %v, want its refusal", err)
 	}
 }
@@ -2038,7 +2038,7 @@ func TestLayersWithoutAHandler(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2062,7 +2062,7 @@ func TestLayersWithANilFuncHandler(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2092,14 +2092,23 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		t.Cleanup(func() { _ = listener.Close() })
 		got := make(chan outcome, 1)
 		go func() {
-			peer, err := listener.Accept()
-			if err != nil {
+			// A host reusing freed ports may deliver another test's stray
+			// connection first; it carries nothing, so the peer reads the
+			// next one.
+			for {
+				peer, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				_ = peer.SetReadDeadline(time.Now().Add(layerWait))
+				all, err := io.ReadAll(peer)
+				_ = peer.Close()
+				if len(all) == 0 {
+					continue
+				}
+				got <- outcome{string(all), err}
 				return
 			}
-			defer peer.Close()
-			_ = peer.SetReadDeadline(time.Now().Add(layerWait))
-			all, err := io.ReadAll(peer)
-			got <- outcome{string(all), err}
 		}()
 		return listener.Addr().String(), got
 	}
@@ -2136,7 +2145,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 				})
 				ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 				defer cancel()
-				if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil {
+				if _, err := events.DialContext(ctx, "tcp://"+addr); err != nil {
 					t.Fatal(err)
 				}
 				for range 2 {
@@ -2156,7 +2165,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		events := dialLayered(t, addr, []Layer{holder()}, func(ev *Events) {})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2166,7 +2175,9 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		if _, err := conn.Write([]byte("late")); !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("a write after CloseWrite = %v, want net.ErrClosed", err)
 		}
-		if err := conn.CloseWrite(); err != nil {
+		// The peer may have read the end and closed first: the repeat is
+		// harmless either way.
+		if err := conn.CloseWrite(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatalf("CloseWrite again = %v, want nothing", err)
 		}
 	})
@@ -2179,7 +2190,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2197,7 +2208,7 @@ func TestCloseWriteAfterHeldOutput(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2297,7 +2308,10 @@ func TestCloseWriteBesideWrites(t *testing.T) {
 		read string
 		err  error
 	}
-	peerReads := func(t *testing.T) (string, chan outcome) {
+	// peerReads reads the connection the test dials, by its address when one
+	// is set — a host reusing freed ports may deliver another test's stray
+	// first — and by content otherwise.
+	peerReads := func(t *testing.T, want *atomic.Pointer[string]) (string, chan outcome) {
 		listener, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -2305,27 +2319,43 @@ func TestCloseWriteBesideWrites(t *testing.T) {
 		t.Cleanup(func() { _ = listener.Close() })
 		got := make(chan outcome, 1)
 		go func() {
-			peer, err := listener.Accept()
-			if err != nil {
+			for {
+				peer, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				_ = peer.SetReadDeadline(time.Now().Add(layerWait))
+				all, err := io.ReadAll(peer)
+				remote := peer.RemoteAddr().String()
+				_ = peer.Close()
+				if want != nil {
+					if w := want.Load(); w != nil {
+						if remote != *w {
+							continue // another connection: not the one under test
+						}
+						got <- outcome{string(all), err}
+						return
+					}
+				}
+				if len(all) == 0 {
+					continue // a stray: the connection under test has not dialed yet
+				}
+				got <- outcome{string(all), err}
 				return
 			}
-			defer peer.Close()
-			_ = peer.SetReadDeadline(time.Now().Add(layerWait))
-			all, err := io.ReadAll(peer)
-			got <- outcome{string(all), err}
 		}()
 		return listener.Addr().String(), got
 	}
 
 	t.Run("a write inside the layer", func(t *testing.T) {
-		addr, got := peerReads(t)
+		addr, got := peerReads(t, nil)
 		gate := &gatedHold{entered: make(chan struct{}, 1), proceed: make(chan struct{})}
 		events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return gate })}, func(ev *Events) {
 
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2349,16 +2379,19 @@ func TestCloseWriteBesideWrites(t *testing.T) {
 
 	t.Run("many writers", func(t *testing.T) {
 		for round := range 20 {
-			addr, got := peerReads(t)
+			want := &atomic.Pointer[string]{}
+			addr, got := peerReads(t, want)
 			events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return &holdUntilFlush{} })}, func(ev *Events) {
 
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
-			conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+			conn, err := events.DialContext(ctx, "tcp://"+addr)
 			cancel()
 			if err != nil {
 				t.Fatal(err)
 			}
+			local := conn.LocalAddr().String()
+			want.Store(&local)
 			const writers, each = 8, 50
 			var mu sync.Mutex
 			accepted := map[string]bool{}
@@ -2474,14 +2507,23 @@ func TestCloseWriteAfterFlushSendsHeld(t *testing.T) {
 			defer listener.Close()
 			got := make(chan outcome, 1)
 			go func() {
-				peer, err := listener.Accept()
-				if err != nil {
+				// A host reusing freed ports may deliver another test's stray
+				// connection first; it carries nothing, so the peer reads the
+				// next one.
+				for {
+					peer, err := listener.Accept()
+					if err != nil {
+						return
+					}
+					_ = peer.SetReadDeadline(time.Now().Add(layerWait))
+					all, err := io.ReadAll(peer)
+					_ = peer.Close()
+					if len(all) == 0 {
+						continue
+					}
+					got <- outcome{string(all), err}
 					return
 				}
-				defer peer.Close()
-				_ = peer.SetReadDeadline(time.Now().Add(layerWait))
-				all, err := io.ReadAll(peer)
-				got <- outcome{string(all), err}
 			}()
 			window := &windowFlush{shutFirst: path == "OnOpen's flush"}
 			results := make(chan error, 2)
@@ -2499,7 +2541,7 @@ func TestCloseWriteAfterFlushSendsHeld(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			defer cancel()
-			conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+			conn, err := events.DialContext(ctx, "tcp://"+addr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2578,7 +2620,7 @@ func TestNoLayerCallsAfterOnClose(t *testing.T) {
 			})
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			defer cancel()
-			conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+			conn, err := events.DialContext(ctx, "tcp://"+addr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -2783,7 +2825,7 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 		events := dialLayered(t, addr, layers, setup)
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2812,7 +2854,9 @@ func TestNoLayerCalledBackFromBelow(t *testing.T) {
 		window.dataMu.Lock()
 		window.open = true
 		window.dataMu.Unlock()
-		if err := conn.Flush(); err != nil {
+		// Opening the window lets a turn flush it too; the explicit flush
+		// is the one under test when the connection is still open.
+		if err := conn.Flush(); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatal(err)
 		}
 		if out := layerWaitFor(t, got, "the peer's read"); out.read != "hello" || out.err != nil {
@@ -2943,7 +2987,7 @@ func TestTurnWorkKeepsTheContract(t *testing.T) {
 		events := dialLayered(t, addr, layers, setup)
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3120,7 +3164,7 @@ func TestCloseFromALayerCallbackStopsTheRest(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3171,7 +3215,7 @@ func TestCloseSucceedsWhenTheGoodbyeIsAnswered(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -3252,7 +3296,7 @@ func TestCloseWriteInFlightAndClosing(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+		conn, err := events.DialContext(ctx, "tcp://"+addr)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -3307,7 +3351,7 @@ func TestCloseWriteInFlightAndClosing(t *testing.T) {
 		defer cancel()
 		// The flush closes the stack inside the Handler's OnOpen: the dial
 		// reports the close rather than a settled connection already closing.
-		if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil && !errors.Is(err, net.ErrClosed) {
+		if _, err := events.DialContext(ctx, "tcp://"+addr); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatal(err)
 		}
 		layerWaitFor(t, ended, "CloseWrite")
@@ -3341,5 +3385,885 @@ func TestRequestedTurnsCoalesce(t *testing.T) {
 	c.requestTurn()
 	if n := socket.wakes.Load(); n != 2 {
 		t.Fatalf("a request after the turn began asked %d wakes in all, want 2", n)
+	}
+}
+
+// blockedGoodbye says its goodbye only when the test lets it, and reports
+// that it began.
+type blockedGoodbye struct {
+	PassThrough
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g *blockedGoodbye) CloseGracefully(LayerContext, error) {
+	close(g.started)
+	<-g.release
+}
+
+// Conn.CloseWith requests the close and returns: the layers say their
+// goodbyes on the connection's next turn, never inside the caller — a
+// goodbye that blocks holds up the turn it runs on, not the CloseWith that
+// asked for it. The blocked goodbye is the assertion: the call returned with
+// the goodbye still held, so a CloseWith that ran it inline would never have
+// returned.
+func TestHandlerCloseRequestsAndReturns(t *testing.T) {
+	goodbye := &blockedGoodbye{started: make(chan struct{}), release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(goodbye.release) })
+	// A failure before the end must not leave the goodbye blocked: Serve
+	// joins the turn it holds.
+	t.Cleanup(release)
+	opened := make(chan Conn, 1)
+	closed := make(chan error, 1)
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler { return goodbye })}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open:  func(c Conn) { signal(opened, c) },
+			Read:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	if _, err := client.DialContext(ctx, "tcp://"+addr); err != nil {
+		t.Fatal(err)
+	}
+	var server Conn
+	select {
+	case server = <-opened:
+	case <-time.After(layerWait):
+		t.Fatal("the server's handler did not open")
+	}
+	if err := server.CloseWith(nil); err != nil {
+		t.Fatalf("CloseWith = %v, want the request taken", err)
+	}
+	select {
+	case <-goodbye.started:
+	case <-time.After(layerWait):
+		buf := make([]byte, 1<<20)
+		buf = buf[:runtime.Stack(buf, true)]
+		t.Fatalf("no the goodbye the turn runs within %v; stacks:\n%s", layerWait, buf)
+	}
+	release()
+	if err := layerWaitFor(t, closed, "the close"); err != nil {
+		t.Fatalf("closed with %v, want nil", err)
+	}
+}
+
+// flushFails is a layer whose Flush always fails and whose goodbye records
+// the cause it was told.
+type flushFails struct {
+	PassThrough
+	err     error
+	goodbye chan error
+}
+
+func (f *flushFails) Flush(LayerContext) error { return f.err }
+
+func (f *flushFails) CloseGracefully(_ LayerContext, cause error) {
+	select {
+	case f.goodbye <- cause:
+	default:
+	}
+}
+
+// A layer flush that fails as a turn ends aborts the connection: the close
+// runs the goodbyes with the flush's cause, rather than the core closing the
+// socket with the layers never told.
+func TestTurnEndFlushErrorAbortsThroughTheStack(t *testing.T) {
+	flushErr := errors.New("the flush failed")
+	goodbye := make(chan error, 1)
+	closed := make(chan error, 1)
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler {
+		return &flushFails{err: flushErr, goodbye: goodbye}
+	})}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open: func(Conn) {},
+			Read: func(c Conn) error {
+				_, _ = c.Discard(c.InboundBuffered())
+				_, err := c.Write([]byte("x"))
+				return err
+			},
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	if _, err := client.DialContext(ctx, "tcp://"+addr); err != nil {
+		t.Fatal(err)
+	}
+	if cause := layerWaitFor(t, goodbye, "the goodbye after the flush failed"); !errors.Is(cause, flushErr) {
+		t.Fatalf("the goodbye was told %v, want the flush's cause", cause)
+	}
+	if cause := layerWaitFor(t, closed, "the close"); !errors.Is(cause, flushErr) {
+		t.Fatalf("the handler's close was told %v, want the flush's cause", cause)
+	}
+}
+
+// endAfterRead ends the stream above on the turn it delivers the bytes that
+// followed it, as a TLS close_notify does: the peer's end is announced in
+// band, not as the socket's FIN.
+type endAfterRead struct{ PassThrough }
+
+func (e endAfterRead) OnRead(ctx LayerContext) error {
+	err := e.PassThrough.OnRead(ctx)
+	ctx.Up().End()
+	return err
+}
+
+// A stream's own end closes gracefully: what the Handler wrote in the turn
+// that carried the end still leaves, whole, instead of the socket closing on
+// the queue.
+func TestPeerEndDrainsWhatWasQueued(t *testing.T) {
+	const payloadSize = 8 << 20
+	payload := bytes.Repeat([]byte{'e'}, payloadSize)
+	var wrote atomic.Bool
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler { return endAfterRead{} })}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open: func(Conn) {},
+			Read: func(c Conn) error {
+				_, _ = c.Discard(c.InboundBuffered())
+				if !wrote.CompareAndSwap(false, true) {
+					return nil
+				}
+				_, err := c.Write(payload)
+				return err
+			},
+			Close: func(Conn, error) {},
+		}
+	})
+	peer, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+	if _, err := peer.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	if err := peer.SetReadDeadline(time.Now().Add(layerWait)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := io.ReadAll(peer)
+	if err != nil {
+		t.Fatalf("read past the stream's end: %v", err)
+	}
+	if len(got) != payloadSize {
+		t.Fatalf("the peer got %d of %d bytes, want the queue drained", len(got), payloadSize)
+	}
+	if !bytes.Equal(got, payload[:len(got)]) {
+		t.Fatal("the payload the peer got differs from what was written")
+	}
+}
+
+// One Dialer serves concurrent dials: its defaults are read only, each call
+// applies its options to a copy of them, and the chain entry the defaults
+// resolved is shared read-only — the per-call WithLayers builds its own.
+func TestDialerConcurrentDials(t *testing.T) {
+	addr, _ := serveLayered(t, []Layer{PassThroughLayer}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open: func(Conn) {},
+			Read: func(c Conn) error {
+				payload := c.PeekChunk()
+				_, _ = c.Discard(len(payload))
+				_, err := c.Write(payload)
+				return err
+			},
+			Close: func(Conn, error) {},
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	dialer, err := client.Dialer(WithLayers(PassThroughLayer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const workers, dials = 16, 8
+	var failures atomic.Int32
+	var wg sync.WaitGroup
+	for worker := 0; worker < workers; worker++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := 0; i < dials; i++ {
+				ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+				var opts []DialOption // half take the Dialer's chain, half their own
+				if worker%2 == 1 {
+					opts = append(opts, WithLayers(PassThroughLayer))
+				}
+				conn, err := dialer.DialContext(ctx, "tcp://"+addr, opts...)
+				if err == nil {
+					_, err = conn.Write([]byte{'x'})
+					if closeErr := conn.CloseWith(nil); err == nil {
+						err = closeErr
+					}
+				}
+				cancel()
+				if err != nil {
+					failures.Add(1)
+				}
+			}
+		}(worker)
+	}
+	wg.Wait()
+	if n := failures.Load(); n != 0 {
+		t.Fatalf("%d of %d concurrent dials failed", n, workers*dials)
+	}
+}
+
+// stashedClose keeps its LayerContext for the test and counts its goodbyes.
+type stashedClose struct {
+	PassThrough
+	ctx     chan LayerContext
+	goodbye atomic.Int32
+}
+
+func (l *stashedClose) OnOpen(ctx LayerContext) {
+	l.ctx <- ctx
+	ctx.Up().Open()
+}
+
+func (l *stashedClose) CloseGracefully(LayerContext, error) { l.goodbye.Add(1) }
+
+// A close from above that finds a walk already pending owns the end: the
+// socket closes with its cause, and the pending walk is dropped — its
+// goodbyes do not run after the socket began closing.
+func TestCloseCutDropsThePendingWalk(t *testing.T) {
+	layer := &stashedClose{ctx: make(chan LayerContext, 1)}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	server := make(chan Conn, 1)
+	closed := make(chan error, 1)
+	// Two layers: the cut arrives at the top one while the bottom one's
+	// close walks.
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer }), PassThroughLayer}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open: func(c Conn) { signal(server, c) },
+			Read: func(c Conn) error {
+				_, _ = c.Discard(c.InboundBuffered())
+				select {
+				case <-blocked:
+				default:
+					close(blocked)
+					<-release
+				}
+				return nil
+			},
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp://"+addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("go")); err != nil { // holds the turn in OnRead
+		t.Fatal(err)
+	}
+	layerWaitFor(t, blocked, "the handler's blocked read")
+	layerCtx := layerWaitFor(t, layer.ctx, "the layer's context")
+	if err := layerCtx.Close(nil); err != nil { // the close whose walk waits for the turn
+		t.Fatal(err)
+	}
+	cut := errors.New("cut the walk short")
+	if err := layerWaitFor(t, server, "the handler's connection").CloseWith(cut); err != nil {
+		t.Fatalf("CloseWith = %v, want the end taken", err)
+	}
+	unblock()
+	if cause := layerWaitFor(t, closed, "the close"); !errors.Is(cause, cut) {
+		t.Fatalf("closed with %v, want the cut's cause", cause)
+	}
+	if n := layer.goodbye.Load(); n != 0 {
+		t.Fatalf("%d goodbyes ran for a walk the cut dropped", n)
+	}
+}
+
+// A CloseWith ends a graceful close a CloseGracefully began, at once: the
+// drain's LingerTimeout is not waited out. See Conn's documentation.
+func TestCloseWithCutsALayeredDrain(t *testing.T) {
+	saved := lingerTimeout
+	lingerTimeout = 10 * time.Second
+	t.Cleanup(func() { lingerTimeout = saved })
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	hold := make(chan struct{})
+	peerDone := make(chan struct{})
+	go func() {
+		defer close(peerDone)
+		peer, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer peer.Close()
+		if raw, ok := peer.(*net.TCPConn); ok {
+			_ = raw.SetReadBuffer(4 << 10) // the queue cannot leave
+		}
+		<-hold // and nothing reads it
+	}()
+	closed := make(chan error, 1)
+	client := dialLayered(t, listener.Addr().String(), []Layer{PassThroughLayer}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open:  func(Conn) {},
+			Read:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp://"+listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write(make([]byte, 8<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.CloseGracefully(nil); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(100 * time.Millisecond) // the drain is under way, and cannot progress
+	began := time.Now()
+	if err := conn.CloseWith(io.EOF); err != nil {
+		t.Fatalf("CloseWith = %v, want the cut taken", err)
+	}
+	select {
+	case <-closed:
+		if took := time.Since(began); took > 2*time.Second {
+			t.Fatalf("the cut took %v, the drain's bound was waited out", took)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CloseWith never ended the drain")
+	}
+	close(hold)
+	<-peerDone
+}
+
+// goodbyeAborts is a layer whose goodbye aborts the connection, as a protocol
+// that cannot say goodbye gracefully does. It counts a flush too: one asked
+// for after its own abort committed the end must not run.
+type goodbyeAborts struct {
+	PassThrough
+	abort        error
+	ran          atomic.Int32
+	aborted      atomic.Bool
+	flushedAfter atomic.Int32
+}
+
+func (g *goodbyeAborts) CloseGracefully(ctx LayerContext, _ error) {
+	g.ran.Add(1)
+	// Marked before the abort: any flush from here on is the walk's leak.
+	g.aborted.Store(true)
+	_ = ctx.Abort(g.abort)
+}
+
+func (g *goodbyeAborts) Flush(LayerContext) error {
+	if g.aborted.Load() {
+		g.flushedAfter.Add(1)
+	}
+	return nil
+}
+
+// goodbyeCounts runs no protocol; it counts that the walk reached it.
+type goodbyeCounts struct {
+	PassThrough
+	ran atomic.Int32
+}
+
+func (g *goodbyeCounts) CloseGracefully(LayerContext, error) { g.ran.Add(1) }
+
+// An abort from inside a goodbye ends the close then and there: the walk is
+// over, and the layers below it are told nothing — the socket's close was
+// already committed.
+func TestAbortInGoodbyeStopsTheWalk(t *testing.T) {
+	abortErr := errors.New("no graceful goodbye")
+	top := &goodbyeAborts{abort: abortErr}
+	bottom := &goodbyeCounts{}
+	closed := make(chan error, 1)
+	attached := make(chan Conn, 1)
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler { return bottom }), LayerFunc(func(LayerContext) LayerHandler { return top })}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open:  func(c Conn) { signal(attached, c) },
+			Read:  func(c Conn) error { _, _ = c.Discard(c.InboundBuffered()); return nil },
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp://"+addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// The close the walk runs is the layered side's: the Handler's Conn.
+	attachedConn := layerWaitFor(t, attached, "the server handler")
+	if err := attachedConn.CloseWith(nil); err != nil {
+		t.Fatal(err)
+	}
+	layerWaitFor(t, closed, "the close")
+	if n := top.ran.Load(); n != 1 {
+		t.Fatalf("the top layer's goodbye ran %d times", n)
+	}
+	if n := bottom.ran.Load(); n != 0 {
+		t.Fatalf("%d goodbyes below an abort that ended the walk", n)
+	}
+	if n := top.flushedAfter.Load(); n != 0 {
+		t.Fatalf("the layer was flushed %d times after its goodbye aborted", n)
+	}
+}
+
+// A close request that yields to the close already under way must leave no
+// mark on its layer: the owner's walk still has to pass through it to reach
+// the socket. The handler here holds the turn, so both requests land before
+// the walk runs — the sequence a real connection hit.
+func TestCloseYieldLeavesTheWalkIntact(t *testing.T) {
+	bottom := &stashedClose{ctx: make(chan LayerContext, 1)}
+	blocked := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	defer unblock()
+	server := make(chan Conn, 1)
+	closed := make(chan error, 1)
+	addr, _ := serveLayered(t, []Layer{LayerFunc(func(LayerContext) LayerHandler { return bottom }), PassThroughLayer}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Open: func(c Conn) { signal(server, c) },
+			Read: func(c Conn) error {
+				_, _ = c.Discard(c.InboundBuffered())
+				select {
+				case <-blocked:
+				default:
+					close(blocked)
+					<-release
+				}
+				return nil
+			},
+			Close: func(_ Conn, err error) { signal(closed, err) },
+		}
+	})
+	client := dialLayered(t, addr, nil, func(ev *Events) {})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := client.DialContext(ctx, "tcp://"+addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("go")); err != nil {
+		t.Fatal(err)
+	}
+	layerWaitFor(t, blocked, "the handler's blocked read")
+	layerCtx := layerWaitFor(t, bottom.ctx, "the layer's context")
+	srv := layerWaitFor(t, server, "the handler's connection")
+	if err := srv.CloseGracefully(nil); err != nil { // the owner: stores the plan
+		t.Fatal(err)
+	}
+	if err := layerCtx.Close(nil); err != nil { // yields; must leave no mark
+		t.Fatal(err)
+	}
+	unblock() // the walk: through both layers, to the socket
+	select {
+	case cause := <-closed:
+		if cause != nil {
+			t.Fatalf("closed with %v, want the graceful close", cause)
+		}
+	case <-time.After(layerWait):
+		t.Fatal("the close never reached the socket")
+	}
+	if n := bottom.goodbye.Load(); n != 1 {
+		t.Fatalf("the bottom layer's goodbye ran %d times, want 1", n)
+	}
+}
+
+// scriptedQueue is a Conn whose OutboundBuffered the test scripts: it takes
+// the value on entry, announces the first read, and waits for the test's
+// transfer before returning it — the window a held-bytes transfer rides in.
+type scriptedQueue struct {
+	Conn
+	queue atomic.Int64
+	read  chan struct{}
+	goOn  chan struct{}
+	once  sync.Once
+}
+
+func (q *scriptedQueue) OutboundBuffered() int {
+	v := int(q.queue.Load())
+	q.once.Do(func() { close(q.read) })
+	<-q.goOn
+	return v
+}
+
+// OutboundBuffered reads what a layer holds before the socket: a transfer
+// moves bytes down and then drops the hold, and reading the socket first
+// would lose the bytes in flight between the two reads.
+func TestOutboundBufferedReadsTheHoldFirst(t *testing.T) {
+	var held atomic.Int64
+	held.Store(90)
+	lower := &scriptedQueue{read: make(chan struct{}), goOn: make(chan struct{})}
+	signalFirstRead := func() { lower.once.Do(func() { close(lower.read) }) }
+	node := &layerNode{stack: &stack{}, lower: lower, ops: layerOps{held: func(LayerContext) int {
+		v := int(held.Load())
+		signalFirstRead()
+		<-lower.goOn
+		return v
+	}}}
+	got := make(chan int, 1)
+	go func() { got <- node.OutboundBuffered() }()
+	<-lower.read // whichever of the two reads ran first
+	// The transfer: the layer writes its bytes down, then drops them.
+	lower.queue.Store(90)
+	held.Store(0)
+	close(lower.goOn)
+	if buffered := <-got; buffered < 90 {
+		t.Fatalf("OutboundBuffered = %d during a transfer, want the bytes counted", buffered)
+	}
+}
+
+// One Events starts once: a second Serve returns ErrEventsStarted and leaves
+// the running one — its loops, its acceptor — alone.
+func TestServeTwiceFails(t *testing.T) {
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Handler: FuncHandler{}}
+	events.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	<-started
+	if err := events.Serve(); !errors.Is(err, ErrEventsStarted) {
+		t.Fatalf("second Serve = %v, want ErrEventsStarted", err)
+	}
+	if err := events.Close(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first Serve = %v", err)
+		}
+	case <-time.After(layerWait):
+		t.Fatal("the first Serve never returned")
+	}
+	if err := events.Serve(); !errors.Is(err, ErrEventsStarted) {
+		t.Fatalf("Serve after it ended = %v, want ErrEventsStarted", err)
+	}
+}
+
+// A Serve refused while the first is shutting down must not publish the
+// lifecycle's end: Wait keeps waiting until OnStop returns and the loops
+// release their connections, which is what the first Serve's return marks.
+func TestServeDuringShutdownDoesNotEndTheLifecycle(t *testing.T) {
+	stop := make(chan struct{})
+	onStop := make(chan struct{})
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Handler: FuncHandler{}}
+	events.Hooks = FuncHandler{
+		Start: func(*Events) { close(started) },
+		Stop: func(*Events) {
+			close(onStop)
+			<-stop
+		},
+	}
+	done := make(chan error, 1)
+	go func() { done <- events.Serve() }()
+	<-started
+	if err := events.Close(nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := events.Serve(); !errors.Is(err, ErrEventsStarted) {
+		t.Fatalf("a Serve during shutdown = %v, want ErrEventsStarted", err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- events.Wait() }()
+	select {
+	case <-onStop:
+	case <-time.After(layerWait):
+		t.Fatal("OnStop never ran")
+	}
+	select {
+	case <-waited:
+		t.Fatal("Wait returned while OnStop was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(stop)
+	select {
+	case err := <-waited:
+		if err != nil {
+			t.Fatalf("Wait = %v", err)
+		}
+	case <-time.After(layerWait):
+		t.Fatal("Wait never returned after OnStop")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("first Serve = %v", err)
+		}
+	case <-time.After(layerWait):
+		t.Fatal("the first Serve never returned")
+	}
+}
+
+// framingHold holds what it is given and, on flush, writes it with a
+// five-byte trailer: its output is larger than the input it accepted, so a
+// receipt taken at input size would point past bytes not yet written.
+type framingHold struct {
+	PassThrough
+	mu      sync.Mutex
+	held    []byte
+	counted int        // held plus what a flush is writing below, until it returns
+	writeMu sync.Mutex // orders flushes: a turn's and a caller's may run at once
+}
+
+func (h *framingHold) OnWrite(_ LayerContext, p []byte) (int, error) {
+	h.mu.Lock()
+	h.held = append(h.held, p...)
+	h.counted += len(p)
+	h.mu.Unlock()
+	return len(p), nil
+}
+
+func (h *framingHold) OutboundHeld(LayerContext) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.counted
+}
+
+func (h *framingHold) Flush(ctx LayerContext) error {
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
+	h.mu.Lock()
+	held := h.held
+	h.held = nil
+	h.mu.Unlock()
+	if len(held) == 0 {
+		return nil
+	}
+	// A trailer far past the socket's send buffer, so the queue genuinely
+	// holds unsent bytes after the peer's first read. The bytes count until
+	// the write below returned, as the OutboundHolder contract says.
+	out := append(held, bytes.Repeat([]byte{'+'}, 8<<20)...)
+	_, err := ctx.Down().Write(out)
+	h.mu.Lock()
+	h.counted -= len(held)
+	h.mu.Unlock()
+	return err
+}
+
+// A tracked write whose path runs through a holder gets no wire position: a
+// flush can put more bytes on the wire than the write wrote, so the receipt
+// must wait until everything handed down has left, not fire when the input
+// size is passed.
+func TestTrackedWritePastAnExpandingHolder(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	firstFour := make(chan string, 1)
+	rest := make(chan string, 1)
+	release := make(chan struct{})
+	// The peer stays open until the test ends: a receipt still outstanding
+	// when the connection closes is not reported, so a peer that closed as
+	// soon as it read the last byte would race the receipt it is here to
+	// observe.
+	untilDone := make(chan struct{})
+	t.Cleanup(func() { close(untilDone) })
+	var progress atomic.Int64
+	go func() {
+		// A host reusing freed ports may deliver another test's stray
+		// connection first; it carries nothing, so the peer reads the next
+		// one.
+		var peer net.Conn
+		for {
+			var err error
+			peer, err = listener.Accept()
+			if err != nil {
+				return
+			}
+			head := make([]byte, 4)
+			n, _ := io.ReadFull(peer, head)
+			if n == 0 {
+				_ = peer.Close()
+				continue
+			}
+			firstFour <- string(head[:n])
+			break
+		}
+		defer peer.Close()
+		<-release
+		trailer := make([]byte, 8<<20)
+		for off := 0; off < len(trailer); {
+			n, err := peer.Read(trailer[off:])
+			off += n
+			progress.Store(int64(off))
+			if err != nil {
+				break
+			}
+		}
+		rest <- string(trailer)
+		<-untilDone
+	}()
+	sent := make(chan SendReceipt, 2)
+	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return &framingHold{} })}, func(ev *Events) {
+		ev.Handler = FuncHandler{
+			Sent:  func(_ Conn, r SendReceipt) { sent <- r },
+			Close: func(Conn, error) {},
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, _, err := conn.(TrackedWriter).WriteTracked([]byte("abcd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Flush(); err != nil { // the holder expands 4 bytes by far more than the socket takes
+		t.Fatal(err)
+	}
+	if got := layerWaitFor(t, firstFour, "the peer's first read"); got != "abcd" {
+		t.Fatalf("the peer read %q", got)
+	}
+	select {
+	case r := <-sent:
+		node := conn.(*layerNode)
+		t.Fatalf("receipt fired early: r=%+v firstHeld=%d held=%d queued=%d", r, node.stack.firstHeld, node.held(), node.OutboundBuffered())
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case got := <-rest:
+		if len(got) != 8<<20 {
+			t.Fatalf("the peer read %d trailer bytes after the first four", len(got))
+		}
+	case <-time.After(layerWait):
+		node := conn.(*layerNode)
+		t.Fatalf("the peer's drain stalled: progress=%d queue=%d state=%b", progress.Load(), node.OutboundBuffered(), conn.State())
+	}
+	select {
+	case <-sent:
+	case <-time.After(layerWait):
+		node := conn.(*layerNode)
+		t.Fatalf("the receipt never fired though the queue emptied: queue=%d progress=%d state=%b", node.OutboundBuffered(), progress.Load(), conn.State())
+	}
+}
+
+// trackingHold holds nothing itself and starts one tracked write below, in
+// its OnOpen. It is a holder above that write's path: the write passes a
+// holder below it while another holder sits above, which once made the
+// receipt look exact and fire on the input's count alone.
+type trackingHold struct {
+	PassThrough
+	sent chan SendReceipt
+}
+
+func (h *trackingHold) OnOpen(ctx LayerContext) {
+	_, _, _ = ctx.Down().(TrackedWriter).WriteTracked([]byte("abcd"))
+	ctx.Up().Open()
+}
+
+func (h *trackingHold) OutboundHeld(LayerContext) int { return 0 }
+
+func (h *trackingHold) Flush(LayerContext) error { return nil }
+
+func (h *trackingHold) OnSent(_ LayerContext, r SendReceipt) {
+	select {
+	case h.sent <- r:
+	default:
+	}
+}
+
+// A tracked write below a holder keeps its receipt inexact even when another
+// holder sits above the write: only the path below the write can expand what
+// it accepted.
+func TestTrackedWriteHeldBelowAHolderAbove(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	firstFour := make(chan string, 1)
+	rest := make(chan string, 1)
+	release := make(chan struct{})
+	untilDone := make(chan struct{})
+	t.Cleanup(func() { close(untilDone) })
+	var progress atomic.Int64
+	go func() {
+		// A host reusing freed ports may deliver another test's stray
+		// connection first; it carries nothing, so the peer reads the next
+		// one.
+		var peer net.Conn
+		for {
+			var err error
+			peer, err = listener.Accept()
+			if err != nil {
+				return
+			}
+			head := make([]byte, 4)
+			n, _ := io.ReadFull(peer, head)
+			if n == 0 {
+				_ = peer.Close()
+				continue
+			}
+			firstFour <- string(head[:n])
+			break
+		}
+		defer peer.Close()
+		<-release
+		trailer := make([]byte, 8<<20)
+		for off := 0; off < len(trailer); {
+			n, err := peer.Read(trailer[off:])
+			off += n
+			progress.Store(int64(off))
+			if err != nil {
+				break
+			}
+		}
+		rest <- string(trailer)
+		<-untilDone
+	}()
+	sent := make(chan SendReceipt, 2)
+	events := dialLayered(t, listener.Addr().String(), []Layer{
+		LayerFunc(func(LayerContext) LayerHandler { return &framingHold{} }),
+		LayerFunc(func(LayerContext) LayerHandler { return &trackingHold{sent: sent} }),
+	}, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got := layerWaitFor(t, firstFour, "the peer's first read"); got != "abcd" {
+		t.Fatalf("the peer read %q", got)
+	}
+	select {
+	case r := <-sent:
+		node := conn.(*layerNode)
+		t.Fatalf("receipt fired early: r=%+v queued=%d", r, node.OutboundBuffered())
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case got := <-rest:
+		if len(got) != 8<<20 {
+			t.Fatalf("the peer read %d trailer bytes after the first four", len(got))
+		}
+	case <-time.After(layerWait):
+		t.Fatalf("the peer's drain stalled: progress=%d", progress.Load())
+	}
+	select {
+	case <-sent:
+	case <-time.After(layerWait):
+		node := conn.(*layerNode)
+		t.Fatalf("the receipt never fired though the queue emptied: queued=%d progress=%d state=%b", node.OutboundBuffered(), progress.Load(), conn.State())
 	}
 }

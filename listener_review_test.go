@@ -33,7 +33,7 @@ func TestConcurrentCloseOfPeerListenerAndEvents(t *testing.T) {
 		recorder := closeRecorder{}
 		events := recorder.events()
 		_, done := serveLoopback(t, events)
-		ln, err := events.Listen("udp://127.0.0.1:0", "p")
+		ln, err := events.Listen("udp://127.0.0.1:0", WithUserdata("p"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -105,7 +105,7 @@ func TestDialedPeerOpensOnceBothSides(t *testing.T) {
 				Close: func(Conn, error) { mu.Lock(); order = append(order, "close"); mu.Unlock() },
 			})
 			serveLoopback(t, events)
-			ln, err := events.Listen("udp://127.0.0.1:0", nil)
+			ln, err := events.Listen("udp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -169,7 +169,7 @@ func TestMappedAndPlainPeerAreOneChild(t *testing.T) {
 		Read: func(c Conn) error { _, _ = c.Discard(-1); return nil },
 	})
 	serveLoopback(t, events)
-	ln, err := events.Listen("udp://127.0.0.1:0", "mapped")
+	ln, err := events.Listen("udp://127.0.0.1:0", WithUserdata("mapped"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestNoCallbacksWhileOnStartRuns(t *testing.T) {
 	})
 	lnOnce := make(chan Listener, 1)
 	funcs(events).Start = func(ev *Events) {
-		ln, err := ev.Listen("tcp://127.0.0.1:0", nil)
+		ln, err := ev.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Error(err)
 		} else {
@@ -302,7 +302,7 @@ func TestDialPeerRefusedWhileEventsCloses(t *testing.T) {
 		},
 	})
 	_, done := serveLoopback(t, events)
-	ln, err := events.Listen("udp://127.0.0.1:0", nil)
+	ln, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -354,10 +354,10 @@ func TestUnstartedListenerCloseCause(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Open:  func(Conn) {},
 		Read:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	funcs(events).Start = func(ev *Events) {
-		listener, err := ev.Listen("udp://127.0.0.1:0", nil)
+		listener, err := ev.Listen("udp://127.0.0.1:0")
 		if err != nil {
 			t.Error(err)
 		} else {
@@ -420,7 +420,7 @@ func TestUnstartedListenerCloseOrdersCallbacks(t *testing.T) {
 	inStart := make(chan Listener, 1)
 	started := make(chan struct{})
 	funcs(events).Start = func(ev *Events) {
-		ln, err := ev.Listen("udp://127.0.0.1:0", nil)
+		ln, err := ev.Listen("udp://127.0.0.1:0")
 		if err != nil {
 			t.Error(err)
 			startedOnceClose(started)
@@ -506,7 +506,7 @@ func TestDialPeerRacingShutdownKeepsCallbacksInside(t *testing.T) {
 		Close: func(Conn, error) { mu.Lock(); callbacks++; mu.Unlock() },
 	})
 	_, done := serveLoopback(t, events)
-	ln, err := events.Listen("udp://127.0.0.1:0", nil)
+	ln, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -562,7 +562,7 @@ func TestUnstartedListenerReleasedWhenCloseRacesShutdown(t *testing.T) {
 	lnOnce := make(chan Listener, 1)
 	release := make(chan struct{})
 	funcs(events).Start = func(ev *Events) {
-		ln, err := ev.Listen("udp://127.0.0.1:0", nil)
+		ln, err := ev.Listen("udp://127.0.0.1:0")
 		if err != nil {
 			t.Error(err)
 			close(release)
@@ -627,7 +627,7 @@ func TestReplacedPeerKeepsItsCloseCause(t *testing.T) {
 	got := make(chan error, rounds*2)
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Read:  func(c Conn) error { _, _ = c.Discard(-1); return nil },
-		Close: func(_ Conn, err error) { got <- err },
+		Close: func(_ Conn, err error) { signal(got, err) },
 	})
 	_, done := serveLoopback(t, events)
 	t.Cleanup(func() {
@@ -638,7 +638,7 @@ func TestReplacedPeerKeepsItsCloseCause(t *testing.T) {
 			t.Error("Serve did not stop")
 		}
 	})
-	ln, err := events.Listen("udp://127.0.0.1:0", nil)
+	ln, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

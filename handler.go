@@ -99,8 +99,11 @@ type FuncHandler struct {
 	Close        func(c Conn, err error)
 	BytesRead    func(c Conn, n int)
 	BytesWritten func(c Conn, n int)
-	Start        func(ev *Events)
-	Stop         func(ev *Events)
+	// Sent hears the receipts of the Handler's own tracked writes over a
+	// layer stack; see SentObserver.
+	Sent  func(c Conn, r SendReceipt)
+	Start func(ev *Events)
+	Stop  func(ev *Events)
 }
 
 func (h FuncHandler) OnOpen(c Conn) {
@@ -133,6 +136,13 @@ func (h FuncHandler) OnClose(c Conn, err error) {
 func (h FuncHandler) OnBytesRead(c Conn, n int) {
 	if h.BytesRead != nil {
 		h.BytesRead(c, n)
+	}
+}
+
+// OnSent implements SentObserver.
+func (h FuncHandler) OnSent(c Conn, r SendReceipt) {
+	if h.Sent != nil {
+		h.Sent(c, r)
 	}
 }
 

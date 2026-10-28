@@ -24,7 +24,7 @@ func TestUnstartedUDPListenerOwnedWithoutReadiness(t *testing.T) {
 	var opens atomic.Int32
 	ev := withFuncs(&Events{Pollers: 1}, FuncHandler{
 		Start: func(ev *Events) {
-			ln, err := ev.Listen("udp4://127.0.0.1:0", nil)
+			ln, err := ev.Listen("udp4://127.0.0.1:0")
 			if err != nil {
 				t.Error(err)
 				return
@@ -94,7 +94,7 @@ func TestUnstartedUDPListenerOwnedWithoutReadiness(t *testing.T) {
 // entry is replaced, even if its closer has not queued the server turn yet.
 func TestUDPServerReleaseClosesReplacedPeers(t *testing.T) {
 	closed := make(chan Conn, 2)
-	ev := withFuncs(&Events{}, FuncHandler{Close: func(c Conn, _ error) { closed <- c }})
+	ev := withFuncs(&Events{}, FuncHandler{Close: func(c Conn, _ error) { signal(closed, c) }})
 	if err := ev.initConfig(); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestClosedUDPListenersReleaseUserdata(t *testing.T) {
 	for range cap(refs) {
 		ref := func() weak.Pointer[[256 << 10]byte] {
 			data := new([256 << 10]byte)
-			ln, err := ev.Listen("udp4://127.0.0.1:0", data)
+			ln, err := ev.Listen("udp4://127.0.0.1:0", WithUserdata(data))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -191,11 +191,11 @@ func TestControlDescriptorLifetime(t *testing.T) {
 		waitLifecycle(t, serveDone, "Serve cleanup")
 	})
 	waitLifecycle(t, started, "OnStart")
-	ln, err := ev.Listen("tcp4://127.0.0.1:0", nil)
+	ln, err := ev.Listen("tcp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := ev.Dial("tcp4://"+ln.Addr().String(), "control")
+	conn, err := ev.Dial("tcp4://"+ln.Addr().String(), WithUserdata("control"))
 	if err != nil {
 		t.Fatal(err)
 	}

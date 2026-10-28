@@ -105,9 +105,9 @@ func (s *Server) Serve(addrs ...string) error {
 				}
 				var ln uio.Listener
 				if len(layers) > 0 {
-					ln, listenErr = events.Listen(addr, nil, uio.WithLayers(layers...))
+					ln, listenErr = events.Listen(addr, uio.WithLayers(layers...))
 				} else {
-					ln, listenErr = events.Listen(addr, nil)
+					ln, listenErr = events.Listen(addr)
 				}
 				_ = ln
 				if listenErr != nil {
@@ -132,6 +132,7 @@ func (s *Server) Serve(addrs ...string) error {
 		Read:         s.onData,
 		Close:        s.onClose,
 		BytesWritten: s.onOutbound,
+		Sent:         s.onSentReceipt,
 	}
 	if s.config.observeTraffic {
 		handler.BytesRead = s.onInbound
@@ -181,7 +182,7 @@ func (c *Conn) expireHeartbeat() {
 func (s *Server) onOpen(raw uio.Conn) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		if state := conn.handshake.Load(); state != nil && state.upgrade != nil {
-			conn.raw = raw
+			conn.setRaw(raw)
 			s.openHTTPConnection(conn, state)
 			return
 		}
@@ -199,10 +200,10 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
 	}
 	conn := &Conn{
-		raw:     raw,
 		config:  config,
 		handler: config.handler,
 	}
+	conn.setRaw(raw)
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
@@ -230,6 +231,14 @@ func (s *Server) onInbound(raw uio.Conn, n int) {
 		if observer, ok := conn.handler.(TrafficObserver); ok {
 			observer.OnInbound(conn, n)
 		}
+	}
+}
+
+// onSentReceipt hears the receipts of the Handler's own tracked writes over a
+// layer chain: the Close frame and the heartbeat Ping the connection waits on.
+func (s *Server) onSentReceipt(raw uio.Conn, r uio.SendReceipt) {
+	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
+		conn.receiptSent(r)
 	}
 }
 

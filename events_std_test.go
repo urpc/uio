@@ -1346,7 +1346,7 @@ func TestStdHeldReadDeadlineAgreesWithTheSocket(t *testing.T) {
 			}
 			return nil
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
@@ -1412,7 +1412,7 @@ func TestStdHeldDeadlineExpiryAndClearAreOrdered(t *testing.T) {
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
 		Read:  func(Conn) error { return nil },
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
@@ -1463,7 +1463,7 @@ func TestStdRefusedReadDeadlineLeavesTheHeldWaitAlone(t *testing.T) {
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
 		Read:  func(Conn) error { return nil },
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
@@ -1575,7 +1575,7 @@ func TestStdDialCanceledDuringRegistrationGetsNoCallbacks(t *testing.T) {
 		<-returned
 	}
 	t.Cleanup(func() { registeredForTest = nil })
-	conn, err := events.DialContext(ctx, "tcp://"+target.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+target.Addr().String())
 	close(returned)
 	if conn != nil || !errors.Is(err, cause) {
 		t.Fatalf("DialContext = %v, %v; want nil, %v", conn, err, cause)
@@ -1608,7 +1608,7 @@ func TestStdAcceptDoesNotWaitForRegistration(t *testing.T) {
 	opened := make(chan struct{}, 16)
 	// Three loops: the client sockets dialed here take descriptors too, so
 	// the accepted ones step by two, which a pair of loops would map to one.
-	events := withFuncs(&Events{Pollers: 3}, FuncHandler{Open: func(Conn) { opened <- struct{}{} }})
+	events := withFuncs(&Events{Pollers: 3}, FuncHandler{Open: func(Conn) { signal(opened, struct{}{}) }})
 	addr, done := serveLoopback(t, events)
 	t.Cleanup(func() {
 		releaseOnce()
@@ -1680,7 +1680,7 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 		defer cancel()
-		dialed, err := ev.DialContext(ctx, target.Addr().String(), nil)
+		dialed, err := ev.DialContext(ctx, target.Addr().String())
 		if dialed != nil {
 			_ = dialed.Close()
 		}
@@ -1701,7 +1701,7 @@ func TestStdWakeThenDialDoesNotStall(t *testing.T) {
 
 	client, server := tcpConnectionPair(t)
 	defer client.Close()
-	if _, err := ev.Adopt(server, nil); err != nil {
+	if _, err := ev.Adopt(server); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Write([]byte("x")); err != nil {
@@ -1860,7 +1860,7 @@ func TestUDPControlDuringListenerCloseIsRefused(t *testing.T) {
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	listener, err := events.Listen("udp4://127.0.0.1:0", nil)
+	listener, err := events.Listen("udp4://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1945,7 +1945,7 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 	}
 	local, _ := pair()
 	blocker := &closeBlocker{Conn: local, entered: make(chan struct{}), release: make(chan struct{})}
-	first, err := events.Adopt(blocker, nil, WithLayers(PassThroughLayer))
+	first, err := events.Adopt(blocker, WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1958,7 +1958,7 @@ func TestAdoptContextCanceledWhileRegistering(t *testing.T) {
 	defer cancel()
 	adopted := make(chan error, 1)
 	go func() {
-		_, err := events.AdoptContext(ctx, second, "canceled", WithLayers(PassThroughLayer))
+		_, err := events.AdoptContext(ctx, second, WithLayers(PassThroughLayer), WithUserdata("canceled"))
 		adopted <- err
 	}()
 	var adoptErr error

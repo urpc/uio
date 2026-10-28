@@ -84,12 +84,12 @@ func dialWake(t *testing.T) (*wakeRecorder, Conn) {
 		<-sinkDone
 	})
 	<-sinkStarted
-	listener, err := sink.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := sink.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -311,7 +311,7 @@ func TestWakeUDPChildFiresInServerTurn(t *testing.T) {
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
 
-	listener, err := events.Listen("udp://127.0.0.1:0", nil)
+	listener, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

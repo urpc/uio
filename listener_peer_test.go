@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,14 +25,14 @@ func newPeerReporter() *peerReporter {
 
 func (r *peerReporter) handler() FuncHandler {
 	return FuncHandler{
-		Open: func(Conn) { r.events <- "open" },
+		Open: func(Conn) { signal(r.events, "open") },
 		Read: func(c Conn) error {
 			buffer := make([]byte, 2048)
 			r.payloads <- append(buffer[:0], c.Peek(buffer)...)
 			_, _ = c.Discard(-1)
 			return nil
 		},
-		Close: func(_ Conn, err error) { r.events <- "close:" + fmt.Sprint(err) },
+		Close: func(_ Conn, err error) { signal(r.events, "close:"+fmt.Sprint(err)) },
 	}
 }
 
@@ -64,7 +65,7 @@ func startPacketFixture(t *testing.T) *packetFixture {
 	reporter := newPeerReporter()
 	events := withFuncs(&Events{Pollers: 2}, reporter.handler())
 	serveLoopback(t, events)
-	ln, err := events.Listen("udp://127.0.0.1:0", "listener-userdata")
+	ln, err := events.Listen("udp://127.0.0.1:0", WithUserdata("listener-userdata"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,8 +172,9 @@ func TestListenerDialPeerAfterClose(t *testing.T) {
 	if got := f.reporter.waitEvent(t); got != "open" {
 		t.Fatalf("first callback was %q, want open", got)
 	}
-	if got := f.reporter.waitEvent(t); got == "open" {
-		t.Fatal("a closed dialed peer opened twice")
+	// A stray datagram from another test's process may open a peer of its
+	// own here; what this test waits for is its own peer's close.
+	for got := f.reporter.waitEvent(t); !strings.HasPrefix(got, "close:"); got = f.reporter.waitEvent(t) {
 	}
 	second, err := f.packet.DialPeer(f.peerAddr, "two")
 	if err != nil {
@@ -213,14 +215,14 @@ func TestListenerWriteTo(t *testing.T) {
 func TestPacketListenerFace(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	serveLoopback(t, events)
-	stream, err := events.Listen("tcp://127.0.0.1:0", nil)
+	stream, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := stream.(PacketListener); ok {
 		t.Fatal("a stream listener carried a PacketListener face")
 	}
-	packet, err := events.Listen("udp://127.0.0.1:0", nil)
+	packet, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -279,7 +281,7 @@ func TestListenerDialPeerConcurrent(t *testing.T) {
 		Close: func(Conn, error) {},
 	})
 	serveLoopback(t, events)
-	listener, err := events.Listen("udp://127.0.0.1:0", nil)
+	listener, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

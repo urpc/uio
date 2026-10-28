@@ -835,7 +835,7 @@ func (c *Conn) tryCloseTransport() (bool, error) {
 }
 
 func (c *Conn) closePendingTransport() (bool, error) {
-	if !c.writes.close.claimPendingTransportClose() {
+	if !c.writes.close.claimPendingTransportClose(c.wireTracked()) {
 		return false, nil
 	}
 	c.stopCloseTimer()

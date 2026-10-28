@@ -60,7 +60,7 @@ func BenchmarkSocketEcho(b *testing.B) {
 				go func() { done <- events.Serve() }()
 				b.Cleanup(func() { _ = events.Close(nil); <-done })
 				<-started
-				listener, err := events.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(chain...))
+				listener, err := events.Listen("tcp://127.0.0.1:0", uio.WithLayers(chain...))
 				if err != nil {
 					b.Fatal(err)
 				}

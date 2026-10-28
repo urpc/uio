@@ -93,22 +93,22 @@ type layeredEvents struct {
 	layers []uio.Layer
 }
 
-func (e *layeredEvents) Listen(addr string, userdata any, opts ...uio.ListenOption) (uio.Listener, error) {
+func (e *layeredEvents) Listen(addr string, opts ...uio.ListenOption) (uio.Listener, error) {
 	if len(e.layers) > 0 {
 		opts = append([]uio.ListenOption{uio.WithLayers(e.layers...)}, opts...)
 	}
-	return e.Events.Listen(addr, userdata, opts...)
+	return e.Events.Listen(addr, opts...)
 }
 
-func (e *layeredEvents) Dial(addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
-	return e.DialContext(context.Background(), addr, userdata, opts...)
+func (e *layeredEvents) Dial(addr string, opts ...uio.DialOption) (uio.Conn, error) {
+	return e.DialContext(context.Background(), addr, opts...)
 }
 
-func (e *layeredEvents) DialContext(ctx context.Context, addr string, userdata any, opts ...uio.DialOption) (uio.Conn, error) {
+func (e *layeredEvents) DialContext(ctx context.Context, addr string, opts ...uio.DialOption) (uio.Conn, error) {
 	if len(e.layers) > 0 {
 		opts = append([]uio.DialOption{uio.WithLayers(e.layers...)}, opts...)
 	}
-	return e.Events.DialContext(ctx, addr, userdata, opts...)
+	return e.Events.DialContext(ctx, addr, opts...)
 }
 
 // layerEvents serves events whose endpoints carry the layers and handler on
@@ -137,9 +137,9 @@ func layerEvents(t *testing.T, handler uio.Handler, listen bool, layers ...uio.L
 	var listener uio.Listener
 	var err error
 	if len(layers) > 0 {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil, uio.WithLayers(layers...))
+		listener, err = events.Listen("tcp://127.0.0.1:0", uio.WithLayers(layers...))
 	} else {
-		listener, err = events.Listen("tcp://127.0.0.1:0", nil)
+		listener, err = events.Listen("tcp://127.0.0.1:0")
 	}
 	if err != nil {
 		t.Fatal(err)
@@ -152,7 +152,7 @@ func dialLayer(t *testing.T, events *layeredEvents, addr string) uio.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,7 +282,7 @@ func TestLayerHandshakeRefusal(t *testing.T) {
 	client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", LayerOptions{})))
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	_, err := client.DialContext(ctx, "tcp://"+addr, nil)
+	_, err := client.DialContext(ctx, "tcp://"+addr)
 	var refused *HandshakeError
 	if !errors.As(err, &refused) || refused.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("DialContext = %v, want a 401 HandshakeError", err)
@@ -427,7 +427,7 @@ func TestLayerOptionsRefuseTransportSettings(t *testing.T) {
 	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+addr+"/", LayerOptions{Options: Options{Pollers: 2}}))
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if _, err := client.DialContext(ctx, "tcp://"+addr, nil); !errors.Is(err, ErrInvalidOptions) {
+	if _, err := client.DialContext(ctx, "tcp://"+addr); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("a dial through a misconfigured layer = %v, want ErrInvalidOptions", err)
 	}
 }
@@ -568,7 +568,7 @@ func TestServerLayerKeepsUserdataAuthorizeLeaves(t *testing.T) {
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", "listener's", uio.WithLayers(ServerLayer(LayerOptions{Authorize: func(*http.Request) (any, error) { return nil, nil }})))
+	listener, err := events.Listen("tcp://127.0.0.1:0", uio.WithLayers(ServerLayer(LayerOptions{Authorize: func(*http.Request) (any, error) { return nil, nil }})), uio.WithUserdata("listener's"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -692,8 +692,9 @@ func TestClientLayerOverAHoldingLayer(t *testing.T) {
 // holdUntilFlush holds what is written to it until Flush.
 type holdUntilFlush struct {
 	uio.PassThrough
-	mu   sync.Mutex
-	held []byte
+	mu      sync.Mutex
+	held    []byte
+	writeMu sync.Mutex // orders flushes: a turn's and a caller's may run at once
 }
 
 func (h *holdUntilFlush) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
@@ -710,6 +711,10 @@ func (h *holdUntilFlush) OutboundHeld(uio.LayerContext) int {
 }
 
 func (h *holdUntilFlush) Flush(ctx uio.LayerContext) error {
+	// Flushes may overlap — a turn's and the caller of Flush — so what one
+	// takes leaves below before the next takes anything.
+	h.writeMu.Lock()
+	defer h.writeMu.Unlock()
 	h.mu.Lock()
 	held := h.held
 	h.held = nil
@@ -1029,13 +1034,13 @@ func TestPingBelowAShrinkingLayer(t *testing.T) {
 		t.Fatal("no WebSocket layer")
 	}
 	heartbeat := ws.conn.Load().heartbeat
-	gate.close() // the next Ping waits in the gate as its position is read
+	gate.close() // the next Ping waits in the gate as its receipt is taken
 	deadline := time.Now().Add(testIOTimeout())
 	for {
 		heartbeat.mu.Lock()
-		target := heartbeat.pingWireTarget
+		tracked := heartbeat.pingReceipt
 		heartbeat.mu.Unlock()
-		if target != 0 && gate.held() > 0 {
+		if tracked != (uio.SendReceipt{}) && gate.held() > 0 {
 			break
 		}
 		if time.Now().After(deadline) {
@@ -1046,14 +1051,14 @@ func TestPingBelowAShrinkingLayer(t *testing.T) {
 	gate.releaseHalf() // the gate sends half of what it held, and holds nothing
 	for {
 		heartbeat.mu.Lock()
-		sentAt, target := heartbeat.pingSentAt, heartbeat.pingWireTarget
+		sentAt := heartbeat.pingSentAt
 		heartbeat.mu.Unlock()
 		if sentAt != 0 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("the queue below emptied but the Ping was never marked sent: target %d, wire sent %d",
-				target, ws.conn.Load().raw.(uio.WireCounter).WireSent())
+			t.Fatalf("the queue below emptied but the Ping was never marked sent: wire sent %d",
+				ws.conn.Load().raw.(uio.WireCounter).WireSent())
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
@@ -1181,7 +1186,7 @@ func TestLayerHeartbeatWhileTheLayerAboveHolds(t *testing.T) {
 	closed := make(chan error, 1)
 	idle := uio.FuncHandler{
 		Read:  func(uio.Conn) error { return nil }, // reads nothing
-		Close: func(_ uio.Conn, err error) { closed <- err },
+		Close: func(_ uio.Conn, err error) { signal(closed, err) },
 	}
 	heartbeat := LayerOptions{Options: Options{
 		HeartbeatInterval: 20 * time.Millisecond,

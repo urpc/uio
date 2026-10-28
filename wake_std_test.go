@@ -21,7 +21,7 @@ func TestWakeUDPChildIntervalStopsAtClose(t *testing.T) {
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
 
-	listener, err := events.Listen("udp://127.0.0.1:0", nil)
+	listener, err := events.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

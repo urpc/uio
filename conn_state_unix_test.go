@@ -20,7 +20,9 @@ package uio
 
 import (
 	"context"
+	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,7 +45,8 @@ func stateOnTurn(t *testing.T, conn Conn, seen *atomic.Uint32, want ConnState) C
 }
 
 // The peer's end shows once what it sent is read, the writing half's once
-// CloseWrite ran, and the close's when it begins — each read on a turn.
+// CloseWrite ran, and the close's when both halves ended — each read on a
+// turn.
 func TestConnStateBits(t *testing.T) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -51,6 +54,9 @@ func TestConnStateBits(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	peerDone := make(chan struct{})
+	peerRelease := make(chan struct{})
+	release := sync.OnceFunc(func() { close(peerRelease) })
+	t.Cleanup(release)
 	go func() {
 		defer close(peerDone)
 		peer, err := listener.Accept()
@@ -58,16 +64,21 @@ func TestConnStateBits(t *testing.T) {
 			return
 		}
 		defer peer.Close()
-		_, _ = peer.Write([]byte("hi"))
+		if _, err := peer.Write([]byte("hi")); err != nil {
+			return
+		}
+		<-peerRelease
 		_ = peer.(*net.TCPConn).CloseWrite()
-		time.Sleep(300 * time.Millisecond)
+		// Keep the reading half open so the connection under test ends when
+		// both its halves have, not on the peer's full close.
+		_, _ = io.Copy(io.Discard, peer)
 	}()
 	opened := make(chan Conn, 1)
 	var seen, closeSeen atomic.Uint32
 	events := dialLayered(t, listener.Addr().String(), nil, func(ev *Events) {
 		ev.AllowHalfOpen = true
 		ev.Handler = FuncHandler{
-			Open: func(c Conn) { opened <- c },
+			Open: func(c Conn) { signal(opened, c) },
 			Read: func(c Conn) error {
 				seen.Store(uint32(c.State()))
 				_, _ = c.Discard(c.InboundBuffered())
@@ -78,25 +89,28 @@ func TestConnStateBits(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil); err != nil {
+	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
 		t.Fatal(err)
 	}
 	server := <-opened
-	state := stateOnTurn(t, server, &seen, StatePeerEnded)
-	if state&StateWriteShut != 0 {
-		t.Fatalf("State() = %b, writes not shut yet", state)
-	}
+	// Shut while the peer's stream is still open: once both halves have
+	// ended, the turn that shuts this one closes the connection itself (see
+	// closeIfEnded), leaving no later turn to see the state on.
 	if err := server.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
+	if state := stateOnTurn(t, server, &seen, StateWriteShut); state&StatePeerEnded != 0 {
+		t.Fatalf("State() = %b, the peer has not ended yet", state)
+	}
+	release()
 	stateOnTurn(t, server, &seen, StatePeerEnded|StateWriteShut)
-	_ = server.CloseWith(nil)
 	deadline := time.Now().Add(layerWait)
 	for ConnState(closeSeen.Load())&StateClosed == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if state := ConnState(closeSeen.Load()); state&(StateClosing|StateClosed) != StateClosing|StateClosed {
-		t.Fatalf("OnClose saw State() = %b, want closing and closed", state)
+	both := StatePeerEnded | StateWriteShut | StateClosing | StateClosed
+	if state := ConnState(closeSeen.Load()); state&both != both {
+		t.Fatalf("OnClose saw State() = %b, want both ends ended, closing and closed", state)
 	}
 	<-peerDone
 }
@@ -147,7 +161,7 @@ func TestLayerDownStatePeerEnded(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

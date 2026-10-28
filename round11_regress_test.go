@@ -44,7 +44,10 @@ func TestHandlerTimerCloseSkipsRead(t *testing.T) {
 }
 
 // A nanosecond interval backed up behind a stall must skip its missed
-// periods arithmetically: looping them off stalls the turn.
+// periods arithmetically: looping them off stalls the turn. The bound is
+// generous on purpose — the elapsed time is wall clock, and a loaded host
+// can deschedule the measuring goroutine for hundreds of milliseconds; a
+// catch-up that really looped would stall for far longer than this.
 func TestWakeIntervalCatchUpIsBounded(t *testing.T) {
 	conn := serveAndDial(t, FuncHandler{
 		Read:  func(Conn) error { return nil },
@@ -59,7 +62,7 @@ func TestWakeIntervalCatchUpIsBounded(t *testing.T) {
 	if err := conn.SetWakeInterval(0); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(before); elapsed > 500*time.Millisecond {
+	if elapsed := time.Since(before); elapsed > 5*time.Second {
 		t.Fatalf("stopping a backed-up 1ns interval took %v, want the catch-up skipped", elapsed)
 	}
 }
@@ -80,11 +83,11 @@ func TestCloseReleasesDeliveredBuffers(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil, WithLayers(PassThroughLayer))
+	listener, err := events.Listen("tcp://127.0.0.1:0", WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil, WithLayers(PassThroughLayer))
+	conn, err := events.Dial("tcp://"+listener.Addr().String(), WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -115,7 +115,7 @@ func (h *httpEchoHandler) OnOpen(conn *Conn) {
 
 func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
 	opened := make(chan struct{}, 1)
-	server := NewServer(Options{Handler: handlerFuncs{onOpen: func(*Conn) { opened <- struct{}{} }}})
+	server := NewServer(Options{Handler: handlerFuncs{onOpen: func(*Conn) { signal(opened, struct{}{}) }}})
 	server.Options.Pollers = 1
 	serveWithoutListener(t, server)
 	httpServer := httptest.NewServer(server)

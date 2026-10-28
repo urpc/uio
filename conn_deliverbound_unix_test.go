@@ -81,7 +81,7 @@ func TestFullDeliveryPacesTheLayer(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestUpWriteTakesAll(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

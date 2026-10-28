@@ -15,6 +15,7 @@ import (
 type listenEcho struct {
 	mu     sync.Mutex
 	opened []any
+	remote []string // each opened connection's peer address, in order
 	closed chan error
 }
 
@@ -25,6 +26,7 @@ func (h *listenEcho) events() *Events {
 		Open: func(c Conn) {
 			h.mu.Lock()
 			h.opened = append(h.opened, c.Userdata())
+			h.remote = append(h.remote, c.RemoteAddr().String())
 			h.mu.Unlock()
 		},
 		Read: func(c Conn) error {
@@ -46,6 +48,21 @@ func (h *listenEcho) userdata() []any {
 	return append([]any(nil), h.opened...)
 }
 
+// openedFrom reports the userdata of the connections whose peer is at addr.
+// A connection nobody here dialed — a stray of another test on a host
+// reusing freed ports — cannot pass for the one under test.
+func (h *listenEcho) openedFrom(addr string) []any {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	var mine []any
+	for i, remote := range h.remote {
+		if remote == addr {
+			mine = append(mine, h.opened[i])
+		}
+	}
+	return mine
+}
+
 func echoOnce(t *testing.T, c net.Conn, payload string) {
 	t.Helper()
 	if _, err := io.WriteString(c, payload); err != nil {
@@ -58,16 +75,20 @@ func echoOnce(t *testing.T, c net.Conn, payload string) {
 	}
 }
 
+// waitRefused waits until nothing listens at addr any more. A listener Close
+// freed is free to bind, so a bind that wins proves it gone — and takes the
+// address back for its instant, where a dial loop would instead spew
+// connections at whatever process reused the freed port meanwhile.
 func waitRefused(t *testing.T, addr string) {
 	t.Helper()
 	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(time.Millisecond) {
-		c, err := net.DialTimeout("tcp", addr, time.Second)
-		if err != nil {
+		ln, err := net.Listen("tcp", addr)
+		if err == nil {
+			_ = ln.Close()
 			return
 		}
-		_ = c.Close()
 		if time.Now().After(deadline) {
-			t.Fatalf("%s still accepts after its listener closed", addr)
+			t.Fatalf("%s still held after its listener closed: %v", addr, err)
 		}
 	}
 }
@@ -79,7 +100,7 @@ func TestListenAddsAndClosesAnAddress(t *testing.T) {
 	events := h.events()
 	_, done := serveLoopback(t, events)
 	_ = done
-	ln, err := events.Listen("tcp://127.0.0.1:0", "proxy-a")
+	ln, err := events.Listen("tcp://127.0.0.1:0", WithUserdata("proxy-a"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +111,8 @@ func TestListenAddsAndClosesAnAddress(t *testing.T) {
 	}
 	defer client.Close()
 	echoOnce(t, client, "before close")
-	if got := h.userdata(); len(got) != 1 || got[0] != "proxy-a" {
-		t.Fatalf("accepted connections opened with %v, want [proxy-a]", got)
+	if got := h.openedFrom(client.LocalAddr().String()); len(got) != 1 || got[0] != "proxy-a" {
+		t.Fatalf("the client's connection opened with %v, want [proxy-a]", got)
 	}
 	if err := ln.Close(); err != nil {
 		t.Fatal(err)
@@ -108,11 +129,11 @@ func TestListenAddsAndClosesAnAddress(t *testing.T) {
 func TestListenOutsideServe(t *testing.T) {
 	h := newListenEcho()
 	events := h.events()
-	if _, err := events.Listen("tcp://127.0.0.1:0", nil); !errors.Is(err, net.ErrClosed) {
+	if _, err := events.Listen("tcp://127.0.0.1:0"); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Listen before Serve = %v, want %v", err, net.ErrClosed)
 	}
 	_, done := serveLoopback(t, events)
-	ln, err := events.Listen("tcp://127.0.0.1:0", nil)
+	ln, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +147,7 @@ func TestListenOutsideServe(t *testing.T) {
 	if err := ln.Close(); err != nil {
 		t.Fatalf("Close after the Events closed = %v", err)
 	}
-	if _, err := events.Listen("tcp://127.0.0.1:0", nil); !errors.Is(err, net.ErrClosed) {
+	if _, err := events.Listen("tcp://127.0.0.1:0"); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("Listen after Close = %v, want %v", err, net.ErrClosed)
 	}
 }
@@ -138,7 +159,7 @@ func TestListenDuringOnStart(t *testing.T) {
 	events := h.events()
 	added := make(chan Listener, 1)
 	funcs(events).Start = func(ev *Events) {
-		ln, err := ev.Listen("tcp://127.0.0.1:0", "early")
+		ln, err := ev.Listen("tcp://127.0.0.1:0", WithUserdata("early"))
 		if err != nil {
 			t.Error(err)
 		}
@@ -180,11 +201,11 @@ func TestListenersAreIndependent(t *testing.T) {
 	h := newListenEcho()
 	events := h.events()
 	serveLoopback(t, events)
-	first, err := events.Listen("tcp://127.0.0.1:0", 1)
+	first, err := events.Listen("tcp://127.0.0.1:0", WithUserdata(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := events.Listen("tcp://127.0.0.1:0", 2)
+	second, err := events.Listen("tcp://127.0.0.1:0", WithUserdata(2))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,7 +235,7 @@ func TestListenCloseChurnWhileDialing(t *testing.T) {
 		rounds = 40
 	}
 	for round := range rounds {
-		ln, err := events.Listen("tcp://127.0.0.1:0", round)
+		ln, err := events.Listen("tcp://127.0.0.1:0", WithUserdata(round))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +266,7 @@ func TestListenUDPPeersCloseWithTheirListener(t *testing.T) {
 	h := newListenEcho()
 	events := h.events()
 	serveLoopback(t, events)
-	ln, err := events.Listen("udp://127.0.0.1:0", "udp-proxy")
+	ln, err := events.Listen("udp://127.0.0.1:0", WithUserdata("udp-proxy"))
 	if err != nil {
 		t.Fatal(err)
 	}

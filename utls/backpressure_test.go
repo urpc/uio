@@ -52,7 +52,7 @@ func TestTLSWritesAgainAfterTheQueueDrains(t *testing.T) {
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(Client(clientConfig)))
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), uio.WithLayers(Client(clientConfig)))
 	if err != nil {
 		t.Fatal(err)
 	}

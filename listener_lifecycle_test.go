@@ -37,12 +37,12 @@ func TestListenerCloseLifecycleOrderings(t *testing.T) {
 			want := errors.New("peer requested close")
 			ev := withFuncs(&Events{Pollers: 1}, FuncHandler{
 				Start: func(ev *Events) {
-					ln, err := ev.Listen("udp4://127.0.0.1:0", nil)
+					ln, err := ev.Listen("udp4://127.0.0.1:0")
 					if err != nil {
 						t.Error(err)
 						return
 					}
-					other, err = ev.Listen("tcp4://127.0.0.1:0", nil)
+					other, err = ev.Listen("tcp4://127.0.0.1:0")
 					if err != nil {
 						t.Error(err)
 						return
@@ -135,14 +135,14 @@ func TestListenControlMayClose(t *testing.T) {
 					waitLifecycle(t, serveDone, "Serve cleanup")
 				})
 				waitLifecycle(t, started, "OnStart")
-				other, err := ev.Listen("udp4://127.0.0.1:0", nil)
+				other, err := ev.Listen("udp4://127.0.0.1:0")
 				if err != nil {
 					t.Fatal(err)
 				}
 				listenDone := make(chan struct{})
 				var added Listener
 				go func() {
-					added, err = ev.Listen(network+"://127.0.0.1:0", nil,
+					added, err = ev.Listen(network+"://127.0.0.1:0",
 						WithListenControl(func(string, string, uintptr) error {
 							if target == "events" {
 								return ev.Close(nil)
@@ -190,7 +190,7 @@ func TestListenControlShutdownAdmission(t *testing.T) {
 			waitLifecycle(t, started, "OnStart")
 			listenDone := make(chan struct{})
 			go func() {
-				ln, err := ev.Listen(network+"://127.0.0.1:0", nil,
+				ln, err := ev.Listen(network+"://127.0.0.1:0",
 					WithListenControl(func(string, string, uintptr) error {
 						close(entered)
 						<-resume
@@ -234,7 +234,7 @@ func TestConnControlMayClose(t *testing.T) {
 				waitLifecycle(t, serveDone, "Serve cleanup")
 			})
 			waitLifecycle(t, started, "OnStart")
-			ln, err := ev.Listen(network+"://127.0.0.1:0", nil)
+			ln, err := ev.Listen(network + "://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -242,7 +242,7 @@ func TestConnControlMayClose(t *testing.T) {
 			if network == "udp4" {
 				conn, err = ln.(PacketListener).DialPeer(netip.MustParseAddrPort("127.0.0.1:9876"), "control")
 			} else {
-				conn, err = ev.Dial(network+"://"+ln.Addr().String(), "control")
+				conn, err = ev.Dial(network+"://"+ln.Addr().String(), WithUserdata("control"))
 			}
 			if err != nil {
 				t.Fatal(err)

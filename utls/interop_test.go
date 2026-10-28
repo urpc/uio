@@ -69,7 +69,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		}
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -137,7 +137,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		}
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -158,7 +158,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		}
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -186,7 +186,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		clientConfig := &tls.Config{ServerName: "localhost", RootCAs: nil}
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -211,7 +211,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		<-started
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil, uio.WithLayers(Client(clientConfig))); err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), uio.WithLayers(Client(clientConfig))); err == nil {
 			t.Fatal("a refused certificate reported no error")
 		}
 		if callbacks != 0 {
@@ -234,7 +234,7 @@ func TestTLSOverTLS(t *testing.T) {
 	innerServer, innerClient := testConfigs(t)
 	server := newEcho()
 	transport := serveTLS(t, server, Server(outerServer), Server(innerServer))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestTLSOverGateLayer(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig), gate)
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

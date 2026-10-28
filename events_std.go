@@ -44,8 +44,8 @@ import (
 //	Dial("udp://[fe80::1%lo0]:53")
 //	Dial("tcp://:80")
 //	Dial("unix:///path/your/unix.sock")
-func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, error) {
-	return ev.defaultDialer().Dial(addr, userdata, opts...)
+func (ev *Events) Dial(addr string, opts ...DialOption) (Conn, error) {
+	return ev.defaultDialer().Dial(addr, opts...)
 }
 
 // Adopt transfers ownership of an established stream connection to ev. The
@@ -54,14 +54,14 @@ func (ev *Events) Dial(addr string, userdata any, opts ...DialOption) (Conn, err
 // DialContext does: once the whole stack opened, with the top layer's
 // connection — the one the Handler holds — and a stack that fails before
 // that reports its error; see AdoptContext to bound the wait.
-func (ev *Events) Adopt(conn net.Conn, userdata any, opts ...AdoptOption) (Conn, error) {
-	return ev.AdoptContext(context.Background(), conn, userdata, opts...)
+func (ev *Events) Adopt(conn net.Conn, opts ...AdoptOption) (Conn, error) {
+	return ev.AdoptContext(context.Background(), conn, opts...)
 }
 
 // AdoptContext is Adopt with ctx bounding the wait for the layers to open; a
 // stack still opening when ctx ends is closed, and AdoptContext reports the
 // cause. Without layers there is nothing to wait for.
-func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any, opts ...AdoptOption) (Conn, error) {
+func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, opts ...AdoptOption) (Conn, error) {
 	if conn == nil {
 		return nil, ErrUnsupported
 	}
@@ -70,6 +70,7 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any,
 		return nil, net.ErrClosed
 	}
 	cfg := adoptConfigFor(opts)
+	userdata := cfg.userdata
 	layered := cfg.hasLayers
 	if layered && isEventLoopGoroutine() {
 		_ = conn.Close()
@@ -121,8 +122,8 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any,
 // callback blocks that callback until dialing completes.
 // A connection it returns gets OnOpen and, at its end, OnClose, even if it is
 // closed first; after an error no callback runs for it.
-func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {
-	return ev.defaultDialer().DialContext(dialCtx, addr, userdata, opts...)
+func (ev *Events) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
+	return ev.defaultDialer().DialContext(dialCtx, addr, opts...)
 }
 
 // Dialer dials through one Events with private defaults — the options it was
@@ -133,7 +134,7 @@ func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any
 // Dialer's.
 type Dialer struct {
 	ev  *Events
-	cfg DialConfig
+	cfg dialConfig
 
 	entryOnce sync.Once
 	entry     *entry
@@ -141,9 +142,10 @@ type Dialer struct {
 }
 
 // Dialer returns a Dialer of ev with opts as its defaults: WithLayers names
-// the chain every dial of it runs unless the dial names its own. It fails on
-// a chain a connection cannot carry; a chain's layers are attached when a
-// dial runs.
+// the chain every dial of it runs unless the dial names its own, and
+// WithUserdata the Userdata its connections start with unless the dial sets
+// its own. It fails on a chain a connection cannot carry; a chain's layers
+// are attached when a dial runs.
 func (ev *Events) Dialer(opts ...DialOption) (*Dialer, error) {
 	cfg := dialConfigFor(opts)
 	if err := validateChain(cfg.layers, cfg.hasLayers); err != nil {
@@ -168,13 +170,13 @@ func (d *Dialer) dialerEntry() (*entry, error) {
 }
 
 // Dial dials addr with this Dialer; see DialContext.
-func (d *Dialer) Dial(addr string, userdata any, opts ...DialOption) (Conn, error) {
-	return d.DialContext(context.Background(), addr, userdata, opts...)
+func (d *Dialer) Dial(addr string, opts ...DialOption) (Conn, error) {
+	return d.DialContext(context.Background(), addr, opts...)
 }
 
 // DialContext connects synchronously through this Dialer's Events; see
 // Events.DialContext.
-func (d *Dialer) DialContext(dialCtx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {
+func (d *Dialer) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
 	ev := d.ev
 	config := d.cfg
 	callLayers := false
@@ -182,11 +184,12 @@ func (d *Dialer) DialContext(dialCtx context.Context, addr string, userdata any,
 		if opt == nil {
 			continue
 		}
-		if _, ok := opt.(LayersOption); ok {
+		if _, ok := opt.(layersOption); ok {
 			callLayers = true
 		}
 		opt.applyDial(&config)
 	}
+	userdata := config.userdata
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}

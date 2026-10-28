@@ -228,7 +228,7 @@ func TestDialedConnectionRunsOpenBeforeRead(t *testing.T) {
 
 	const dials = 20
 	for i := 0; i < dials; i++ {
-		if _, err := events.Dial("tcp://"+peer.Addr().String(), nil); err != nil {
+		if _, err := events.Dial("tcp://" + peer.Addr().String()); err != nil {
 			t.Fatal(err)
 		}
 		select {

@@ -76,7 +76,7 @@ func dialOverride(t *testing.T, events *layeredEvents, addr string, opts ...Dial
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil, opts...)
+	conn, err := events.DialContext(ctx, "tcp://"+addr, opts...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +139,7 @@ func TestWithLayersOnChainlessEvents(t *testing.T) {
 	adopted := &markLayer{}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.AdoptContext(ctx, raw, nil, WithLayers(layerOf(adopted)))
+	conn, err := events.AdoptContext(ctx, raw, WithLayers(layerOf(adopted)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +161,7 @@ func TestWithLayersLayerCap(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	_, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(chain...))
+	_, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(chain...))
 	if err == nil || !strings.Contains(err.Error(), "at most") {
 		t.Fatalf("DialContext = %v, want the layer cap refused", err)
 	}
@@ -172,7 +172,7 @@ func TestWithLayersRefusesPacketConnections(t *testing.T) {
 	events := dialLayered(t, overrideListener(t, 0), nil, nil)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "udp://127.0.0.1:1", nil, WithLayers(PassThroughLayer)); !errors.Is(err, ErrLayersNeedStream) {
+	if _, err := events.DialContext(ctx, "udp://127.0.0.1:1", WithLayers(PassThroughLayer)); !errors.Is(err, ErrLayersNeedStream) {
 		t.Fatalf("DialContext = %v, want ErrLayersNeedStream", err)
 	}
 }
@@ -194,7 +194,7 @@ func TestWithLayersConcurrentDials(t *testing.T) {
 			defer wg.Done()
 			ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 			defer cancel()
-			conn, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(layerOf(own[i])))
+			conn, err := events.DialContext(ctx, "tcp://"+addr, WithLayers(layerOf(own[i])))
 			if err != nil {
 				t.Error(err)
 				return
@@ -224,7 +224,7 @@ func TestAdoptWithLayersOverridesTheChain(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.AdoptContext(ctx, raw, nil, WithLayers(layerOf(own)))
+	conn, err := events.AdoptContext(ctx, raw, WithLayers(layerOf(own)))
 	if err != nil {
 		t.Fatal(err)
 	}

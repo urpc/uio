@@ -68,6 +68,35 @@ type Conn struct {
 	closeTimer atomic.Pointer[closeTimerState]
 }
 
+// setRaw installs the transport the connection runs on and records whether
+// it hands out wire receipts (uio.TrackedWriter): with layers, the connection
+// follows the Close frame and the heartbeat Ping by their receipts instead of
+// counting bytes; a plain socket has no wire position to hand out and keeps
+// the byte accounting. The bit rides the close flags so the connection keeps
+// its size class.
+func (c *Conn) setRaw(raw uio.LayerDown) {
+	c.raw = raw
+	if _, ok := raw.(uio.TrackedWriter); ok {
+		c.writes.close.flags.Or(wireTrackedFlag)
+	}
+}
+
+// wireTracked reports a transport that hands out wire receipts; see setRaw.
+func (c *Conn) wireTracked() bool { return c.writes.close.flags.Load()&wireTrackedFlag != 0 }
+
+// receiptSent is a tracked write's proof that the wire passed r. The Close
+// frame and the heartbeat Ping are the tracked writes, and each takes its
+// proof here: the Close frame lets the transport close be claimed, the Ping
+// starts the Pong timeout.
+func (c *Conn) receiptSent(r uio.SendReceipt) {
+	if c.writes.close.claimReceipt(r) && c.writes.close.closePending() {
+		_, _ = c.tryCloseTransport()
+	}
+	if heartbeat := c.heartbeat; heartbeat != nil && heartbeat.claimPingReceipt(r) {
+		heartbeat.markPingReceiptSent(time.Now())
+	}
+}
+
 // connWriteState serializes frame construction and submission. mu is held only
 // while one message or control frame is encoded and handed to UIO, never
 // across application code, so every sender may wait for it. close tracks
@@ -82,15 +111,30 @@ type connWriteState struct {
 // retiring. transitionMu only protects short state transitions; it never
 // covers socket I/O or application work.
 type connCloseProgress struct {
-	pendingBytes  atomic.Int64
-	transitionMu  sync.Mutex
-	deferredClose *deferredCloseFrame // guarded by transitionMu
-	flags         atomic.Uint32
+	pendingBytes atomic.Int64
+	transitionMu sync.Mutex
+	// aux carries the rare per-close state: the deferred Close frame's
+	// payload until it is written, then the tracked frame's receipt. It
+	// lives behind one pointer so the connection keeps its size class; only
+	// the atomic done is read outside transitionMu.
+	aux   *closeAux // guarded by transitionMu
+	flags atomic.Uint32
 }
 
-// deferredCloseFrame owns the payload of a Close frame the outbound limit had
-// no room for, until the transport drains enough to take it.
-type deferredCloseFrame struct{ payload []byte }
+// closeAux is one close's rare state: a Close frame waiting for outbound
+// room, and later — once that frame is written — the tracked frame's place on
+// the wire and whether the wire passed it. A deferred frame clears its
+// payload as it is written, so the two never both hold data.
+type closeAux struct {
+	payload []byte          // a deferred Close frame; guarded by transitionMu
+	receipt uio.SendReceipt // the tracked Close frame's position; guarded by transitionMu
+	// earlySend keeps a receipt OnSent delivered before the writer registered
+	// it: an external Close's tracked write returns from WriteTracked only
+	// after a turn may have reported its receipt, and that report must not be
+	// dropped; setReceipt consumes it. Guarded by transitionMu.
+	earlySend uio.SendReceipt
+	done      atomic.Bool // the wire passed the receipt
+}
 
 const (
 	transportCloseIdle uint32 = iota
@@ -104,6 +148,11 @@ const (
 	// from the refusal until the frame is accepted or the transport aborts.
 	closeFrameDeferred
 )
+
+// wireTrackedFlag marks a transport that hands out wire receipts; see setRaw.
+// It sits above the transport phase bits (transportPhaseShift-Mask), which
+// share this word.
+const wireTrackedFlag uint32 = 1 << 4
 
 const (
 	transportPhaseShift = 2
@@ -189,18 +238,16 @@ type heartbeatState struct {
 	// rest.
 	nextPingAt int64
 	armedAt    int64
-	// Accepted and retired are monotonic FIFO byte positions. The ping target
-	// marks when its complete frame has left the transport queue without
-	// requiring the connection's later writes to drain first.
+	// Accepted and retired are monotonic FIFO byte positions, a plain
+	// transport's: the ping target marks when its complete frame has left the
+	// transport queue without requiring the connection's later writes to
+	// drain first. A tracked transport follows the Ping by its wire receipt
+	// instead — pingReceipt, zero while that Ping is not tracked — and the
+	// counters stay still.
 	outboundAccepted atomic.Uint64
 	outboundRetired  atomic.Uint64
 	pingOutstanding  atomic.Bool
-	// Over a layered transport the positions above are the protocol's bytes
-	// and the transport reports the wire's, which the layers below change.
-	// There pingWireTarget is the wire position the Ping's frame ends at,
-	// taken from the stack's uio.WireCounter once it was handed down; zero
-	// while unknown.
-	pingWireTarget uint64
+	pingReceipt      uio.SendReceipt // guarded by mu
 }
 
 // closeTimerState protects lazy creation, replacement, and cancellation of the

@@ -100,7 +100,7 @@ func TestRejectedIOBatchHasBoundedCallbacksAndCompletesOnStop(t *testing.T) {
 // ends the turn and must release the connection itself, or it never closes.
 func TestRejectedTaskHandsBackDeferredClose(t *testing.T) {
 	closed := make(chan error, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { closed <- err }})
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Close: func(_ Conn, err error) { signal(closed, err) }})
 	testConn := newTestConnection(t, events)
 	conn := testConn.conn
 	for deadline := time.Now().Add(2 * time.Second); conn.taskState.Load()&taskScheduledBit != 0 || conn.ioOwner.Load() != 0; {

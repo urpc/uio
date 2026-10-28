@@ -3,11 +3,12 @@
 package uio
 
 import (
-	"fmt"
-	"github.com/urpc/uio/internal/socket"
 	"net"
 	"testing"
 	"time"
+
+	"github.com/urpc/uio/internal/socket"
+	"golang.org/x/sys/unix"
 )
 
 // retire waits for an accept in progress and refuses new ones, so a closing
@@ -47,7 +48,7 @@ func TestListenReusePortGroup(t *testing.T) {
 	events := h.events()
 	events.ReusePort = true
 	serveLoopback(t, events)
-	ln, err := events.Listen("tcp://127.0.0.1:0", "group")
+	ln, err := events.Listen("tcp://127.0.0.1:0", WithUserdata("group"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,10 +78,10 @@ func TestListenReusePortGroup(t *testing.T) {
 // takes over its descriptor number accepts as usual.
 func TestPausedListenerCloseBeforeResume(t *testing.T) {
 	opened := make(chan Conn, 4)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Open: func(c Conn) { opened <- c }})
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Open: func(c Conn) { signal(opened, c) }})
 	serveClosing(t, events)
 	for round := range 20 {
-		ln, err := events.Listen("tcp4://127.0.0.1:0", nil)
+		ln, err := events.Listen("tcp4://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,7 +91,7 @@ func TestPausedListenerCloseBeforeResume(t *testing.T) {
 		if err := ln.Close(); err != nil {
 			t.Fatal(err)
 		}
-		next, err := events.Listen("tcp4://127.0.0.1:0", nil)
+		next, err := events.Listen("tcp4://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -127,7 +128,7 @@ func TestReusePortGroupKeepsAddressFamily(t *testing.T) {
 		t.Run(tc.addr, func(t *testing.T) {
 			events := withFuncs(&Events{Pollers: 1, ReusePort: true}, FuncHandler{})
 			serveClosing(t, events)
-			ln, err := events.Listen(tc.addr, nil)
+			ln, err := events.Listen(tc.addr)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -144,12 +145,21 @@ func TestReusePortGroupKeepsAddressFamily(t *testing.T) {
 					t.Fatalf("member %d family = %d, want %d", i, family, tc.family)
 				}
 			}
-			port := ln.Addr().(*net.TCPAddr).Port
-			other := net.JoinHostPort(map[uint8]string{4: "[::1]", 6: "127.0.0.1"}[tc.family], fmt.Sprint(port))
-			conn, err := net.DialTimeout(tc.other, other, time.Second)
-			if err == nil {
-				_ = conn.Close()
-				t.Fatalf("a %s listener accepted a %s peer", tc.addr, tc.other)
+			if tc.family == 6 {
+				// A live dial from the other family would test the same thing,
+				// but on a shared host the random port may be bound by another
+				// process's listener meanwhile: assert the property on the
+				// socket itself. V6ONLY is what refuses IPv4 peers, and the
+				// family check above pins the rest.
+				for i, m := range group.members {
+					v6only, err := unix.GetsockoptInt(int(m.fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY)
+					if err != nil {
+						t.Fatalf("member %d IPV6_V6ONLY: %v", i, err)
+					}
+					if v6only != 1 {
+						t.Fatalf("member %d IPV6_V6ONLY = %d, a tcp4 peer could be accepted", i, v6only)
+					}
+				}
 			}
 		})
 	}

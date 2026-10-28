@@ -120,7 +120,11 @@ func TestWSSRoundTrip(t *testing.T) {
 	serverTLS, clientTLS := wssConfigs(t)
 	addr := startWSS(t, serverTLS)
 
-	client := newWSSRecorder()
+	// The client's handler must not echo: the server's own recorder does,
+	// and an echoing client would ping-pong "secure hello" between the two
+	// recorders until the close, filling their queues — a turn blocked on
+	// one of them then holds the shutdown up.
+	client := quietRecorder{newWSSRecorder()}
 	dialer := &Dialer{Options: Options{
 		Handler:   client,
 		TLSConfig: clientTLS,
@@ -135,11 +139,8 @@ func TestWSSRoundTrip(t *testing.T) {
 	if err := conn.SendText("secure hello"); err != nil {
 		t.Fatal(err)
 	}
-	// The server echoes, and the client's own echo handler answers back.
-	for i := 0; i < 2; i++ {
-		if got := wssWait(t, client.got, "client message"); got != "secure hello" {
-			t.Fatalf("message %d = %q", i, got)
-		}
+	if got := wssWait(t, client.got, "client message"); got != "secure hello" {
+		t.Fatalf("echo = %q", got)
 	}
 	_ = conn.Close(1000, "done")
 	select {
@@ -449,17 +450,17 @@ func TestWSSAuthorizeSeesTLS(t *testing.T) {
 }
 
 // A frame batched in a read round is still owed while it sits in the batch:
-// over a layered transport, a report that the queue below is empty retires
-// what was handed down, not what has not been yet.
-func TestBatchedFrameStaysOwedOverLayers(t *testing.T) {
-	serverTLS, clientTLS := wssConfigs(t)
-	addr := startWSS(t, serverTLS)
+// on a plain transport a report retires what was handed down, not what has
+// not been yet. (A tracked transport keeps no pending count at all: its Close
+// frame's receipt orders after whatever was queued before it.)
+func TestBatchedFrameStaysOwed(t *testing.T) {
+	addr := startEchoServer(t, robustEchoHandler{})
 	client := quietRecorder{newWSSRecorder()}
-	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	dialer := &Dialer{Options: Options{Handler: client}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
-	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+	if err := dialer.Dial(ctx, "ws://"+addr+"/", nil); err != nil {
 		t.Fatal(err)
 	}
 	conn := wssWait(t, client.opened, "the client's open")
@@ -488,7 +489,7 @@ func TestBatchedFrameStaysOwedOverLayers(t *testing.T) {
 }
 
 // Heartbeats on both ends of a wss connection under a steady pipelined load:
-// the Pings follow their frames through TLS by wire position, are answered,
+// the Pings follow their frames through TLS by wire receipt, are answered,
 // and no end is closed for a heartbeat it kept.
 func TestWSSHeartbeatUnderPipelinedLoad(t *testing.T) {
 	serverTLS, clientTLS := wssConfigs(t)
@@ -602,7 +603,10 @@ func TestDialerMixedSchemes(t *testing.T) {
 	wssAddr := startWSS(t, serverTLS)
 	plainAddr := startPlain(t)
 
-	client := newWSSRecorder()
+	// quietRecorder, not the echoing server recorder: an echoing client
+	// handler ping-pongs every echo back until the close, and under load
+	// the two queues fill and a blocked turn holds the shutdown up.
+	client := quietRecorder{newWSSRecorder()}
 	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
 	t.Cleanup(func() { _ = dialer.Close(nil) })
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
@@ -642,4 +646,13 @@ func TestDialerMixedSchemes(t *testing.T) {
 	waitMessage("clear")
 	_ = secure.Close(1000, "done")
 	_ = clear.Close(1000, "done")
+}
+
+// signal delivers v to ch without blocking: a callback that signals must not
+// hold up the turn that runs it.
+func signal[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
 }

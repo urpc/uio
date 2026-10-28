@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -191,7 +192,9 @@ func TestInboundLimitResumesAfterWakeConsumes(t *testing.T) {
 		time.Sleep(2 * time.Millisecond)
 		consume.Store(true)
 		if err := server.Wake(); err != nil {
-			t.Fatal(err)
+			buf := make([]byte, 1<<20)
+			buf = buf[:runtime.Stack(buf, true)]
+			t.Fatalf("Wake = %v; state=%b stacks:\n%s", err, server.State(), buf)
 		}
 		time.Sleep(2 * time.Millisecond)
 		consume.Store(false)
@@ -267,7 +270,7 @@ func TestInboundLimitBoundsARelayToASlowReader(t *testing.T) {
 	}
 	client, server := serveInboundTest(t, events)
 	relayIn.Store(server)
-	out, err := events.Dial("tcp://"+sinkLn.Addr().String(), "out")
+	out, err := events.Dial("tcp://"+sinkLn.Addr().String(), WithUserdata("out"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -399,7 +402,7 @@ func TestInboundLimitCloseWhileHeld(t *testing.T) {
 		MaxInboundBuffered: limit,
 	}, FuncHandler{
 		Read:  func(Conn) error { return nil },
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	writeUntilStalled(t, client, 16<<20)
@@ -433,7 +436,7 @@ func TestInboundLimitHangupBehindHeldReads(t *testing.T) {
 			}
 			return nil
 		},
-		Close: func(_ Conn, err error) { closed <- err },
+		Close: func(_ Conn, err error) { signal(closed, err) },
 	})
 	client, server := serveInboundTest(t, events)
 	const total = 256 << 10
@@ -485,7 +488,7 @@ func TestInboundLimitDeadlineWhileHeld(t *testing.T) {
 						MaxInboundBuffered: limit,
 					}, FuncHandler{
 						Read:  func(Conn) error { return nil },
-						Close: func(_ Conn, err error) { closed <- err },
+						Close: func(_ Conn, err error) { signal(closed, err) },
 					})
 					client, server := serveInboundTest(t, events)
 					if when == "before hold" {
@@ -594,7 +597,7 @@ func TestInboundLimitDeadlineEdgeValuesWhileHeld(t *testing.T) {
 				MaxInboundBuffered: limit,
 			}, FuncHandler{
 				Read:  func(Conn) error { return nil },
-				Close: func(_ Conn, err error) { closed <- err },
+				Close: func(_ Conn, err error) { signal(closed, err) },
 			})
 			client, server := serveInboundTest(t, events)
 			writeUntilStalled(t, client, 16<<20)

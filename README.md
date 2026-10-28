@@ -82,8 +82,8 @@ func main() {
 Once `Serve` is running (`Serve()` with no address for a dial-only client),
 the same `Events` can dial out with `Dial` or `DialContext`, take over an
 established stream `net.Conn` with `Adopt`, or add an address with
-`Listen(addr, userdata)`. Each connection a listener accepts starts with its
-userdata, and closing the returned `Listener` stops accepting there while the
+`Listen(addr, opts...)`. Each connection a listener accepts starts with the
+`Userdata` its `WithUserdata` option names, and closing the returned `Listener` stops accepting there while the
 connections it accepted stay open (a UDP listener's peers share its socket and
 close with it). A packet listener also dials: assert the returned
 `Listener` to a `PacketListener` and `DialPeer(raddr, userdata)` makes the
@@ -208,7 +208,7 @@ func (x *xorHandler) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	return len(p), nil
 }
 
-ln, err := events.Listen(addr, nil, uio.WithLayers(
+ln, err := events.Listen(addr, uio.WithLayers(
 	uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &xorHandler{key: 0x5a} }),
 ))
 ```
@@ -284,22 +284,28 @@ These are UIO's to keep, not each layer's to remember:
    layer replaces another's.
 3. **The turn callbacks never overlap.** `OnOpen`, `OnRead`, `OnTimer`,
    `OnWireSent`, `OnClose` and the Handler's callbacks run on the connection's
-   turns. The others run where they are called for and may overlap the
-   turns: `OnWrite` on the writer's goroutine, `CloseGracefully` and
-   `CloseWrite` on the closing goroutine, `OutboundHeld` on writers' and
-   `Flush` on a turn's or the caller of `Flush`. State they share needs a
-   lock. UIO never calls a layer from below or from inside another layer's
-   callback — `Up().Open()` records a request, and the layers above open on
-   the turn's open stage, after the calling callback returned — so a layer may
-   hold its lock while it writes, flushes or closes below.
+   turns, and so does a close's walk: `CloseGracefully` runs on a turn,
+   whatever asked for the close. The others run where they are called for and
+   may overlap the turns: `OnWrite` on the writer's goroutine, `CloseWrite` on
+   the goroutine closing the connection or on the turn that finishes its end,
+   `OutboundHeld` on writers' and `Flush` on a turn's or the caller of
+   `Flush`. State they share needs a lock. UIO never calls a layer from below
+   or from inside another layer's callback — `Up().Open()` records a request,
+   and the layers above open on the turn's open stage, after the calling
+   callback returned — so a layer may hold its lock while it writes, flushes
+   or closes below.
 4. **A connection ends once, top down.** The Handler's `OnClose` comes first,
    if its `OnOpen` ran, then every layer's. A connection whose stack never
    opened — a failed handshake — ends without a Handler callback. Once a
    close has begun — from the Handler or from any layer, even inside its
-   `OnWireSent` or `Flush` — no new call reaches a layer from a turn: writes,
-   flushes and closes return `net.ErrClosed`, and only `OnClose` follows. The
-   close itself is the one caller left: the goodbyes it walks, and the
-   flushes it makes below the layer that began it.
+   `OnWireSent` or `Flush` — no new call reaches a layer from a turn: writes
+   and flushes return `net.ErrClosed`, and only `OnClose` follows. A close
+   asked after that follows its own API's repeated-request contract — a
+   repeated `CloseWith` reports `net.ErrClosed`, unless it meets a graceful
+   drain, which it cuts short; `CloseGracefully` and a layer's `Close` yield
+   to the close under way — and no second goodbye starts. The close itself is
+   the one caller left: the goodbyes it walks, and the flushes it makes below
+   the layer that began it.
 5. **The end of a stream travels up.** A layer whose peer ended its stream
    calls `LayerContext.Up().End()`; the layer above reads `io.EOF` after the
    rest.
@@ -335,7 +341,7 @@ and `AdoptContext` do the same for a `net.Conn` you hand over:
 
 ```go
 client := &uio.Events{}
-conn, err := client.DialContext(ctx, "tcp://example.org:443", nil,
+conn, err := client.DialContext(ctx, "tcp://example.org:443",
 	uio.WithLayers(utls.Client(cfg)))
 // conn reads and writes plaintext; utls encrypts below it
 ```
@@ -393,11 +399,14 @@ turn, replacing the old probe reads.
   refused with `ErrLayersNeedStream`: there is no data-unit declaration yet,
   so a datagram transport such as KCP is built outside the layer model for
   now.
-- **A layer's delivery to the layer above is bounded** (DefaultDeliverBound,
-  or `MaxInboundBuffered`): the framework stops calling a layer whose delivery
-  is full until the layer above reads. A Handler that peeks a whole frame
-  without consuming (ReserveInbound + PeekChunk) therefore sees at most one
-  bound's worth; set `MaxInboundBuffered` to size such frames.
+- **A layer's delivery to the layer above is paced** (DefaultDeliverBound,
+  or `MaxInboundBuffered`): the framework stops calling a layer whose
+  delivery is full until the layer above reads. The bound is a pacing
+  threshold, not a cap on one write: the write that crosses it — and any a
+  layer makes from `OnOpen`, `OnWireSent` or `OnSent` — lands whole. A
+  Handler that peeks a whole frame without consuming (ReserveInbound +
+  PeekChunk) therefore sees about one bound's worth from a layer that
+  delivers in chunks; set `MaxInboundBuffered` to size such frames.
 
 ## Configuration
 

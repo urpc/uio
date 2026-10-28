@@ -6,8 +6,8 @@
 // whatever runs there — a protocol handler, another layer, another TLS
 // layer — speaks TLS without knowing it:
 //
-//	listener, err := events.Listen(addr, nil, uio.WithLayers(utls.Server(config)))
-//	conn, err := events.Dial(addr, nil, uio.WithLayers(utls.Client(config)))
+//	listener, err := events.Listen(addr, uio.WithLayers(utls.Server(config)))
+//	conn, err := events.Dial(addr, uio.WithLayers(utls.Client(config)))
 //
 // Nothing costs a goroutine. The handshake runs as a coroutine that OnRead
 // resumes with the bytes that arrive: when crypto/tls asks its transport

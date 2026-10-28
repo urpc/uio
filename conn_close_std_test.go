@@ -78,7 +78,7 @@ func TestStdCloseHandoffsJoinLifecycle(t *testing.T) {
 			var cause error
 			ev := withFuncs(&Events{Pollers: 1}, FuncHandler{
 				Start: func(ev *Events) {
-					ln, err := ev.Listen("udp4://127.0.0.1:0", nil)
+					ln, err := ev.Listen("udp4://127.0.0.1:0")
 					if err != nil {
 						t.Error(err)
 						return
@@ -176,7 +176,7 @@ func TestStdCloseHandoffsJoinLifecycle(t *testing.T) {
 func TestCloseRequestCountedBeforeShutdownSeesIt(t *testing.T) {
 	addr, _ := serveLayered(t, nil, nil)
 	ev := dialLayered(t, addr, nil, nil)
-	conn, err := ev.DialContext(context.Background(), "tcp://"+addr, nil)
+	conn, err := ev.DialContext(context.Background(), "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,7 +241,7 @@ func TestRefusedWritesScheduleNoTurns(t *testing.T) {
 	defer close(release)
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}

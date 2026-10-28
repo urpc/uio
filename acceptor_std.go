@@ -84,11 +84,10 @@ func (ld *acceptor) addListen(addr string) error {
 }
 
 // listenGroup adds addr while Serve runs.
-func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) (Listener, error) {
+func (ld *acceptor) listenGroup(addr string, cfg listenConfig) (Listener, error) {
 	// A socket control may close Events or another listener. Create the
 	// socket before taking the registry lock, then admit it against shutdown.
-	cfg := listenConfigFor(opts)
-	l, err := ld.listen(addr, ld.events.ReusePort, cfg.Control)
+	l, err := ld.listen(addr, ld.events.ReusePort, cfg.control)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +102,7 @@ func (ld *acceptor) listenGroup(addr string, userdata any, opts []ListenOption) 
 	}
 	ld.mux.Lock()
 	defer ld.mux.Unlock()
-	if err = ld.addLocked(l, userdata); err != nil {
+	if err = ld.addLocked(l, cfg.userdata); err != nil {
 		return nil, err
 	}
 	var local net.Addr
@@ -266,19 +265,19 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	if ld.events != nil {
 		l.entry = ld.events.plainEntry()
 	}
-	listenConfig := netListenConfigFor(reusePort, control)
+	lnConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {
 	case "tcp", "tcp4", "tcp6":
 		l.addr = u.Host
-		l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Host)
+		l.ln, err = lnConfig.Listen(context.Background(), u.Scheme, u.Host)
 	case "udp", "udp4", "udp6":
 		l.addr = u.Host
-		l.udp, err = listenConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
+		l.udp, err = lnConfig.ListenPacket(context.Background(), u.Scheme, u.Host)
 	case "unix", "unixgram", "unixpacket":
 		if err = os.RemoveAll(u.Path); nil == err || os.IsNotExist(err) {
 			l.addr = u.Path
-			l.ln, err = listenConfig.Listen(context.Background(), u.Scheme, u.Path)
+			l.ln, err = lnConfig.Listen(context.Background(), u.Scheme, u.Path)
 		}
 	default:
 		return nil, fmt.Errorf("unsupported protocol: %s", u.Scheme)

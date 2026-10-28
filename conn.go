@@ -109,7 +109,10 @@ type Conn interface {
 	// If it is time.Zero, SetReadDeadline will clear the deadline.
 	SetReadDeadline(t time.Time) error
 
-	// SetWriteDeadline sets the deadline for future data writing.
+	// SetWriteDeadline sets the deadline for future data writing; a deadline
+	// that passes closes the connection, as SetReadDeadline's does, whether
+	// or not a write is in flight: a callback cannot be interrupted, so the
+	// bound is the connection's on every backend.
 	// If it is time.Zero, SetWriteDeadline will clear the deadline.
 	SetWriteDeadline(t time.Time) error
 
@@ -257,8 +260,11 @@ type Conn interface {
 	// has passed without progress; on native Unix leftover output reaches
 	// OnClose as UnflushedError appended to cause. On a layered connection the
 	// layers' goodbyes are said first, and the mode is this call's whatever
-	// the cause. A CloseWith at any time ends the wait at once. Datagram
-	// connections close as CloseWith does: their sends wait for nothing.
+	// the cause. A CloseWith at any time ends the wait at once: a drain this
+	// call, or a layer's LayerContext.Close, began ends there and then, while
+	// a CloseWith that finds a close another CloseWith began joins it.
+	// Datagram connections close as CloseWith does: their sends wait for
+	// nothing.
 	CloseGracefully(cause error) error
 
 	// CloseWrite shuts the connection's writing half: the peer reads the end

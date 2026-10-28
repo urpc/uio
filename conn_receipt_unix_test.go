@@ -51,6 +51,34 @@ func receiptPeer(t *testing.T, want int) (addr string, got <-chan string) {
 	return listener.Addr().String(), read
 }
 
+// receiptPeerOpen is receiptPeer whose peer keeps the connection open until
+// the test ends. A receipt still outstanding when the close begins is not
+// reported — OnClose is the notice — so a test about the report itself must
+// not race the peer's close against it.
+func receiptPeerOpen(t *testing.T, want int) (addr string, got <-chan string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	done := make(chan struct{})
+	t.Cleanup(func() { close(done) })
+	read := make(chan string, 1)
+	go func() {
+		peer, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer peer.Close()
+		all := make([]byte, want)
+		n, _ := io.ReadFull(peer, all)
+		read <- string(all[:n])
+		<-done
+	}()
+	return listener.Addr().String(), read
+}
+
 // waitRead takes the peer's read from a receive-only channel.
 func waitRead(t *testing.T, c <-chan string) string {
 	t.Helper()
@@ -102,14 +130,14 @@ func (l *trackedLayer) OnWrite(ctx LayerContext, p []byte) (int, error) {
 // A tracked write's receipt reports once the bytes leave the wire.
 func TestWriteTrackedReportsWhenBytesLeave(t *testing.T) {
 	layer := &trackedLayer{writes: [][]byte{[]byte("tracked")}, sent: make(chan SendReceipt, 2)}
-	addr, got := receiptPeer(t, 7)
+	addr, got := receiptPeerOpen(t, 7)
 	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
 
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,14 +157,14 @@ func TestWriteTrackedReportsInOrder(t *testing.T) {
 		writes: [][]byte{[]byte("one"), []byte("two")},
 		sent:   make(chan SendReceipt, 4),
 	}
-	addr, got := receiptPeer(t, 6)
+	addr, got := receiptPeerOpen(t, 6)
 	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return layer })}, func(ev *Events) {
 
 		ev.Handler = FuncHandler{Close: func(Conn, error) {}}
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +205,7 @@ func TestWriteTrackedStopsReportingAtClose(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), nil)
+	conn, err := events.DialContext(ctx, "tcp://"+listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -193,7 +221,8 @@ func TestWriteTrackedStopsReportingAtClose(t *testing.T) {
 	}
 }
 
-// A write into the top reports to no one and does not fault.
+// A write into the top reports to no one when the Handler asks for nothing,
+// and does not fault.
 func TestWriteTrackedOnTopConn(t *testing.T) {
 	addr, got := receiptPeer(t, 2)
 	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} })}, func(ev *Events) {
@@ -202,7 +231,7 @@ func TestWriteTrackedOnTopConn(t *testing.T) {
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -216,5 +245,40 @@ func TestWriteTrackedOnTopConn(t *testing.T) {
 	}
 	if out := waitRead(t, got); out != "hi" {
 		t.Fatalf("the peer read %q, want %q", out, "hi")
+	}
+}
+
+// A Handler that asks, through FuncHandler's Sent or a SentObserver, hears
+// the receipts of its own tracked writes over the stack.
+func TestWriteTrackedReportsToTheHandler(t *testing.T) {
+	addr, got := receiptPeerOpen(t, 2)
+	sent := make(chan SendReceipt, 2)
+	events := dialLayered(t, addr, []Layer{LayerFunc(func(LayerContext) LayerHandler { return PassThrough{} })}, func(ev *Events) {
+
+		ev.Handler = FuncHandler{
+			Sent:  func(_ Conn, r SendReceipt) { sent <- r },
+			Close: func(Conn, error) {},
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, _, err := conn.(TrackedWriter).WriteTracked([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if out := waitRead(t, got); out != "hi" {
+		t.Fatalf("the peer read %q, want %q", out, "hi")
+	}
+	select {
+	case r := <-sent:
+		if r == (SendReceipt{}) {
+			t.Fatal("the handler heard a receipt that marks nothing")
+		}
+	case <-time.After(layerWait):
+		t.Fatal("the handler never heard its receipt")
 	}
 }

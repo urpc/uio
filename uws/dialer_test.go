@@ -27,6 +27,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"runtime"
 	"strings"
 	"sync"
@@ -941,6 +942,26 @@ func TestDialRacingDialerCloseReportsEveryConnectionClosed(t *testing.T) {
 			if time.Now().After(deadline) {
 				t.Fatalf("round %d: %d of %d dialed connections never got OnClose", round, missing, len(dialed))
 			}
+		}
+	}
+}
+
+// A ws/wss URL without a port dials the scheme's default one, and the
+// request's Host keeps the authority the URL wrote.
+func TestDialHostDefaultsThePort(t *testing.T) {
+	for _, tc := range []struct{ url, host string }{
+		{"ws://example.test/chat", "example.test:80"},
+		{"wss://example.test/chat", "example.test:443"},
+		{"ws://example.test:8080/chat", "example.test:8080"},
+		{"wss://[::1]/chat", "[::1]:443"},
+		{"ws://[::1]:9/chat", "[::1]:9"},
+	} {
+		target, err := url.Parse(tc.url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := dialHost(target); got != tc.host {
+			t.Fatalf("dialHost(%s) = %q, want %q", tc.url, got, tc.host)
 		}
 	}
 }

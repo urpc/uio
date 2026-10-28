@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"errors"
 	"net"
 	"runtime"
 	"sync"
@@ -85,9 +86,10 @@ type entry struct {
 // shared read buffers, and application callbacks for one server/dialer
 // lifecycle. Configure it before Serve; an Events value is not restartable.
 type Events struct {
-	loopState                 // the backend's event loops
-	acceptor       *acceptor  // connection acceptor
-	mux            sync.Mutex // serializes initialization and shutdown publication
+	loopState                  // the backend's event loops
+	acceptor       *acceptor   // connection acceptor
+	mux            sync.Mutex  // serializes initialization and shutdown publication
+	started        atomic.Bool // Serve was called: an Events starts once
 	closing        atomic.Bool
 	ready          atomic.Bool    // Dial is allowed only after full initialization
 	callbackWG     sync.WaitGroup // std connections, I/O goroutines, and callbacks
@@ -200,10 +202,25 @@ type Events struct {
 	Hooks ServeHooks
 }
 
+// ErrEventsStarted reports a second Serve on one Events: an Events starts
+// once, and a Serve that found it running or finished returns this.
+var ErrEventsStarted = errors.New("uio: Events.Serve was already called")
+
 // Serve starts the event loops and listens on each supplied address. Calling
-// Serve without an address starts a dial-only Events.
+// Serve without an address starts a dial-only Events. An Events starts once:
+// a second Serve, while the first runs or after it ended, returns
+// [ErrEventsStarted] — the runtime, the loops and the acceptor are the
+// first Serve's, and so is the completion of its lifecycle. A Serve that
+// finds a Close before any other Serve returns net.ErrClosed: the close
+// completed the idle lifecycle, and nothing starts.
 func (ev *Events) Serve(addrs ...string) (err error) {
+	if !ev.started.CompareAndSwap(false, true) {
+		return ErrEventsStarted
+	}
 	if ev.closing.Load() {
+		// Close came first: no loops ever ran, and the idle close already
+		// published what a Serve signs for. Completing it here is for the
+		// Wait that ran after this Serve claimed the start.
 		ev.finishLifecycle(net.ErrClosed)
 		return net.ErrClosed
 	}

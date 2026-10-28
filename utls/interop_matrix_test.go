@@ -65,7 +65,7 @@ func roundTrip(t *testing.T, conn stream, payload []byte) {
 
 // roundTripThrough writes payload through a UIO connection and waits for the
 // handler to have collected its echo.
-func roundTripThrough(t *testing.T, conn uio.Conn, echo *collectEcho, payload []byte) {
+func roundTripThrough(t *testing.T, conn uio.Conn, echo *collector, payload []byte) {
 	t.Helper()
 	written := make(chan error, 1)
 	go func() {
@@ -85,32 +85,45 @@ func roundTripThrough(t *testing.T, conn uio.Conn, echo *collectEcho, payload []
 	}
 }
 
-// collectEcho echoes what it reads and keeps a copy, signalling when it has
-// target bytes.
-type collectEcho struct {
+// collector keeps what it reads and signals when it has target bytes. As a
+// server handler it answers each chunk — an echo. As a client handler it
+// answers nothing: the server it talks to echoes back, so a client that wrote
+// what it read would keep the two ends echoing each other for as long as the
+// connection lives. That endless stream is what fills an echo server's
+// unconsumed queue; once full, its OnRead blocks for good and the server's
+// Serve can never return.
+type collector struct {
 	target int64
 
 	mu     sync.Mutex
 	got    []byte
 	done   chan struct{}
 	closed chan error
+
+	answer bool
 }
 
-func newCollectEcho(target int64) *collectEcho {
-	return &collectEcho{target: target, done: make(chan struct{}), closed: make(chan error, 4)}
+func newCollectEcho(target int64) *collector {
+	return &collector{target: target, answer: true, done: make(chan struct{}), closed: make(chan error, 4)}
 }
 
-func (e *collectEcho) OnOpen(uio.Conn) {}
+func newCollector(target int64) *collector {
+	return &collector{target: target, done: make(chan struct{}), closed: make(chan error, 4)}
+}
 
-func (e *collectEcho) OnRead(c uio.Conn) error {
+func (e *collector) OnOpen(uio.Conn) {}
+
+func (e *collector) OnRead(c uio.Conn) error {
 	chunk := c.PeekChunk()
 	n := len(chunk)
 	e.mu.Lock()
 	e.got = append(e.got, chunk...)
 	reached := int64(len(e.got)) >= e.target
 	e.mu.Unlock()
-	if _, err := c.Write(chunk); err != nil {
-		return err
+	if e.answer {
+		if _, err := c.Write(chunk); err != nil {
+			return err
+		}
 	}
 	_, _ = c.Discard(n)
 	if reached {
@@ -123,10 +136,10 @@ func (e *collectEcho) OnRead(c uio.Conn) error {
 	return nil
 }
 
-func (e *collectEcho) OnTimer(uio.Conn) error        { return nil }
-func (e *collectEcho) OnClose(_ uio.Conn, err error) { e.closed <- err }
+func (e *collector) OnTimer(uio.Conn) error        { return nil }
+func (e *collector) OnClose(_ uio.Conn, err error) { e.closed <- err }
 
-func (e *collectEcho) payload() []byte {
+func (e *collector) payload() []byte {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]byte(nil), e.got...)
@@ -156,7 +169,7 @@ func dialThrough(t *testing.T, events *layeredEvents, addr string) uio.Conn {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
-	conn, err := events.DialContext(ctx, "tcp://"+addr, nil)
+	conn, err := events.DialContext(ctx, "tcp://"+addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -174,7 +187,7 @@ func TestInteropLargePayload(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		echo := newCollectEcho(total)
 		transport := serveTLS(t, echo, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -194,10 +207,10 @@ func TestInteropLargePayload(t *testing.T) {
 	t.Run("our client, stdlib server", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		where := stdEcho(t, serverConfig)
-		echo := newCollectEcho(total)
-		events := startClient(t, echo, Client(clientConfig))
+		sink := newCollector(total)
+		events := startClient(t, sink, Client(clientConfig))
 		conn := dialThrough(t, events, string(where))
-		roundTripThrough(t, conn, echo, randomBytes(t, total))
+		roundTripThrough(t, conn, sink, randomBytes(t, total))
 	})
 }
 
@@ -210,7 +223,7 @@ func TestInteropRecordBoundaries(t *testing.T) {
 			serverConfig, clientConfig := testConfigs(t)
 			echo := newCollectEcho(int64(size))
 			transport := serveTLS(t, echo, Server(serverConfig))
-			listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -229,7 +242,7 @@ func TestInteropRecordBoundaries(t *testing.T) {
 		const each = 17
 		echo := newCollectEcho(messages * each)
 		transport := serveTLS(t, echo, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -265,7 +278,7 @@ func TestInteropMutualTLS(t *testing.T) {
 	t.Run("our server requires, stdlib client presents", func(t *testing.T) {
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -289,10 +302,10 @@ func TestInteropMutualTLS(t *testing.T) {
 
 	t.Run("stdlib server requires, our client presents", func(t *testing.T) {
 		where := stdEcho(t, serverConfig)
-		echo := newCollectEcho(6)
-		events := startClient(t, echo, Client(clientConfig))
+		sink := newCollector(6)
+		events := startClient(t, sink, Client(clientConfig))
 		conn := dialThrough(t, events, string(where))
-		roundTripThrough(t, conn, echo, []byte("mutual"))
+		roundTripThrough(t, conn, sink, []byte("mutual"))
 	})
 
 	// Under TLS 1.2 the server's verdict arrives inside the handshake, so the
@@ -314,7 +327,7 @@ func TestInteropMutualTLS(t *testing.T) {
 		}))
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+string(where), nil); err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+string(where)); err == nil {
 			t.Fatal("a client with no certificate dialed cleanly")
 		}
 		if calls != 0 {
@@ -328,14 +341,14 @@ func TestInteropMutualTLS(t *testing.T) {
 		events := startClient(t, uio.FuncHandler{
 			Open:  func(uio.Conn) {},
 			Read:  func(uio.Conn) error { return nil },
-			Close: func(_ uio.Conn, err error) { closed <- err },
+			Close: func(_ uio.Conn, err error) { signal(closed, err) },
 		}, Client(&tls.Config{
 			ServerName: "localhost", RootCAs: pool,
 			MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13,
 		}))
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		conn, err := events.DialContext(ctx, "tcp://"+string(where), nil)
+		conn, err := events.DialContext(ctx, "tcp://"+string(where))
 		if err != nil {
 			// A peer that rejects earlier than 1.3's own sequencing allows is
 			// reporting the same refusal, so the outcome is the same.
@@ -379,7 +392,7 @@ func TestInteropExplicitVersions(t *testing.T) {
 			// stdlib client over our server.
 			server := newEcho()
 			transport := serveTLS(t, server, Server(serverConfig))
-			listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -394,14 +407,14 @@ func TestInteropExplicitVersions(t *testing.T) {
 
 			// Our client over a stdlib server.
 			where := stdEcho(t, serverConfig)
-			echo := newCollectEcho(5)
-			events := startClient(t, echo, Client(clientConfig))
+			sink := newCollector(5)
+			events := startClient(t, sink, Client(clientConfig))
 			conn := dialThrough(t, events, string(where))
 			state := uio.LayerOf(conn).(interface{ State() ConnectionState }).State()
 			if state.Version != version.value {
 				t.Fatalf("negotiated %#x, want %#x", state.Version, version.value)
 			}
-			roundTripThrough(t, conn, echo, []byte("hello"))
+			roundTripThrough(t, conn, sink, []byte("hello"))
 		})
 	}
 }
@@ -416,7 +429,7 @@ func TestInteropMatchesStdlibByteForByte(t *testing.T) {
 
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,10 +443,10 @@ func TestInteropMatchesStdlibByteForByte(t *testing.T) {
 	_ = stdConn.Close()
 
 	// Ours, through the stack, with the same bytes.
-	echo := newCollectEcho(total)
-	events := startClient(t, echo, Client(clientConfig))
+	sink := newCollector(total)
+	events := startClient(t, sink, Client(clientConfig))
 	conn := dialThrough(t, events, listener.Addr().String())
-	roundTripThrough(t, conn, echo, payload)
+	roundTripThrough(t, conn, sink, payload)
 }
 
 // Connections do not interfere: many handshakes and payloads at once settle
@@ -445,7 +458,7 @@ func TestInteropConcurrentConnections(t *testing.T) {
 
 	handler := &countingEcho{}
 	transport := serveTLS(t, handler, Server(serverConfig))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -529,7 +542,7 @@ func TestInteropCloseNotify(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -551,7 +564,7 @@ func TestInteropCloseNotify(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
 		transport := serveTLS(t, server, Server(serverConfig))
-		listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -578,7 +591,7 @@ func TestInteropCertificateChain(t *testing.T) {
 
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -670,7 +683,7 @@ func TestInteropServerSideResumption(t *testing.T) {
 	}
 	server := newEcho()
 	transport := serveTLS(t, server, Server(serverConfig))
-	listener, err := transport.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}

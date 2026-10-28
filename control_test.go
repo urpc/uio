@@ -40,7 +40,7 @@ func ttlOf(t *testing.T, conn Conn) int {
 func TestConnControlSetsSocketOptions(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
-	conn, err := events.Dial("tcp://"+addr, nil)
+	conn, err := events.Dial("tcp://" + addr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestConnControlOnDialedPeer(t *testing.T) {
 func TestDialWithLocalAddr(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
-	conn, err := events.Dial("tcp://"+addr, nil, WithLocalAddr("127.0.0.1:0"))
+	conn, err := events.Dial("tcp://"+addr, WithLocalAddr("127.0.0.1:0"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestDialWithControl(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
 	var gotNetwork, gotAddr string
-	conn, err := events.Dial("tcp://"+addr, nil, WithDialControl(func(network, address string, fd uintptr) error {
+	conn, err := events.Dial("tcp://"+addr, WithDialControl(func(network, address string, fd uintptr) error {
 		gotNetwork, gotAddr = network, address
 		return setTTL(fd)
 	}))
@@ -126,7 +126,7 @@ func TestDialWithControlErrorFails(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
 	want := errors.New("no")
-	if _, err := events.Dial("tcp://"+addr, nil, WithDialControl(func(string, string, uintptr) error {
+	if _, err := events.Dial("tcp://"+addr, WithDialControl(func(string, string, uintptr) error {
 		return want
 	})); !errors.Is(err, want) {
 		t.Fatalf("Dial = %v, want the control's error", err)
@@ -142,7 +142,7 @@ func TestListenWithControl(t *testing.T) {
 			events.ReusePort = reusePort
 			serveLoopback(t, events)
 			var runs atomic.Int32
-			ln, err := events.Listen("tcp://127.0.0.1:0", nil, WithListenControl(func(network, address string, fd uintptr) error {
+			ln, err := events.Listen("tcp://127.0.0.1:0", WithListenControl(func(network, address string, fd uintptr) error {
 				if network != "tcp4" {
 					t.Errorf("control network = %s, want tcp4", network)
 				}
@@ -203,7 +203,7 @@ func TestDialWithLocalAddrUnixSchemeStripped(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	conn, err := events.Dial("unix://"+remote, nil, WithLocalAddr("unix://"+local))
+	conn, err := events.Dial("unix://"+remote, WithLocalAddr("unix://"+local))
 	if err != nil {
 		t.Fatal(err)
 	}

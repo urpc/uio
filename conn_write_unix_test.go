@@ -1728,7 +1728,7 @@ func TestWriteBeforeOpenWaitsForOnOpen(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Events did not start")
 	}
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2037,7 +2037,7 @@ func runBidirectionalLimitTransfer(t *testing.T, raw [2]net.Conn, limit int) {
 		done[i] = make(chan error, 1)
 		go func() { done[i] <- ev.Serve() }()
 		<-started
-		conn, err := ev.Adopt(raw[i], nil)
+		conn, err := ev.Adopt(raw[i])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -2328,7 +2328,7 @@ func TestExternalConnectedUDPWrites(t *testing.T) {
 	}
 	defer receiver.Close()
 	started := make(chan struct{}, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { started <- struct{}{} }})
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { signal(started, struct{}{}) }})
 	serveDone := make(chan error, 1)
 	go func() { serveDone <- events.Serve() }()
 	defer func() {
@@ -2344,7 +2344,7 @@ func TestExternalConnectedUDPWrites(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("dial-only Events did not start")
 	}
-	conn, err := events.DialContext(t.Context(), "udp://"+receiver.LocalAddr().String(), nil)
+	conn, err := events.DialContext(t.Context(), "udp://"+receiver.LocalAddr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

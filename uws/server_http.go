@@ -115,7 +115,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	if s.opts.TLSConfig != nil {
 		opts = append(opts, uio.WithLayers(uio.PassThroughLayer))
 	}
-	_, err = s.events.Adopt(tcpConn, wsConn, opts...)
+	_, err = s.events.Adopt(tcpConn, append(opts, uio.WithUserdata(wsConn))...)
 	if err != nil {
 		return
 	}

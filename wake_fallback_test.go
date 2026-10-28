@@ -34,12 +34,12 @@ func TestWakeFallsBackWhenKernelTimerFails(t *testing.T) {
 		<-sinkDone
 	})
 	<-sinkStarted
-	listener, err := sink.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := sink.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,12 +94,12 @@ func TestWakeIntervalFallsBackAndRepeats(t *testing.T) {
 		<-sinkDone
 	})
 	<-sinkStarted
-	listener, err := sink.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := sink.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

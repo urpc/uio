@@ -55,12 +55,12 @@ func dialTimer(t *testing.T) (*timerRecorder, Conn) {
 		<-done
 	})
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +132,15 @@ func TestHandlerTimerErrorCloses(t *testing.T) {
 	events := &Events{Pollers: 1, Handler: FuncHandler{
 		Read:  func(Conn) error { return nil },
 		Timer: func(Conn) error { return wantErr },
-		Close: func(Conn, error) { closed <- struct{}{} },
+		Close: func(Conn, error) {
+			// A signal, not a hand-off: both ends of this Events close
+			// together, and a close callback blocked on a full channel keeps
+			// Serve from ever joining it.
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		},
 	}, Hooks: FuncHandler{Start: func(*Events) { close(started) }}}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
@@ -141,12 +149,12 @@ func TestHandlerTimerErrorCloses(t *testing.T) {
 		<-done
 	})
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,12 +186,12 @@ func TestHandlerTimerThroughLayers(t *testing.T) {
 		<-done
 	})
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil, WithLayers(PassThroughLayer))
+	conn, err := events.Dial("tcp://"+listener.Addr().String(), WithLayers(PassThroughLayer))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,12 +279,12 @@ func serveAndDial(t *testing.T, handler Handler) Conn {
 		<-done
 	})
 	<-started
-	listener, err := events.Listen("tcp://127.0.0.1:0", nil)
+	listener, err := events.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = listener.Close() })
-	conn, err := events.Dial("tcp://"+listener.Addr().String(), nil)
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}

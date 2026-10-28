@@ -46,7 +46,7 @@ func TestUnixConnectionAddressesAreKept(t *testing.T) {
 		<-clientDone
 	})
 	<-clientStarted
-	dialed, err := clientEvents.Dial("unix://"+dialPath, nil)
+	dialed, err := clientEvents.Dial("unix://" + dialPath)
 	if err != nil {
 		t.Fatal(err)
 	}

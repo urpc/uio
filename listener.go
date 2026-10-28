@@ -67,9 +67,10 @@ type PacketListener interface {
 
 // Listen adds addr, in Serve's syntax, to a serving Events and accepts on it
 // at once, with the Handler, Observer and options of the rest. Every
-// connection accepted there starts with userdata as its Userdata, the way
-// Dial's userdata starts a dialed one. opts configure this listener: its
-// chain (WithLayers) and its sockets (WithListenControl). With ReusePort, the
+// connection accepted there starts with the Userdata a WithUserdata option
+// names, the way a dial's names its connection's. opts configure this
+// listener: the accepted connections' Userdata (WithUserdata), its chain
+// (WithLayers) and its sockets (WithListenControl). With ReusePort, the
 // address gets the group of listeners Serve would give it. A unix path is
 // unlinked and bound afresh, taking the socket file over from whoever held
 // it. Listen binds even from ServeHooks.OnStart, and accepting on such a
@@ -77,7 +78,7 @@ type PacketListener interface {
 // their chains before any callback runs. Before Serve has started, and once
 // it is closing, Listen returns net.ErrClosed. Events.Close closes the
 // listeners Listen added along with the others.
-func (ev *Events) Listen(addr string, userdata any, opts ...ListenOption) (Listener, error) {
+func (ev *Events) Listen(addr string, opts ...ListenOption) (Listener, error) {
 	if !ev.ready.Load() || ev.closing.Load() {
 		return nil, net.ErrClosed
 	}
@@ -91,7 +92,7 @@ func (ev *Events) Listen(addr string, userdata any, opts ...ListenOption) (Liste
 	}
 	// Socket creation can call application controls. The acceptor admits the
 	// resulting sockets under its own shutdown lock, after those calls return.
-	return ev.acceptor.listenGroup(addr, userdata, opts)
+	return ev.acceptor.listenGroup(addr, cfg)
 }
 
 // listenerGroup is the Listener of one Listen: the listeners it created for
