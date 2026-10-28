@@ -241,6 +241,42 @@ type WireCounter interface {
 	WireSent() uint64
 }
 
+// SendReceipt marks one tracked write's place on the wire. The write has
+// left once WireSent reaches the receipt's position, the queue below the
+// connection it entered is empty — everything handed down left, whatever the
+// counts say — or the connection ended; on an end the receipt is not
+// reported, and the layer's OnClose is the notice. The zero value marks no
+// bytes and is never reported.
+type SendReceipt struct{ wire uint64 }
+
+// done reports a receipt the wire passed; zero marks nothing and is done.
+func (r SendReceipt) done(sent uint64) bool { return r.wire == 0 || sent >= r.wire }
+
+// TrackedWriter is implemented by the connection below a layer — what
+// LayerContext.Down returns — when it can report when one of its writes has
+// left the wire: WireCounter tells a layer where the wire is, and a tracked
+// write tells it where its own bytes are.
+//
+//	n, r, err := ctx.Down().(uio.TrackedWriter).WriteTracked(p)
+//
+// The receipt is the write's output position, taken once the write returned:
+// above layers that add or remove bytes, it counts the position the write
+// left at, never one guessed from byte counts. A layer that wants the
+// notice implements [ReceiptObserver].
+type TrackedWriter interface {
+	WriteTracked(p []byte) (int, SendReceipt, error)
+}
+
+// ReceiptObserver is implemented by a LayerHandler whose tracked writes it
+// wants to hear about: OnSent runs on the connection's turn, once per
+// receipt, in the order the writes entered the connection, and may write. A
+// receipt still outstanding when the close begins is not reported — once a
+// close starts no layer call follows but the close itself, and OnClose is
+// the notice.
+type ReceiptObserver interface {
+	OnSent(ctx LayerContext, r SendReceipt)
+}
+
 // maxLayers is how many layers one stack takes: their timers, and the
 // Handler's, share one bit mask.
 const maxLayers = 63
@@ -549,13 +585,20 @@ type stack struct {
 	socket   Conn
 	layers   []*layerNode
 	probe    atomic.Pointer[dialProbe] // a dial waiting for the stack to open, until it does
-	limit    int          // MaxOutboundBuffered; see reserve
-	reserved atomic.Int64 // bytes admitted at the top, not yet queued below
-	halfOpen bool         // AllowHalfOpen
-	inLimit  int          // MaxInboundBuffered; see inboundFull
-	sends    []*layerNode // the layers that observe sends, bottom up
-	holders  bool         // some layer holds output of its own
-	flushers []*layerNode // the layers that hold output to flush, top down
+	limit    int                       // MaxOutboundBuffered; see reserve
+	reserved atomic.Int64              // bytes admitted at the top, not yet queued below
+	halfOpen bool                      // AllowHalfOpen
+	inLimit  int                       // MaxInboundBuffered; see inboundFull
+	sends    []*layerNode              // the layers that observe sends, bottom up
+	holders  bool                      // some layer holds output of its own
+	flushers []*layerNode              // the layers that hold output to flush, top down
+
+	// receiptMu guards receipts, the outstanding tracked writes in the order
+	// they entered the stack; receiptCount spares a turn the lock while none
+	// is outstanding.
+	receiptMu    sync.Mutex
+	receipts     []pendingReceipt
+	receiptCount atomic.Int32
 
 	// inHeld marks a stack that stopped pulling from below because what its
 	// layers hold reached inLimit; a read above that makes room wakes it.
@@ -745,9 +788,9 @@ func (c *stack) finishTurn() error {
 	var err error
 	if len(c.sends) == 0 && len(c.flushers) == 0 {
 		// Nothing to deliver or flush: only settle's look, and that only
-		// when an end waits for a turn.
+		// when an end, a receipt or a close waits for a turn.
 		c.inTurn.Store(false)
-		if c.shutsPending.Load() > 0 || c.over() {
+		if c.shutsPending.Load() > 0 || c.receiptCount.Load() != 0 || c.over() {
 			c.settle()
 		}
 		return nil
@@ -786,6 +829,7 @@ func (c *stack) settle() {
 	if c.sentPending.Load() > 0 || c.upPending.Swap(false) {
 		c.requestTurn()
 	}
+	c.retireReceipts()
 	c.finishShuts()
 }
 
@@ -994,6 +1038,7 @@ func (c *stack) closed(err error) {
 	}
 	c.stopTimers()
 	c.sentPending.Store(0)
+	c.dropReceipts()
 	if c.topOpen.Load() {
 		c.top.OnClose(c.topConn(), err)
 	}
@@ -1044,7 +1089,7 @@ func stackSent(next func(Conn, int)) func(Conn, int) {
 		if l, ok := conn.(*layerNode); ok && !l.stack.closedStack() {
 			c := l.stack
 			c.wireSent.Add(uint64(n))
-			if len(c.sends) > 0 && !c.over() {
+			if !c.over() && (len(c.sends) > 0 || c.receiptCount.Load() != 0) {
 				c.sentPending.Add(int64(n))
 				c.requestTurn()
 			}
@@ -1243,11 +1288,12 @@ func (c *stack) stopTimers() {
 // the table instead of asserting at every call, and a layer without a
 // capability costs one nil check.
 type layerOps struct {
-	graceful    func(LayerContext, error) // GracefulCloser
-	closeWriter func(LayerContext) error  // CloseWriter
-	flush       func(LayerContext) error  // Flusher
-	held        func(LayerContext) int    // OutboundHolder
-	wireSent    func(LayerContext, int)   // WireCounterObserver
+	graceful    func(LayerContext, error)       // GracefulCloser
+	closeWriter func(LayerContext) error        // CloseWriter
+	flush       func(LayerContext) error        // Flusher
+	held        func(LayerContext) int          // OutboundHolder
+	wireSent    func(LayerContext, int)         // WireCounterObserver
+	sent        func(LayerContext, SendReceipt) // ReceiptObserver
 }
 
 // opsOf resolves a LayerHandler's optional interfaces.
@@ -1267,6 +1313,9 @@ func opsOf(h LayerHandler) layerOps {
 	}
 	if observer, ok := h.(WireCounterObserver); ok {
 		ops.wireSent = observer.OnWireSent
+	}
+	if observer, ok := h.(ReceiptObserver); ok {
+		ops.sent = observer.OnSent
 	}
 	return ops
 }
@@ -1305,8 +1354,8 @@ type layerNode struct {
 
 // The two facts a write into a layer is admitted by; see layerNode.gate.
 const (
-	gateOpenUp uint32 = 1 << iota // the layer opened the layers above it
-	gateWriteShut                 // the layer above ended its writing half
+	gateOpenUp    uint32 = 1 << iota // the layer opened the layers above it
+	gateWriteShut                    // the layer above ended its writing half
 )
 
 func (l *layerNode) openUp() bool { return l.gate.Load()&gateOpenUp != 0 }
@@ -1513,6 +1562,23 @@ func (s socketLower) ReserveOutbound(n int) ([]byte, error) {
 	return room, err
 }
 
+var _ TrackedWriter = socketLower{}
+
+// WriteTracked writes p to the socket and takes its wire position; the first
+// layer hears the receipt once it leaves. See TrackedWriter.
+func (s socketLower) WriteTracked(p []byte) (int, SendReceipt, error) {
+	n, err := s.Write(p)
+	if err != nil || n == 0 {
+		return n, SendReceipt{}, err
+	}
+	r := SendReceipt{wire: s.stack.wireQueued.Load()}
+	if r.wire == 0 || len(s.stack.layers) == 0 {
+		return n, SendReceipt{}, nil
+	}
+	s.stack.addReceipt(pendingReceipt{conn: s, above: s.stack.layers[0], r: r})
+	return n, r, nil
+}
+
 func (s socketLower) SetWakeDeadline(when time.Time) error { return s.stack.setTimer(0, when, 0) }
 
 func (s socketLower) SetWakeInterval(interval time.Duration) error {
@@ -1580,6 +1646,87 @@ func (l *layerNode) WireQueued() uint64 {
 
 // WireSent is what the socket reported sent.
 func (l *layerNode) WireSent() uint64 { return l.stack.wireSent.Load() }
+
+// pendingReceipt is one tracked write the wire has not passed yet.
+type pendingReceipt struct {
+	conn  Conn       // the connection the write entered, for its queue
+	above *layerNode // the layer above it, to hear; nil past the top
+	r     SendReceipt
+}
+
+var _ TrackedWriter = (*layerNode)(nil)
+
+// WriteTracked writes p into the layer and takes the position its output
+// holds on the wire once the write returned; see TrackedWriter. The layer
+// above this connection hears the receipt on a turn once it leaves.
+func (l *layerNode) WriteTracked(p []byte) (int, SendReceipt, error) {
+	n, err := l.Write(p)
+	if err != nil || n == 0 {
+		return n, SendReceipt{}, err
+	}
+	r := SendReceipt{wire: l.WireQueued()}
+	if r.wire == 0 {
+		return n, SendReceipt{}, nil
+	}
+	c := l.stack
+	var above *layerNode
+	if l.index+1 < len(c.layers) {
+		above = c.layers[l.index+1]
+	}
+	c.addReceipt(pendingReceipt{conn: l, above: above, r: r})
+	return n, r, nil
+}
+
+// addReceipt queues a tracked write, for the turn that sees the wire pass it.
+func (c *stack) addReceipt(pr pendingReceipt) {
+	c.receiptCount.Add(1)
+	c.receiptMu.Lock()
+	c.receipts = append(c.receipts, pr)
+	c.receiptMu.Unlock()
+	c.requestTurn()
+}
+
+// retireReceipts reports the tracked writes the wire passed, and keeps the
+// rest. It runs as a turn ends: a receipt may not fire from inside the write
+// that moved the wire — the layer holding its lock must not be called back.
+func (c *stack) retireReceipts() {
+	if c.receiptCount.Load() == 0 {
+		return
+	}
+	c.receiptMu.Lock()
+	out := c.receipts
+	c.receipts = nil
+	c.receiptMu.Unlock()
+	sent := c.wireSent.Load()
+	var keep []pendingReceipt
+	for _, pr := range out {
+		if pr.r.done(sent) || pr.conn.OutboundBuffered() == 0 {
+			c.receiptCount.Add(-1)
+			if pr.above != nil && pr.above.ops.sent != nil {
+				pr.above.ops.sent(layerCtx{pr.above}, pr.r)
+			}
+			continue
+		}
+		keep = append(keep, pr)
+	}
+	if len(keep) > 0 {
+		c.receiptMu.Lock()
+		c.receipts = append(keep, c.receipts...) // kept writes entered first
+		c.receiptMu.Unlock()
+	}
+}
+
+// dropReceipts forgets the tracked writes the connection ended under: the
+// layers hear OnClose instead.
+func (c *stack) dropReceipts() {
+	if c.receiptCount.Load() == 0 {
+		return
+	}
+	c.receiptMu.Lock()
+	c.receipts = nil
+	c.receiptMu.Unlock()
+	c.receiptCount.Store(0)
+}
 
 // SetWakeInterval arms the layer above's timer to repeat; see Conn.
 func (l *layerNode) SetWakeInterval(interval time.Duration) error {
