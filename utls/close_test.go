@@ -707,19 +707,12 @@ func (e *endWithTheLast) OnRead(ctx uio.LayerContext) error {
 		return e.PassThrough.OnRead(ctx)
 	}
 	lower := ctx.Down()
-	if chunk := lower.PeekChunk(); len(chunk) > 0 {
-		e.held = append(e.held, chunk...)
-		_, _ = lower.Discard(len(chunk))
-	}
+	chunk := lower.PeekChunk()
+	e.held = append(e.held, chunk...)
+	_, _ = lower.Discard(len(chunk))
 	if _, err := lower.Read(nil); err == io.EOF {
-		// Deliver what was held in the chunks the delivery takes, and the
-		// end after the last of it.
-		n, _ := ctx.Up().Write(e.held)
-		e.held = e.held[n:]
-		if len(e.held) > 0 {
-			ctx.Up().Yield()
-			return nil
-		}
+		ctx.Up().Write(e.held)
+		e.held = nil
 		ctx.Up().End()
 	}
 	return nil

@@ -113,7 +113,8 @@ type LayerHandler interface {
 	// and bytes still wait below, the turn calls it again. The bottom layer is
 	// not called at all while the stack holds MaxInboundBuffered unread, until
 	// a read above makes room; the layers above it go on moving what the stack
-	// already holds up.
+	// already holds up. A layer whose own delivery to the layer above is full
+	// waits the same way — its next call is the turn the layer above reads on.
 	OnRead(ctx LayerContext) error
 
 	// OnWrite runs for what the layer above writes, on the writer's
@@ -373,11 +374,11 @@ type LayerDown interface {
 }
 
 // LayerUp is the layer above's input, as the layer below writes to it. Write
-// never fails; it takes what the layer above's delivery has room for —
-// DefaultDeliverBound bytes past what it has not read, or
-// Events.MaxInboundBuffered when set — and reports a short write for the
-// rest, which asks the layer to Yield and hand the remainder up on a later
-// turn, once a read above made room. A layer may hold the Up it got.
+// always takes all of p and never fails. What the delivery holds is bounded
+// by the framework, not by the writer: once a layer's delivery to the layer
+// above reaches DefaultDeliverBound — Events.MaxInboundBuffered, when set —
+// the framework stops calling that layer until the layer above reads, so a
+// layer never paces its own writes. A layer may hold the Up it got.
 // Its methods run in OnRead or OnTimer, on the connection's turn, whose pass
 // then carries what they wrote up through the layers above; a call made
 // anywhere else races the turn.
@@ -398,11 +399,9 @@ type LayerUp interface {
 	// opened. Call it on the connection's turn.
 	Open()
 
-	// Reserve returns up to n bytes of room past what is written, for the
+	// Reserve returns at least n bytes of room past what is written, for the
 	// layer to fill in place — decrypting straight into it — and Commit
-	// delivers the first n of them. It returns fewer than asked, or nothing,
-	// when the layer above's delivery bound is reached; see Write. Call both
-	// in OnRead or OnTimer.
+	// delivers the first n of them. Call both in OnRead or OnTimer.
 	Reserve(n int) []byte
 	Commit(n int)
 
@@ -463,16 +462,9 @@ func (PassThrough) OnOpen(ctx LayerContext) { ctx.Up().Open() }
 func (PassThrough) OnRead(ctx LayerContext) error {
 	lower := ctx.Down()
 	if chunk := lower.PeekChunk(); len(chunk) > 0 {
-		n, _ := ctx.Up().Write(chunk)
-		if n > 0 {
-			if _, err := lower.Discard(n); err != nil {
-				return err
-			}
-		}
-		if n < len(chunk) {
-			// The delivery is full: the read above runs the turn that
-			// carries the rest.
-			ctx.Up().Yield()
+		_, _ = ctx.Up().Write(chunk)
+		if _, err := lower.Discard(len(chunk)); err != nil {
+			return err
 		}
 	}
 	if lowerEnded(lower) {
@@ -948,6 +940,14 @@ func (c *stack) inbound(layer *layerNode) error {
 		if layer.index == 0 && c.inboundFull() {
 			return nil
 		}
+		// A layer whose delivery to the layer above is full waits: it is not
+		// called again until the layer above reads, and that read — roomMade
+		// on this layer — asks for the turn. The layers above it go on
+		// draining what it delivered.
+		if layer.held() >= c.deliverBound() {
+			layer.paced.Store(true)
+			return nil
+		}
 		before := layer.waitingBelow()
 		if err := layer.conn.OnRead(layerCtx{layer}); err != nil {
 			return err
@@ -1372,6 +1372,7 @@ type layerNode struct {
 	shutFlushed atomic.Bool
 	writers     atomic.Int32
 	stalled     atomic.Bool // the layer stopped short; see LayerUp.Yield
+	paced       atomic.Bool // a full delivery kept the layer from running; the read above wakes it
 
 	// delivered is what the layer handed up that the layer above has not
 	// read, from at on; only the connection's turns touch it.
@@ -1434,18 +1435,10 @@ func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
 type layerUp struct{ l *layerNode }
 
 func (u layerUp) Write(p []byte) (int, error) {
-	l := u.l
-	if room := l.stack.deliverBound() - l.held(); room < len(p) {
-		// The layer above has not read what is already delivered: take what
-		// its delivery has room for and report the rest for a later turn.
-		if room <= 0 {
-			return 0, nil
-		}
-		p = p[:room]
-	}
 	if len(p) == 0 {
 		return 0, nil
 	}
+	l := u.l
 	l.compact()
 	l.delivered = append(l.delivered, p...)
 	return len(p), nil
@@ -1466,14 +1459,6 @@ func (u layerUp) Open() {
 
 func (u layerUp) Reserve(n int) []byte {
 	l := u.l
-	if room := l.stack.deliverBound() - l.held(); room < n {
-		// As Write: the layer above has room for what its delivery bound
-		// leaves, and the rest waits for the read that makes room.
-		if room <= 0 {
-			return nil
-		}
-		n = room
-	}
 	l.compact()
 	if spare := cap(l.delivered) - len(l.delivered); spare < n {
 		// Grow by doubling, as append does: a layer that commits a little at
@@ -1876,6 +1861,11 @@ func (l *layerNode) roomMade() {
 	// Loads first: every read runs this, and a compare-and-swap costs a
 	// locked instruction even when it fails.
 	if l.stalled.Load() && l.stalled.CompareAndSwap(true, false) {
+		_ = l.stack.socket.Wake()
+	}
+	if l.paced.Load() && l.paced.Swap(false) {
+		// The layer feeding this one was paused on a full delivery; the read
+		// that just ran makes room, so a turn calls it again.
 		_ = l.stack.socket.Wake()
 	}
 	if l.stack.inHeld.Load() {

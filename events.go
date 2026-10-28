@@ -160,10 +160,11 @@ type Events struct {
 	// With layers installed it bounds what the layers hold for the Handler
 	// too: once they hold the limit unread, the stack takes nothing more from
 	// the socket, whose own buffer then fills to the limit and stops its
-	// reads. It is also each layer's delivery bound: what a layer writes up
-	// past what the layer above has room for is a short write (see LayerUp),
-	// and DefaultDeliverBound stands in when this is zero. A connection holds
-	// at most twice the limit, and a layer's one delivery more.
+	// reads. It is also each layer's delivery bound: a layer whose delivery
+	// to the layer above holds the limit is not called again until that layer
+	// reads, so a delivery passes it by one callback's write at most;
+	// DefaultDeliverBound stands in when this is zero. A connection holds at
+	// most twice the limit, and a layer's one delivery more.
 	MaxInboundBuffered int
 
 	// AllowHalfOpen keeps a stream connection open after its peer shuts its
