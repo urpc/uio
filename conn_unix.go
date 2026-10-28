@@ -672,6 +672,25 @@ func (conn *fdConn) readEnded() bool {
 	return conn.readEOF() && conn.inbound.Empty() && len(conn.inboundTail) == 0
 }
 
+// State reports where the connection's streams stand; see ConnState.
+func (conn *fdConn) State() ConnState {
+	var state ConnState
+	if conn.readEnded() {
+		state |= StatePeerEnded
+	}
+	if conn.writeState.Load()&writeShutFlag != 0 {
+		state |= StateWriteShut
+	}
+	phase := conn.close.phase.Load()
+	if phase >= closeDraining {
+		state |= StateClosing
+	}
+	if phase >= closeResourcesReleased {
+		state |= StateClosed
+	}
+	return state
+}
+
 // closeIfEnded closes a half-open connection whose two halves have both
 // ended, once a callback consumed the last bytes its peer sent.
 func (conn *fdConn) closeIfEnded() {

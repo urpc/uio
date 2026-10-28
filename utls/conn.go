@@ -248,7 +248,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 // from one inside a record, a truncation it reports as an error. It requires
 // c.mu.
 func (c *conn) noteLowerEndLocked(lower uio.LayerDown) {
-	if _, err := lower.Read(nil); err == io.EOF {
+	if lower.State()&uio.StatePeerEnded != 0 {
 		c.lowerEnded = true
 	}
 }

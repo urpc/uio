@@ -360,6 +360,11 @@ type LayerDown interface {
 	ReserveOutbound(n int) ([]byte, error)
 	Flush() error
 
+	// State reports where the connection's streams stand: the peer's end
+	// once everything it sent was read, this end's writing half, and a close.
+	// It reads state the turns keep, so call it on the connection's turn.
+	State() ConnState
+
 	Wake() error
 	SetWakeDeadline(when time.Time) error
 	SetWakeInterval(interval time.Duration) error
@@ -477,14 +482,9 @@ func (PassThrough) OnRead(ctx LayerContext) error {
 }
 
 // lowerEnded reports a stream below that ended and was read to its end, as
-// lower.Read(nil) reporting io.EOF does — for a layer below, without the
-// call's bookkeeping, which a read of nothing never needs.
+// lower.Read(nil) reporting io.EOF does.
 func lowerEnded(lower LayerDown) bool {
-	if below, ok := lower.(*layerNode); ok {
-		return below.ended && below.held() == 0
-	}
-	_, err := lower.Read(nil)
-	return err == io.EOF
+	return lower.State()&StatePeerEnded != 0
 }
 
 // OnWrite writes what is written as it is.
@@ -1689,6 +1689,24 @@ func (l *layerNode) WireQueued() uint64 {
 
 // WireSent is what the socket reported sent.
 func (l *layerNode) WireSent() uint64 { return l.stack.wireSent.Load() }
+
+// State reports where the connection stands; see ConnState.
+func (l *layerNode) State() ConnState {
+	var state ConnState
+	if l.ended && l.held() == 0 {
+		state |= StatePeerEnded
+	}
+	if l.gate.Load()&gateWriteShut != 0 {
+		state |= StateWriteShut
+	}
+	switch l.stack.state.Load() & stackPhaseMask {
+	case stackClosing:
+		state |= StateClosing
+	case stackClosed:
+		state |= StateClosing | StateClosed
+	}
+	return state
+}
 
 // pendingReceipt is one tracked write the wire has not passed yet.
 type pendingReceipt struct {

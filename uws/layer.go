@@ -265,7 +265,7 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 	if err != nil {
 		return err
 	}
-	if _, end := ctx.Down().Read(nil); end == io.EOF && !conn.closed.Load() {
+	if ctx.Down().State()&uio.StatePeerEnded != 0 && !conn.closed.Load() {
 		// The stream below ended without the peer's Close: an abnormal end,
 		// unless this end's Close went out and waits for the transport.
 		cause := io.ErrUnexpectedEOF

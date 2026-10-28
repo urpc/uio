@@ -270,6 +270,11 @@ type Conn interface {
 	// connections, and stdio-backend connections whose net.Conn cannot shut
 	// one half, return an unsupported error.
 	CloseWrite() error
+
+	// State reports where the connection's streams stand: the peer's end
+	// once everything it sent was read, this end's writing half, and a close.
+	// It reads state the turns keep, so call it on the connection's turn.
+	State() ConnState
 }
 
 // ErrUnsupported reports a method this connection cannot carry: CloseWrite on
@@ -307,6 +312,26 @@ func (err UnflushedError) Error() string {
 }
 
 func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
+
+// ConnState reports where a connection's streams stand, as Conn.State and
+// LayerDown.State report it. The bits are independent: a peer-ended
+// connection still writes, a write-shut one still reads.
+type ConnState uint32
+
+const (
+	// StatePeerEnded reports a peer that ended its stream with everything it
+	// sent read — what Read(nil) reporting io.EOF says. A layer above still
+	// writing holds it open.
+	StatePeerEnded ConnState = 1 << iota
+	// StateWriteShut reports this end's writing half ended: by CloseWrite,
+	// or by a close.
+	StateWriteShut
+	// StateClosing reports a close begun — by either side — after which
+	// writes are refused and reads end.
+	StateClosing
+	// StateClosed reports the connection released: OnClose ran or is due.
+	StateClosed
+)
 
 // LingerTimeout bounds how long a graceful close — [Conn.CloseGracefully] —
 // waits for its output without progress before it closes with what remains.

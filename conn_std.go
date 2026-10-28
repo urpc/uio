@@ -1139,6 +1139,27 @@ func (fc *fdConn) Close() error {
 	return fc.CloseWith(io.ErrUnexpectedEOF)
 }
 
+// State reports where the connection's streams stand; see ConnState.
+func (fc *fdConn) State() ConnState {
+	var state ConnState
+	// The same condition Read reports io.EOF by.
+	if fc.readEOF.Load() && fc.inbound.Empty() && len(fc.inboundTail) == 0 {
+		state |= StatePeerEnded
+	}
+	fc.mux.Lock()
+	if fc.writeShut {
+		state |= StateWriteShut
+	}
+	fc.mux.Unlock()
+	if fc.isClosing() {
+		state |= StateClosing
+	}
+	if fc.IsClosed() {
+		state |= StateClosed
+	}
+	return state
+}
+
 // CloseGracefully closes as CloseWith does: this backend's writer flushes
 // what it holds before the close, so nothing accepted waits on a queue.
 func (fc *fdConn) CloseGracefully(cause error) error {
