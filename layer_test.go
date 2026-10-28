@@ -2857,7 +2857,7 @@ type sentCounter struct {
 
 func (s *sentCounter) OnWireSent(ctx LayerContext, _ int) {
 	s.calls.Add(1)
-	if ctx.(layerCtx).l.stack.closing.Load() {
+	if ctx.(layerCtx).l.stack.over() {
 		s.closing.Add(1)
 	}
 }
@@ -3023,13 +3023,16 @@ type closingProbe struct {
 }
 
 func (p *closingProbe) lateCall(ctx LayerContext) {
-	if ctx.(layerCtx).l.stack.closing.Load() {
+	if ctx.(layerCtx).l.stack.over() {
 		p.late.Add(1)
 	}
 }
 
 func (p *closingProbe) OnWireSent(ctx LayerContext, _ int) { p.lateCall(ctx) }
-func (p *closingProbe) Flush(ctx LayerContext) error       { p.lateCall(ctx); return nil }
+
+// Flush is not counted: the goodbye walk flushes the layers below the close's
+// initiator while the stack is closing, and that flush is the close itself.
+func (p *closingProbe) Flush(LayerContext) error { return nil }
 func (p *closingProbe) OnTimer(ctx LayerContext) error     { p.lateCall(ctx); return nil }
 func (p *closingProbe) CloseWrite(ctx LayerContext) error {
 	p.lateCall(ctx)

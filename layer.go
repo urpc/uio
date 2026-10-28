@@ -74,8 +74,10 @@ import (
 //     it — or ended, UIO starts no call into a layer, checking again after
 //     every callback, so a layer that closes from OnWireSent or Flush is the
 //     last called: a write, flush or close that comes after returns
-//     net.ErrClosed, and only OnClose follows. A call already under way on
-//     another goroutine may still overlap.
+//     net.ErrClosed, and only OnClose follows. The close itself is the one
+//     caller left: the goodbyes it walks, and the flushes it makes below the
+//     layer that began it, run while every layer already reads closing. A
+//     call already under way on another goroutine may still overlap.
 //   - What the layers hold for the layers above counts against
 //     MaxInboundBuffered with the socket's own buffer: a stack whose layers
 //     hold the limit pulls nothing more from below until a read above makes
@@ -507,7 +509,12 @@ type stack struct {
 	userdata atomic.Pointer[any] // every layer's Userdata, the Handler's
 
 	topOpen atomic.Bool // the Handler's OnOpen ran; set on a turn
-	ended   atomic.Bool // the stack closed
+
+	// state packs the lifecycle phase (low bits) with the close initiator's
+	// index+1 (high bits), so a close publishes both in one store: a write
+	// that sees closing also sees which layers may still write down, and a
+	// turn that sees closed sees it before any OnClose runs.
+	state atomic.Uint32
 
 	// shutsPending counts the layers whose CloseWrite has not passed below
 	// yet; see shutDown.
@@ -525,11 +532,6 @@ type stack struct {
 	// upPending marks a layer that wrote up in OnWireSent: the turn running
 	// has delivered already, so settle asks for the one that carries it.
 	upPending atomic.Bool
-
-	// closing is set as a close reaches the socket from the layers: a turn
-	// that is running stops there, and flushes nothing more — a graceful close
-	// flushed already, an abort drops what is held.
-	closing atomic.Bool
 
 	// wireQueued and wireSent count, on the wire, what the socket was handed
 	// and what it reported sent; see WireCounter.
@@ -557,7 +559,7 @@ type timerSlot struct {
 // timer first, then the Handler. Every turn reaches the Handler once it is
 // open, whether or not a layer delivered anything.
 func (c *stack) turn() error {
-	if c.ended.Load() {
+	if c.closedStack() {
 		return nil
 	}
 	// Cleared before the turn looks at anything, so a request after this
@@ -565,7 +567,7 @@ func (c *stack) turn() error {
 	if c.turnAsked.Load() {
 		c.turnAsked.Store(false)
 	}
-	if c.closing.Load() {
+	if c.over() {
 		// Closing — a graceful close waiting for its queue, or aborted with
 		// the socket's close still to come: what arrives is no longer
 		// anyone's, and kept it would grow for as long as the queue takes
@@ -596,7 +598,83 @@ func (c *stack) turn() error {
 // one that is closing. A layer's callback can end it — a close from OnWireSent,
 // a protocol error — so every call into a layer is followed by this check
 // before the next.
-func (c *stack) over() bool { return c.ended.Load() || c.closing.Load() }
+func (c *stack) over() bool { return c.state.Load()&stackPhaseMask >= stackClosing }
+
+// closedStack reports the socket's OnClose run: no turn and no callback is
+// owed any more.
+func (c *stack) closedStack() bool { return c.state.Load()&stackPhaseMask == stackClosed }
+
+// beginClosing publishes the stack as closing on behalf of the layer at
+// initiator, reporting whether this call published it. The close that does
+// runs the goodbyes; one that finds the stack closing already passes its
+// cause to the socket alone.
+func (c *stack) beginClosing(initiator int) bool {
+	for {
+		state := c.state.Load()
+		if state&stackPhaseMask >= stackClosing {
+			return false
+		}
+		next := uint32(initiator+1)<<stackPhaseBits | stackClosing
+		if c.state.CompareAndSwap(state, next) {
+			return true
+		}
+	}
+}
+
+// markOpen turns an opening stack open: every layer and the Handler opened.
+func (c *stack) markOpen() {
+	for {
+		state := c.state.Load()
+		if state&stackPhaseMask != stackOpening {
+			return
+		}
+		if c.state.CompareAndSwap(state, state&^stackPhaseMask|stackOpen) {
+			return
+		}
+	}
+}
+
+// markClosed publishes the stack closed, reporting whether this call
+// published it: the socket's OnClose runs the callbacks once.
+func (c *stack) markClosed() bool {
+	for {
+		state := c.state.Load()
+		if state&stackPhaseMask == stackClosed {
+			return false
+		}
+		if c.state.CompareAndSwap(state, state&^stackPhaseMask|stackClosed) {
+			return true
+		}
+	}
+}
+
+// mayWriteDown reports whether a write entering the layer at index may enter
+// the stack: anything while it is open, and while it is closing only the
+// goodbyes of the layers below the close's initiator — never a Handler's
+// write, and never through the initiator's own OnWrite.
+func (c *stack) mayWriteDown(index int) bool {
+	state := c.state.Load()
+	switch state & stackPhaseMask {
+	case stackClosing:
+		return uint32(index+1) < state>>stackPhaseBits
+	case stackClosed:
+		return false
+	}
+	return true
+}
+
+// stackPhase is the stack's lifecycle; the low bits of stack.state.
+const (
+	stackOpening uint32 = iota // the layers open; the dial waits
+	stackOpen                  // settled: turns, writes and goodbyes flow
+	stackClosing               // a close began: no layer call, no new write
+	stackClosed                // the socket's OnClose ran
+)
+
+const (
+	stackPhaseBits = 8
+	stackPhaseMask = 1<<stackPhaseBits - 1
+)
 
 // finishTurn ends a turn: the layers hear what was sent, then flush what
 // they hold — what OnWireSent wrote too — unless the connection is closing, an
@@ -611,7 +689,7 @@ func (c *stack) finishTurn() error {
 		// Nothing to deliver or flush: only settle's look, and that only
 		// when an end waits for a turn.
 		c.inTurn.Store(false)
-		if c.shutsPending.Load() > 0 || c.closing.Load() {
+		if c.shutsPending.Load() > 0 || c.over() {
 			c.settle()
 		}
 		return nil
@@ -642,7 +720,7 @@ func (c *stack) finishTurn() error {
 // back. Once the connection is closing, nothing reaches the layers: the
 // socket's own graceful close carries the queue from there.
 func (c *stack) settle() {
-	if c.closing.Load() {
+	if c.over() {
 		c.sentPending.Store(0)
 		return
 	}
@@ -704,14 +782,14 @@ func (c *stack) run() error {
 			if err := layer.conn.OnTimer(layerCtx{layer}); err != nil {
 				return err
 			}
-			if c.closing.Load() {
+			if c.over() {
 				return nil
 			}
 		}
 		if err := c.inbound(layer); err != nil {
 			return err
 		}
-		if c.ended.Load() || c.closing.Load() {
+		if c.over() {
 			return nil // a layer closed the connection: nothing above runs
 		}
 	}
@@ -722,7 +800,7 @@ func (c *stack) run() error {
 		if err := c.top.OnTimer(c.topConn()); err != nil {
 			return err
 		}
-		if c.closing.Load() {
+		if c.over() {
 			return nil
 		}
 	}
@@ -752,7 +830,7 @@ func (c *stack) inbound(layer *layerNode) error {
 		if err := layer.conn.OnRead(layerCtx{layer}); err != nil {
 			return err
 		}
-		if c.ended.Load() || c.closing.Load() || layer.stalled.Load() {
+		if c.over() || layer.stalled.Load() {
 			return nil
 		}
 		after := layer.waitingBelow()
@@ -800,7 +878,7 @@ func (c *stack) inboundFullNow() bool {
 // openLayer opens layer i, or the Handler past the top layer. It runs on
 // the connection's turn.
 func (c *stack) openLayer(i int) {
-	if c.ended.Load() || c.closing.Load() {
+	if c.over() {
 		return
 	}
 	if i < len(c.layers) {
@@ -830,6 +908,7 @@ func (c *stack) openLayer(i int) {
 	// aimed at was not open yet, and aimLocked skipped it — is aimed now; a
 	// timer armed after this sees the slot open and aims itself.
 	c.topOpen.Store(true)
+	c.markOpen()
 	c.reaim()
 	c.top.OnOpen(c.topConn())
 }
@@ -837,7 +916,7 @@ func (c *stack) openLayer(i int) {
 // closed is the socket's OnClose: the Handler hears it first, once it
 // opened, then every layer, top down; a dial still waiting hears the cause.
 func (c *stack) closed(err error) {
-	if !c.ended.CompareAndSwap(false, true) {
+	if !c.markClosed() {
 		return
 	}
 	c.stopTimers()
@@ -889,10 +968,10 @@ func (c *stack) sent(n int) {
 // layers' OnWireSent on the next turn's end, and asks for that turn.
 func stackSent(next func(Conn, int)) func(Conn, int) {
 	return func(conn Conn, n int) {
-		if l, ok := conn.(*layerNode); ok && !l.stack.ended.Load() {
+		if l, ok := conn.(*layerNode); ok && !l.stack.closedStack() {
 			c := l.stack
 			c.wireSent.Add(uint64(n))
-			if len(c.sends) > 0 && !c.closing.Load() {
+			if len(c.sends) > 0 && !c.over() {
 				c.sentPending.Add(int64(n))
 				c.requestTurn()
 			}
@@ -918,24 +997,27 @@ func (c *stack) queued() int {
 	return c.socket.OutboundBuffered()
 }
 
-// closeSocket is a close reaching the socket from the layers. A graceful one
-// is the socket's own CloseGracefully: writes are refused from here, and the
-// queue — the goodbyes the layers it passed queued below — leaves before the
-// connection releases, bounded by LingerTimeout without progress; see
-// Conn.CloseGracefully. An abort closes at once, and cuts a graceful close's
-// wait short.
+// closeSocket is a close reaching the socket with no layer above to say a
+// goodbye for: the stack moves to closing first, then the socket closes. A
+// graceful one is the socket's own CloseGracefully — writes refused, queue
+// drained, bounded by LingerTimeout without progress; see Conn.CloseGracefully.
+// An abort closes at once, and cuts a graceful close's wait short.
 func (c *stack) closeSocket(cause error) error {
-	wasClosing := c.closing.Swap(true)
+	return c.endAtSocket(cause, c.beginClosing(len(c.layers)))
+}
+
+// endAtSocket hands cause to the socket. first reports that this close moved
+// the stack to closing: a socket found closed already is then the peer
+// answering the close first, and the close reports itself done — reported by
+// the close that did not move the stack as it is.
+func (c *stack) endAtSocket(cause error, first bool) error {
 	var err error
 	if gracefulCause(cause) {
 		err = c.socket.CloseGracefully(cause)
 	} else {
 		err = c.socket.CloseWith(cause)
 	}
-	if !wasClosing && errors.Is(err, net.ErrClosed) {
-		// The socket closed under this close, the first: the peer answered
-		// the goodbye it sent before the socket's own close came. The
-		// connection closed as asked.
+	if first && errors.Is(err, net.ErrClosed) {
 		return nil
 	}
 	return err
@@ -980,7 +1062,7 @@ func (c *stack) release(n int) {
 func (c *stack) setTimer(slot int, when time.Time, every time.Duration) error {
 	c.timerMu.Lock()
 	defer c.timerMu.Unlock()
-	if c.ended.Load() {
+	if c.closedStack() {
 		return net.ErrClosed
 	}
 	if c.timers == nil {
@@ -1019,7 +1101,7 @@ func (c *stack) reaim() {
 		return
 	}
 	c.timerMu.Lock()
-	if c.timers != nil && !c.ended.Load() {
+	if c.timers != nil && !c.closedStack() {
 		_ = c.aimLocked(time.Time{})
 	}
 	c.timerMu.Unlock()
@@ -1094,7 +1176,7 @@ type layerNode struct {
 	opened  atomic.Bool // the layer's OnOpen ran; set on a turn
 	ended   bool        // the layer ended its stream up; only turns touch it
 	openUp  atomic.Bool // the layer opened the layers above it
-	closing atomic.Bool // the layer above asked for the close
+	closing atomic.Bool // this layer's close walk began; see CloseWith
 	// writeShut is set as the layer above ends its writing half: writes into
 	// the layer are refused from then on. shutPending marks the end not yet
 	// passed below, shutFlushed its flush made, and writers counts the
@@ -1351,7 +1433,7 @@ func (l *layerNode) SetWakeDeadline(when time.Time) error { return l.stack.setTi
 // never missed.
 func (l *layerNode) WireQueued() uint64 {
 	held := 0
-	if l.stack.holders && !l.stack.ended.Load() {
+	if l.stack.holders && !l.stack.closedStack() {
 		for _, below := range l.stack.layers[:l.index+1] {
 			if holder, ok := below.conn.(OutboundHolder); ok {
 				held += holder.OutboundHeld(layerCtx{below})
@@ -1410,7 +1492,7 @@ func (l *layerNode) Read(b []byte) (int, error) {
 // holds, if it holds any, and what the layers below and the socket queue.
 func (l *layerNode) OutboundBuffered() int {
 	queued := l.lower.OutboundBuffered()
-	if holder, ok := l.conn.(OutboundHolder); ok && !l.stack.ended.Load() {
+	if holder, ok := l.conn.(OutboundHolder); ok && !l.stack.closedStack() {
 		queued += holder.OutboundHeld(layerCtx{l})
 	}
 	return queued
@@ -1523,11 +1605,13 @@ func (l *layerNode) enter(n int) error {
 	return nil
 }
 
-// refuses reports a layer writes no longer reach: not open above yet,
-// closing, its writing half ended, or the connection closing or over — a
-// layer below may have closed it itself.
+// refuses reports a layer writes no longer reach: not open above yet, its
+// writing half ended, or the stack closing — where only the goodbyes below
+// the close's initiator still write down. The stack reads one state word, so
+// a write racing the close is refused at once, not when the walk reaches its
+// layer.
 func (l *layerNode) refuses() bool {
-	return !l.openUp.Load() || l.closing.Load() || l.writeShut.Load() || l.stack.over()
+	return !l.openUp.Load() || l.writeShut.Load() || !l.stack.mayWriteDown(l.index)
 }
 
 func (l *layerNode) leave(n int) {
@@ -1573,22 +1657,46 @@ func (l *layerNode) WriteOwned(buffer *Buffer) (int, error) {
 // began it, which may be inside a callback of its own.
 func (l *layerNode) CloseWith(err error) error {
 	c := l.stack
-	if c.ended.Load() || !l.closing.CompareAndSwap(false, true) {
+	if c.closedStack() || !l.closing.CompareAndSwap(false, true) {
 		return net.ErrClosed
 	}
-	if c.closing.Load() {
+	if !c.beginClosing(l.index) {
 		// Closing already — a layer below closed it: no layer is called any
 		// more, and the socket hears this cause, an abort cutting a
 		// graceful close's wait short.
-		return c.closeSocket(err)
+		return c.endAtSocket(err, false)
 	}
+	done := l.closeWalk(err)
+	if errors.Is(done, net.ErrClosed) {
+		// The socket closed under this close, which began the stack's: the
+		// peer answered the goodbye it sent before the socket's own close
+		// came. The connection closed as asked.
+		return nil
+	}
+	return done
+}
+
+// closeWalk says this layer's goodbye and passes the close to the layer
+// below, one layer at a time, until it reaches the socket. The stack is
+// closing throughout — no turn calls a layer — and the walk is what still
+// writes down: its goodbyes enter the layers below the initiator, and
+// nothing above them.
+func (l *layerNode) closeWalk(err error) error {
+	c := l.stack
 	if graceful, ok := l.conn.(GracefulCloser); ok && l.openUp.Load() {
 		graceful.CloseGracefully(layerCtx{l}, err)
 	}
-	if flusher, ok := l.conn.(Flusher); ok && gracefulCause(err) && l.opened.Load() && !c.over() {
+	if flusher, ok := l.conn.(Flusher); ok && gracefulCause(err) && l.opened.Load() && !c.closedStack() {
 		_ = flusher.Flush(layerCtx{l})
 	}
-	return l.lower.CloseWith(err)
+	below, ok := l.lower.(*layerNode)
+	if !ok {
+		return l.lower.CloseWith(err) // the socket
+	}
+	if !below.closing.CompareAndSwap(false, true) {
+		return net.ErrClosed // a close from below owns that layer
+	}
+	return below.closeWalk(err)
 }
 
 // CloseGracefully closes the connection as CloseWith does with a graceful
@@ -1666,7 +1774,7 @@ func (l *layerNode) shutDown() (bool, error) {
 // longer hold anything back. It runs as a turn ends; an error closes the
 // connection: nobody is left to return it to.
 func (c *stack) finishShuts() {
-	if c.shutsPending.Load() == 0 || c.ended.Load() {
+	if c.shutsPending.Load() == 0 || c.closedStack() {
 		return
 	}
 	for i := len(c.layers) - 1; i >= 0; i-- {
