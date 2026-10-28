@@ -174,6 +174,10 @@ type wsLayerHandler struct {
 	// conn is set as the layer opens; OnWireSent, which runs wherever the socket
 	// sends, may come first — for what the layers below sent to open.
 	conn atomic.Pointer[Conn]
+	// staged holds the frames that arrived behind the handshake: the engine
+	// hands them over rather than reading them before the layers above
+	// opened. Only the connection's turns touch it.
+	staged []byte
 	// writeMu keeps one write from above whole: the messages a large write
 	// is split into go out together, never between another writer's.
 	writeMu sync.Mutex
@@ -233,6 +237,19 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 	if conn == nil {
 		return nil
 	}
+	if len(w.staged) > 0 {
+		// Frames that arrived behind a handshake which settled on an earlier
+		// round: the layers above open after that callback returned, so they
+		// go up now, in order.
+		extra := w.staged
+		w.staged = nil
+		if _, err := conn.feedFrames(extra, conn.acceptFrame); err != nil {
+			if errors.Is(err, ErrClosed) {
+				return nil
+			}
+			return conn.protocolClose(err)
+		}
+	}
 	if conn.opened.Load() && ctx.Up().Buffered() >= layerDeliverBound {
 		ctx.Up().Yield() // the layer above's next read runs the turn again
 		return nil
@@ -252,6 +269,12 @@ func (w *wsLayerHandler) OnRead(ctx uio.LayerContext) error {
 			cause = io.EOF
 		}
 		return cause
+	}
+	if len(w.staged) > 0 {
+		// Frames that arrived behind a handshake that settled this round: the
+		// layers above open after this callback returns, and the round asked
+		// for here feeds them up then.
+		_ = ctx.Wake()
 	}
 	return nil
 }

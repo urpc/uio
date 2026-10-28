@@ -648,15 +648,29 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	extra := append([]byte(nil), input[consumed:]...)
 	c.notifyOpen()
 	if len(extra) > 0 {
-		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
-			if errors.Is(err, ErrClosed) {
-				// OnOpen closed this end: stop consuming rather than treat
-				// it as a protocol error, which would end the transport
-				// before the peer answers the close handshake.
-				return nil
-			}
-			return c.protocolClose(err)
+		return c.feedBehindHandshake(extra)
+	}
+	return nil
+}
+
+// feedBehindHandshake takes the frames that arrived behind a handshake. A
+// plain Conn's OnOpen ran inside notifyOpen, so they are fed now. A Conn
+// running as a layer opens the layers above only on the turn's open stage,
+// after this callback returned — so the layer held the frames, and feeds
+// them in the round asked for after it; see wsLayerHandler.
+func (c *Conn) feedBehindHandshake(extra []byte) error {
+	if sink, ok := c.handler.(layerSink); ok {
+		sink.w.staged = append(sink.w.staged, extra...)
+		return nil
+	}
+	if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
+		if errors.Is(err, ErrClosed) {
+			// OnOpen closed this end: stop consuming rather than treat it as
+			// a protocol error, which would end the transport before the peer
+			// answers the close handshake.
+			return nil
 		}
+		return c.protocolClose(err)
 	}
 	return nil
 }
@@ -699,9 +713,7 @@ func (c *Conn) consumeClientHandshake() error {
 	extra := append([]byte(nil), state.data[consumed:]...)
 	c.notifyOpen()
 	if len(extra) > 0 {
-		if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
-			return c.protocolClose(err)
-		}
+		return c.feedBehindHandshake(extra)
 	}
 	return nil
 }

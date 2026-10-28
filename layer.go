@@ -458,7 +458,7 @@ func (h *stackDriver) OnOpen(socket Conn) {
 	}
 	c.inTurn.Store(true)
 	defer c.inTurn.Store(false)
-	c.openLayer(0)
+	c.openUpTo()
 	if err := c.finishTurn(); err != nil {
 		_ = socket.CloseWith(err)
 	}
@@ -509,6 +509,9 @@ type stack struct {
 	userdata atomic.Pointer[any] // every layer's Userdata, the Handler's
 
 	topOpen atomic.Bool // the Handler's OnOpen ran; set on a turn
+	// openedCount is how many layers opened, bottom up: the prefix of the
+	// stack openUpTo resumes from. Only turns touch it.
+	openedCount int
 
 	// state packs the lifecycle phase (low bits) with the close initiator's
 	// index+1 (high bits), so a close publishes both in one store: a write
@@ -699,6 +702,7 @@ func (c *stack) finishTurn() error {
 		if c.over() {
 			break // a layer ended the connection: nothing more reaches any
 		}
+		c.openUpTo() // an Up().Open an OnWireSent made opens the layers above now
 		if flushErr := c.flushHeld(); err == nil {
 			err = flushErr
 		}
@@ -792,6 +796,7 @@ func (c *stack) run() error {
 		if c.over() {
 			return nil // a layer closed the connection: nothing above runs
 		}
+		c.openUpTo() // an Up().Open the layer made opens the layers above now
 	}
 	if !c.topOpen.Load() {
 		return nil
@@ -833,6 +838,9 @@ func (c *stack) inbound(layer *layerNode) error {
 		if c.over() || layer.stalled.Load() {
 			return nil
 		}
+		// An Up().Open the layer made takes effect here, before the round
+		// reads on into bytes that arrived behind its handshake.
+		c.openUpTo()
 		after := layer.waitingBelow()
 		if after == 0 || after >= before {
 			return nil
@@ -875,42 +883,52 @@ func (c *stack) inboundFullNow() bool {
 	return held >= c.inLimit
 }
 
-// openLayer opens layer i, or the Handler past the top layer. It runs on
-// the connection's turn.
-func (c *stack) openLayer(i int) {
-	if c.over() {
-		return
-	}
-	if i < len(c.layers) {
-		layer := c.layers[i]
-		if layer.opened.Load() {
+// openUpTo opens every layer that may open now, and the Handler past the
+// top, iterating rather than recursing: a layer's Up().Open only records the
+// request, and the framework opens the layers above after the callback
+// returned — never from inside another callback. Turns run it after every
+// callback that may ask, so a handshake that settles mid-round still opens
+// the layers above on the same turn, and a round that finds bytes waiting
+// below runs again once they are open. It runs on the connection's turn.
+func (c *stack) openUpTo() {
+	for !c.over() {
+		if c.openedCount < len(c.layers) {
+			i := c.openedCount
+			if i > 0 && !c.layers[i-1].openUp.Load() {
+				return // the layer below has not opened the layers above it
+			}
+			layer := c.layers[i]
+			c.openedCount = i + 1
+			layer.opened.Store(true)
+			c.reaim() // a timer it armed before it opened
+			layer.conn.OnOpen(layerCtx{layer})
+			continue // an Up().Open it made opens the next layer here, after it returned
+		}
+		if c.topOpen.Load() {
 			return
 		}
-		layer.opened.Store(true)
-		c.reaim() // a timer it armed before it opened
-		layer.conn.OnOpen(layerCtx{layer})
+		if !c.layers[len(c.layers)-1].openUp.Load() {
+			return // the top layer has not opened the layers above it
+		}
+		if probe := c.probe.Load(); probe != nil && probe.claimed.Load() {
+			// The dial gave up while a layer opened, and closes the
+			// connection: the Handler never hears of it.
+			return
+		}
+		// The Handler opens last, the stack turns open with it, and the dial
+		// settles in the same step: DialContext returns a conn only after the
+		// Handler's OnOpen returned, so the conn a dial holds is never one
+		// the Handler has not heard of. A close that claimed the stack first
+		// keeps it out — probe.settle finds the probe claimed and fails.
+		c.topOpen.Store(true)
+		c.reaim()
+		c.top.OnOpen(c.topConn())
+		c.markOpen()
+		if probe := c.probe.Swap(nil); probe != nil {
+			probe.settle(c.topConn())
+		}
 		return
 	}
-	if c.topOpen.Load() {
-		return
-	}
-	if probe := c.probe.Swap(nil); probe != nil {
-		if !probe.settle(c.topConn()) {
-			return // the dial gave up and closes the connection
-		}
-		// The dial has its connection from here on: it may close it, or
-		// arm its timer, before this turn goes on.
-		if c.over() {
-			return // closed under the dial: the Handler never hears of it
-		}
-	}
-	// Open before aiming, so a timer the dial armed in between — the slot it
-	// aimed at was not open yet, and aimLocked skipped it — is aimed now; a
-	// timer armed after this sees the slot open and aims itself.
-	c.topOpen.Store(true)
-	c.markOpen()
-	c.reaim()
-	c.top.OnOpen(c.topConn())
 }
 
 // closed is the socket's OnClose: the Handler hears it first, once it
@@ -1242,7 +1260,6 @@ func (u layerUp) End() { u.l.ended = true }
 // without a lock OnWrite takes.
 func (u layerUp) Open() {
 	u.l.openUp.Store(true)
-	u.l.stack.openLayer(u.l.index + 1)
 }
 
 func (u layerUp) Reserve(n int) []byte {
