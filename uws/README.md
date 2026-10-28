@@ -288,7 +288,7 @@ dialer := uws.NewDialer(uws.Options{
 	Handler:   handler,
 	TLSConfig: &tls.Config{}, // system roots; each dial verifies its URL's host
 })
-err := dialer.Dial(ctx, "wss://example.org/socket", nil)
+err := dialer.Dial(ctx, "wss://example.org:443/socket", nil)
 ```
 
 A dialer with a `TLSConfig` still dials `ws://` in the clear; without one it

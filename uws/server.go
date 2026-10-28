@@ -34,7 +34,10 @@ type Server struct {
 	CheckOrigin func(*http.Request) bool
 	// Authorize decides an upgrade request that passed validation and
 	// CheckOrigin, before the server answers it. A nil error accepts it, and
-	// userdata becomes the connection's Userdata from OnOpen on. An error
+	// userdata becomes the connection's Userdata from OnOpen on (`uws.Conn`
+	// in the sugar; a stack's `ServerLayer` reports it through
+	// uio.FindLayer instead). On the ServeHTTP path Authorize runs on the
+	// http server's goroutine, before the connection is adopted. An error
 	// refuses it: a *RejectError with the status, header and reason it names,
 	// any other error with 403. A refused connection never reaches the
 	// Handler. Authorize runs on the connection's turn, so a slow check holds

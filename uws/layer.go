@@ -60,13 +60,15 @@ type LayerOptions struct {
 //
 // It answers the upgrade request, and opens the layers above once the
 // handshake succeeded; a request it refuses gets its answer and closes the
-// connection, which the layers above never hear of. From then on it carries
+// connection — the layers above never see OnOpen, and end with OnClose alone.
+// From then on it carries
 // a byte stream: what the layer above writes leaves as Binary messages —
 // split at MaxMessageSize — and the payload of every message that arrives,
 // Text or Binary, is handed up once the message is whole, message boundaries
 // dropped. Pings are answered, heartbeats run, and a Close from the peer is
 // answered and ends the connection. Closing the connection from above sends
-// a Close frame first: 1000 for a graceful close, 1011 for an abort. The
+// a Close frame first: 1000 for a graceful close, 1011 for an abort — an
+// abort sends it best-effort, since nothing is flushed or drained. The
 // stream has no half-close: CloseWrite is not supported.
 //
 // Each write from above leaves as its own frame, through the Events the layer

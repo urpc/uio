@@ -112,7 +112,7 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 	// when the Server's own accepts speak TLS, this connection's chain
 	// leaves it out.
 	var opts []uio.DialOption
-	if s.Options.TLSConfig != nil {
+	if s.opts.TLSConfig != nil {
 		opts = append(opts, uio.WithLayers(uio.PassThroughLayer))
 	}
 	_, err = s.events.Adopt(tcpConn, wsConn, opts...)

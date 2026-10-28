@@ -20,12 +20,14 @@
 //
 // The handshake is bounded by the layer's own timer, whose expiry closes the
 // connection. A connection opens
-// to the handler above once its handshake settles; one accepted whose
-// handshake fails or times out reaches OnClose instead, with its cause, and a
-// dial that fails before it settles reports its cause from DialContext, the
-// handler hearing nothing of it. Close sends the peer
-// close_notify once what was accepted has left, and CloseWrite sends it one
-// way; a peer's close_notify delivers what arrived with it and then the
+// to the handler above once its handshake settles; a connection whose
+// handshake fails or times out — accepted or dialed — ends without a handler
+// callback (the Handler never opened, so it hears neither OnOpen nor
+// OnClose), and a dial reports its cause from DialContext. Close sends the
+// peer close_notify once what was accepted has left, and CloseWrite sends it
+// one way, then shuts the connection below's writing half — a stack below
+// that cannot end one direction reports ErrUnsupported after close_notify
+// went. A peer's close_notify delivers what arrived with it and then the
 // close. The connection below's deadlines and fd-shaped options reach
 // through to it.
 //
@@ -119,9 +121,12 @@ func HandshakeTimeout(timeout time.Duration) Option {
 
 // StagingBound bounds the decrypted bytes the layer holds for the handler
 // above. Once it holds its bound it stops consuming the connection below, so a
-// pause at the top stills the wire. During the handshake it bounds the
-// ciphertext the layer takes from below that the handshake has not read yet,
-// though never below one TLS record. Zero means DefaultStagingBound.
+// pause at the top stills the wire — and the framework pauses the layer at
+// its own delivery bound (DefaultDeliverBound, or MaxInboundBuffered) as
+// well, so a larger StagingBound is capped there. During the handshake it
+// bounds the ciphertext the layer takes from below that the handshake has not
+// read yet, though never below one TLS record. Zero means
+// DefaultStagingBound.
 func StagingBound(bytes int) Option {
 	return func(m *tlsLayer) { m.stagingBound = bytes }
 }

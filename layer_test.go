@@ -396,7 +396,7 @@ func (l *timerLayer) OnTimer(LayerContext) error {
 // passThroughLayer is a layer that changes nothing.
 type passThroughLayer struct{}
 
-func (passThroughLayer) Attach(LayerContext) LayerHandler { return PassThrough{} }
+func (passThroughLayer) Attach(LayerContext) LayerHandler { return passThroughHandler{} }
 
 // A turn that delivers nothing still reaches the Handler: a wake through a
 // stack of layers that pass nothing up arrives all the same.
@@ -1220,6 +1220,8 @@ type holdsOutput struct {
 
 func (h *holdsOutput) OutboundHeld(LayerContext) int { return int(h.held.Load()) }
 
+func (h *holdsOutput) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
+
 // A graceful close waits for a slow peer that keeps reading past the linger
 // bound: the bound is on progress, not on the whole drain.
 //
@@ -1540,6 +1542,8 @@ func (h *holdUntilFlush) OnWrite(_ LayerContext, p []byte) (int, error) {
 }
 
 func (h *holdUntilFlush) OutboundHeld(LayerContext) int { return int(h.counted.Load()) }
+
+func (h *holdUntilFlush) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
 
 func (h *holdUntilFlush) Flush(ctx LayerContext) error {
 	h.mu.Lock()
@@ -2216,6 +2220,8 @@ func (f *failingFlush) Flush(LayerContext) error {
 	return nil
 }
 
+func (f *failingFlush) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
+
 // sendWindow holds what is written until release, as a layer with a closed
 // send window does; Flush cannot send it.
 type sendWindow struct {
@@ -2225,6 +2231,8 @@ type sendWindow struct {
 	held    []byte
 	counted atomic.Int64
 }
+
+func (w *sendWindow) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
 
 func (w *sendWindow) OnOpen(ctx LayerContext) {
 	w.mu.Lock()
@@ -2415,6 +2423,8 @@ func (w *windowFlush) OnWrite(_ LayerContext, p []byte) (int, error) {
 }
 
 func (w *windowFlush) OutboundHeld(LayerContext) int { return int(w.counted.Load()) }
+
+func (w *windowFlush) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
 
 func (w *windowFlush) Flush(ctx LayerContext) error {
 	n := w.flushes.Add(1)
@@ -3032,8 +3042,8 @@ func (p *closingProbe) OnWireSent(ctx LayerContext, _ int) { p.lateCall(ctx) }
 
 // Flush is not counted: the goodbye walk flushes the layers below the close's
 // initiator while the stack is closing, and that flush is the close itself.
-func (p *closingProbe) Flush(LayerContext) error { return nil }
-func (p *closingProbe) OnTimer(ctx LayerContext) error     { p.lateCall(ctx); return nil }
+func (p *closingProbe) Flush(LayerContext) error       { return nil }
+func (p *closingProbe) OnTimer(ctx LayerContext) error { p.lateCall(ctx); return nil }
 func (p *closingProbe) CloseWrite(ctx LayerContext) error {
 	p.lateCall(ctx)
 	return ctx.Down().CloseWrite()
@@ -3179,6 +3189,8 @@ type splitWriter struct {
 	proceed chan struct{}
 }
 
+func (w *splitWriter) CloseWrite(ctx LayerContext) error { return ctx.Down().CloseWrite() }
+
 func (s *splitWriter) OnWrite(ctx LayerContext, p []byte) (int, error) {
 	n, err := ctx.Down().Write(p[:2])
 	if err != nil {
@@ -3290,7 +3302,9 @@ func TestCloseWriteInFlightAndClosing(t *testing.T) {
 		})
 		ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil {
+		// The flush closes the stack inside the Handler's OnOpen: the dial
+		// reports the close rather than a settled connection already closing.
+		if _, err := events.DialContext(ctx, "tcp://"+addr, nil); err != nil && !errors.Is(err, net.ErrClosed) {
 			t.Fatal(err)
 		}
 		layerWaitFor(t, ended, "CloseWrite")

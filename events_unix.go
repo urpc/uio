@@ -125,8 +125,10 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, userdata any,
 
 // DialContext connects synchronously and allows cancellation while resolving
 // or establishing the connection. The connection is registered on the calling
-// goroutine, so calling it from a connection callback waits for nothing but
-// the dial itself.
+// goroutine; with layers installed it returns once the whole stack opened,
+// which waits for that connection's turns, so a call from a connection
+// callback waits for the dial and its open stage — never call it from an
+// event loop goroutine.
 // A connection it returns gets OnOpen and, at its end, OnClose, even if it is
 // closed first; after an error no callback runs for it.
 func (ev *Events) DialContext(dialCtx context.Context, addr string, userdata any, opts ...DialOption) (Conn, error) {

@@ -91,7 +91,9 @@ func TestFullDeliveryPacesTheLayer(t *testing.T) {
 		_ = conn.Wake()
 		time.Sleep(time.Millisecond)
 	}
-	if got := layer.written.Load(); got >= chunk*calls {
+	if got := layer.written.Load(); got == 0 {
+		t.Fatal("the layer never ran: the pacing assertion would be vacuous")
+	} else if got >= chunk*calls {
 		t.Fatalf("the layer wrote its whole budget %d past a full delivery", got)
 	}
 	if bound := int64(DefaultDeliverBound + chunk); heldMax.Load() > bound {

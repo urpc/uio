@@ -49,7 +49,9 @@ type DialConfig struct {
 	hasLayers bool
 }
 
-// DialOption configures one dial; see WithLocalAddr and WithDialControl.
+// DialOption configures one dial — and one adoption, which takes the same
+// options and honors WithLayers; the socket-shaping ones apply to a dial
+// only.
 type DialOption func(*DialConfig)
 
 // WithLocalAddr binds the dial's socket to addr; see DialConfig.LocalAddr.

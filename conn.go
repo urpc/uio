@@ -200,7 +200,9 @@ type Conn interface {
 	// queue is sent after the callback returns; elsewhere, or while output
 	// written from another goroutine is queued for or being sent by a write
 	// turn, it reserves nothing and returns ErrReserveUnsupported, and the
-	// caller writes another way. Once a reservation succeeds, output from other
+	// caller writes another way. A layered connection's Conn does not serve
+	// it at all: the layers between would have to be bypassed to fill the
+	// queue in place. Once a reservation succeeds, output from other
 	// goroutines waits for the end of the connection's turn.
 	// Every reserved byte must be written before the callback returns and
 	// before the next Flush.
@@ -252,10 +254,11 @@ type Conn interface {
 	// before the call leaves first, so the peer reads it whole. Writes are
 	// refused from the call — net.ErrClosed — while reads go on, and the
 	// connection's turn releases it once its queue is empty or LingerTimeout
-	// has passed without progress, reporting leftover output as
-	// UnflushedError appended to cause. A CloseWith at any time ends the wait
-	// at once. Datagram connections close as CloseWith does: their sends wait
-	// for nothing.
+	// has passed without progress; on native Unix leftover output reaches
+	// OnClose as UnflushedError appended to cause. On a layered connection the
+	// layers' goodbyes are said first, and the mode is this call's whatever
+	// the cause. A CloseWith at any time ends the wait at once. Datagram
+	// connections close as CloseWith does: their sends wait for nothing.
 	CloseGracefully(cause error) error
 
 	// CloseWrite shuts the connection's writing half: the peer reads the end
@@ -264,11 +267,14 @@ type Conn interface {
 	// until the peer shuts its own writing half; with Events.AllowHalfOpen it
 	// then closes, without it the end of the stream closes it as before. It
 	// may be called from any goroutine, and calling it again does nothing. On
-	// a layered connection it runs the layer's own CloseWrite before it
-	// returns — flushing that layer, and for TLS writing a close_notify — so
-	// it may wait on I/O; a bare connection returns at once. Datagram
-	// connections, and stdio-backend connections whose net.Conn cannot shut
-	// one half, return an unsupported error.
+	// a layered connection the top layer's own CloseWrite runs once what was
+	// written before it has gone below and the layer holds nothing — before
+	// this returns when that already holds — flushing the layer, and for TLS
+	// writing a close_notify, so it may wait on I/O; otherwise the end is
+	// passed on a turn. A stack whose layers do not implement CloseWriter
+	// returns ErrUnsupported. Datagram connections, and stdio-backend
+	// connections whose net.Conn cannot shut one half, return an unsupported
+	// error too.
 	CloseWrite() error
 
 	// State reports where the connection's streams stand: the peer's end
@@ -279,8 +285,9 @@ type Conn interface {
 
 // ErrUnsupported reports a method this connection cannot carry: CloseWrite on
 // a datagram or stdio connection, or on a layered one whose layers do not
-// implement CloseWriter; a deadline, a reserve or an option the backend has no
-// way to honor.
+// implement CloseWriter; a deadline or an option the backend has no way to
+// honor. A reserve the connection cannot serve reports ErrReserveUnsupported
+// instead.
 var ErrUnsupported = fmt.Errorf("unsupported method")
 
 var (
@@ -323,11 +330,10 @@ const (
 	// sent read — what Read(nil) reporting io.EOF says. A layer above still
 	// writing holds it open.
 	StatePeerEnded ConnState = 1 << iota
-	// StateWriteShut reports this end's writing half ended: by CloseWrite,
-	// or by a close.
+	// StateWriteShut reports this end's writing half ended by CloseWrite.
 	StateWriteShut
 	// StateClosing reports a close begun — by either side — after which
-	// writes are refused and reads end.
+	// writes are refused. A graceful close still reads until it releases.
 	StateClosing
 	// StateClosed reports the connection released: OnClose ran or is due.
 	StateClosed

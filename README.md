@@ -180,9 +180,10 @@ one connection; `LayerContext` is that instance's place in the stack: `Down()`,
 the connection below it reads from, `Up()`, the layer above's input it writes
 to, and the connection's lifecycle — `ctx.Close(cause)` says this layer's
 goodbye and drains the queue like a close from above, `ctx.Abort(cause)` ends
-it at once. `Down()` carries bytes, options and addressing, never closing: a
+it at once. `Down()` carries bytes, options and addressing, never a close: a
 layer ends the connection through the context, so every close runs the stack's
-one close algorithm from the layer that began it. An obfuscation layer is all
+one close algorithm from the layer that began it (`CloseWrite` stays: ending
+one direction is part of a layer's own protocol). An obfuscation layer is all
 of this:
 
 ```go
@@ -238,8 +239,10 @@ connection
    │
    ├─ stackDriver.OnOpen
    ├─ Attach(kcp) → Attach(tls) → Attach(trace)
-   └─ kcp.OnOpen ──Up().Open()──→ tls.OnOpen ──Up().Open()──→
-      trace.OnOpen ──Up().Open()──→ Handler.OnOpen
+   └─ kcp.OnOpen ─Up().Open()→ tls.OnOpen ─Up().Open()→ trace.OnOpen
+      ─Up().Open()→ Handler.OnOpen   (each opens after the one below
+      returned — never inside another callback — and the dial settles
+      once the Handler's OnOpen returned)
 
 one turn: inbound goes up, outbound goes down
 
@@ -251,8 +254,9 @@ outbound socket ◄── [kcp] ◄── [tls] ◄── [trace] ◄── Hand
 
 close
 
-Handler or a layer calls Close
-   └─ close passes downward (graceful close flushes first) ──► socket closes
+Handler calls Close, or a layer ctx.Close/Abort (walked on a turn)
+   └─ closing published once; the close passes downward, goodbyes and
+      flushes first on a graceful close ──► the socket drains, then closes
       └─ Handler.OnClose → trace.OnClose → tls.OnClose → kcp.OnClose
 ```
 
@@ -340,8 +344,9 @@ state under any stack — and `uio.LayerOf(conn)` the one that built `conn`.
 A `LayerHandler` may also implement optional interfaces:
 
 - `CloseWriter` ends one direction in its own protocol (a TLS close_notify).
-  A layer without it does not support `CloseWrite`; `PassThrough` passes it
-  down. UIO calls it only after what was written before `CloseWrite` has
+  A layer without it does not support `CloseWrite` — embedding `PassThrough`
+  does not grant it (`PassThroughLayer` does, as the layer that changes
+  nothing). UIO calls it only after what was written before `CloseWrite` has
   gone below: writes in flight finished, the layer flushed, held output
   sent.
 - `GracefulCloser` says goodbye as the layer above closes, told the close's
@@ -352,6 +357,14 @@ A `LayerHandler` may also implement optional interfaces:
 - `OutboundHolder` and `Flusher` are for a layer that holds output of its own,
   a send window or a compressor's buffer: what it holds counts as queued, and
   `Flush` reaches it.
+- `TrackedWriter` answers when one tracked write has left the wire:
+  `ctx.Down().(uio.TrackedWriter).WriteTracked(p)` returns a `SendReceipt`,
+  and a `ReceiptObserver` hears it on the turn it retires — which is how a
+  protocol knows its own frame is out.
+
+`Conn.State()` reports where the streams stand — `StatePeerEnded`,
+`StateWriteShut`, `StateClosing`, `StateClosed` — read on the connection's
+turn, replacing the old probe reads.
 
 ### What it is not
 
@@ -365,6 +378,19 @@ A `LayerHandler` may also implement optional interfaces:
   to or close the connection.
 - **`Use` before `Serve`.** `Serve` reads the layers once; a `Use` after it
   installs nothing.
+- **The stack is fixed once a connection starts.** `Use` composes it per
+  Events; `WithLayers` picks it per dial or adoption. There is no runtime
+  layer replacement — a protocol that sniffs its first bytes (ALPN, a PROXY
+  header) decides inside one layer, not by trading the stack.
+- **Packet connections carry no layers.** UDP, IP and unixgram/unixpacket are
+  refused with `ErrLayersNeedStream`: there is no data-unit declaration yet,
+  so a datagram transport such as KCP is built outside the layer model for
+  now.
+- **A layer's delivery to the layer above is bounded** (DefaultDeliverBound,
+  or `MaxInboundBuffered`): the framework stops calling a layer whose delivery
+  is full until the layer above reads. A Handler that peeks a whole frame
+  without consuming (ReserveInbound + PeekChunk) therefore sees at most one
+  bound's worth; set `MaxInboundBuffered` to size such frames.
 
 ## Configuration
 

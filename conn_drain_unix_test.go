@@ -209,6 +209,9 @@ func TestCloseWithCutsADrainShort(t *testing.T) {
 
 // A drain whose queue is empty releases at once: nothing waits.
 func TestCloseGracefullyWithEmptyQueueClosesAtOnce(t *testing.T) {
+	saved := lingerTimeout
+	lingerTimeout = 10 * time.Second // waiting out the bound must not look at-once
+	defer func() { lingerTimeout = saved }()
 	closed := make(chan error, 1)
 	events := &Events{Pollers: 1}
 	funcs(events).Read = func(Conn) error { return nil }
@@ -225,7 +228,7 @@ func TestCloseGracefullyWithEmptyQueueClosesAtOnce(t *testing.T) {
 		if cause != nil {
 			t.Fatalf("OnClose reported %v; want nil", cause)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("an empty drain did not release at once")
 	}
 }

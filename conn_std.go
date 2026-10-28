@@ -1160,8 +1160,9 @@ func (fc *fdConn) State() ConnState {
 	return state
 }
 
-// CloseGracefully closes as CloseWith does: this backend's writer flushes
-// what it holds before the close, so nothing accepted waits on a queue.
+// CloseGracefully refuses new writes and lets the writer drain what was
+// accepted, bounded by LingerTimeout without progress, before the close it
+// asked for; this backend reports no UnflushedError.
 func (fc *fdConn) CloseGracefully(cause error) error {
 	if fc.udp != nil || fc.loop == nil {
 		return fc.CloseWith(cause)

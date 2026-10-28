@@ -22,6 +22,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -154,8 +155,9 @@ func TestWithLayersLayerCap(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
 	defer cancel()
-	if _, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(chain...)); err == nil {
-		t.Fatal("a chain past the layer cap was accepted")
+	_, err := events.DialContext(ctx, "tcp://"+addr, nil, WithLayers(chain...))
+	if err == nil || !strings.Contains(err.Error(), "at most") {
+		t.Fatalf("DialContext = %v, want the layer cap refused", err)
 	}
 }
 
@@ -200,5 +202,32 @@ func TestWithLayersConcurrentDials(t *testing.T) {
 		if got := layer.opened.Load(); got != 1 {
 			t.Fatalf("dial %d's own layer opened %d times, want 1", i, got)
 		}
+	}
+}
+
+// An adoption carries its own chain too: the override runs instead of the
+// Events' chain, for that connection alone.
+func TestAdoptWithLayersOverridesTheChain(t *testing.T) {
+	def, own := &markLayer{}, &markLayer{}
+	events := dialLayered(t, overrideListener(t, 0), func(ev *Events) {
+		ev.Use(LayerFunc(func(LayerContext) LayerHandler { return def }))
+	})
+	addr := overrideListener(t, 1)
+	raw, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), layerWait)
+	defer cancel()
+	conn, err := events.AdoptContext(ctx, raw, nil, WithLayers(layerOf(own)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if got := own.opened.Load(); got != 1 {
+		t.Fatalf("the adopted connection's own layer opened %d times, want 1", got)
+	}
+	if got := def.opened.Load(); got != 0 {
+		t.Fatalf("the default chain opened %d times under an override, want 0", got)
 	}
 }

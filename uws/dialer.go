@@ -81,7 +81,9 @@ func NewDialer(opts Options) *Dialer {
 func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 
 // Dial starts a WebSocket connection and returns once the upgrade request is
-// on its way; the Handler reports the rest. An error means no connection was
+// on its way — with a TLSConfig, once the transport's stack opened, which is
+// where the request is written from; the Handler reports the rest. An error
+// means no connection was
 // made and no callback follows — uio.ErrFirstTurnRefused when a custom
 // Executor declined the connection's first turn. After a nil error, OnOpen
 // reports a completed handshake, and OnClose always reports how the
@@ -109,9 +111,6 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	if err != nil || target.Host == "" || (target.Scheme != "ws" && target.Scheme != "wss") {
 		return fmt.Errorf("uws: only ws:// and wss:// targets are supported: %w", ErrProtocol)
 	}
-	if target.Scheme == "wss" && d.Options.TLSConfig == nil {
-		return fmt.Errorf("%w: wss:// needs TLSConfig", ErrInvalidOptions)
-	}
 	keyBytes := make([]byte, 16)
 	if _, err = rand.Read(keyBytes); err != nil {
 		return err
@@ -124,6 +123,12 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	if err = d.start(attemptCtx); err != nil {
 		cleanupAttempt()
 		return err
+	}
+	// The options are the frozen snapshot start took; a Dialer without a TLS
+	// config cannot speak wss.
+	if target.Scheme == "wss" && d.opts.TLSConfig == nil {
+		cleanupAttempt()
+		return fmt.Errorf("%w: wss:// needs TLSConfig", ErrInvalidOptions)
 	}
 	config := d.config
 	header, err := d.requestHeader(userdata)
@@ -148,10 +153,10 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 	// The stack is this connection's own: TLS only when the URL asked for
 	// it, and only a Dialer given a Config can speak it.
 	var dopts []uio.DialOption
-	if d.Options.TLSConfig != nil {
+	if d.opts.TLSConfig != nil {
 		var chain []uio.Layer
 		if target.Scheme == "wss" {
-			chain = append(chain, clientTLSLayer(d.Options.TLSConfig, d.Options, target.Hostname()))
+			chain = append(chain, clientTLSLayer(d.opts.TLSConfig, d.opts, target.Hostname()))
 		}
 		dopts = append(dopts, uio.WithLayers(chain...))
 	}
