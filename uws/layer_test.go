@@ -266,8 +266,9 @@ func TestLayerHandshakeRefusal(t *testing.T) {
 	}
 }
 
-// Authorize's userdata is the connection's, and the subprotocol the
-// handshake chose is the layer's to report.
+// Authorize's value is the WebSocket connection's, reported by the layer; the
+// connection's UIO userdata stays the application's, and the subprotocol the
+// handshake chose is the layer's to report too.
 func TestServerLayerUserdataAndSubprotocol(t *testing.T) {
 	server := newStreamPeer(false)
 	_, addr := layerEvents(t, server, true, (ServerLayer(LayerOptions{
@@ -280,8 +281,11 @@ func TestServerLayerUserdataAndSubprotocol(t *testing.T) {
 	})))
 	conn := dialLayer(t, client, addr)
 	accepted := wssWait(t, server.opened, "the server's open")
-	if got := accepted.Userdata(); got != "user:/room" {
-		t.Fatalf("server userdata = %v, want Authorize's", got)
+	if got, ok := uio.FindLayer[interface{ Userdata() any }](accepted); !ok || got.Userdata() != "user:/room" {
+		t.Fatalf("Authorize's userdata through the layer = %v, want %q", got, "user:/room")
+	}
+	if got := accepted.Userdata(); got != nil {
+		t.Fatalf("the connection's UIO userdata = %v, want the application's own (nil)", got)
 	}
 	for _, c := range []uio.Conn{conn, accepted} {
 		ws, ok := uio.LayerOf(c).(interface{ Subprotocol() string })

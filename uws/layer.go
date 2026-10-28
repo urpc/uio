@@ -45,8 +45,8 @@ type LayerOptions struct {
 	// outbound limit is the Events' MaxOutboundBuffered.
 	Options
 	// CheckOrigin and Authorize decide a ServerLayer's upgrade requests as
-	// they do a Server's; the userdata Authorize returns, when not nil,
-	// becomes the connection's Userdata.
+	// they do a Server's; what Authorize returns is the layer's to report,
+	// through uio.FindLayer — see ServerLayer.
 	CheckOrigin func(*http.Request) bool
 	Authorize   func(r *http.Request) (userdata any, err error)
 	// Header is added to a ClientLayer's upgrade request, as a Dialer's is.
@@ -76,8 +76,10 @@ type LayerOptions struct {
 // Options that are not valid for a layer fail every connection through it
 // with ErrInvalidOptions — a dial reports it — as LayerOptions.Validate does.
 //
-// The layer above can read the negotiated subprotocol through uio.FindLayer:
+// The layer above can read the negotiated subprotocol — and what Authorize
+// returned for this connection — through uio.FindLayer:
 //
+//	if ws, ok := uio.FindLayer[interface{ Userdata() any }](conn); ok { … }
 //	if ws, ok := uio.FindLayer[interface{ Subprotocol() string }](conn); ok { … }
 func ServerLayer(opts LayerOptions) uio.Layer {
 	resolved, err := opts.resolve()
@@ -348,6 +350,17 @@ func (w *wsLayerHandler) OnClose(uio.LayerContext, error) {
 	}
 }
 
+// Userdata is what Authorize returned for this connection, nil when none
+// did: the layer above reads it through uio.FindLayer, as it reads the
+// subprotocol. It is the WebSocket connection's own — the connection's UIO
+// userdata stays the application's.
+func (w *wsLayerHandler) Userdata() any {
+	if conn := w.conn.Load(); conn != nil {
+		return conn.Userdata()
+	}
+	return nil
+}
+
 // Subprotocol reports the subprotocol the handshake chose, if any.
 func (w *wsLayerHandler) Subprotocol() string {
 	if conn := w.conn.Load(); conn != nil {
@@ -360,12 +373,7 @@ func (w *wsLayerHandler) Subprotocol() string {
 // and hands them what arrives.
 type layerSink struct{ w *wsLayerHandler }
 
-func (s layerSink) OnOpen(c *Conn) {
-	if c.userData != nil {
-		s.w.ctx.Down().SetUserdata(c.userData) // what Authorize returned
-	}
-	s.w.ctx.Up().Open()
-}
+func (s layerSink) OnOpen(*Conn) { s.w.ctx.Up().Open() }
 
 func (s layerSink) OnMessage(_ *Conn, m Message) { s.w.ctx.Up().Write(m.Payload) }
 
