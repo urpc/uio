@@ -907,6 +907,15 @@ func (conn *fdConn) retireFlush(written int, err error) (int, error) {
 	if written > 0 {
 		conn.retireSent(written)
 		conn.events.onSocketBytesWrite(conn, written)
+		if conn.close.isDraining() {
+			// A drain's queue is moving: its bound starts over, so a close
+			// waits as long as its output keeps leaving, not a fixed time.
+			if w := conn.wake.Load(); w != nil {
+				if bound := w.drain.Load(); bound != nil {
+					bound.timer.Reset(bound.wait)
+				}
+			}
+		}
 	}
 	return written, err
 }

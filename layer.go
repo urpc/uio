@@ -155,26 +155,19 @@ type CloseWriter interface {
 // error for an abort.
 //
 // A graceful close of a layered connection lets what was queued leave first,
-// the goodbyes included: the socket closes once the queue — the socket's, and
-// the bytes OutboundHolder layers at or below the one that began the close
-// hold — is empty, or once it made no progress for LingerTimeout. Nothing
-// reaches the layers or the Handler
-// meanwhile, and what arrives is discarded. An abort closes at once. A layer
-// that closes the connection itself, through its LayerContext, ends it for
-// the layers above too: what they hold is dropped, and the close waits only
-// for what lies below. UIO does not flush such a layer on its way — the close
-// passes down, flushing each layer below — so the layer sends what it holds
-// itself, with Down().Flush, before it closes.
+// the goodbyes included: the socket's queue drains, bounded by LingerTimeout
+// without progress, before the connection releases — the socket's own
+// CloseGracefully carries it, and leftover output reaches OnClose as
+// UnflushedError. Nothing reaches
+// the layers or the Handler meanwhile, and what arrives is discarded. An
+// abort closes at once. A layer that closes the connection itself, through
+// its LayerContext, ends it for the layers above too: what they hold is
+// dropped. UIO does not flush such a layer on its way — the close passes
+// down, flushing each layer below — so the layer sends what it holds itself,
+// with Down().Flush, before it closes.
 type GracefulCloser interface {
 	CloseGracefully(ctx LayerContext, cause error)
 }
-
-// LingerTimeout bounds how long a graceful close of a layered connection
-// waits for its queue to make progress; see GracefulCloser.
-const LingerTimeout = 5 * time.Second
-
-// lingerTimeout is LingerTimeout, which tests shorten.
-var lingerTimeout = LingerTimeout
 
 // WireCounterObserver watches the [WireCounter] every layered Conn shares:
 // OnWireSent is its WireSent moving, pushed. A protocol whose state moves as
@@ -543,20 +536,6 @@ type stack struct {
 	wireQueued atomic.Uint64
 	wireSent   atomic.Uint64
 
-	// lingering holds a graceful close's cause while the socket waits for
-	// its queue to empty, lingerTimer bounds the wait, and lingerDone marks
-	// the close made.
-	// lingerBelow is how many layers, from the bottom, a graceful close
-	// waits for: those below the one that began it. A layer that closes the
-	// connection itself ends it for the layers above, whose held output is
-	// dropped, as an abort drops it.
-	lingerBelow atomic.Int32
-	lingering   atomic.Pointer[error]
-	lingerFor   time.Duration // lingerTimeout as the close began; under lingerMu
-	lingerTimer *time.Timer
-	lingerMu    sync.Mutex
-	lingerDone  atomic.Bool
-
 	// timers holds the timer of every layer, and in its last slot the one
 	// the Handler armed with SetWakeDeadline; the socket's own wake slot
 	// carries the earliest of them. hasTimers spares a turn the lock while
@@ -587,9 +566,10 @@ func (c *stack) turn() error {
 		c.turnAsked.Store(false)
 	}
 	if c.closing.Load() {
-		// Closing — lingering, or aborted with the socket's close still to
-		// come: what arrives is no longer anyone's, and kept it would grow
-		// for as long as the queue takes to drain.
+		// Closing — a graceful close waiting for its queue, or aborted with
+		// the socket's close still to come: what arrives is no longer
+		// anyone's, and kept it would grow for as long as the queue takes
+		// to drain.
 		_, _ = c.socket.Discard(c.socket.InboundBuffered())
 		c.settle()
 		return nil
@@ -629,7 +609,7 @@ func (c *stack) finishTurn() error {
 	var err error
 	if len(c.sends) == 0 && len(c.flushers) == 0 {
 		// Nothing to deliver or flush: only settle's look, and that only
-		// when an end or a linger waits for one.
+		// when an end waits for a turn.
 		c.inTurn.Store(false)
 		if c.shutsPending.Load() > 0 || c.closing.Load() {
 			c.settle()
@@ -654,20 +634,16 @@ func (c *stack) finishTurn() error {
 }
 
 // settle does, as a turn ends, what waits for one: ends CloseWrite left
-// waiting for output to go below, and a lingering close's look at the queue.
-// Send reports that came after the turn's own delivery — during its flush —
-// get a turn of their own, which delivers them and then flushes what OnWireSent
-// writes. It runs only where no layer is in a callback — the framework never
-// calls a layer from inside another's — so a layer holding its own lock
-// while it writes or flushes below is never called back. Once the
-// connection is closing, nothing reaches the layers: only the linger looks
-// at the queue.
+// waiting for output to go below. Send reports that came after the turn's own
+// delivery — during its flush — get a turn of their own, which delivers them
+// and then flushes what OnWireSent writes. It runs only where no layer is in
+// a callback — the framework never calls a layer from inside another's — so a
+// layer holding its own lock while it writes or flushes below is never called
+// back. Once the connection is closing, nothing reaches the layers: the
+// socket's own graceful close carries the queue from there.
 func (c *stack) settle() {
 	if c.closing.Load() {
 		c.sentPending.Store(0)
-		if c.lingering.Load() != nil {
-			c.finishLinger()
-		}
 		return
 	}
 	if c.sentPending.Load() > 0 || c.upPending.Swap(false) {
@@ -865,7 +841,6 @@ func (c *stack) closed(err error) {
 		return
 	}
 	c.stopTimers()
-	c.stopLinger()
 	c.sentPending.Store(0)
 	if c.topOpen.Load() {
 		c.top.OnClose(c.topConn(), err)
@@ -906,13 +881,12 @@ func (c *stack) sent(n int) {
 }
 
 // stackSent wraps the Observer's OnBytesWritten, if any, so a stack's send
-// reports reach its layers, and a lingering close learns the queue moved.
+// reports reach its layers.
 //
 // A send report can run inside the write that made it — a layer's OnWrite
 // writing below while it holds a lock, crypto/tls its record lock — so it
 // calls no layer: it counts the bytes, for WireSent at once and for the
-// layers' OnWireSent on the next turn's end, and asks for that turn. A lingering
-// close needs no layer, only the queue's size.
+// layers' OnWireSent on the next turn's end, and asks for that turn.
 func stackSent(next func(Conn, int)) func(Conn, int) {
 	return func(conn Conn, n int) {
 		if l, ok := conn.(*layerNode); ok && !l.stack.ended.Load() {
@@ -921,9 +895,6 @@ func stackSent(next func(Conn, int)) func(Conn, int) {
 			if len(c.sends) > 0 && !c.closing.Load() {
 				c.sentPending.Add(int64(n))
 				c.requestTurn()
-			}
-			if c.lingering.Load() != nil {
-				c.lingerProgress()
 			}
 		}
 		if next != nil {
@@ -948,88 +919,26 @@ func (c *stack) queued() int {
 }
 
 // closeSocket is a close reaching the socket from the layers. A graceful one
-// waits for the queue to empty — the send reports tell it when — and gives up
-// once the queue made no progress for lingerTimeout; it closes with its own
-// cause either way. The layers it passed flushed their goodbyes already; see
-// layerNode.CloseWith.
+// is the socket's own CloseGracefully: writes are refused from here, and the
+// queue — the goodbyes the layers it passed queued below — leaves before the
+// connection releases, bounded by LingerTimeout without progress; see
+// Conn.CloseGracefully. An abort closes at once, and cuts a graceful close's
+// wait short.
 func (c *stack) closeSocket(cause error) error {
 	wasClosing := c.closing.Swap(true)
-	if !gracefulCause(cause) || c.lingerQueued() == 0 {
-		err := c.socket.CloseWith(cause)
-		if !wasClosing && errors.Is(err, net.ErrClosed) {
-			// The socket closed under this close, the first: the peer
-			// answered the goodbye it sent before the socket's own close
-			// came. The connection closed as asked.
-			return nil
-		}
-		return err
+	var err error
+	if gracefulCause(cause) {
+		err = c.socket.CloseGracefully(cause)
+	} else {
+		err = c.socket.CloseWith(cause)
 	}
-	if !c.lingering.CompareAndSwap(nil, &cause) {
-		return net.ErrClosed
+	if !wasClosing && errors.Is(err, net.ErrClosed) {
+		// The socket closed under this close, the first: the peer answered
+		// the goodbye it sent before the socket's own close came. The
+		// connection closed as asked.
+		return nil
 	}
-	c.lingerMu.Lock()
-	if !c.ended.Load() {
-		c.lingerFor = lingerTimeout
-		c.lingerTimer = time.AfterFunc(c.lingerFor, c.lingerExpired)
-	}
-	c.lingerMu.Unlock()
-	c.finishLinger() // the queue may have emptied before lingering was set
-	return nil
-}
-
-// lingerProgress is a send report while lingering: the queue moved, so the
-// bound starts again, and an empty queue closes.
-func (c *stack) lingerProgress() {
-	c.lingerMu.Lock()
-	if c.lingerTimer != nil {
-		c.lingerTimer.Reset(c.lingerFor)
-	}
-	c.lingerMu.Unlock()
-	c.finishLinger()
-}
-
-// lingerExpired closes a lingering connection whose queue stopped moving.
-func (c *stack) lingerExpired() { c.closeLingering() }
-
-// finishLinger makes a lingering close once the queue is empty.
-func (c *stack) finishLinger() {
-	if c.lingerQueued() == 0 {
-		c.closeLingering()
-	}
-}
-
-// lingerQueued is what a graceful close waits for: the socket's queue and
-// what the layers below the one that began the close hold.
-func (c *stack) lingerQueued() int {
-	queued := c.socket.OutboundBuffered()
-	if !c.holders || c.ended.Load() {
-		return queued
-	}
-	for _, layer := range c.layers[:c.lingerBelow.Load()] {
-		if holder, ok := layer.conn.(OutboundHolder); ok {
-			queued += holder.OutboundHeld(layerCtx{layer})
-		}
-	}
-	return queued
-}
-
-func (c *stack) closeLingering() {
-	cause := c.lingering.Load()
-	if cause == nil || !c.lingerDone.CompareAndSwap(false, true) {
-		return
-	}
-	c.stopLinger()
-	_ = c.socket.CloseWith(*cause)
-}
-
-// stopLinger stops the linger's bound.
-func (c *stack) stopLinger() {
-	c.lingerMu.Lock()
-	if c.lingerTimer != nil {
-		c.lingerTimer.Stop()
-		c.lingerTimer = nil
-	}
-	c.lingerMu.Unlock()
+	return err
 }
 
 // reserve admits a write of n bytes from the Handler, or refuses it when the
@@ -1519,9 +1428,9 @@ func (l *layerNode) Flush() error {
 	if err == nil && !l.stack.over() {
 		err = l.lower.Flush()
 	}
-	// What the flush sent may be what an end or a close waits for: a turn
-	// looks, since this flush may run inside a layer above's.
-	if c := l.stack; c.shutsPending.Load() > 0 || c.lingering.Load() != nil {
+	// What the flush sent may be what an end waits for: a turn looks, since
+	// this flush may run inside a layer above's.
+	if c := l.stack; c.shutsPending.Load() > 0 {
 		c.requestTurn()
 	}
 	return err
@@ -1673,9 +1582,6 @@ func (l *layerNode) CloseWith(err error) error {
 		// graceful close's wait short.
 		return c.closeSocket(err)
 	}
-	// The first layer the close reaches marks how much of the stack it
-	// waits for: this layer and those below.
-	c.lingerBelow.CompareAndSwap(0, int32(l.index+1))
 	if graceful, ok := l.conn.(GracefulCloser); ok && l.openUp.Load() {
 		graceful.CloseGracefully(layerCtx{l}, err)
 	}

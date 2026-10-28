@@ -1994,11 +1994,16 @@ func (conn *fdConn) CloseGracefully(cause error) error {
 		return nil
 	}
 	// Bound the wait, on the lazily-allocated timer state so a connection
-	// that never closes gracefully carries nothing for it. A queue that
-	// drains in the instant between the check and the arm leaves a stray
-	// timer whose callback finds the phase moved on and does nothing.
+	// that never closes gracefully carries nothing for it. The bound is
+	// captured once: progress resets it by the same span without reading the
+	// package variable again. A queue that drains in the instant between the
+	// check and the arm leaves a stray timer whose callback finds the phase
+	// moved on and does nothing.
 	if conn.close.isDraining() {
-		conn.wakeState().drain.Store(time.AfterFunc(lingerTimeout, conn.escalateDrain))
+		conn.wakeState().drain.Store(&drainBound{
+			timer: time.AfterFunc(lingerTimeout, conn.escalateDrain),
+			wait:  lingerTimeout,
+		})
 	}
 	// Output that already waits may have no sender of its own.
 	conn.kickWriterOutside()
@@ -2019,8 +2024,8 @@ func (conn *fdConn) escalateDrain() {
 // wherever a connection ends.
 func (conn *fdConn) stopDrainTimer() {
 	if w := conn.wake.Load(); w != nil {
-		if timer := w.drain.Swap(nil); timer != nil {
-			timer.Stop()
+		if bound := w.drain.Swap(nil); bound != nil {
+			bound.timer.Stop()
 		}
 	}
 }

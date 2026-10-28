@@ -485,8 +485,9 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   writing a TLS close_notify — so it may wait on I/O.
 - `CloseGracefully` closes after everything accepted has been sent: writes are
   refused from the call, reads go on, and the connection releases once its
-  queue is empty or `LingerTimeout` has passed, reporting leftover output as
-  `UnflushedError` appended to the cause. A `CloseWith` ends the wait at once.
+  queue is empty or `LingerTimeout` passes without progress, reporting
+  leftover output as `UnflushedError` appended to the cause. A `CloseWith`
+  ends the wait at once.
 - `OnBytesWritten` can run concurrently with the connection's other callbacks.
 - `Events.Close` only requests shutdown and returns at once; `Serve` returns
   once everything has stopped, or call `Events.Wait` from another goroutine.

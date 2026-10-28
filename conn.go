@@ -252,9 +252,10 @@ type Conn interface {
 	// before the call leaves first, so the peer reads it whole. Writes are
 	// refused from the call — net.ErrClosed — while reads go on, and the
 	// connection's turn releases it once its queue is empty or LingerTimeout
-	// has passed, reporting leftover output as UnflushedError appended to
-	// cause. A CloseWith at any time ends the wait at once. Datagram
-	// connections close as CloseWith does: their sends wait for nothing.
+	// has passed without progress, reporting leftover output as
+	// UnflushedError appended to cause. A CloseWith at any time ends the wait
+	// at once. Datagram connections close as CloseWith does: their sends wait
+	// for nothing.
 	CloseGracefully(cause error) error
 
 	// CloseWrite shuts the connection's writing half: the peer reads the end
@@ -302,6 +303,13 @@ func (err UnflushedError) Error() string {
 }
 
 func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
+
+// LingerTimeout bounds how long a graceful close — [Conn.CloseGracefully] —
+// waits for its output without progress before it closes with what remains.
+const LingerTimeout = 5 * time.Second
+
+// lingerTimeout is LingerTimeout, which tests shorten.
+var lingerTimeout = LingerTimeout
 
 // commonConn contains transport-independent identity and inbound storage.
 // inboundTail is a borrowed current-read slice; inbound owns only bytes that a

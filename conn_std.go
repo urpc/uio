@@ -98,6 +98,15 @@ type fdConn struct {
 	callbackMu     sync.Mutex // serializes OnOpen, OnRead, Wake, and OnClose
 	internal       bool       // framework-owned endpoint, not a user connection
 
+	// A graceful close refuses writes and waits, bounded, for the writer to
+	// drain what was accepted — this backend's queue — before the close it
+	// asked for. draining is set once; drainCause, drainWait and drainTimer
+	// are guarded by mux and live only while it is set.
+	draining   atomic.Bool
+	drainCause error
+	drainWait  time.Duration
+	drainTimer *time.Timer
+
 	// opened records that OnOpen has run, which a connection's read goroutine
 	// does first, closing or not; only an opened connection gets OnClose. wakesAfterOpen
 	// counts the Wakes that arrived before OnOpen, for the read goroutine to
@@ -822,7 +831,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 	}
 
 	fc.mux.Lock()
-	if fc.isClosing() || fc.writeShut {
+	if fc.isClosing() || fc.draining.Load() || fc.writeShut {
 		fc.mux.Unlock()
 		return 0, net.ErrClosed
 	}
@@ -1005,7 +1014,7 @@ func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
 	}
 
 	fc.mux.Lock()
-	if fc.isClosing() || fc.writeShut {
+	if fc.isClosing() || fc.draining.Load() || fc.writeShut {
 		fc.mux.Unlock()
 		bytebuf.ReleaseBuffer(owned)
 		return 0, net.ErrClosed
@@ -1073,6 +1082,11 @@ func (fc *fdConn) drainOutbound() (int, error) {
 	fc.writeBytes = fc.outbound.Len()
 	if fc.writeBytes == 0 {
 		fc.mux.Unlock()
+		if fc.draining.Load() {
+			// A graceful close waits for an empty queue; the writer just
+			// found one, or drained the last of it elsewhere.
+			fc.finishDrain()
+		}
 		return 0, nil
 	}
 	// The detached batch is immutable while producers append to a fresh buffer.
@@ -1092,6 +1106,11 @@ func (fc *fdConn) drainOutbound() (int, error) {
 			totalWritten += n
 			fc.mux.Lock()
 			fc.writeBytes -= n
+			if fc.draining.Load() && fc.drainTimer != nil {
+				// A drain's queue is moving: its bound starts over, as the
+				// native backend's does on a send report.
+				fc.drainTimer.Reset(fc.drainWait)
+			}
 			fc.mux.Unlock()
 		}
 		if err != nil {
@@ -1106,7 +1125,13 @@ func (fc *fdConn) drainOutbound() (int, error) {
 	fc.writeBatch.Reset()
 	fc.mux.Lock()
 	fc.writeBytes = 0
+	empty := fc.draining.Load() && fc.outbound.Len() == 0
 	fc.mux.Unlock()
+	if empty {
+		// The writer drained everything queued: a graceful close's wait is
+		// over. Producers are refused while draining, so nothing follows.
+		fc.finishDrain()
+	}
 	return totalWritten, writeErr
 }
 
@@ -1117,7 +1142,50 @@ func (fc *fdConn) Close() error {
 // CloseGracefully closes as CloseWith does: this backend's writer flushes
 // what it holds before the close, so nothing accepted waits on a queue.
 func (fc *fdConn) CloseGracefully(cause error) error {
-	return fc.CloseWith(cause)
+	if fc.udp != nil || fc.loop == nil {
+		return fc.CloseWith(cause)
+	}
+	fc.mux.Lock()
+	if fc.isClosing() || !fc.draining.CompareAndSwap(false, true) {
+		fc.mux.Unlock()
+		return net.ErrClosed
+	}
+	fc.drainCause = cause
+	fc.drainWait = lingerTimeout
+	queued := fc.outbound.Len() + fc.writeBytes
+	if queued > 0 {
+		fc.drainTimer = time.AfterFunc(fc.drainWait, fc.finishDrain)
+	}
+	fc.mux.Unlock()
+	if queued > 0 {
+		select {
+		case fc.writeSig <- struct{}{}:
+		default:
+		}
+		return nil
+	}
+	fc.finishDrain()
+	return nil
+}
+
+// finishDrain ends a graceful close's wait — its queue drained, or the bound
+// arrived — closing as it asked. Any goroutine may call it.
+func (fc *fdConn) finishDrain() {
+	if !fc.draining.Swap(false) {
+		return
+	}
+	fc.mux.Lock()
+	cause := fc.drainCause
+	fc.drainCause = nil
+	if fc.drainTimer != nil {
+		fc.drainTimer.Stop()
+		fc.drainTimer = nil
+	}
+	fc.mux.Unlock()
+	if fc.isClosing() {
+		return // an abort, or the Events closing, ended it already
+	}
+	_ = fc.enqueueClose(cause)
 }
 
 func (fc *fdConn) CloseWith(err error) error {
@@ -1370,6 +1438,10 @@ func (fc *fdConn) closeDescriptor() {
 	fc.outbound.Reset()
 	fc.writeBatch.Reset()
 	fc.writeBytes = 0
+	if fc.drainTimer != nil {
+		fc.drainTimer.Stop()
+		fc.drainTimer = nil
+	}
 	fc.mux.Unlock()
 	fc.writeMu.Unlock()
 }

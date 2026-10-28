@@ -49,8 +49,16 @@ type wakeState struct {
 	// drain bounds a graceful close's wait for its output to leave. It lives
 	// on this lazily-allocated state, not the connection, so a connection
 	// that never closes gracefully pays nothing. The pointer is set once, by
-	// the close that claimed the drain, and swapped away by whatever ends it.
-	drain atomic.Pointer[time.Timer]
+	// the close that claimed the drain, and swapped away by whatever ends it;
+	// the record is read-only after that, so progress may reset the bound
+	// from any goroutine without a lock.
+	drain atomic.Pointer[drainBound]
+}
+
+// drainBound is a graceful close's timer and the span it waits for progress.
+type drainBound struct {
+	timer *time.Timer
+	wait  time.Duration
 }
 
 // SetWakeDeadline arms the connection's wake timer for when; see the Conn
