@@ -252,8 +252,11 @@ func claimerTag() uint32 { return uint32(currentGoroutineID()) << writeClaimerSh
 
 const (
 	// Close is split so a close can be requested from anywhere while the
-	// connection's own turn releases it and delivers OnClose.
+	// connection's own turn releases it and delivers OnClose. A graceful
+	// close passes through closeDraining first: accepted output leaves the
+	// socket before the release, bounded by LingerTimeout.
 	closeOpen uint32 = iota
+	closeDraining
 	closeRequested
 	closeResourcesReleased
 	closeCallbackDelivered
@@ -289,9 +292,33 @@ func newCloseRequest(err error) *closeRequest {
 }
 
 func (state *connCloseState) isClosing() bool  { return state.phase.Load() >= closeRequested }
+func (state *connCloseState) isDraining() bool { return state.phase.Load() == closeDraining }
 func (state *connCloseState) isReleased() bool { return state.phase.Load() >= closeResourcesReleased }
+
+// request advances to closeRequested from open or draining — the first call
+// wins, and a close requested during a drain ends the wait at once, as an
+// abort does a graceful close's.
 func (state *connCloseState) request() bool {
-	return state.phase.CompareAndSwap(closeOpen, closeRequested)
+	for {
+		phase := state.phase.Load()
+		if phase >= closeRequested {
+			return false
+		}
+		if state.phase.CompareAndSwap(phase, closeRequested) {
+			return true
+		}
+	}
+}
+
+// drain claims the connection for a graceful close: open moves to draining,
+// where output still leaves and nothing new is accepted.
+func (state *connCloseState) drain() bool {
+	return state.phase.CompareAndSwap(closeOpen, closeDraining)
+}
+
+// escalate ends a drain by advancing it to closeRequested.
+func (state *connCloseState) escalate() bool {
+	return state.phase.CompareAndSwap(closeDraining, closeRequested)
 }
 func (state *connCloseState) abandon() bool {
 	for {
@@ -407,6 +434,11 @@ func (conn *fdConn) releaseWrite() {
 		// after the send that drains it schedules this then; scheduling on
 		// every release would spin turns while the socket is full.
 		conn.scheduleIO(ioEventShutWrite)
+	}
+	if conn.close.isDraining() && conn.pending.Load() == 0 {
+		// A graceful close's queue left the socket as this holder sent: a
+		// turn ends the drain, since none is owed for empty output.
+		conn.scheduleTeardown()
 	}
 }
 
@@ -651,7 +683,8 @@ func (conn *fdConn) closeIfEnded() {
 // outputClosed reports a connection that accepts no more output: closing, or
 // with its writing half shut by CloseWrite.
 func (conn *fdConn) outputClosed() bool {
-	return conn.isClosing() || conn.writeState.Load()&writeShutFlag != 0
+	// One load: anything past open — draining, or closing — refuses writes.
+	return conn.close.phase.Load() != closeOpen || conn.writeState.Load()&writeShutFlag != 0
 }
 
 // Read is commonConn.Read that reports io.EOF once a half-open connection's
@@ -1131,9 +1164,10 @@ func (conn *fdConn) runIOTask() {
 		// only what the rounds must read on for outlives the turn.
 		conn.turn &= turnHangup | turnReadToEnd
 		if conn.scratch != nil {
-			// A panic left the round's reservations in its reply space.
-			conn.handOverScratch()
-			conn.scratch = nil
+			// A panic left the round's reservations in its reply space, with
+			// bytes the panicking callback never filled: dropped, not sent,
+			// and the read buffer returns to the pool.
+			conn.dropScratch()
 		}
 		if conn.turnOwnsClaim() {
 			// The round's reservations are filled and flushed, or a callback
@@ -1151,6 +1185,10 @@ func (conn *fdConn) runIOTask() {
 		}
 		if settle && conn.readStalled() {
 			conn.settleInterest()
+		}
+		if conn.close.isDraining() && conn.pending.Load() == 0 {
+			// The turn drained a graceful close's queue itself.
+			conn.escalateDrain()
 		}
 		if conn.isClosing() {
 			conn.closeInTurn()
@@ -1593,6 +1631,11 @@ func (conn *fdConn) onRead() error {
 	err := conn.readRound(holder.bytes)
 	conn.turn &^= turnCorked
 	conn.scratch = nil
+	// Unbind the borrowed tail before its holder returns to the pool: an
+	// error exit leaves it aliasing the holder, and the close it asks for can
+	// wait out a write in flight, long enough for another round to Get the
+	// buffer back and overwrite it.
+	conn.inboundTail = nil
 	if out := holder.out; out != nil && out.Len() > 0 {
 		if sendErr := conn.sendScratch(holder); err == nil {
 			err = sendErr
@@ -1924,6 +1967,64 @@ func (conn *fdConn) YieldRead() error {
 
 func (conn *fdConn) Close() error { return conn.CloseWith(io.ErrUnexpectedEOF) }
 
+// CloseGracefully requests a close that lets what was accepted leave first,
+// and returns. Writes are refused from the call; the connection's turn
+// releases it once its queue is empty — or once LingerTimeout passes, a
+// CloseWith at any time, or the Events closing ends the wait — and leftover
+// output reaches OnClose as UnflushedError appended to cause. Reads go on
+// until the release, so the peer's acknowledgements are seen. A datagram
+// connection has no queue to wait for: it closes as CloseWith does.
+func (conn *fdConn) CloseGracefully(cause error) error {
+	if conn.loop == nil {
+		return net.ErrClosed
+	}
+	if conn.isDatagram() {
+		return conn.CloseWith(cause)
+	}
+	conn.submitMu.Lock()
+	if conn.isClosing() || conn.events.closing.Load() || conn.loop.stopping.Load() || !conn.close.drain() {
+		conn.submitMu.Unlock()
+		return net.ErrClosed
+	}
+	conn.setDeferredCloseLocked(cause)
+	pending := conn.pending.Load()
+	conn.submitMu.Unlock()
+	if pending == 0 {
+		conn.escalateDrain()
+		return nil
+	}
+	// Bound the wait, on the lazily-allocated timer state so a connection
+	// that never closes gracefully carries nothing for it. A queue that
+	// drains in the instant between the check and the arm leaves a stray
+	// timer whose callback finds the phase moved on and does nothing.
+	if conn.close.isDraining() {
+		conn.wakeState().drain.Store(time.AfterFunc(lingerTimeout, conn.escalateDrain))
+	}
+	// Output that already waits may have no sender of its own.
+	conn.kickWriterOutside()
+	return nil
+}
+
+// escalateDrain ends a drain — its queue left, or its bound arrived — so the
+// close proceeds as CloseWith's does. Any goroutine may call it.
+func (conn *fdConn) escalateDrain() {
+	if !conn.close.escalate() {
+		return
+	}
+	conn.stopDrainTimer()
+	conn.routeClose()
+}
+
+// stopDrainTimer drops a drain's bound, if it has not fired already. It runs
+// wherever a connection ends.
+func (conn *fdConn) stopDrainTimer() {
+	if w := conn.wake.Load(); w != nil {
+		if timer := w.drain.Swap(nil); timer != nil {
+			timer.Stop()
+		}
+	}
+}
+
 // CloseWith requests the close and returns: the connection is released, and
 // OnClose delivered, by its own turn once the callback that closed it has
 // returned. Requesting it under submitMu puts Close after external writes
@@ -2109,6 +2210,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	conn.submitMu.Lock()
 	conn.outbound.Reset()
 	conn.submitMu.Unlock()
+	conn.stopDrainTimer()
 	conn.releaseInflight()
 	conn.inbound.Reset()
 	conn.inboundTail = nil

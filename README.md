@@ -477,12 +477,16 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   connection's own callback. Slices they return are valid until the callback
   returns or consumes more input; copy anything you hand to another goroutine.
   Builds with `-race` catch most misuse with a panic.
-- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`
-  and `CloseWith` are safe from any goroutine.
+- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`,
+  `CloseWith` and `CloseGracefully` are safe from any goroutine.
 - `CloseWrite` shuts a stream connection's writing half after everything
   accepted has been sent; later writes return `net.ErrClosed`. On a layered
   connection it runs the layer's own `CloseWrite` inline — flushing it, and
   writing a TLS close_notify — so it may wait on I/O.
+- `CloseGracefully` closes after everything accepted has been sent: writes are
+  refused from the call, reads go on, and the connection releases once its
+  queue is empty or `LingerTimeout` has passed, reporting leftover output as
+  `UnflushedError` appended to the cause. A `CloseWith` ends the wait at once.
 - `OnBytesWritten` can run concurrently with the connection's other callbacks.
 - `Events.Close` only requests shutdown and returns at once; `Serve` returns
   once everything has stopped, or call `Events.Wait` from another goroutine.

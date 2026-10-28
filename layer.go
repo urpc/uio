@@ -1338,6 +1338,13 @@ func (s socketLower) SetUserdata(value any) { s.stack.userdata.Store(&value) }
 
 func (s socketLower) CloseWith(cause error) error { return s.stack.closeSocket(cause) }
 
+// Close and CloseGracefully follow the same road as CloseWith, so the first
+// layer cannot end the stack under itself: the close a layer asks for runs
+// the stack's goodbyes and waits, not the socket's own one-shot flush.
+func (s socketLower) Close() error { return s.stack.closeSocket(io.ErrUnexpectedEOF) }
+
+func (s socketLower) CloseGracefully(cause error) error { return s.stack.closeSocket(cause) }
+
 // The writes that hand the socket bytes count them; see WireCounter.
 
 func (s socketLower) Write(p []byte) (int, error) {
@@ -1676,6 +1683,15 @@ func (l *layerNode) CloseWith(err error) error {
 		_ = flusher.Flush(layerCtx{l})
 	}
 	return l.lower.CloseWith(err)
+}
+
+// CloseGracefully closes the connection as CloseWith does with a graceful
+// cause: the goodbyes are said and the close waits for what was queued.
+func (l *layerNode) CloseGracefully(cause error) error {
+	if !gracefulCause(cause) {
+		cause = io.ErrUnexpectedEOF
+	}
+	return l.CloseWith(cause)
 }
 
 // CloseWrite ends the layer above's writing half, through the layer's

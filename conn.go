@@ -248,6 +248,15 @@ type Conn interface {
 	// returned, and reports unsent accepted payload as UnflushedError.
 	CloseWith(err error) error
 
+	// CloseGracefully requests the close and returns; everything accepted
+	// before the call leaves first, so the peer reads it whole. Writes are
+	// refused from the call — net.ErrClosed — while reads go on, and the
+	// connection's turn releases it once its queue is empty or LingerTimeout
+	// has passed, reporting leftover output as UnflushedError appended to
+	// cause. A CloseWith at any time ends the wait at once. Datagram
+	// connections close as CloseWith does: their sends wait for nothing.
+	CloseGracefully(cause error) error
+
 	// CloseWrite shuts the connection's writing half: the peer reads the end
 	// of the stream once everything accepted before the call has been sent,
 	// and writes after it return net.ErrClosed. The connection keeps reading

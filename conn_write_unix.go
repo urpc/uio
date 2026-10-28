@@ -227,6 +227,29 @@ func (conn *fdConn) handOverScratchSpace() {
 	holder.out = nil
 }
 
+// dropScratch drops the reply space a read round reserved, counting its
+// bytes unsent. A panic an Executor recovered ends the round without
+// sendScratch, and the space may hold reservations the panicking callback
+// never filled — bytes the pool left in the block — so they leave for the
+// heap, not the wire. It runs on the connection's turn, after onRead would
+// have sent the space itself.
+func (conn *fdConn) dropScratch() {
+	holder := conn.scratch
+	if holder == nil {
+		return
+	}
+	conn.scratch = nil
+	conn.inboundTail = nil
+	if out := holder.out; out != nil {
+		if n := out.Len(); n > 0 {
+			conn.pending.Add(-int64(n))
+		}
+		bytebuf.ReleaseBuffer(out)
+		holder.out = nil
+	}
+	conn.events.readPool.Put(holder)
+}
+
 // sendScratch sends the replies a read round reserved once it has ended,
 // straight from its reply space when nothing else is queued. What the socket
 // does not take, or everything when other output is queued, the connection is

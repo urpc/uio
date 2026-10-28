@@ -1114,6 +1114,12 @@ func (fc *fdConn) Close() error {
 	return fc.CloseWith(io.ErrUnexpectedEOF)
 }
 
+// CloseGracefully closes as CloseWith does: this backend's writer flushes
+// what it holds before the close, so nothing accepted waits on a queue.
+func (fc *fdConn) CloseGracefully(cause error) error {
+	return fc.CloseWith(cause)
+}
+
 func (fc *fdConn) CloseWith(err error) error {
 	return fc.enqueueClose(err)
 }

@@ -844,6 +844,85 @@ func (e *recoveringExecutor) SubmitBatch(tasks []IOTask) int {
 	return len(tasks)
 }
 
+// A read round's panic must not send the reply space it reserved: bytes the
+// panicking callback never filled are pool memory, not output, so they are
+// dropped, counted unsent, and the read buffer returns to the pool.
+func TestPanicDropsUnfilledReservations(t *testing.T) {
+	executor := &recoveringExecutor{}
+	opened := make(chan *fdConn, 1)
+	started := make(chan string, 1)
+	var panicking atomic.Bool
+	var reserved atomic.Int64
+	events := &Events{Pollers: 1, Executor: executor, MaxBufferSize: 1}
+	funcs(events).Start = func(ev *Events) {
+		for _, listener := range ev.acceptor.listeners {
+			started <- listener.pair.local.String()
+			return
+		}
+	}
+	funcs(events).Open = func(conn Conn) { opened <- conn.(*fdConn) }
+	funcs(events).Read = func(conn Conn) error {
+		buf := make([]byte, conn.InboundBuffered())
+		_, _ = io.ReadFull(conn, buf)
+		room, err := conn.ReserveOutbound(64)
+		if err != nil {
+			t.Errorf("ReserveOutbound: %v", err)
+			return nil
+		}
+		reserved.Add(int64(len(room)))
+		copy(room, "half") // filled only in part, then panic
+		if panicking.CompareAndSwap(true, false) {
+			panic("reservation half-filled")
+		}
+		copy(room[4:5], "!")
+		return nil
+	}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0") }()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-serveDone
+	})
+	client, err := net.Dial("tcp", <-started)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	server := <-opened
+	for deadline := time.Now().Add(2 * time.Second); server.writeState.Load()&writeOpenedFlag == 0 ||
+		server.ioOwner.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("connection did not finish opening")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	panicking.Store(true)
+	if _, err := client.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(2 * time.Second); executor.recovered.Load() == 0; {
+		if time.Now().After(deadline) {
+			t.Fatal("the panic never ran")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// The dropped reservation leaves nothing pending and nothing sent.
+	for deadline := time.Now().Add(2 * time.Second); server.pending.Load() != 0; {
+		if time.Now().After(deadline) {
+			t.Fatalf("pending still %d after the drop", server.pending.Load())
+		}
+		time.Sleep(time.Millisecond)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	got := make([]byte, 64)
+	if n, _ := client.Read(got); n != 0 {
+		t.Fatalf("client read %q: the unfilled half of the reservation reached the wire", got[:n])
+	}
+	if reserved.Load() != 64 {
+		t.Fatalf("reserved %d bytes, want 64", reserved.Load())
+	}
+}
+
 // An OnWrite that panics during a flush, on a write turn or on the
 // connection's own turn, gives the write claim back: later output is still
 // sent, and Close and Serve return.

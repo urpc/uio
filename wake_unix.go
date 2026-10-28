@@ -46,6 +46,11 @@ type wakeState struct {
 	armed  bool
 	due    int64 // unix nanos; 0 is a legal deadline, so armed says whether one is set
 	period int64
+	// drain bounds a graceful close's wait for its output to leave. It lives
+	// on this lazily-allocated state, not the connection, so a connection
+	// that never closes gracefully pays nothing. The pointer is set once, by
+	// the close that claimed the drain, and swapped away by whatever ends it.
+	drain atomic.Pointer[time.Timer]
 }
 
 // SetWakeDeadline arms the connection's wake timer for when; see the Conn
