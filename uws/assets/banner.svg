@@ -82,8 +82,8 @@
 <text x="52.0" y="92.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" fill="url(#word)" text-anchor="start" font-weight="700" letter-spacing="-2">uws</text>
 <text x="196.0" y="66.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#E6EDF6" text-anchor="start" font-weight="500">WebSocket for Go, on uio</text>
 <text x="196.0" y="90.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A9BB4" text-anchor="start" font-weight="400">No goroutine per connection.</text>
-<rect x="56" y="122" width="274" height="30" rx="8" fill="#0A1628" stroke="#22304A"/>
-<text x="70.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#22D3EE" text-anchor="start" font-weight="400">$</text>
-<text x="84.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#CBD5E1" text-anchor="start" font-weight="400">go get github.com/urpc/uio/uws</text>
-<text x="346.0" y="141.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">server · client · net/http</text>
+<rect x="56" y="122" width="286" height="30" rx="8" fill="#0A1628" stroke="#22304A"/>
+<text x="70.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#22D3EE" text-anchor="start" font-weight="400">import</text>
+<text x="122.5" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#CBD5E1" text-anchor="start" font-weight="400">"github.com/urpc/uio/uws"</text>
+<text x="358.0" y="141.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">server · client · net/http</text>
 </svg>

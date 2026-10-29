@@ -1,4 +1,8 @@
 <p align="center">
+  <img src="assets/banner.svg" alt="ukcp: KCP for Go, on uio" width="100%">
+</p>
+
+<p align="center">
   <a href="https://pkg.go.dev/github.com/urpc/uio/ukcp"><img src="https://pkg.go.dev/badge/github.com/urpc/uio/ukcp.svg" alt="Go Reference"></a>
   <a href="https://github.com/urpc/uio/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
@@ -37,9 +41,12 @@ The protocol engine is the battle-tested one from
 
 ## Install
 
-```bash
-go get github.com/urpc/uio/ukcp
+```go
+import "github.com/urpc/uio/ukcp"
 ```
+
+The package ships inside the [uio module](https://github.com/urpc/uio);
+`go get github.com/urpc/uio` fetches it.
 
 ## Quick start
 

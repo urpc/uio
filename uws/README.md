@@ -34,9 +34,12 @@ frame reaches you straight from the read buffer.
 
 ## Install
 
-```bash
-go get github.com/urpc/uio/uws
+```go
+import "github.com/urpc/uio/uws"
 ```
+
+The package ships inside the [uio module](https://github.com/urpc/uio);
+`go get github.com/urpc/uio` fetches it.
 
 ## Quick start
 
