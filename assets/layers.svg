@@ -13,7 +13,7 @@
 
 <text x="40.0" y="30.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">PROTOCOL LAYERS</text>
 <text x="40.0" y="54.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="16.5" fill="#E6EDF6" text-anchor="start" font-weight="600">The same chain, both directions</text>
-<text x="920.0" y="54.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="end" font-weight="400">events.Use(tls, websocket)</text>
+<text x="920.0" y="54.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="end" font-weight="400">WithLayers(tls, websocket)</text>
 
 <text x="40.0" y="90.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="start" font-weight="600">read →</text>
 <text x="40.0" y="142.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#818CF8" text-anchor="start" font-weight="600">write ←</text>

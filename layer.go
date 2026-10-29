@@ -2518,8 +2518,9 @@ func LayerOf(conn LayerDown) LayerHandler {
 	return nil
 }
 
-// FindLayer returns the first LayerHandler of type T below conn, from the layer
-// that built conn down to the socket — the TLS state under a WebSocket layer:
+// FindLayer returns the first LayerHandler of type T at or below conn —
+// starting with the layer that built conn, down to the socket: the TLS state
+// under a WebSocket layer:
 //
 //	tls, ok := uio.FindLayer[interface{ State() tls.ConnectionState }](conn)
 func FindLayer[T any](conn LayerDown) (T, bool) {

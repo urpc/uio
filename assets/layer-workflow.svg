@@ -8,11 +8,11 @@
 <rect x="0.5" y="0.5" width="959" height="759" rx="15.5" fill="none" stroke="#22304A"/>
 <text x="40" y="52" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="2">LAYER WORKFLOW</text>
 <text x="40" y="80" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="22" fill="#E6EDF6" text-anchor="start" font-weight="600">The framework drives the stack</text>
-<text x="920" y="80" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8A9BB4" text-anchor="end" font-weight="400">events.Use(kcp, tls, trace)</text>
+<text x="920" y="80" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" fill="#8A9BB4" text-anchor="end" font-weight="400">WithLayers(kcp, tls, trace)</text>
 <rect x="40" y="116" width="420" height="580" rx="12" fill="#0E182B" stroke="#22304A"/>
 <rect x="58" y="116" width="34" height="2" fill="#22D3EE"/>
 <text x="58" y="146" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="1.2">THE STACK</text>
-<text x="58" y="172" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#E6EDF6" text-anchor="start" font-weight="600">one LayerConn per layer, per connection</text>
+<text x="58" y="172" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#E6EDF6" text-anchor="start" font-weight="600">one LayerHandler per layer, per connection</text>
 <rect x="86" y="202" width="320" height="48" rx="8" fill="#0E182B" stroke="#818CF8" stroke-width="1.1"/>
 <text x="100" y="223" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" fill="#E6EDF6" text-anchor="start" font-weight="600">handler</text>
 <text x="100" y="240" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">OnRead · OnTimer</text>
@@ -71,7 +71,7 @@
 <path d="M854,199 l-4.620000000000001,-2.1 h9.240000000000002 z" fill="#22D3EE" opacity="0.8"/>
 <rect x="858" y="184" width="64" height="30" rx="7" fill="#0E182B" stroke="#818CF8" stroke-width="1.1"/>
 <text x="890.0" y="202.78" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="10.5" fill="#E6EDF6" text-anchor="middle" font-weight="600">handler</text>
-<text x="498" y="238" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">each ctx.Open() lets the next one open; tls opens when its handshake settles</text>
+<text x="498" y="238" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">each Up().Open() lets the next one open; tls opens when its handshake settles</text>
 <rect x="480" y="258" width="440" height="250" rx="12" fill="#0E182B" stroke="#22304A"/>
 <rect x="498" y="258" width="34" height="2" fill="#22D3EE"/>
 <text x="498" y="286" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="start" font-weight="600" letter-spacing="1.2">02  TURN</text>
@@ -89,8 +89,8 @@
 <text x="526" y="407" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">the handler — a due timer of its own ran first</text>
 <circle cx="507" cy="424" r="8" fill="none" stroke="#818CF8" stroke-width="1.1"/>
 <text x="507" y="427" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8" fill="#818CF8" text-anchor="middle" font-weight="600">4</text>
-<text x="526" y="428" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#E6EDF6" text-anchor="start" font-weight="400">OnSent(n)</text>
-<text x="526" y="441" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">bytes the wire took, for the layers that ask</text>
+<text x="526" y="428" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#E6EDF6" text-anchor="start" font-weight="400">OnWireSent(n) · OnSent(r)</text>
+<text x="526" y="441" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8.5" fill="#8A9BB4" text-anchor="start" font-weight="400">what the wire took, for the layers that ask</text>
 <circle cx="507" cy="458" r="8" fill="none" stroke="#818CF8" stroke-width="1.1"/>
 <text x="507" y="461" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="8" fill="#818CF8" text-anchor="middle" font-weight="600">5</text>
 <text x="526" y="462" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#E6EDF6" text-anchor="start" font-weight="400">Flush()</text>

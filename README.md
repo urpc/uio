@@ -230,7 +230,7 @@ gave it, fixed for its life: one port, one stack. A `Dialer` holds the
 defaults it was built with — `events.Dialer(uio.WithLayers(tls))` — and each
 dial may name its own, replacing them for that connection alone: one Dialer
 serves `wss://` and `ws://` alike, the first dial naming the TLS layer and the
-second `WithLayers(PassThroughLayer)`. `DialContext(ctx, addr, nil,
+second `WithLayers(PassThroughLayer)`. `DialContext(ctx, addr,
 uio.WithLayers(tls))` on the Events is the chainless default Dialer naming
 the chain for that one dial.
 
@@ -349,9 +349,10 @@ conn, err := client.DialContext(ctx, "tcp://example.org:443",
 A layer that fails before the stack opens reports its error from
 `DialContext`, and the Handler hears nothing of the connection — no `OnOpen`,
 no `OnClose`. What a layer negotiated is its own to report:
-`uio.FindLayer[T](conn)` returns the first layer of type `T` below `conn` —
-`uio.FindLayer[interface{ State() tls.ConnectionState }](conn)` finds the TLS
-state under any stack — and `uio.LayerOf(conn)` the one that built `conn`.
+`uio.FindLayer[T](conn)` returns the first layer of type `T` at or below
+`conn` — `uio.FindLayer[interface{ State() tls.ConnectionState }](conn)` finds
+the TLS state under any stack — and `uio.LayerOf(conn)` the one that built
+`conn`.
 
 A `LayerHandler` may also implement optional interfaces:
 
@@ -477,6 +478,15 @@ pauses the source rather than erroring.
 ## Going faster
 
 These are optional. Plain `Read`, `Write` and `WriteTo` work on every backend.
+
+**Read a TLS record whole.** A TLS record carries up to 16 KiB, and a layer
+reads what the socket delivered: the default 4 KiB `MaxBufferSize` splits
+every record across four rounds, and each round carries its ciphertext
+through the stack again. Over one loopback connection, a TLS layer moves
+about 1.3× the bytes of a default one with `MaxBufferSize: 16 << 10` and
+about 1.8× with `64 << 10` — past crypto/tls on the same wire. Smaller
+frames lose nothing to the bigger reads: `ReserveInbound` and `PeekChunk`
+read a frame from wherever in the buffer it lies.
 
 **Decode in place.** `PeekChunk` returns the first chunk of buffered bytes
 without copying.

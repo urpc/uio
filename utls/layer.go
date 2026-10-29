@@ -19,6 +19,11 @@
 // bytes the round read; a record that arrives across several rounds stays
 // cut in crypto/tls's buffer until it is whole.
 //
+// A record carries up to 16 KiB, so a transport whose reads are smaller
+// carries every record through several rounds: set Events.MaxBufferSize to
+// at least a record — 16 KiB, with 64 KiB measured fastest for bulk
+// transfers, about twice the 4 KiB default's throughput.
+//
 // The handshake is bounded by the layer's own timer, whose expiry closes the
 // connection. A connection opens
 // to the handler above once its handshake settles; a connection whose

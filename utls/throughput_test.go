@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -46,6 +47,16 @@ func TestThroughputCompare(t *testing.T) {
 		total = n
 	}
 	rounds := 3
+	// UTLS_BENCH_ONLY="utls/download" runs one configuration in one direction,
+	// so a CPU profile of -cpuprofile holds that path alone.
+	onlyConfig, onlyDirection := "", ""
+	if only := os.Getenv("UTLS_BENCH_ONLY"); only != "" {
+		var ok bool
+		onlyConfig, onlyDirection, ok = strings.Cut(only, "/")
+		if !ok || onlyDirection == "" {
+			t.Fatalf("UTLS_BENCH_ONLY: %q, want <config>/<direction>", only)
+		}
+	}
 	t.Logf("%s/%s, %d CPUs, %d MiB per transfer, best of %d rounds, handshake excluded",
 		runtime.GOOS, runtime.GOARCH, runtime.NumCPU(), total>>20, rounds)
 
@@ -67,7 +78,13 @@ func TestThroughputCompare(t *testing.T) {
 		name     string
 		download bool
 	}{{"download", true}, {"upload", false}} {
+		if onlyDirection != "" && direction.name != onlyDirection {
+			continue
+		}
 		for _, config := range configs {
+			if onlyConfig != "" && strings.ReplaceAll(config.name, " ", "") != onlyConfig {
+				continue
+			}
 			best := 0.0
 			for range rounds {
 				var rate float64
@@ -90,6 +107,9 @@ func TestThroughputCompare(t *testing.T) {
 	t.Log("configuration    download MB/s   upload MB/s")
 	for _, config := range configs {
 		entry := report[config.name]
+		if entry[0] == 0 && entry[1] == 0 {
+			continue
+		}
 		t.Logf("%-10s %15.1f %13.1f", config.name, entry[0], entry[1])
 	}
 }
