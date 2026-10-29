@@ -698,3 +698,33 @@ func TestHeartbeatRefusedArmIsRetried(t *testing.T) {
 		t.Fatal("a steady turn re-armed an already armed timer")
 	}
 }
+
+// Ready closes once Serve has brought the transport up, and not before: it is
+// what a ServeHTTP mount waits on so an early upgrade is not answered 500.
+func TestServerReadySignalsServeStart(t *testing.T) {
+	server := NewServer(Options{})
+	select {
+	case <-server.Ready():
+		t.Fatal("Ready closed before Serve")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- server.Serve("tcp://127.0.0.1:0") }()
+	select {
+	case <-server.Ready():
+	case <-time.After(5 * time.Second):
+		t.Fatal("Ready never closed though Serve started the transport")
+	}
+	if err := server.Close(nil); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil && !errors.Is(err, ErrClosed) {
+			t.Fatalf("Serve = %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not return")
+	}
+}

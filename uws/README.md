@@ -23,8 +23,8 @@ frame reaches you straight from the read buffer.
   `http.Handler` for existing `net/http` servers, and a client.
 - **Zero-copy reads.** Frames are unmasked in place, and an unfragmented,
   uncompressed message is handed to `OnMessage` straight from the read buffer.
-- **Send from anywhere.** `SendText`, `SendBinary` and `Ping` are safe from any
-  goroutine and keep their order; they never block on the socket.
+- **Send from anywhere.** `SendText`, `SendBinary`, `Send` and `Ping` are safe
+  from any goroutine and keep their order; they never block on the socket.
 - **Batched replies.** Small replies to the frames of one read are encoded
   together and handed to the socket as one write.
 - **Bounded by design.** Limits on frame and message size; replies are paced
@@ -107,7 +107,9 @@ log.Fatal(http.ListenAndServe(":8080", nil))
 The handler takes over plain HTTP/1.1 connections. TLS and HTTP/2 connections
 cannot be moved onto uio's event loops: terminate TLS in a proxy in front, or
 let `Serve` take wss itself with `TLSConfig`.
-A request that arrives before `Serve` has started gets HTTP 500.
+A request that arrives before `Serve` has started gets HTTP 500; `Server.Ready`
+closes a channel once the transport is up, so anything that mounts the handler
+programmatically — a proxy that builds it at start-up — can wait on it first.
 
 ## Client
 

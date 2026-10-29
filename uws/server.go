@@ -57,13 +57,23 @@ type Server struct {
 	// startHook runs inside the transport's OnStart, after ready is set; it
 	// lets tests observe or block startup on the calling goroutine.
 	startHook func()
+	// readyOnce closes readyCh when the transport comes up, for Ready.
+	readyOnce sync.Once
+	readyCh   chan struct{}
 }
 
 // NewServer returns a Server using opts. http.Server-style: the exported
 // fields are the configuration, this constructor only fills them in.
 func NewServer(opts Options) *Server {
-	return &Server{Options: opts}
+	return &Server{Options: opts, readyCh: make(chan struct{})}
 }
+
+// Ready returns a channel closed once Serve has brought the transport up: the
+// moment ServeHTTP begins accepting upgrades. A Server that never gets there —
+// Serve failed to bind, or Close came first — never closes it, so a caller
+// waiting on it must bound the wait. Mounting behind net/http, wait on this
+// before taking traffic: an upgrade that arrives earlier gets HTTP 500.
+func (s *Server) Ready() <-chan struct{} { return s.readyCh }
 
 // Stats reports the read pausing of this server's connections.
 func (s *Server) Stats() Stats { return s.stats.snapshot() }
@@ -126,6 +136,9 @@ func (s *Server) Serve(addrs ...string) error {
 			s.closeMu.Unlock()
 			if hook != nil {
 				hook()
+			}
+			if s.ready.Load() {
+				s.readyOnce.Do(func() { close(s.readyCh) })
 			}
 		},
 		Open:         s.onOpen,

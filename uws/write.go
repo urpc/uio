@@ -268,6 +268,18 @@ func (c *Conn) SendBinary(payload []byte) error {
 	return c.send(BinaryMessage, payload)
 }
 
+// Send queues payload as one message of typ — TextMessage or BinaryMessage —
+// framing it with that opcode. It is SendText and SendBinary under one name
+// for a caller that holds bytes and a type already: text goes out without
+// converting the bytes to a string first. An unknown typ reports ErrProtocol.
+//
+// As with SendText and SendBinary, payload is framed without being retained:
+// the bytes may be reused once Send returns. A text payload must be valid
+// UTF-8; it is sent as given, and only received text is validated.
+func (c *Conn) Send(typ MessageType, payload []byte) error {
+	return c.send(typ, payload)
+}
+
 // Ping sends a ping control frame with up to 125 bytes of payload.
 func (c *Conn) Ping(payload []byte) error {
 	if len(payload) > 125 {
