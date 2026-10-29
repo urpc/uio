@@ -479,14 +479,15 @@ pauses the source rather than erroring.
 
 These are optional. Plain `Read`, `Write` and `WriteTo` work on every backend.
 
-**Read a TLS record whole.** A TLS record carries up to 16 KiB, and a layer
-reads what the socket delivered: the default 4 KiB `MaxBufferSize` splits
+**Read a TLS record whole.** A TLS record carries up to 16 KiB, and crypto/tls
+reads a record per socket read: the default 4 KiB `MaxBufferSize` splits
 every record across four rounds, and each round carries its ciphertext
-through the stack again. Over one loopback connection, a TLS layer moves
-about 1.3× the bytes of a default one with `MaxBufferSize: 16 << 10` and
-about 1.8× with `64 << 10` — past crypto/tls on the same wire. Smaller
-frames lose nothing to the bigger reads: `ReserveInbound` and `PeekChunk`
-read a frame from wherever in the buffer it lies.
+through the stack again. At 16 KiB — the record size, the socket-read cadence
+the standard library runs at — a TLS layer moves about 1.4× the bytes of the
+4 KiB default and ahead of crypto/tls on the same wire; at 64 KiB, four
+records per read, 1.4–1.8× the default across the hosts we ran, the fastest
+point on both. Smaller frames lose nothing to the bigger reads: `ReserveInbound`
+and `PeekChunk` read a frame from wherever in the buffer it lies.
 
 **Decode in place.** `PeekChunk` returns the first chunk of buffered bytes
 without copying.

@@ -1009,3 +1009,35 @@ func TestGatherOnAnEmptyBufferHoldsTheTail(t *testing.T) {
 	}
 	b.Reset()
 }
+
+func TestCompositeBufferWriteCoalesced(t *testing.T) {
+	buffer := NewCompositeBuffer()
+	defer buffer.Reset()
+
+	// The first write into an empty queue takes a block of its own size; the
+	// next fills the block's room, then opens a coalescing block.
+	if n := buffer.WriteCoalesced(make([]byte, 900), 4096); n != 900 {
+		t.Fatalf("WriteCoalesced = %d, want 900", n)
+	}
+	if blocks := buffer.Blocks(); blocks != 1 {
+		t.Fatalf("blocks after first write = %d, want 1", blocks)
+	}
+	buffer.WriteCoalesced(make([]byte, 100), 4096)
+	if blocks := buffer.Blocks(); blocks != 1 {
+		t.Fatalf("blocks after a write into the tail's room = %d, want 1", blocks)
+	}
+	buffer.WriteCoalesced(make([]byte, 3800), 4096) // spills into a coalescing block
+	if blocks := buffer.Blocks(); blocks != 2 {
+		t.Fatalf("blocks after a spill = %d, want 2", blocks)
+	}
+	if got := buffer.Cap(); got < 1000+100+3800 {
+		t.Fatalf("capacity = %d, want at least the payload", got)
+	}
+	last := buffer.bufList[len(buffer.bufList)-1]
+	if last.Cap() < 4096 {
+		t.Fatalf("coalescing block capacity = %d, want at least 4096", last.Cap())
+	}
+	if got, want := buffer.Len(), 4800; got != want {
+		t.Fatalf("length = %d, want %d", got, want)
+	}
+}

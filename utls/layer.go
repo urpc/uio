@@ -21,8 +21,10 @@
 //
 // A record carries up to 16 KiB, so a transport whose reads are smaller
 // carries every record through several rounds: set Events.MaxBufferSize to
-// at least a record — 16 KiB, with 64 KiB measured fastest for bulk
-// transfers, about twice the 4 KiB default's throughput.
+// at least a record. 16 KiB reads — the cadence crypto/tls runs at — move a
+// bulk transfer about 1.4× the 4 KiB default's, ahead of crypto/tls on the
+// same wire; 64 KiB reads measured 1.4–1.8× the default and fastest on both
+// hosts we ran.
 //
 // The handshake is bounded by the layer's own timer, whose expiry closes the
 // connection. A connection opens
@@ -126,13 +128,18 @@ func HandshakeTimeout(timeout time.Duration) Option {
 }
 
 // StagingBound bounds the decrypted bytes the layer holds for the handler
-// above. Once it holds its bound it stops consuming the connection below, so a
-// pause at the top stills the wire — and the framework pauses the layer at
-// its own delivery bound (DefaultDeliverBound, or MaxInboundBuffered) as
-// well, so a larger StagingBound is capped there. During the handshake it
-// bounds the ciphertext the layer takes from below that the handshake has not
-// read yet, though never below one TLS record. Zero means
-// DefaultStagingBound.
+// above: at its bound the layer stops taking new chunks from the connection
+// below, so a pause at the top stills the wire. It paces the rounds rather
+// than capping one delivery: a chunk in hand is decrypted whole — stopping
+// mid-chunk would carry its ciphertext through a copy into the next round —
+// and crypto/tls hands a record over whole however its bytes arrived, one it
+// had been assembling from earlier rounds included, so the delivery may pass
+// the bound by that record (up to 16 KiB) and the turn's chunk (one socket
+// read). The framework pauses the layer at its own delivery bound
+// (DefaultDeliverBound, or MaxInboundBuffered) as well, so a larger
+// StagingBound is capped there. During the handshake it bounds the
+// ciphertext the layer takes from below that the handshake has not read yet,
+// though never below one TLS record. Zero means DefaultStagingBound.
 func StagingBound(bytes int) Option {
 	return func(m *tlsLayer) { m.stagingBound = bytes }
 }

@@ -476,7 +476,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 			return 0, ErrOutboundOverflow
 		}
 		conn.submitMu.Lock()
-		_, _ = conn.outbound.Write(data)
+		conn.outbound.WriteCoalesced(data, conn.coalesceBlockSize())
 		conn.submitMu.Unlock()
 		return len(data), nil
 	}

@@ -44,9 +44,14 @@ type conn struct {
 	tls *stdtls.Conn
 	rec recordCursor
 	// pending is ciphertext the connection below delivered that the engine
-	// has not read, from readAt on.
+	// has not read, from readAt on. live is the current turn's chunk, lent by
+	// the layer below and served before any copy: whatever the turn leaves of
+	// it is appended to pending as the turn ends, so a turn that reads all it
+	// took copies nothing.
 	pending []byte
 	readAt  int
+	live    []byte
+	liveAt  int
 
 	// resume continues the handshake's coroutine, and stop ends it; both
 	// nil once the handshake settled. yield is the suspension inside the
@@ -152,13 +157,21 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 		if room := bound - (len(c.pending) - c.readAt); len(chunk) > room {
 			chunk = chunk[:max(room, 0)]
 		}
-		c.pending = append(c.pending, chunk...)
-		_, _ = lower.Discard(len(chunk))
-		c.noteLowerEndLocked(lower)
+		c.live, c.liveAt = chunk, 0
 		resume := c.resume
 		c.mu.Unlock()
-		if _, waiting := resume(); !waiting {
+		_, waiting := resume()
+		if !waiting {
 			c.settle(ctx)
+		}
+		if c.finishLive(lower) {
+			// The chunk held the stream's end: read it out now, on the turn
+			// that saw it, not on one that may never come.
+			if waiting {
+				_ = ctx.Wake() // the coroutine suspended: resume it on the end
+			} else if err := c.pump(ctx); err != nil {
+				_ = ctx.Abort(err)
+			}
 		}
 		return nil
 	}
@@ -176,35 +189,63 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 	}
 	chunk := lower.PeekChunk()
 	c.mu.Lock()
-	c.pending = append(c.pending, chunk...)
-	_, _ = lower.Discard(len(chunk))
-	c.noteLowerEndLocked(lower)
+	c.live, c.liveAt = chunk, 0
 	c.mu.Unlock()
-	if err := c.pump(ctx); err != nil {
+	err := c.pump(ctx)
+	if c.finishLive(lower) && err == nil && !c.readEndedNow() {
+		// The chunk held the stream's end: this turn reads it out, so the
+		// handler hears io.EOF here rather than on a turn that may never
+		// come.
+		err = c.pump(ctx)
+	}
+	if err != nil {
 		_ = ctx.Abort(err)
 	}
 	return nil
 }
 
+// finishLive appends what the turn left of its chunk to pending and hands the
+// chunk back below. The chunk belongs to the layer below's delivery buffer:
+// valid until the turn returns, and Discarded here. It reports whether the
+// stream's end became visible with the discard.
+func (c *conn) finishLive(lower uio.LayerDown) bool {
+	c.mu.Lock()
+	if tail := c.live[c.liveAt:]; len(tail) > 0 {
+		c.pending = append(c.pending, tail...)
+	}
+	length := len(c.live)
+	c.live, c.liveAt = nil, 0
+	c.mu.Unlock()
+	if length > 0 {
+		_, _ = lower.Discard(length)
+	}
+	// A held chunk is unread bytes by definition: the end below shows only
+	// once it is consumed.
+	c.mu.Lock()
+	ended := c.lowerEnded
+	c.noteLowerEndLocked(lower)
+	became := !ended && c.lowerEnded
+	c.mu.Unlock()
+	return became
+}
+
+// readEndedNow reports the engine's end flag.
+func (c *conn) readEndedNow() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readEnded
+}
+
 // pump decrypts into the layer's delivery space, one record at a time,
-// until the staging bound or the end of what arrived. It runs on a turn.
+// until the end of what the round holds. The delivery bound paces the
+// rounds — OnRead takes a new chunk only while the layer above's unread
+// bytes are below it — not what one round decrypts: stopping short of the
+// chunk would carry its tail through a copy into the next round. It runs on
+// a turn.
 func (c *conn) pump(ctx uio.LayerContext) error {
-	bound := c.stagingBound()
 	for {
-		if ctx.Up().Buffered() >= bound {
-			// Work left for a later turn — ciphertext still to read, or the end
-			// of the stream below still to read out — needs the read above
-			// that makes room to run that turn.
-			c.mu.Lock()
-			waiting := c.readAt < len(c.pending) || (c.lowerEnded && !c.readEnded)
-			c.mu.Unlock()
-			if waiting {
-				ctx.Up().Yield()
-			}
-			return nil
-		}
 		c.mu.Lock()
-		if c.readEnded || !c.ready || (c.readAt >= len(c.pending) && !c.lowerEnded) {
+		if c.readEnded || !c.ready || (c.readAt >= len(c.pending) && c.liveAt >= len(c.live) && !c.lowerEnded) {
 			// Nothing left for the engine to read: a Read here could only
 			// report errWouldBlock. Once the stream below ended it reads on,
 			// to learn whether it ended at a record's edge or inside one.

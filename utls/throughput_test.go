@@ -124,15 +124,31 @@ func stdRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 		t.Fatal(err)
 	}
 	defer listener.Close()
-	if useTLS {
-		listener = tls.NewListener(listener, serverConfig)
+	// capped caps what one socket Read takes, under TLS or plain: crypto/tls
+	// has no buffer of its own between records, so this is how its socket
+	// reads get a size to compare at.
+	capped := func(conn net.Conn) net.Conn {
+		if n := stdReadCap(); n > 0 {
+			return cappedConn{Conn: conn, max: n}
+		}
+		return conn
 	}
 	received := make(chan error, 1)
 	go func() {
-		conn, err := listener.Accept()
+		raw, err := listener.Accept()
 		if err != nil {
 			received <- err
 			return
+		}
+		conn := capped(raw)
+		if useTLS {
+			tlsConn := tls.Server(conn, serverConfig)
+			if err := tlsConn.Handshake(); err != nil {
+				raw.Close()
+				received <- err
+				return
+			}
+			conn = tlsConn
 		}
 		defer conn.Close()
 		if download {
@@ -143,13 +159,15 @@ func stdRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 		}
 	}()
 
-	client, err := net.Dial("tcp", listener.Addr().String())
+	rawClient, err := net.Dial("tcp", listener.Addr().String())
 	if err != nil {
 		t.Fatal(err)
 	}
+	var client net.Conn = capped(rawClient)
 	if useTLS {
 		tlsClient := tls.Client(client, clientConfig)
 		if err := tlsClient.Handshake(); err != nil {
+			rawClient.Close()
 			t.Fatal(err)
 		}
 		client = tlsClient
@@ -170,6 +188,33 @@ func stdRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 		t.Fatal(err)
 	}
 	return mbps(total, time.Since(started))
+}
+
+// cappedConn caps what one Read takes from the socket.
+type cappedConn struct {
+	net.Conn
+	max int
+}
+
+func (c cappedConn) Read(p []byte) (int, error) {
+	if len(p) > c.max {
+		p = p[:c.max]
+	}
+	return c.Conn.Read(p)
+}
+
+// stdReadCap is the socket read size the standard library rounds run at,
+// from UTLS_BENCH_STD_READ; zero leaves crypto/tls's own record-sized reads.
+func stdReadCap() int {
+	v := os.Getenv("UTLS_BENCH_STD_READ")
+	n := 0
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return 0
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n
 }
 
 // uioRound transfers total bytes one way over one fresh UIO stack — with a

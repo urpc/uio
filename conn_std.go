@@ -827,6 +827,12 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 
 // Write copies tiny payloads into the shared outbound tail and transfers larger
 // payloads as owned blocks, keeping allocation and copying outside mux.
+// coalesceBlockSize is the block size queued writes pack into while the peer
+// is slow to drain: two read buffers' worth, capped at 64 KiB.
+func (fc *fdConn) coalesceBlockSize() int {
+	return min(64<<10, fc.events().readBufferSize*2)
+}
+
 func (fc *fdConn) Write(p []byte) (n int, err error) {
 	if fc.isClosing() {
 		return 0, net.ErrClosed
@@ -872,13 +878,8 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
-	n, err = fc.outbound.Write(p)
+	n = fc.outbound.WriteCoalesced(p, fc.coalesceBlockSize())
 	fc.mux.Unlock()
-
-	if nil != err {
-		// unreachable here.
-		return
-	}
 
 	select {
 	case fc.writeSig <- struct{}{}:
@@ -997,13 +998,8 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 		fc.mux.Unlock()
 		return 0, ErrOutboundOverflow
 	}
-	n, err = fc.outbound.Writev(vec)
+	n = fc.outbound.WritevCoalesced(vec, fc.coalesceBlockSize())
 	fc.mux.Unlock()
-
-	if nil != err {
-		// unreachable here.
-		return
-	}
 
 	select {
 	case fc.writeSig <- struct{}{}:

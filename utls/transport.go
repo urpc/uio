@@ -24,8 +24,9 @@ import (
 
 // transport is what crypto/tls reads and writes the connection through. To
 // crypto/tls it is a net.Conn: Read serves the ciphertext the connection
-// below delivered, at most the rest of the record under way so crypto/tls's
-// own buffer stays record-sized. During the handshake a Read that runs out
+// below delivered — the current turn's chunk in place, what earlier turns
+// kept copied — at most the rest of the record under way so crypto/tls's own
+// buffer stays record-sized. During the handshake a Read that runs out
 // suspends the handshake's coroutine and returns when the next round
 // resumes it with more; afterwards it never waits, and reports errWouldBlock
 // instead, which is how the record path runs without a goroutine. Write
@@ -39,12 +40,7 @@ func (t *transport) Read(p []byte) (int, error) {
 	c := t.c
 	c.mu.Lock()
 	for {
-		if c.readAt < len(c.pending) {
-			n := t.c.rec.take(p, c.pending[c.readAt:])
-			c.readAt += n
-			if c.readAt == len(c.pending) {
-				c.releasePendingLocked()
-			}
+		if n := t.serveLocked(p); n > 0 {
 			c.mu.Unlock()
 			return n, nil
 		}
@@ -71,6 +67,31 @@ func (t *transport) Read(p []byte) (int, error) {
 			return 0, net.ErrClosed
 		}
 	}
+}
+
+// serveLocked copies into p the ciphertext the connection holds — what
+// earlier turns carried in pending, then the chunk the current turn lent —
+// no further than the end of the record under way. It requires c.mu.
+func (t *transport) serveLocked(p []byte) int {
+	c := t.c
+	n := 0
+	if c.readAt < len(c.pending) {
+		k := c.rec.take(p, c.pending[c.readAt:])
+		c.readAt += k
+		n += k
+		if c.readAt == len(c.pending) {
+			c.releasePendingLocked()
+		}
+		if n == len(p) || c.rec.atBoundary() {
+			return n
+		}
+	}
+	if c.liveAt < len(c.live) {
+		k := c.rec.take(p[n:], c.live[c.liveAt:])
+		c.liveAt += k
+		n += k
+	}
+	return n
 }
 
 // Write is crypto/tls writing a record; the connection below copies it, as
@@ -133,3 +154,7 @@ func (r *recordCursor) take(p, src []byte) int {
 	}
 	return copy(p, src[:n])
 }
+
+// atBoundary reports the cursor between records: no header and no body under
+// way.
+func (r *recordCursor) atBoundary() bool { return r.headerLen == 0 && r.bodyLeft == 0 }

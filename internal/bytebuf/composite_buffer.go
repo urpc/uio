@@ -531,3 +531,35 @@ func (b *CompositeBuffer) removeRange(endIdx int) {
 		b.bufList = b.bufList[endIdx:]
 	}
 }
+
+// WriteCoalesced appends p the way WritevCoalesced appends its vector: into
+// the tail block's room, or a new block of at least blockSize while output is
+// already queued, so back-to-back writes a slow peer makes queue do not take
+// one block each.
+func (b *CompositeBuffer) WriteCoalesced(p []byte, blockSize int) int {
+	total := len(p)
+	if total == 0 {
+		return 0
+	}
+	var last *Buffer
+	if count := len(b.bufList); count > 0 {
+		last = b.bufList[count-1]
+	}
+	remaining := total
+	for len(p) > 0 {
+		if last == nil || len(last.buf) == cap(last.buf) {
+			size := remaining
+			if len(b.bufList) > 0 && size < blockSize {
+				size = blockSize
+			}
+			last = getBlock(size)
+			b.bufList = append(b.bufList, last)
+		}
+		n := min(cap(last.buf)-len(last.buf), len(p))
+		last.buf = append(last.buf, p[:n]...)
+		p = p[n:]
+		remaining -= n
+	}
+	b.length += total
+	return total
+}
