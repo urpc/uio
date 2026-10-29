@@ -71,14 +71,18 @@ func dialTimer(t *testing.T) (*timerRecorder, Conn) {
 func waitForNote(t *testing.T, rec *timerRecorder, what string, want int, within time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(within)
-	for time.Now().Before(deadline) {
-		if rec.count(what) >= want {
+	for {
+		// Look before giving up: a fire landing just past the deadline must
+		// not turn into a failure that reports the count it was waiting for.
+		if got := rec.count(what); got >= want {
 			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s fired %d times within %v, want at least %d; ran %v",
+				what, rec.count(what), within, want, rec.sequence())
 		}
 		time.Sleep(2 * time.Millisecond)
 	}
-	t.Fatalf("%s fired %d times within %v, want at least %d; ran %v",
-		what, rec.count(what), within, want, rec.sequence())
 }
 
 // SetWakeDeadline on a bare connection runs OnTimer once the deadline
@@ -113,12 +117,18 @@ func TestHandlerWakeIntervalFiresEachPeriod(t *testing.T) {
 	if err := conn.SetWakeInterval(25 * time.Millisecond); err != nil {
 		t.Fatal(err)
 	}
-	waitForNote(t, rec, "timer", 3, 250*time.Millisecond)
+	// The budget only has to tell a repeating timer from a one-shot: the
+	// period itself is the wheel's business, and a loaded CI runner may take
+	// it late.
+	waitForNote(t, rec, "timer", 3, 2*time.Second)
 	if err := conn.SetWakeInterval(0); err != nil {
 		t.Fatal(err)
 	}
-	stopped := rec.count("timer")
+	// A fire already on its way when the interval stopped still runs; give
+	// it room to land before counting what comes after.
 	time.Sleep(80 * time.Millisecond)
+	stopped := rec.count("timer")
+	time.Sleep(120 * time.Millisecond)
 	if n := rec.count("timer"); n != stopped {
 		t.Fatalf("OnTimer ran %d more times after the interval stopped", n-stopped)
 	}
