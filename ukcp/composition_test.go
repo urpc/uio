@@ -204,7 +204,14 @@ func TestHalfCloseThroughKCPAndTLS(t *testing.T) {
 	serverClosed := make(chan error, 1) // the server connection's close cause
 	var serverConnMu sync.Mutex
 	var serverConn uio.Conn
-	server := newServer(t, uio.FuncHandler{
+	// AllowHalfOpen on both ends is the setting a half close is defined by.
+	// With it off, the peer's whole-connection close — its answer to this
+	// end's close_notify and FIN, back on loopback before CloseWrite finished
+	// walking down — legitimately closes the connection, and CloseWrite then
+	// reports net.ErrClosed although its close_notify already left. That race
+	// is how this test flaked (rarely, on both backends); a half close needs
+	// the end it is made from to stay open when the peer's end arrives.
+	server := newServerHalfOpen(t, uio.FuncHandler{
 		Read: func(conn uio.Conn) error {
 			serverConnMu.Lock()
 			serverConn = conn
@@ -245,7 +252,7 @@ func TestHalfCloseThroughKCPAndTLS(t *testing.T) {
 	t.Cleanup(func() { _ = ln.Close() })
 
 	client := newCollector()
-	conn, _ := dialKCP(t, client.handler(), "udp://"+ln.Addr().String(),
+	conn, _ := dialKCPHalfOpen(t, client.handler(), "udp://"+ln.Addr().String(),
 		ClientLayer(Options{}), utls.Client(clientTLS))
 
 	if _, err := conn.Write([]byte("bye")); err != nil {

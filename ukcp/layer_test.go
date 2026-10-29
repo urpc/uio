@@ -41,8 +41,22 @@ type serveKCP struct {
 
 func newServer(t *testing.T, handler uio.Handler, chain ...uio.Layer) *serveKCP {
 	t.Helper()
+	return newServerEvents(t, handler, false, chain...)
+}
+
+// newServerHalfOpen is newServer with the Events' AllowHalfOpen: the peer's
+// end of stream wakes the handler without closing the connection. A half-close
+// test needs it on the end it half-closes from — see
+// TestHalfCloseThroughKCPAndTLS.
+func newServerHalfOpen(t *testing.T, handler uio.Handler, chain ...uio.Layer) *serveKCP {
+	t.Helper()
+	return newServerEvents(t, handler, true, chain...)
+}
+
+func newServerEvents(t *testing.T, handler uio.Handler, halfOpen bool, chain ...uio.Layer) *serveKCP {
+	t.Helper()
 	started := make(chan struct{})
-	events := &uio.Events{Pollers: 2, Handler: handler, Hooks: uio.FuncHandler{
+	events := &uio.Events{Pollers: 2, AllowHalfOpen: halfOpen, Handler: handler, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
 	done := make(chan error, 1)
@@ -75,8 +89,21 @@ func (s *serveKCP) Listen(addr string, opts ...uio.ListenOption) (uio.Listener, 
 // dialKCP serves a client Events with the chain and dials addr through it.
 func dialKCP(t *testing.T, handler uio.Handler, addr string, chain ...uio.Layer) (uio.Conn, *uio.Events) {
 	t.Helper()
+	return dialKCPEvents(t, handler, false, addr, chain...)
+}
+
+// dialKCPHalfOpen is dialKCP with the client Events' AllowHalfOpen: the
+// peer's end of stream does not close this end, which is what CloseWrite
+// needs while the peer's response to it is already on its way back.
+func dialKCPHalfOpen(t *testing.T, handler uio.Handler, addr string, chain ...uio.Layer) (uio.Conn, *uio.Events) {
+	t.Helper()
+	return dialKCPEvents(t, handler, true, addr, chain...)
+}
+
+func dialKCPEvents(t *testing.T, handler uio.Handler, halfOpen bool, addr string, chain ...uio.Layer) (uio.Conn, *uio.Events) {
+	t.Helper()
 	started := make(chan struct{})
-	events := &uio.Events{Pollers: 1, Handler: handler, Hooks: uio.FuncHandler{
+	events := &uio.Events{Pollers: 1, AllowHalfOpen: halfOpen, Handler: handler, Hooks: uio.FuncHandler{
 		Start: func(*uio.Events) { close(started) },
 	}}
 	done := make(chan error, 1)
@@ -516,7 +543,12 @@ func TestWriteBackpressure(t *testing.T) {
 // CloseWrite ends the peer's stream after the bytes written before it.
 func TestCloseWriteEndsThePeerStream(t *testing.T) {
 	eof := make(chan string, 1)
-	server := newServer(t, uio.FuncHandler{
+	// Half-open on both ends: the peer's close, its answer to this end's FIN,
+	// may be back before CloseWrite returns, and without AllowHalfOpen it
+	// would close this connection under the call (net.ErrClosed) — a close
+	// race no half close should be judged by. See
+	// TestHalfCloseThroughKCPAndTLS for the TLS-and-KCP form of it.
+	server := newServerHalfOpen(t, uio.FuncHandler{
 		Read: func(conn uio.Conn) error {
 			buf := make([]byte, 64<<10)
 			for {
@@ -539,7 +571,7 @@ func TestCloseWriteEndsThePeerStream(t *testing.T) {
 	t.Cleanup(func() { _ = ln.Close() })
 
 	client := newCollector()
-	conn, _ := dialKCP(t, client.handler(), "udp://"+ln.Addr().String(), ClientLayer(Options{}))
+	conn, _ := dialKCPHalfOpen(t, client.handler(), "udp://"+ln.Addr().String(), ClientLayer(Options{}))
 	if _, err := conn.Write([]byte("bye")); err != nil {
 		t.Fatal(err)
 	}
