@@ -89,10 +89,12 @@ import (
 //   - What the layers hold for the layers above counts against
 //     MaxInboundBuffered with the socket's own buffer: a stack whose layers
 //     hold the limit pulls nothing more from below until a read above makes
-//     room.
-//   - Layers carry streams. An Events with layers refuses packet
-//     connections — UDP, IP, unixgram, unixpacket — with
-//     ErrLayersNeedStream.
+//     room. A packet connection keeps no buffer to hold and is never paced:
+//     its PacketLayer carries whatever backpressure its protocol provides.
+//   - Layers carry streams. A packet connection — UDP, IP, unixgram,
+//     unixpacket — takes a [PacketLayer] at the bottom of the chain, which
+//     reads its datagrams and hands the layers above the stream it makes of
+//     them; a chain without one is refused with ErrLayersNeedStream.
 //   - Every connection ends once, top down: the Handler's OnClose first, if
 //     it opened, then every layer's. A connection whose stack never opened —
 //     a failed handshake — ends without a Handler callback, and a dial
@@ -104,6 +106,36 @@ type Layer interface {
 	// Attach builds the layer's state for one connection. The LayerContext
 	// stays valid until the connection's OnClose.
 	Attach(ctx LayerContext) LayerHandler
+}
+
+// PacketLayer is a Layer that takes packets: installed at the bottom of a
+// chain on a packet connection — UDP, IP, unixgram, unixpacket — it reads the
+// connection's datagrams and hands the layers above the stream it makes of
+// them, a reliable stream for a protocol like KCP that runs over one. A chain
+// on a packet connection must start with a PacketLayer; without one the
+// endpoint reports ErrLayersNeedStream. On a stream connection the marker
+// changes nothing.
+//
+// The framework hands a PacketLayer one datagram per turn: its Down's
+// PeekChunk and Discard see that datagram alone, and what the layer leaves of
+// it when OnRead returns is dropped — a packet connection keeps no unread
+// bytes between turns, so the layer must consume what the turn brought.
+//
+// The framework never paces a PacketLayer, whatever the layer above has yet
+// to read: a datagram it does not take is gone, so it is called for every one
+// that arrives. The layer bounds what it delivers up itself, and its protocol
+// carries the backpressure to the peer — a full window, for KCP.
+type PacketLayer interface {
+	Layer
+
+	// CarriesPackets marks the layer as one that reads datagrams from below.
+	CarriesPackets()
+}
+
+// isPacketLayer reports a Layer that declares it takes packets from below.
+func isPacketLayer(layer Layer) bool {
+	_, ok := layer.(PacketLayer)
+	return ok
 }
 
 // LayerHandler is a layer's instance on one connection: the callbacks UIO runs
@@ -618,7 +650,9 @@ type stackDriver struct {
 }
 
 func (h *stackDriver) OnOpen(socket Conn) {
-	c := &stack{top: h.top, topSent: h.topSent, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen}
+	packetBottom := len(h.layers) > 0 && isPacketLayer(h.layers[0]) &&
+		socket.LocalAddr() != nil && packetNetwork(socket.LocalAddr().Network())
+	c := &stack{top: h.top, topSent: h.topSent, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen, packetBottom: packetBottom}
 	held := socket.Userdata()
 	if probe, ok := held.(*dialProbe); ok {
 		c.probe.Store(probe)
@@ -698,6 +732,10 @@ type stack struct {
 	reserved atomic.Int64              // bytes admitted at the top, not yet queued below
 	halfOpen bool                      // AllowHalfOpen
 	inLimit  int                       // MaxInboundBuffered; see inboundFull
+	// packetBottom marks a stack on a packet connection whose bottom layer is
+	// a PacketLayer: its turns carry one datagram each, and the bottom layer
+	// is never paced, because a datagram it does not take is gone.
+	packetBottom bool
 	// firstHeld is the index of the lowest layer that holds output, or -1.
 	// A tracked write into that layer or any above it passes a holder — the
 	// layers below the write are the ones whose flushes can expand it — so
@@ -1126,20 +1164,27 @@ func (c *stack) run() error {
 // inbound runs a layer's OnRead until it takes nothing more: the bytes
 // below may sit in several chunks, and a layer reads one at a time, so it is
 // called again while what waits below shrinks. It stops once nothing waits,
-// the layer took nothing, or it stalled at its bound.
+// the layer took nothing, or it stalled at its bound. A packet connection
+// has one datagram per turn instead: the bottom layer is called once and
+// never paced — what it leaves of the datagram is dropped when the turn
+// returns.
 func (c *stack) inbound(layer *layerNode) error {
+	packetBottom := c.packetBottom && layer.index == 0
 	for {
 		// Only the bottom layer stops at the limit: it is the one taking new
 		// bytes from the socket. The layers above go on moving what the stack
-		// holds up to the Handler, which must be able to read it.
-		if layer.index == 0 && c.inboundFull() {
+		// holds up to the Handler, which must be able to read it. A packet
+		// connection's datagram waits for no one, so its bottom layer is not
+		// stopped here.
+		if layer.index == 0 && !packetBottom && c.inboundFull() {
 			return nil
 		}
 		// A layer whose delivery to the layer above is full waits: it is not
 		// called again until the layer above reads, and that read — roomMade
 		// on this layer — asks for the turn. The layers above it go on
-		// draining what it delivered.
-		if layer.held() >= c.deliverBound() {
+		// draining what it delivered. A packet bottom is never paced: a
+		// datagram it does not take is gone.
+		if !packetBottom && layer.held() >= c.deliverBound() {
 			layer.paced.Store(true)
 			return nil
 		}
@@ -1153,6 +1198,12 @@ func (c *stack) inbound(layer *layerNode) error {
 		// An Up().Open the layer made takes effect here, before the round
 		// reads on into bytes that arrived behind its handshake.
 		c.openUpTo()
+		if packetBottom {
+			// The turn carried one datagram. Reading on would hand the layer
+			// whatever it left of it as if it were another packet; the
+			// connection drops that tail when the turn returns.
+			return nil
+		}
 		after := layer.waitingBelow()
 		if after == 0 || after >= before {
 			return nil
@@ -1843,6 +1894,29 @@ func (s socketLower) WriteTracked(p []byte) (int, SendReceipt, error) {
 	}
 	s.stack.addReceipt(pendingReceipt{conn: s, above: s.stack.layers[0], r: r})
 	return n, r, nil
+}
+
+// PacketSource reports the socket's datagrams. Only the first layer's Down —
+// the socket itself — can answer for them: what a layer builds above another
+// one is a byte stream, whatever the socket beneath it carries. A layer that
+// cares about the shape of its direct lower asserts this interface on Down:
+//
+//	if source, ok := ctx.Down().(interface{ PacketSource() bool }); ok && source.PacketSource() { … }
+func (s socketLower) PacketSource() bool {
+	addr := s.Conn.LocalAddr()
+	return addr != nil && packetNetwork(addr.Network())
+}
+
+// SocketReadSize reports the Events' read buffer: the most bytes one socket
+// read, or one datagram, carries. A layer whose units must fit inside a read
+// — a segment, a record — checks it at OnOpen and refuses what cannot fit:
+//
+//	if size, ok := ctx.Down().(interface{ SocketReadSize() int }); ok { … }
+func (s socketLower) SocketReadSize() int {
+	if c, ok := s.Conn.(*fdConn); ok {
+		return c.events().readBufferSize
+	}
+	return 0
 }
 
 func (s socketLower) SetWakeDeadline(when time.Time) error { return s.stack.setTimer(0, when, 0) }
@@ -2538,9 +2612,9 @@ func FindLayer[T any](conn LayerDown) (T, bool) {
 }
 
 // ErrLayersNeedStream reports a packet connection — UDP, IP, unixgram,
-// unixpacket — on an Events with layers installed: a layer carries a byte
-// stream, and a packet connection has message boundaries no layer would
-// keep.
+// unixpacket — on an endpoint whose layer chain does not start with a
+// [PacketLayer]: a layer carries a byte stream, and only a PacketLayer takes
+// a packet connection's messages, boundaries kept.
 var ErrLayersNeedStream = errors.New("uio: layers carry streams, not packet connections")
 
 // packetNetwork reports a network whose connections carry messages, not a
@@ -2554,13 +2628,17 @@ func packetNetwork(network string) bool {
 	return false
 }
 
-// refuseLayerPacket refuses a packet network on an endpoint that carries a
-// chain.
-func refuseLayerPacket(network string, layered bool) error {
-	if layered && packetNetwork(network) {
-		return ErrLayersNeedStream
+// refuseLayerPacket refuses a packet network on an endpoint whose chain does
+// not start with a layer that takes packets below. An endpoint without a
+// chain is not refused: it takes the packets itself.
+func refuseLayerPacket(network string, layers []Layer, layered bool) error {
+	if !layered || !packetNetwork(network) {
+		return nil
 	}
-	return nil
+	if len(layers) > 0 && isPacketLayer(layers[0]) {
+		return nil
+	}
+	return ErrLayersNeedStream
 }
 
 // observed is the connection an Observer hears about: the socket counts the

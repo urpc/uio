@@ -140,9 +140,9 @@ type unixUDPState struct {
 	// whichever claims it.
 	openOwed atomic.Bool
 
-	// readBuffer belongs to the socket's turns, which read one datagram at a
-	// time and lend it only for its callbacks. A child never reads.
-	readBuffer []byte
+	// batch stages the datagrams one read round takes from the socket; it
+	// belongs to the reading turn. A child never reads.
+	batch *udpBatch
 
 	// Datagrams are sent on whichever goroutine writes them, and the bytes
 	// they report wait in outboundPending for whoever holds outboundClaim; see
@@ -1738,34 +1738,85 @@ func (conn *fdConn) readRound(buffer []byte) error {
 // owed when the budget runs out is redelivered to the next turn. A server's
 // children share this socket and its peer map, so their callbacks run here.
 func (conn *fdConn) onRecvUDP() error {
-	buffer := conn.udp.readBuffer
-	if buffer == nil {
-		buffer = make([]byte, conn.events().readBufferSize)
-		conn.udp.readBuffer = buffer
+	slot := conn.events().readBufferSize
+	if slot <= 0 {
+		slot = 1
 	}
-	totalRead := 0
-	var receive socket.UDPReceive
-	for packets := 0; packets < 256 && totalRead < 1<<20; packets++ {
+	// The batch belongs to the reading socket and grows with the bursts it
+	// sees: a quiet socket stages one datagram, a busy one a round's worth.
+	if conn.udp.batch == nil {
+		conn.udp.batch = newUDPBatch(slot, 1)
+	}
+	batch := conn.udp.batch
+
+	totalRead, packets := 0, 0
+	for packets < 256 && totalRead < 1<<20 {
+		want := min(len(batch.slots), 256-packets)
 		gate, open := conn.enterDescriptor()
 		if !open {
 			return nil // The listener closed its socket; the release follows.
 		}
-		n, err := socket.RecvUDP(int(conn.fd), buffer, &receive)
+		got, err := socket.RecvUDPBatch(int(conn.fd), batch.slots[:want], batch.recvs[:want])
 		gate.leave()
+		for i := 0; i < got; i++ {
+			n := min(batch.recvs[i].Len, slot)
+			totalRead += n
+			packets++
+			conn.handleUDPPacket(batch.slots[i][:n], batch.recvs[i].Addr)
+			if conn.isClosing() {
+				return nil
+			}
+		}
 		if err != nil {
 			if isWouldBlock(err) {
 				return nil
 			}
 			return err
 		}
-		totalRead += n
-		conn.handleUDPPacket(buffer[:n], receive.Addr)
-		if conn.isClosing() {
-			return nil
+		if got < want {
+			return nil // drained
+		}
+		if got == len(batch.slots) {
+			batch.grow(slot)
 		}
 	}
 	conn.setReadStalled(true)
 	return nil
+}
+
+// udpReadBatch is the most datagrams one read round asks the kernel for; the
+// round then runs one turn per datagram, in arrival order.
+const udpReadBatch = 32
+
+// udpBatch stages one UDP read round: a slot of readBufferSize per datagram,
+// the vectors pointing into them, and their sources. It starts at one slot
+// and doubles after full rounds, so a quiet socket holds a read's worth and a
+// busy one a round's.
+type udpBatch struct {
+	data  []byte
+	slots [][]byte
+	recvs []socket.UDPReceive
+}
+
+func newUDPBatch(slotSize, count int) *udpBatch {
+	batch := &udpBatch{
+		data:  make([]byte, slotSize*count),
+		slots: make([][]byte, count),
+		recvs: make([]socket.UDPReceive, count),
+	}
+	for i := range batch.slots {
+		batch.slots[i] = batch.data[i*slotSize : (i+1)*slotSize]
+	}
+	return batch
+}
+
+// grow doubles the batch after a full round, up to udpReadBatch slots.
+func (batch *udpBatch) grow(slotSize int) {
+	count := len(batch.slots) * 2
+	if count > udpReadBatch {
+		return
+	}
+	*batch = *newUDPBatch(slotSize, count)
 }
 
 // handleUDPPacket resolves or creates the logical peer connection and lends
@@ -1833,6 +1884,11 @@ func (conn *fdConn) Wake() error {
 
 // dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
 func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
+	if server.entry != nil && server.entry.layered {
+		// A chain's peer connection is the stack's: the socket-level Conn
+		// returned here would bypass every layer. Dial is the way in.
+		return nil, ErrUnsupported
+	}
 	udp := server.udp
 	key, err := socket.UDPAddressFor(udp.family, addr)
 	if err != nil {

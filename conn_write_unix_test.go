@@ -2302,8 +2302,19 @@ func TestExternalUDPServerPeerWrites(t *testing.T) {
 	if n, err := conn.Write([]byte("too-large")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
 		t.Fatalf("UDP overflow = %d, %v", n, err)
 	}
-	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, ErrUnsupported) {
+	// Each buffer of a datagram Writev is one datagram of its own.
+	if n, err := conn.Writev([][]byte{[]byte("ab"), []byte("cd")}); n != 4 || err != nil {
 		t.Fatalf("UDP Writev = %d, %v", n, err)
+	}
+	for _, want := range []string{"ab", "cd"} {
+		if err = client.SetReadDeadline(time.Now().Add(3 * time.Second)); err != nil {
+			t.Fatal(err)
+		}
+		var received [16]byte
+		read, readErr := client.Read(received[:])
+		if readErr != nil || string(received[:read]) != want {
+			t.Fatalf("UDP Writev datagram = %q, %v; want %q", received[:read], readErr, want)
+		}
 	}
 	if got := conn.OutboundBuffered(); got != 0 {
 		t.Fatalf("pending UDP bytes = %d", got)

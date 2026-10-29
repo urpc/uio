@@ -254,7 +254,12 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 				return err
 			}
 			l.udpSvr = &fdConn{}
-			l.udpSvr.entry = ld.events.plainEntry()
+			// Its peers run the endpoint's own: the listener's entry, set
+			// before the group was added.
+			l.udpSvr.entry = l.entry
+			if l.udpSvr.entry == nil {
+				l.udpSvr.entry = ld.events.plainEntry()
+			}
 			l.udpSvr.fd = int32(l.fd)
 			l.udpSvr.udp = &unixUDPState{
 				file:   l.file,

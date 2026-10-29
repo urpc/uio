@@ -80,7 +80,7 @@ func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, opts ...Adopt
 		_ = conn.Close()
 		return nil, ErrDialOnEventLoop
 	}
-	if err := refuseLayerPacket(conn.LocalAddr().Network(), layered); err != nil {
+	if err := refuseLayerPacket(conn.LocalAddr().Network(), cfg.layers, cfg.hasLayers); err != nil {
 		_ = conn.Close()
 		return nil, err
 	}
@@ -215,7 +215,7 @@ func (d *Dialer) DialContext(dialCtx context.Context, addr string, opts ...DialO
 	if nil != err {
 		return nil, err
 	}
-	if err := refuseLayerPacket(u.Scheme, callLayers || d.cfg.hasLayers); err != nil {
+	if err := refuseLayerPacket(u.Scheme, config.layers, config.hasLayers); err != nil {
 		return nil, err
 	}
 	var entry *entry

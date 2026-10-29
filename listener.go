@@ -57,6 +57,10 @@ type PacketListener interface {
 	// initial Userdata. Before any datagram from raddr arrives, a closed
 	// child is replaced: a peer whose old connection is closing can be dialed
 	// again.
+	//
+	// A listener that carries a layer chain refuses DialPeer with
+	// ErrUnsupported: the peer's connection is the stack's, which only the
+	// stack opens, and the Conn returned here would bypass every layer.
 	DialPeer(raddr netip.AddrPort, userdata any) (Conn, error)
 
 	// WriteTo sends one datagram to raddr from the listener's socket, from
@@ -87,7 +91,7 @@ func (ev *Events) Listen(addr string, opts ...ListenOption) (Listener, error) {
 		network = scheme
 	}
 	cfg := listenConfigFor(opts)
-	if err := refuseLayerPacket(network, cfg.hasLayers); err != nil {
+	if err := refuseLayerPacket(network, cfg.layers, cfg.hasLayers); err != nil {
 		return nil, err
 	}
 	// Socket creation can call application controls. The acceptor admits the

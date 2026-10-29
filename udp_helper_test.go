@@ -1,5 +1,3 @@
-//go:build linux || darwin || netbsd || freebsd || openbsd || dragonfly || stdio
-
 package uio
 
 import (

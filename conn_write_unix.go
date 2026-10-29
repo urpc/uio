@@ -91,7 +91,9 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 		return 0, net.ErrClosed
 	}
 	if conn.isDatagram() {
-		return 0, ErrUnsupported
+		// Each buffer is one datagram, sent in one sendmmsg where the system
+		// has it; see writevUDP.
+		return conn.writevUDP(vec)
 	}
 	if conn.directOwner() {
 		return conn.writevOnLoop(vec, total)
@@ -362,6 +364,43 @@ func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 	gate.leave()
 	owner.submitMu.Unlock()
 	return conn.finishDatagram(data, written, err)
+}
+
+// writevUDP sends each buffer as one datagram, batched into one sendmmsg
+// where the system has it. A datagram the socket refuses is lost, as a
+// datagram transport allows: the protocol above retransmits what it needs.
+// The count reports the bytes of the datagrams the socket took.
+func (conn *fdConn) writevUDP(vec [][]byte) (int, error) {
+	if limit := conn.payloadLimit(); limit > 0 {
+		for _, segment := range vec {
+			if len(segment) > limit {
+				return 0, ErrOutboundOverflow
+			}
+		}
+	}
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events().closing.Load() || conn.loop.stopping.Load() {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	written, err := socket.SendUDPBatch(int(conn.fd), vec, conn.udp.remote)
+	gate.leave()
+	owner.submitMu.Unlock()
+	conn.reportOutbound(written)
+	if err != nil {
+		if isUDPSendBlocked(err) {
+			return written, err
+		}
+		conn.requestClose(err)
+		return written, err
+	}
+	return written, nil
 }
 
 func (conn *fdConn) precheckOutbound(size int) error {

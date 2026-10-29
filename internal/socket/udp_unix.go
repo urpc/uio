@@ -40,6 +40,9 @@ type UDPAddress struct {
 type UDPReceive struct {
 	raw  unix.RawSockaddrAny
 	Addr UDPAddress
+	// Len is the datagram's original length, which exceeds its buffer when
+	// the datagram was truncated.
+	Len int
 }
 
 // RecvUDP receives one datagram without allocating a Sockaddr interface.
@@ -65,6 +68,7 @@ func RecvUDP(fd int, packet []byte, receive *UDPReceive) (int, error) {
 	if err := receive.parse(addrLen); err != nil {
 		return int(n), err
 	}
+	receive.Len = int(n)
 	return int(n), nil
 }
 

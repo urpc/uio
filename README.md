@@ -103,7 +103,7 @@ punching itself is yours.
 ## How it works
 
 <p align="center">
-  <img src="assets/architecture.svg" alt="Event loops collect readiness, a sharded scheduler queues each connection on its own core, a connection turn reads and runs your callbacks, and a write turn sends writes from other goroutines" width="100%">
+  <img src="assets/architecture.svg" alt="Event loops collect readiness, a sharded scheduler keeps each connection's turns serialized on one shard, a connection turn reads and runs your callbacks, and a write turn sends writes from other goroutines" width="100%">
 </p>
 
 1. **Watch.** A few event loops — epoll or kqueue instances, one per four Ps
@@ -159,6 +159,19 @@ into a TLS record, and the record leaves by the same socket.
 <p align="center">
   <img src="assets/layers.svg" alt="Two rows over the same four boxes — socket, tls, websocket, handler: the top row reads left to right, decrypting then deframing into messages, and the bottom row writes right to left, framing then encrypting" width="100%">
 </p>
+
+The same seam carries a datagram transport into the model. `ukcp` runs KCP —
+a reliable stream over an unreliable datagram network — as a `PacketLayer`:
+on a UDP connection it reads a datagram per turn and hands the layers above
+a reliable stream, so TLS composes over it exactly as it does over TCP. Above
+a stream it frames its segments itself, so another KCP or a TLS connection
+composes below it just as well:
+
+```go
+listener, err := events.Listen("udp://:9000",
+	uio.WithLayers(ukcp.ServerLayer(ukcp.Options{}), utls.Server(cfg)))
+// the Handler reads a TLS stream carried by KCP over UDP
+```
 
 A layer transforms bytes, and UIO carries everything else. Writing one means
 writing what the protocol changes — nothing more:
@@ -326,8 +339,11 @@ These are UIO's to keep, not each layer's to remember:
 8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
    the Handler count against it with the socket's buffer: a stack holding the
    limit takes nothing more from the socket until the Handler reads.
-9. **Layers carry streams.** An endpoint whose chain has layers refuses
-   UDP, IP, unixgram and unixpacket connections with `ErrLayersNeedStream`.
+9. **Layers carry streams.** A packet connection — UDP, IP, unixgram,
+   unixpacket — takes a `PacketLayer` at the bottom of the chain (`ukcp`
+   runs KCP as one): that layer reads the datagrams and hands the layers
+   above the stream it makes of them. A chain without one is refused with
+   `ErrLayersNeedStream`.
 
 A layer carries one connection: one above for each one below. A protocol that
 opens several streams over one connection — HTTP/2, QUIC — is the Handler's to
@@ -396,10 +412,12 @@ turn, replacing the old probe reads.
 - **The stack is fixed once a connection starts.** There is no runtime layer
   replacement — a protocol that sniffs its first bytes (ALPN, a PROXY
   header) decides inside one layer, not by trading the stack.
-- **Packet connections carry no layers.** UDP, IP and unixgram/unixpacket are
-  refused with `ErrLayersNeedStream`: there is no data-unit declaration yet,
-  so a datagram transport such as KCP is built outside the layer model for
-  now.
+- **Packet connections need a `PacketLayer` at the bottom.** UDP, IP and
+  unixgram/unixpacket are refused with `ErrLayersNeedStream` unless the first
+  layer of the chain declares it takes packets (`CarriesPackets`): that layer
+  reads one datagram per turn and hands the layers above a stream — `ukcp`
+  runs KCP exactly this way. It is never paced; a datagram it does not take
+  is gone, so its own protocol carries the backpressure.
 - **A layer's delivery to the layer above is paced** (DefaultDeliverBound,
   or `MaxInboundBuffered`): the framework stops calling a layer whose
   delivery is full until the layer above reads. The bound is a pacing
@@ -420,7 +438,7 @@ Everything is optional; the zero `Events` is ready to use.
 | `MaxBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnRead` are batched either way. |
 | `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
-| `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnRead` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. |
+| `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnRead` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. A packet connection keeps no buffer to hold and is never paced by it: its bottom `PacketLayer` carries whatever backpressure its protocol provides. |
 | `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnRead` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes once both halves are shut and the bytes the peer sent have been consumed. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `LockOSThread` | off | Locks each event-loop goroutine to its own OS thread; callback workers are unaffected. |

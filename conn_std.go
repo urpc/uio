@@ -936,7 +936,20 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	if fc.udp != nil {
-		return 0, ErrUnsupported
+		// Each buffer is one datagram; the standard library exposes no
+		// batched datagram send.
+		written := 0
+		for _, segment := range vec {
+			if len(segment) == 0 {
+				continue
+			}
+			n, err := fc.Write(segment)
+			written += n
+			if err != nil {
+				return written, err
+			}
+		}
+		return written, nil
 	}
 
 	total := 0
@@ -1309,6 +1322,11 @@ func peerKey(addr netip.AddrPort) netip.AddrPort {
 // goroutine of its own serialized with the reader by the child's callback
 // mutex; a datagram from the peer that arrives first runs it there instead.
 func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
+	if fc.entry != nil && fc.entry.layered {
+		// A chain's peer connection is the stack's: the socket-level Conn
+		// returned here would bypass every layer. Dial is the way in.
+		return nil, ErrUnsupported
+	}
 	// The open joins the lifecycle before the peer is visible to any cleanup,
 	// in one section with the shutdown publication: either the Events is
 	// closing and none of this runs, or the open is counted and Serve's join

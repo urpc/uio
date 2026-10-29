@@ -7,55 +7,9 @@ import (
 	"net"
 	"net/netip"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
-
-// wakeRecorder counts read turns and timer fires, and records when they ran.
-type wakeRecorder struct {
-	mu     sync.Mutex
-	times  []time.Time
-	timers []time.Time
-	opened atomic.Int32
-	closed atomic.Int32
-}
-
-func (r *wakeRecorder) OnOpen(Conn) { r.opened.Add(1) }
-
-func (r *wakeRecorder) OnRead(Conn) error {
-	r.mu.Lock()
-	r.times = append(r.times, time.Now())
-	r.mu.Unlock()
-	return nil
-}
-
-func (r *wakeRecorder) OnTimer(Conn) error {
-	r.mu.Lock()
-	r.timers = append(r.timers, time.Now())
-	r.mu.Unlock()
-	return nil
-}
-
-func (r *wakeRecorder) OnClose(Conn, error) { r.closed.Add(1) }
-
-func (r *wakeRecorder) timerFires() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.timers)
-}
-
-func (r *wakeRecorder) fires() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return len(r.times)
-}
-
-func (r *wakeRecorder) firstAt() time.Time {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.times[0]
-}
 
 // dialWake dials a sink and returns its recorder with the connection: wake
 // tests need one settled connection, not a server.
@@ -95,18 +49,6 @@ func dialWake(t *testing.T) (*wakeRecorder, Conn) {
 	}
 	t.Cleanup(func() { _ = conn.Close() })
 	return rec, conn
-}
-
-// waitFor polls cond until it holds or the timeout passes.
-func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for !cond() {
-		if time.Now().After(deadline) {
-			return
-		}
-		time.Sleep(2 * time.Millisecond)
-	}
 }
 
 // A wake deadline fires one OnData near its time.

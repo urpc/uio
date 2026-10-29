@@ -183,7 +183,13 @@ type Conn interface {
 	// Notice: non-blocking interface, should not be used as you use std.
 	io.StringWriter
 
-	// Writev "writev"-like batch write optimization.
+	// Writev "writev"-like batch write. On a stream connection the buffers
+	// form one byte stream, written together. On a packet connection each
+	// buffer is one datagram of its own, sent in one sendmmsg where the
+	// system has it; the count reports the bytes of the datagrams the socket
+	// took, and a datagram it refused is lost — a datagram transport leaves
+	// the retransmission to its protocol above, or has none. Empty buffers
+	// carry no datagram.
 	// Notice: non-blocking interface, should not be used as you use std.
 	Writev(vec [][]byte) (int, error)
 

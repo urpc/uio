@@ -1,5 +1,10 @@
 package uio
 
+import (
+	"testing"
+	"time"
+)
+
 // liveFuncs is a Handler, TrafficObserver and ServeHooks that reads its
 // FuncHandler's fields at every call, unlike Serve's resolution of a
 // FuncHandler, which takes them once. Tests that set or wrap one callback at a
@@ -60,5 +65,18 @@ func signal[T any](ch chan<- T, v T) {
 	select {
 	case ch <- v:
 	default:
+	}
+}
+
+// waitFor polls cond until it holds or the timeout passes; an unmet condition
+// is the caller's to assert.
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
 	}
 }

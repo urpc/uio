@@ -2207,8 +2207,11 @@ func TestLoopBufferedWritevAndOverflow(t *testing.T) {
 		t.Fatalf("fireWriteEvent = %v, blocked %v", err, conn.writeBlocked())
 	}
 	conn.udp = &unixUDPState{}
-	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 0 || !errors.Is(err, ErrUnsupported) {
+	if n, err := conn.Writev([][]byte{[]byte("x")}); n != 1 || err != nil {
 		t.Fatalf("UDP Writev = %d, %v", n, err)
+	}
+	if got := string(readPeer(t, fds[1], 1)); got != "x" {
+		t.Fatalf("peer received %q", got)
 	}
 	if err := conn.fireWriteEvent(); err != nil {
 		t.Fatalf("UDP fireWriteEvent = %v", err)

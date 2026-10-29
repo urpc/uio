@@ -174,7 +174,12 @@ func (ld *acceptor) addLocked(l *listener, userdata any) error {
 
 	if l.udp != nil {
 		l.udpSvr = &fdConn{}
-		l.udpSvr.entry = ld.events.plainEntry()
+		// Its peers run the endpoint's own: the listener's entry, set before
+		// the group was added.
+		l.udpSvr.entry = l.entry
+		if l.udpSvr.entry == nil {
+			l.udpSvr.entry = ld.events.plainEntry()
+		}
 		l.udpSvr.loop = ld.loop
 		l.udpSvr.internal = true
 		l.udpSvr.setLocalAddr(l.udp.LocalAddr()) // what its peers report
