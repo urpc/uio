@@ -3722,13 +3722,20 @@ func TestCloseWithCutsALayeredDrain(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Write(make([]byte, 8<<20)); err != nil {
+	// Large enough to outrun any loopback buffer tuning: a queue the drain
+	// has to wait on.
+	if _, err := conn.Write(make([]byte, 32<<20)); err != nil {
 		t.Fatal(err)
 	}
 	if err := conn.CloseGracefully(nil); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(100 * time.Millisecond) // the drain is under way, and cannot progress
+	if conn.OutboundBuffered() == 0 {
+		// The transport took the whole write with a 4 KiB peer window: this
+		// platform's loopback holds no queue, and there is no drain to cut.
+		t.Skip("the platform drained the write: no stalled queue to cut")
+	}
 	began := time.Now()
 	if err := conn.CloseWith(io.EOF); err != nil {
 		t.Fatalf("CloseWith = %v, want the cut taken", err)
@@ -4012,6 +4019,73 @@ func TestServeDuringShutdownDoesNotEndTheLifecycle(t *testing.T) {
 // framingHold holds what it is given and, on flush, writes it with a
 // five-byte trailer: its output is larger than the input it accepted, so a
 // receipt taken at input size would point past bytes not yet written.
+// passThenHold is a layer that passes the first few bytes written through
+// and holds the rest until released: a transport that stalls, made by the
+// stack itself. A real socket cannot provide one on every platform — Windows
+// loopback buffers megabytes with no reader at all — so the tests that need
+// a queue which cannot leave below a write put this layer between the write
+// and the socket.
+type passThenHold struct {
+	PassThrough
+	pass     int
+	mu       sync.Mutex
+	passed   bool
+	released bool
+	held     []byte
+	counted  atomic.Int64
+}
+
+func (h *passThenHold) OnWrite(ctx LayerContext, p []byte) (int, error) {
+	h.mu.Lock()
+	n := 0
+	if !h.passed {
+		h.passed = true
+		n = min(h.pass, len(p))
+	}
+	release := h.released
+	if !release && len(p) > n {
+		h.held = append(h.held, p[n:]...)
+		h.counted.Add(int64(len(p) - n))
+	}
+	h.mu.Unlock()
+	if n > 0 {
+		if _, err := ctx.Down().Write(p[:n]); err != nil {
+			return 0, err
+		}
+	}
+	if release && len(p) > n {
+		if _, err := ctx.Down().Write(p[n:]); err != nil {
+			return n, err
+		}
+	}
+	return len(p), nil
+}
+
+func (h *passThenHold) OutboundHeld(LayerContext) int { return int(h.counted.Load()) }
+
+// Flush moves what it holds down once released, and nothing before: a
+// goodbye must not push a stall the test has not released yet.
+func (h *passThenHold) Flush(ctx LayerContext) error {
+	h.mu.Lock()
+	if !h.released || len(h.held) == 0 {
+		h.mu.Unlock()
+		return nil
+	}
+	out := h.held
+	h.held = nil
+	h.counted.Store(0)
+	h.mu.Unlock()
+	_, err := ctx.Down().Write(out)
+	return err
+}
+
+// release lets the held bytes leave on the next flush.
+func (h *passThenHold) release() {
+	h.mu.Lock()
+	h.released = true
+	h.mu.Unlock()
+}
+
 type framingHold struct {
 	PassThrough
 	mu      sync.Mutex
@@ -4110,7 +4184,13 @@ func TestTrackedWritePastAnExpandingHolder(t *testing.T) {
 		<-untilDone
 	}()
 	sent := make(chan SendReceipt, 2)
-	events := dialLayered(t, listener.Addr().String(), []Layer{LayerFunc(func(LayerContext) LayerHandler { return &framingHold{} })}, func(ev *Events) {
+	// The stall is the stack's own, not the kernel's: the sponge passes the
+	// first four bytes and holds the rest until released.
+	sponge := &passThenHold{pass: 4}
+	events := dialLayered(t, listener.Addr().String(), []Layer{
+		LayerFunc(func(LayerContext) LayerHandler { return sponge }),
+		LayerFunc(func(LayerContext) LayerHandler { return &framingHold{} }),
+	}, func(ev *Events) {
 		ev.Handler = FuncHandler{
 			Sent:  func(_ Conn, r SendReceipt) { sent <- r },
 			Close: func(Conn, error) {},
@@ -4139,6 +4219,10 @@ func TestTrackedWritePastAnExpandingHolder(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(release)
+	sponge.release()
+	if err := conn.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case got := <-rest:
 		if len(got) != 8<<20 {
@@ -4231,7 +4315,11 @@ func TestTrackedWriteHeldBelowAHolderAbove(t *testing.T) {
 		<-untilDone
 	}()
 	sent := make(chan SendReceipt, 2)
+	// The stall is the stack's own, not the kernel's: the sponge passes the
+	// first four bytes and holds the rest until released.
+	sponge := &passThenHold{pass: 4}
 	events := dialLayered(t, listener.Addr().String(), []Layer{
+		LayerFunc(func(LayerContext) LayerHandler { return sponge }),
 		LayerFunc(func(LayerContext) LayerHandler { return &framingHold{} }),
 		LayerFunc(func(LayerContext) LayerHandler { return &trackingHold{sent: sent} }),
 	}, nil)
@@ -4252,6 +4340,10 @@ func TestTrackedWriteHeldBelowAHolderAbove(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(release)
+	sponge.release()
+	if err := conn.Flush(); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case got := <-rest:
 		if len(got) != 8<<20 {

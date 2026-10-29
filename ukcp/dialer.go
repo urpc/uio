@@ -44,6 +44,13 @@ func Dial(addr string) (uio.Conn, error) {
 // connection returned is for writing, closing and addressing. For TLS over
 // KCP, use the layer form — ClientLayer above utls.Client in a WithLayers
 // chain — as with any other protocol.
+//
+// The Events-level settings — Handler, MaxBufferSize, Pollers, Executor,
+// SocketReadBuffer, SocketWriteBuffer, WriteBufferedThreshold,
+// MaxOutboundBuffered, AllowHalfOpen — are read when the transport starts at
+// the first dial and frozen with it; the session settings — MTU, the
+// windows, KeepAlive and the rest — are read on every dial. Set them before
+// dialing.
 type Dialer struct {
 	Options
 
@@ -81,7 +88,7 @@ func (d *Dialer) DialContext(ctx context.Context, addr string) (uio.Conn, error)
 	if err != nil {
 		return nil, err
 	}
-	chain := []uio.Layer{newLayer(resolved, true)}
+	chain := []uio.Layer{newResolvedLayer(resolved, true)}
 	dialOpts := []uio.DialOption{uio.WithLayers(chain...)}
 	if control := resolved.socketControl(); control != nil {
 		dialOpts = append(dialOpts, uio.WithDialControl(control))

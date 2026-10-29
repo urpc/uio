@@ -38,6 +38,14 @@ func newLayer(opts Options, client bool) uio.Layer {
 	return &kcpLayer{opts: resolved, client: client, err: err}
 }
 
+// newResolvedLayer builds the layer from options that already passed resolve.
+// Resolving them twice would read a negative's normalized zero — KeepAlive
+// off, the first segment's wait unbounded, fast retransmit disabled — as the
+// "take the default" sentinel and put the defaults back.
+func newResolvedLayer(resolved Options, client bool) uio.Layer {
+	return &kcpLayer{opts: resolved, client: client}
+}
+
 // CarriesPackets marks the layer: it reads a packet connection's datagrams,
 // one per turn, and hands the layers above the stream it makes of them.
 func (l *kcpLayer) CarriesPackets() {}

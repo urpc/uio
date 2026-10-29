@@ -18,8 +18,9 @@ The protocol engine is the battle-tested one from
   layers above a reliable stream. Above a stream connection it frames its own
   segments, so it composes in either direction with TLS and with itself.
 - **Zero goroutines, zero timers.** The flush clock, retransmissions, window
-  probes and the keepalive all run on the session's own turn timer. An idle
-  session wakes for nothing.
+  probes and the keepalive all run on the session's own turn timer — no
+  goroutine of its own, no timer of its own. An idle session wakes only for
+  the keepalive; turn `KeepAlive` off to stop even that.
 - **TLS, composed not bundled.** There is no built-in TLS: KCP has no `wss://`
   of its own to match, so TLS is a layer above (or below) by your choice,
   through `uio.WithLayers`.
@@ -123,7 +124,7 @@ type, the zero value is the defaults — KCP's **Fast profile** — and
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `MTU` | 1400 | Largest segment, header included (24..1500). Must not exceed the Events' `MaxBufferSize`, or the socket truncates datagrams. |
+| `MTU` | 1400 | Largest segment, header included (24..1500). Must not exceed the Events' `MaxBufferSize` — on both ends, since the peer's segments arrive into this end's read buffer. |
 | `SendWindow` / `RecvWindow` | 1024 | Windows in segments, each at most 65535 — the header's window field is a `uint16`. A window times the MTU bounds what a session holds, about 1.4 MiB each way. |
 | `NoDelay` | off | The engine's low-latency RTO mode: a 30 ms floor instead of 100 ms. |
 | `Interval` | 30 ms | The engine's flush cadence, 10 ms to 5 s. Data never waits for it. |
@@ -250,6 +251,7 @@ every type and method.
 
 The protocol engine under `internal/kcp` is
 [xtaci/kcp-go v5.7.1](https://github.com/xtaci/kcp-go), MIT licensed
-(`internal/kcp/LICENSE`), vendored file-for-file with two small patches — a
-stream-mode empty send as the end-of-stream marker, and a test clock hook —
-both marked `ukcp:` in `kcp.go` and described in `internal/kcp/README.md`.
+(`internal/kcp/LICENSE`), vendored with three patches marked `ukcp:` in
+`kcp.go` — a stream-mode empty send as the end-of-stream marker, a test clock
+hook, and a flush type that keeps an answer-only flush from moving the send
+queue — described in `internal/kcp/README.md`.

@@ -57,7 +57,9 @@
 //
 // MTU must not exceed the Events' MaxBufferSize (4 KiB by default), or the
 // socket truncates datagrams and segments never reassemble; the defaults
-// (1400) fit.
+// (1400) fit. Both ends' MTU matter: a segment arrives into this end's read
+// buffer, so a peer's larger MTU must fit here too — run both ends with the
+// same MTU, or keep MaxBufferSize at least the largest one in play.
 package ukcp
 
 import (
@@ -155,7 +157,8 @@ type Options struct {
 
 	// MTU is the largest segment, header included. The engine's buffers hold
 	// 1500, so 24..1500; the default is 1400. It must not exceed the Events'
-	// MaxBufferSize (4 KiB by default).
+	// MaxBufferSize (4 KiB by default) — on both ends: a segment from the
+	// peer must fit this end's read buffer too.
 	MTU int
 
 	// SendWindow and RecvWindow are the windows, in segments: how much a

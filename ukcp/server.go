@@ -98,7 +98,7 @@ func (s *Server) Serve(addrs ...string) error {
 		AllowHalfOpen:          resolved.AllowHalfOpen,
 		Handler:                resolved.Handler,
 	}
-	chain := []uio.Layer{newLayer(resolved, false)}
+	chain := []uio.Layer{newResolvedLayer(resolved, false)}
 	listenOpts := []uio.ListenOption{uio.WithLayers(chain...)}
 	if control := resolved.socketControl(); control != nil {
 		listenOpts = append(listenOpts, uio.WithListenControl(control))

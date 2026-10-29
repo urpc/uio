@@ -749,11 +749,14 @@ func TestKeepaliveProbeKeepsTheWindow(t *testing.T) {
 	t.Cleanup(func() { _ = ln.Close() })
 
 	client := newCollector()
+	// The period is large enough that a stalled CI runner — a slow turn with
+	// no inbound for three periods ends the session — cannot kill the client
+	// between probes, and the sleep stays several periods long.
 	dialKCP(t, client.handler(), "udp://"+ln.Addr().String(),
-		ClientLayer(Options{KeepAlive: 50 * time.Millisecond}))
+		ClientLayer(Options{KeepAlive: 300 * time.Millisecond}))
 
 	// Idle long enough for several probes to cross.
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(time.Second)
 
 	serverConnMu.Lock()
 	sc := serverConn

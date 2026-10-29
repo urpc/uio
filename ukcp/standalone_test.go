@@ -200,3 +200,26 @@ func TestStandaloneValidation(t *testing.T) {
 		t.Fatalf("dial without a handler: %v, want ErrInvalidOptions", err)
 	}
 }
+
+// The standalone endpoints resolve once: a negative — keepalive off, the
+// first segment's wait unbounded, fast retransmit disabled — must survive
+// into the sessions they build. A second resolve would read its normalized
+// zero as "take the default" and put the defaults back.
+func TestStandaloneKeepsNegativeOptions(t *testing.T) {
+	raw := Options{Handler: echoHandler, KeepAlive: -1, HandshakeTimeout: -1, Resend: -1}
+	resolved, err := raw.resolve()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.KeepAlive != 0 || resolved.HandshakeTimeout != 0 || resolved.Resend != 0 {
+		t.Fatalf("resolve normalized to %+v", resolved)
+	}
+	session, ok := newResolvedLayer(resolved, false).Attach(nil).(*conn)
+	if !ok {
+		t.Fatal("the layer built no session")
+	}
+	if session.opts.KeepAlive != 0 || session.opts.HandshakeTimeout != 0 || session.opts.Resend != 0 {
+		t.Fatalf("the standalone layer re-resolved: keepalive %v, handshake %v, resend %d",
+			session.opts.KeepAlive, session.opts.HandshakeTimeout, session.opts.Resend)
+	}
+}

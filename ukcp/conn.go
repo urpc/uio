@@ -309,6 +309,10 @@ func (c *conn) OnRead(uio.LayerContext) error {
 		next := c.kcp.Flush()
 		c.sendBatch(true)
 		c.noteHeld()
+		if c.kcp.IsDead() {
+			c.fatal(ErrDeadLink)
+			return nil
+		}
 		c.arm(next)
 	} else {
 		c.kcp.FlushAckOnly()
@@ -442,10 +446,11 @@ func (c *conn) inputStream() bool {
 func (c *conn) feed(seg []byte) bool {
 	if seg[5] != 0 {
 		// The stream dialect frames with frg=0. A segment in message mode
-		// from the session's own peer would take a sequence number this end
-		// cannot deliver — a hole every later segment waits behind — so it
-		// ends the session instead of being dropped. A stray from another
-		// conversation is not this session's to judge.
+		// would take a sequence number this end cannot deliver — a hole
+		// every later segment waits behind — so it ends the session instead
+		// of being dropped. Before a session exists the segment is the one
+		// that would found it, so it is this connection's to judge too; once
+		// one does, only its own conversation is.
 		if c.kcp == nil || binary.LittleEndian.Uint32(seg[0:4]) == c.conv {
 			c.fatal(fmt.Errorf("%w: a segment in message mode (frg=%d)", ErrProtocol, seg[5]))
 		}
@@ -570,6 +575,11 @@ func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 		rest = rest[n:]
 	}
 	c.maintain()
+	if c.ended {
+		// The flush that carried the write ended the session: the bytes sit in
+		// a queue that will never be retransmitted, so the write did not take.
+		return 0, c.writeErr
+	}
 	return len(p), nil
 }
 
