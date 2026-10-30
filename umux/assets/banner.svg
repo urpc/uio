@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="188" viewBox="0 0 960 188">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0F1A2E"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0.35"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#818CF8" stop-opacity="0.22"/>
+    <stop offset="1" stop-color="#818CF8" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="word" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#A5F3FC"/>
+  </linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="#22304A"/>
+  </pattern>
+</defs>
+<rect width="960" height="188" rx="16" fill="url(#bg)"/>
+<rect width="960" height="188" rx="16" fill="url(#dots)" opacity="0.55"/>
+<rect x="0.5" y="0.5" width="959" height="187" rx="15.5" fill="none" stroke="#22304A"/>
+<circle cx="770" cy="94.0" r="96" fill="url(#glow)"/>
+<circle cx="600" cy="94.0" r="70" fill="url(#glow2)"/>
+<line x1="520" y1="72.0" x2="736" y2="72.0" stroke="#22D3EE" stroke-width="1.2" opacity="0.55"/>
+<path d="M734,72.0 l-7,-4 v8 z" fill="#22D3EE" opacity="0.8"/>
+<rect x="530.0" y="62.0" width="58.0" height="20" rx="5" fill="#0B1220" stroke="#22D3EE" stroke-opacity="0.85"/><text x="559.0" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="middle" font-weight="600">DATA 1</text>
+<rect x="596.0" y="62.0" width="58.0" height="20" rx="5" fill="#0B1220" stroke="#22D3EE" stroke-opacity="0.85"/><text x="625.0" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#22D3EE" text-anchor="middle" font-weight="600">DATA 3</text>
+<rect x="662.0" y="62.0" width="51.0" height="20" rx="5" fill="#0B1220" stroke="#94A3B8" stroke-opacity="0.85"/><text x="687.5" y="75.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#94A3B8" text-anchor="middle" font-weight="600">FIN 1</text>
+<line x1="736" y1="116.0" x2="520" y2="116.0" stroke="#818CF8" stroke-width="1.2" opacity="0.55"/>
+<path d="M518,116.0 l7,-4 v8 z" fill="#818CF8" opacity="0.8"/>
+<rect x="530" y="101.0" width="192" height="30" rx="8" fill="none" stroke="#818CF8" stroke-opacity="0.45" stroke-dasharray="3 4"/>
+<rect x="536.0" y="106.0" width="58.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="565.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">DATA 3</text>
+<rect x="600.0" y="106.0" width="58.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="629.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">DATA 1</text>
+<rect x="664.0" y="106.0" width="42.0" height="20" rx="5" fill="#0B1220" stroke="#C7D2FE" stroke-opacity="0.85"/><text x="685.0" y="119.8" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">ACK</text>
+<text x="616.0" y="146.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="middle" font-weight="400">streams interleave</text>
+<circle cx="770" cy="94.0" r="32" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="1"/>
+<circle cx="770" cy="94.0" r="41" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="0.45"/>
+<circle cx="770" cy="94.0" r="51" fill="none" stroke="#22D3EE" stroke-width="1.2" opacity="0.2"/>
+<circle cx="770" cy="94.0" r="31" fill="#0B1220"/>
+<defs><clipPath id="muxclip"><circle cx="50" cy="50" r="50"/></clipPath><linearGradient id="muxsky" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#38BDF8"/><stop offset="1" stop-color="#6366F1"/></linearGradient></defs>
+<g transform="translate(742.00 66.00) scale(0.5600)">
+<circle cx="50" cy="50" r="50" fill="url(#muxsky)"/>
+<g clip-path="url(#muxclip)">
+<line x1="16" y1="30" x2="47" y2="30" stroke="#14181F" stroke-width="6" stroke-linecap="round"/>
+<line x1="16" y1="50" x2="47" y2="50" stroke="#14181F" stroke-width="6" stroke-linecap="round"/>
+<line x1="16" y1="70" x2="47" y2="70" stroke="#14181F" stroke-width="6" stroke-linecap="round"/>
+<rect x="45" y="25" width="9" height="50" rx="4.5" fill="#14181F"/>
+<line x1="54" y1="50" x2="80" y2="50" stroke="#14181F" stroke-width="6" stroke-linecap="round"/>
+<path d="M86,50 l-9,-5.5 v11 z" fill="#14181F"/>
+<path d="M20,34 C28,31.5 36,31 43,31" fill="none" stroke="#FFFFFF" stroke-width="1.8" stroke-linecap="round" opacity="0.6"/>
+</g>
+<circle cx="50" cy="50" r="49" fill="none" stroke="#0B1220" stroke-opacity="0.25" stroke-width="2"/>
+</g>
+<rect x="840" y="49.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="64.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">yamux v1 wire</text>
+<rect x="840" y="83.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="98.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">flow control</text>
+<rect x="840" y="117.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="132.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">half-close</text>
+<text x="52.0" y="92.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" fill="url(#word)" text-anchor="start" font-weight="700" letter-spacing="-2">umux</text>
+<text x="212.0" y="66.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#E6EDF6" text-anchor="start" font-weight="500">Multiplexed streams, on uio</text>
+<text x="212.0" y="90.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A9BB4" text-anchor="start" font-weight="400">Many streams over one connection, a turn at a time.</text>
+<rect x="56" y="122" width="286" height="30" rx="8" fill="#0A1628" stroke="#22304A"/>
+<text x="70.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#22D3EE" text-anchor="start" font-weight="400">import</text>
+<text x="122.5" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#CBD5E1" text-anchor="start" font-weight="400">"github.com/urpc/uio/umux"</text>
+<text x="358.0" y="141.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">one transport · N streams</text>
+</svg>
