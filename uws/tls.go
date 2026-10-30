@@ -23,18 +23,21 @@ import (
 	"github.com/urpc/uio/utls"
 )
 
-// tlsOptions carries Options' handshake bound onto the TLS layers.
-func tlsOptions(opts Options) []utls.Option {
-	if opts.HandshakeTimeout <= 0 {
-		return nil
+// tlsLayerOptions carries Options' handshake bound onto the TLS layers. A
+// non-positive bound is the TLS layer's own default, as it was before the
+// layers took their options as a struct.
+func tlsLayerOptions(config *tls.Config, opts Options) utls.LayerOptions {
+	timeout := opts.HandshakeTimeout
+	if timeout < 0 {
+		timeout = 0
 	}
-	return []utls.Option{utls.HandshakeTimeout(opts.HandshakeTimeout)}
+	return utls.LayerOptions{TLSConfig: config, HandshakeTimeout: timeout}
 }
 
 // serverTLSLayer is what TLSConfig installs on a Server: its listener's
 // accepted connections speak TLS.
 func serverTLSLayer(config *tls.Config, opts Options) uio.Layer {
-	return utls.Server(config, tlsOptions(opts)...)
+	return utls.ServerLayer(tlsLayerOptions(config, opts))
 }
 
 // clientTLSLayer is the layer one wss:// dial brings; host is the name the
@@ -45,5 +48,5 @@ func clientTLSLayer(config *tls.Config, opts Options, host string) uio.Layer {
 		cloned.ServerName = host
 		config = cloned
 	}
-	return utls.Client(config, tlsOptions(opts)...)
+	return utls.ClientLayer(tlsLayerOptions(config, opts))
 }

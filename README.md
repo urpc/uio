@@ -169,7 +169,8 @@ composes below it just as well:
 
 ```go
 listener, err := events.Listen("udp://:9000",
-	uio.WithLayers(ukcp.ServerLayer(ukcp.Options{}), utls.Server(cfg)))
+	uio.WithLayers(ukcp.ServerLayer(ukcp.LayerOptions{}),
+		utls.ServerLayer(utls.LayerOptions{TLSConfig: cfg})))
 // the Handler reads a TLS stream carried by KCP over UDP
 ```
 
@@ -358,7 +359,7 @@ and `AdoptContext` do the same for a `net.Conn` you hand over:
 ```go
 client := &uio.Events{}
 conn, err := client.DialContext(ctx, "tcp://example.org:443",
-	uio.WithLayers(utls.Client(cfg)))
+	uio.WithLayers(utls.ClientLayer(utls.LayerOptions{TLSConfig: cfg})))
 // conn reads and writes plaintext; utls encrypts below it
 ```
 

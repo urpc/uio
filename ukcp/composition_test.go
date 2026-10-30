@@ -87,14 +87,14 @@ func TestComposedEchoMatrix(t *testing.T) {
 		{"udp_kcp", "udp", []uio.Layer{serverKCP()}, []uio.Layer{clientKCP()}},
 		{"tcp_kcp", "tcp", []uio.Layer{serverKCP()}, []uio.Layer{clientKCP()}},
 		{"udp_kcp_tls", "udp",
-			[]uio.Layer{serverKCP(), utls.Server(serverTLS)},
-			[]uio.Layer{clientKCP(), utls.Client(clientTLS)}},
+			[]uio.Layer{serverKCP(), utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS})},
+			[]uio.Layer{clientKCP(), utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS})}},
 		{"tcp_kcp_tls", "tcp",
-			[]uio.Layer{serverKCP(), utls.Server(serverTLS)},
-			[]uio.Layer{clientKCP(), utls.Client(clientTLS)}},
+			[]uio.Layer{serverKCP(), utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS})},
+			[]uio.Layer{clientKCP(), utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS})}},
 		{"tcp_tls_kcp", "tcp",
-			[]uio.Layer{utls.Server(serverTLS), serverKCP()},
-			[]uio.Layer{utls.Client(clientTLS), clientKCP()}},
+			[]uio.Layer{utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}), serverKCP()},
+			[]uio.Layer{utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}), clientKCP()}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,7 +126,7 @@ func TestComposedEchoMatrix(t *testing.T) {
 // and all.
 func TestComposedEchoThroughLoss(t *testing.T) {
 	serverTLS, clientTLS := testTLSConfigs(t)
-	server := newServer(t, echoHandler, ServerLayer(Options{}), utls.Server(serverTLS))
+	server := newServer(t, echoHandler, ServerLayer(Options{}), utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}))
 	ln, err := server.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -136,7 +136,7 @@ func TestComposedEchoThroughLoss(t *testing.T) {
 	proxy := newLossyProxy(t, ln.Addr().String(), 3)
 	client := newCollector()
 	conn, _ := dialKCP(t, client.handler(), "udp://"+proxy.addr(),
-		ClientLayer(Options{}), utls.Client(clientTLS))
+		ClientLayer(Options{}), utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}))
 
 	payload := payloadBytes(64 << 10)
 	for off := 0; off < len(payload); off += 1024 {
@@ -187,7 +187,7 @@ func TestComposedEchoThroughReorder(t *testing.T) {
 func TestPacketEndpointRefusesTLSBottom(t *testing.T) {
 	serverTLS, _ := testTLSConfigs(t)
 	server := newServer(t, echoHandler)
-	if _, err := server.Events.Listen("udp://127.0.0.1:0", uio.WithLayers(utls.Server(serverTLS))); !errors.Is(err, uio.ErrLayersNeedStream) {
+	if _, err := server.Events.Listen("udp://127.0.0.1:0", uio.WithLayers(utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}))); !errors.Is(err, uio.ErrLayersNeedStream) {
 		t.Fatalf("udp Listen with TLS at the bottom: %v, want ErrLayersNeedStream", err)
 	}
 }
@@ -244,7 +244,7 @@ func TestHalfCloseThroughKCPAndTLS(t *testing.T) {
 			default:
 			}
 		},
-	}, ServerLayer(Options{}), utls.Server(serverTLS))
+	}, ServerLayer(Options{}), utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}))
 	ln, err := server.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -253,7 +253,7 @@ func TestHalfCloseThroughKCPAndTLS(t *testing.T) {
 
 	client := newCollector()
 	conn, _ := dialKCPHalfOpen(t, client.handler(), "udp://"+ln.Addr().String(),
-		ClientLayer(Options{}), utls.Client(clientTLS))
+		ClientLayer(Options{}), utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}))
 
 	if _, err := conn.Write([]byte("bye")); err != nil {
 		t.Fatal(err)
@@ -311,7 +311,7 @@ func TestUWSOverKCP(t *testing.T) {
 	client := newCollector()
 	target := "ws://" + ln.Addr().String() + "/"
 	conn, _ := dialKCP(t, client.handler(), "udp://"+ln.Addr().String(),
-		ClientLayer(Options{}), uws.ClientLayer(target, uws.LayerOptions{}))
+		ClientLayer(Options{}), uws.ClientLayer(uws.LayerOptions{Target: target}))
 
 	payload := payloadBytes(32 << 10)
 	for off := 0; off < len(payload); off += 1024 {

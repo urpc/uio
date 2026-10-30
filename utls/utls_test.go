@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"math/big"
 	"net"
 	"sync/atomic"
@@ -261,13 +262,13 @@ func dialTLS(t *testing.T, layers ...any) (uio.Conn, *record) {
 func TestTLSEchoBothSides(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	clientConn, clientEcho := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+	clientConn, clientEcho := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 	if _, err := clientConn.Write([]byte("over the wire")); err != nil {
 		t.Fatal(err)
 	}
@@ -318,8 +319,8 @@ func TestTLSEchoBothSides(t *testing.T) {
 func TestEmptyTurnReachesHandlerAbove(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newRecord()
-	addr, _ := listenTLS(t, server, Server(serverConfig))
-	conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+addr)
+	addr, _ := listenTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
+	conn, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+addr)
 	if _, err := conn.Write([]byte("hello")); err != nil {
 		t.Fatal(err)
 	}
@@ -342,5 +343,20 @@ func signal[T any](ch chan<- T, v T) {
 	select {
 	case ch <- v:
 	default:
+	}
+}
+
+// Options the layer refuses are reported by Validate, and every connection
+// through the layer ends with ErrInvalidOptions instead of a handshake.
+func TestInvalidOptionsRefused(t *testing.T) {
+	if err := (LayerOptions{}).Validate(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("Validate of empty options = %v, want ErrInvalidOptions", err)
+	}
+	layer, ok := ServerLayer(LayerOptions{}).(*tlsLayer)
+	if !ok || !errors.Is(layer.err, ErrInvalidOptions) {
+		t.Fatalf("layer error = %v, want ErrInvalidOptions", layer.err)
+	}
+	if err := (LayerOptions{TLSConfig: &Config{}}).Validate(); err != nil {
+		t.Fatalf("Validate of a TLSConfig = %v, want nil", err)
 	}
 }

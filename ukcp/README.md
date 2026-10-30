@@ -126,8 +126,14 @@ acknowledgement to open: the first segments retransmit until the peer answers.
 ## Configuration
 
 `Options` holds every setting; `Server`, `Dialer` and the layers embed the same
-type, the zero value is the defaults — KCP's **Fast profile** — and
-`Options.Validate` reports up front what a session would refuse.
+type (`LayerOptions` names it where a layer is built), the zero value is the
+defaults — KCP's **Fast profile** — and `LayerOptions.Validate` reports up
+front what a session would refuse. A layer refuses the settings only the
+standalone endpoints own — `Handler`, `WriteBufferedThreshold`,
+`MaxOutboundBuffered`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`
+and the socket buffers — with `ErrInvalidOptions`, since under a layer they
+would be silently inert; `MaxBufferSize` stays allowed, because it must still
+hold a segment.
 
 | Field | Default | What it does |
 | --- | --- | --- |
@@ -141,7 +147,7 @@ type, the zero value is the defaults — KCP's **Fast profile** — and
 | `HandshakeTimeout` | 10 s | How long a server waits for the peer's first segment. KCP has no handshake, but a peer that never speaks must not hold a connection for ever: it ends with `ErrPeerSilent`. A negative value waits without a bound; a client never waits. |
 | `KeepAlive` | 10 s | An idle session probes the peer's window this often; silence for three periods ends it with `ErrKeepAliveTimeout`. A negative value disables keepalive. |
 | `MaxBuffered` | 4 MiB | Bytes a session holds for the writer; a write past it returns `ErrOutboundOverflow`. |
-| `Handler` | none | The connection callbacks. Required by `Server` and `Dialer`; a layer hands its stream to the layer above instead. |
+| `Handler` | none | The connection callbacks. Required by `Server` and `Dialer`; a layer hands its stream to the layer above instead, and refuses Handler. |
 | `MaxBufferSize` | Events default | The Events' socket read size; must be at least `MTU`. |
 | `WriteBufferedThreshold` | off | Passed to the Events: writes below it join the turn's batch. |
 | `MaxOutboundBuffered` | off | Passed to the Events: a hard limit on the socket's queue, returning `ErrOutboundOverflow`. |
@@ -169,10 +175,10 @@ refuses it with `uio.ErrLayersNeedStream` — for stacks of your own:
 ```go
 // udp -> kcp -> tls: a TLS stream carried by KCP over UDP
 listener, err := events.Listen("udp://:9000", uio.WithLayers(
-	ukcp.ServerLayer(ukcp.Options{}), utls.Server(tlsConfig),
+	ukcp.ServerLayer(ukcp.LayerOptions{}), utls.ServerLayer(utls.LayerOptions{TLSConfig: tlsConfig}),
 ))
 conn, err := client.DialContext(ctx, "udp://example.org:9000", uio.WithLayers(
-	ukcp.ClientLayer(ukcp.Options{}), utls.Client(tlsConfig),
+	ukcp.ClientLayer(ukcp.LayerOptions{}), utls.ClientLayer(utls.LayerOptions{TLSConfig: tlsConfig}),
 ))
 ```
 
@@ -182,7 +188,7 @@ above KCP all compose:
 
 ```go
 // tcp -> kcp -> tls, and kcp -> kcp over UDP
-uio.WithLayers(ukcp.ServerLayer(opts), utls.Server(tlsConfig))
+uio.WithLayers(ukcp.ServerLayer(opts), utls.ServerLayer(utls.LayerOptions{TLSConfig: tlsConfig}))
 uio.WithLayers(ukcp.ServerLayer(opts), ukcp.ServerLayer(opts))
 ```
 
@@ -197,8 +203,8 @@ below the layer, so a session whose MTU exceeds it is refused with
 `ErrInvalidOptions` instead.
 
 There is deliberately no `TLSConfig` option. KCP has no standard TLS port or
-URL scheme as `wss` does, so the composition is yours: put `utls.Server` or
-`utls.Client` above `ServerLayer`/`ClientLayer` in the `WithLayers` chain and
+URL scheme as `wss` does, so the composition is yours: put `utls.ServerLayer` or
+`utls.ClientLayer` above `ServerLayer`/`ClientLayer` in the `WithLayers` chain and
 configure TLS there, exactly as over TCP. The standalone `Server`/`Dialer` are
 bare KCP; for TLS use the layer form above.
 

@@ -77,6 +77,10 @@ var (
 // OnOpen starts the handshake: its coroutine, and the deadline that bounds
 // it.
 func (c *conn) OnOpen(ctx uio.LayerContext) {
+	if err := c.tlsLayer.err; err != nil {
+		_ = ctx.Abort(err)
+		return
+	}
 	c.mu.Lock()
 	engine := &transport{c: c}
 	if c.tlsLayer.client {

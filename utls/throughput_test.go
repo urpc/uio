@@ -227,7 +227,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	var serverCount atomic.Int64
 	var serverLayers []uio.Layer
 	if useTLS {
-		serverLayers = append(serverLayers, Server(serverConfig))
+		serverLayers = append(serverLayers, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	}
 	serverConnOpened := make(chan uio.Conn, 1)
 	server := uio.FuncHandler{
@@ -273,7 +273,7 @@ func uioRound(t *testing.T, useTLS, download bool, total int, serverConfig, clie
 	var clientCount atomic.Int64
 	var clientLayers []uio.Layer
 	if useTLS {
-		clientLayers = append(clientLayers, Client(clientConfig))
+		clientLayers = append(clientLayers, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 	}
 	client := uio.FuncHandler{
 		Open: func(uio.Conn) {},
@@ -414,7 +414,7 @@ func TestMemoryBaseline(t *testing.T) {
 	const conns = 300
 	serverConfig, clientConfig := testConfigs(t)
 	raw := memBaseline(t, conns, nil, nil)
-	withTLS := memBaseline(t, conns, Server(serverConfig), Client(clientConfig))
+	withTLS := memBaseline(t, conns, ServerLayer(LayerOptions{TLSConfig: serverConfig}), ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 	perConn := (withTLS - raw) / conns / 2
 	t.Logf("%d connections: raw %d KiB, with TLS %d KiB, TLS adds ~%d KiB per connection per side",
 		conns, raw>>10, withTLS>>10, perConn>>10)

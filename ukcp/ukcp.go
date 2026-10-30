@@ -23,8 +23,10 @@
 // [uio.PacketLayer]) or a stream connection's bytes, and hands the layers
 // above one reliable stream — TLS and the like can run over it:
 //
-//	events.Listen("udp://:9000", uio.WithLayers(ukcp.ServerLayer(opts), utls.Server(cfg)))
-//	events.Dial("udp://host:9000", uio.WithLayers(ukcp.ClientLayer(opts), utls.Client(cfg)))
+//	events.Listen("udp://:9000", uio.WithLayers(
+//		ukcp.ServerLayer(opts), utls.ServerLayer(utls.LayerOptions{TLSConfig: cfg})))
+//	events.Dial("udp://host:9000", uio.WithLayers(
+//		ukcp.ClientLayer(opts), utls.ClientLayer(utls.LayerOptions{TLSConfig: cfg})))
 //
 // Nothing costs a goroutine: every session runs on the connection's turns,
 // its clock is the layer's timer, and an idle session wakes for nothing.
@@ -42,8 +44,8 @@
 // connection's callbacks, and Dialer.Dial — DialContext, when the dial needs a
 // bound; the package Dial uses DefaultDialer — returns the connection whose
 // events reach Options.Handler the same way. There is no built-in TLS: KCP has no such
-// standard, and what rides it is the wiring's to choose — put utls.Server or
-// utls.Client above ServerLayer/ClientLayer in a WithLayers chain, exactly as
+// standard, and what rides it is the wiring's to choose — put utls.ServerLayer or
+// utls.ClientLayer above ServerLayer/ClientLayer in a WithLayers chain, exactly as
 // over TCP. Both standalone endpoints need a Handler: reads arrive through
 // its OnRead, as they do for any uio connection.
 //
@@ -151,8 +153,8 @@ var errSegmentTooLarge = errors.New("ukcp: segment larger than the engine can ho
 // transport's. The zero value runs the Fast profile {false, 30ms, 2, 1}.
 type Options struct {
 	// Handler receives the connection callbacks of the standalone server and
-	// dialer. A layer hands its stream to the layer above instead; leaving
-	// Handler set there is ignored.
+	// dialer. A layer hands its stream to the layer above instead, and
+	// refuses Handler with ErrInvalidOptions.
 	Handler uio.Handler
 
 	// MTU is the largest segment, header included. The engine's buffers hold
@@ -214,7 +216,9 @@ type Options struct {
 	MaxBuffered int
 
 	// ---- The transport, for the standalone server and dialer ----
-	// A layer takes these from its Events instead.
+	// A layer takes these from the Events it runs on instead, and refuses
+	// them with ErrInvalidOptions rather than leaving them silently inert.
+	// MaxBufferSize excepted: it must still hold a segment.
 
 	// MaxBufferSize is the Events' MaxBufferSize, the socket read size. It
 	// must be at least MTU; zero leaves the Events default (4 KiB).
@@ -237,10 +241,14 @@ type Options struct {
 	// defaults — and a kernel default of a few hundred KiB drops much of it.
 	// Zero takes DefaultSocketBuffer; a negative value leaves the socket's
 	// buffers as they came. A layer endpoint sizes its own sockets through
-	// uio.WithListenControl and uio.WithDialControl.
+	// uio.WithListenControl and uio.WithDialControl, and refuses these two.
 	SocketReadBuffer  int
 	SocketWriteBuffer int
 }
+
+// LayerOptions names the options a ServerLayer or ClientLayer runs with: the
+// protocol's own Options, under the name every layer package's options share.
+type LayerOptions = Options
 
 // Validate reports what a layer built from o would refuse.
 func (o Options) Validate() error {
@@ -354,6 +362,28 @@ func withKCPScheme(addr string) string {
 	return "udp://" + addr
 }
 
+// checkLayerOptions refuses what a standalone endpoint owns: a layer runs
+// inside an Events it does not own and hands its stream to the layer above,
+// so these settings would be silently inert under it. MaxBufferSize is not
+// among them: it still has to hold a segment (see checkTransport).
+func (o Options) checkLayerOptions() error {
+	switch {
+	case o.Handler != nil:
+		return fmt.Errorf("%w: a layer hands its stream to the layer above, not to a Handler", ErrInvalidOptions)
+	case o.WriteBufferedThreshold != 0:
+		return fmt.Errorf("%w: WriteBufferedThreshold belongs to the layer's Events", ErrInvalidOptions)
+	case o.MaxOutboundBuffered != 0:
+		return fmt.Errorf("%w: a stack's outbound limit is its Events' MaxOutboundBuffered", ErrInvalidOptions)
+	case o.AllowHalfOpen:
+		return fmt.Errorf("%w: AllowHalfOpen belongs to the layer's Events", ErrInvalidOptions)
+	case o.Pollers != 0, o.ReusePort, o.Executor != nil:
+		return fmt.Errorf("%w: Pollers, ReusePort and Executor belong to the layer's Events", ErrInvalidOptions)
+	case o.SocketReadBuffer != 0, o.SocketWriteBuffer != 0:
+		return fmt.Errorf("%w: a layer sizes its sockets through uio.WithListenControl and uio.WithDialControl", ErrInvalidOptions)
+	}
+	return nil
+}
+
 // checkTransport refuses transport settings no session can run with.
 func (o Options) checkTransport() error {
 	if o.MaxBufferSize > 0 && o.MaxBufferSize < o.MTU {
@@ -368,10 +398,10 @@ func (o Options) checkTransport() error {
 // datagram per turn) or over a stream one (TCP, TLS), which its segments
 // self-frame on. It opens the layers above when the peer's first segment
 // names the session's conversation id, and hands them one reliable stream.
-func ServerLayer(opts Options) uio.Layer { return newLayer(opts, false) }
+func ServerLayer(opts LayerOptions) uio.Layer { return newLayer(opts, false) }
 
 // ClientLayer runs the client side of KCP as a [uio.Layer]: it opens the
 // layers above at once with a conversation id of its own, and the dial does
 // not wait for the peer — the first segments retransmit until it answers.
 // One layer dials one peer.
-func ClientLayer(opts Options) uio.Layer { return newLayer(opts, true) }
+func ClientLayer(opts LayerOptions) uio.Layer { return newLayer(opts, true) }

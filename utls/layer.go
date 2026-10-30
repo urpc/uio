@@ -1,13 +1,15 @@
 // Package utls runs TLS as a protocol layer over a UIO transport, with
 // crypto/tls doing the cryptography.
 //
-// Server and Client return a [uio.Layer]: name one in a Listen's or a
+// ServerLayer and ClientLayer return a [uio.Layer]: name one in a Listen's or a
 // Dial's [uio.WithLayers] and it hands everything above it plaintext, so
 // whatever runs there — a protocol handler, another layer, another TLS
 // layer — speaks TLS without knowing it:
 //
-//	listener, err := events.Listen(addr, uio.WithLayers(utls.Server(config)))
-//	conn, err := events.Dial(addr, uio.WithLayers(utls.Client(config)))
+//	listener, err := events.Listen(addr, uio.WithLayers(
+//		utls.ServerLayer(utls.LayerOptions{TLSConfig: serverConfig})))
+//	conn, err := events.Dial(addr, uio.WithLayers(
+//		utls.ClientLayer(utls.LayerOptions{TLSConfig: clientConfig})))
 //
 // Nothing costs a goroutine. The handshake runs as a coroutine that OnRead
 // resumes with the bytes that arrive: when crypto/tls asks its transport
@@ -106,62 +108,86 @@ func (wouldBlockError) Temporary() bool { return true }
 
 var errClosed = errors.New("utls: connection closed")
 
+// ErrInvalidOptions reports options no connection through the layer can run
+// with; every one of them fails with it. LayerOptions.Validate says so up
+// front.
+var ErrInvalidOptions = errors.New("utls: invalid options")
+
 // errHandshakeTimeout ends a connection whose handshake outlasted its bound.
 var errHandshakeTimeout = fmt.Errorf("utls: handshake timeout: %w", os.ErrDeadlineExceeded)
 
-// tlsLayer is what Server and Client build: the configuration its
-// connections run with, and the bounds it keeps.
+// tlsLayer is what ServerLayer and ClientLayer build: the configuration its
+// connections run with, the bounds it keeps, and the options' fault, which
+// fails every connection through it.
 type tlsLayer struct {
 	config           *Config
 	client           bool
 	handshakeTimeout time.Duration
 	stagingBound     int
+	err              error
 }
 
-// Option configures the layer Server or Client builds.
-type Option func(*tlsLayer)
-
-// HandshakeTimeout bounds the handshake. Zero means
-// DefaultHandshakeTimeout, a negative value means no bound.
-func HandshakeTimeout(timeout time.Duration) Option {
-	return func(m *tlsLayer) { m.handshakeTimeout = timeout }
+// LayerOptions configures the layer ServerLayer or ClientLayer builds.
+type LayerOptions struct {
+	// TLSConfig is what the layer's connections run with: certificates and
+	// ALPN on a server; ServerName or InsecureSkipVerify on a client, as for
+	// crypto/tls.Client. It is required.
+	TLSConfig *Config
+	// HandshakeTimeout bounds the handshake. Zero means
+	// DefaultHandshakeTimeout, a negative value means no bound.
+	HandshakeTimeout time.Duration
+	// StagingBound bounds the decrypted bytes the layer holds for the handler
+	// above: at its bound the layer stops taking new chunks from the
+	// connection below, so a pause at the top stills the wire. It paces the
+	// rounds rather than capping one delivery: a chunk in hand is decrypted
+	// whole — stopping mid-chunk would carry its ciphertext through a copy
+	// into the next round — and crypto/tls hands a record over whole
+	// however its bytes arrived, one it had been assembling from earlier
+	// rounds included, so the delivery may pass the bound by that record (up
+	// to 16 KiB) and the turn's chunk (one socket read). The framework
+	// pauses the layer at its own delivery bound (DefaultDeliverBound, or
+	// MaxInboundBuffered) as well, so a larger StagingBound is capped there.
+	// During the handshake it bounds the ciphertext the layer takes from
+	// below that the handshake has not read yet, though never below one TLS
+	// record. Zero means DefaultStagingBound.
+	StagingBound int
 }
 
-// StagingBound bounds the decrypted bytes the layer holds for the handler
-// above: at its bound the layer stops taking new chunks from the connection
-// below, so a pause at the top stills the wire. It paces the rounds rather
-// than capping one delivery: a chunk in hand is decrypted whole — stopping
-// mid-chunk would carry its ciphertext through a copy into the next round —
-// and crypto/tls hands a record over whole however its bytes arrived, one it
-// had been assembling from earlier rounds included, so the delivery may pass
-// the bound by that record (up to 16 KiB) and the turn's chunk (one socket
-// read). The framework pauses the layer at its own delivery bound
-// (DefaultDeliverBound, or MaxInboundBuffered) as well, so a larger
-// StagingBound is capped there. During the handshake it bounds the
-// ciphertext the layer takes from below that the handshake has not read yet,
-// though never below one TLS record. Zero means DefaultStagingBound.
-func StagingBound(bytes int) Option {
-	return func(m *tlsLayer) { m.stagingBound = bytes }
-}
-
-// Server serves the layer above over TLS with config: certificates, ALPN,
-// whatever a crypto/tls server runs with.
-func Server(config *Config, opts ...Option) uio.Layer {
-	m := &tlsLayer{config: config}
-	for _, opt := range opts {
-		opt(m)
+// Validate reports what a layer built from o would refuse: a missing
+// TLSConfig, today.
+func (o LayerOptions) Validate() error {
+	if o.TLSConfig == nil {
+		return fmt.Errorf("%w: TLSConfig is required", ErrInvalidOptions)
 	}
+	return nil
+}
+
+// newLayer builds the layer's policy. Options it refuses fail every
+// connection through the layer with the cause, as uws and ukcp layers do.
+func newLayer(opts LayerOptions, client bool) uio.Layer {
+	m := &tlsLayer{
+		config:           opts.TLSConfig,
+		client:           client,
+		handshakeTimeout: opts.HandshakeTimeout,
+		stagingBound:     opts.StagingBound,
+	}
+	m.err = opts.Validate()
 	return m
 }
 
-// Client takes the client side of TLS with config, for a dial: config needs
-// ServerName, or InsecureSkipVerify, as it does for crypto/tls.Client.
-func Client(config *Config, opts ...Option) uio.Layer {
-	m := &tlsLayer{config: config, client: true}
-	for _, opt := range opts {
-		opt(m)
-	}
-	return m
+// ServerLayer runs the server side of TLS as a [uio.Layer]: certificates,
+// ALPN, whatever a crypto/tls server runs with. Options it refuses fail
+// every connection through it with ErrInvalidOptions.
+func ServerLayer(opts LayerOptions) uio.Layer {
+	return newLayer(opts, false)
+}
+
+// ClientLayer runs the client side of TLS as a [uio.Layer], for a dial: it
+// needs ServerName, or InsecureSkipVerify, as crypto/tls.Client does. One
+// layer dials one connection at a time; its options are shared by every
+// connection through it.
+func ClientLayer(opts LayerOptions) uio.Layer {
+	return newLayer(opts, true)
 }
 
 // Attach starts TLS on one connection.

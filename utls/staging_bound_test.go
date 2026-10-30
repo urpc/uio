@@ -42,12 +42,12 @@ func TestDeliveryPeaksPastTheStagingBound(t *testing.T) {
 			// One-byte socket reads against a one-byte bound: every record is
 			// assembled across thousands of rounds.
 			transport := serveTLSWith(t, top, func(ev *uio.Events) { ev.MaxBufferSize = 1 },
-				Server(serverConfig, StagingBound(1)))
+				ServerLayer(LayerOptions{TLSConfig: serverConfig, StagingBound: 1}))
 			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
-			conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+			conn, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 			if _, err := conn.Write(payload); err != nil {
 				t.Fatal(err)
 			}

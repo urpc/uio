@@ -42,7 +42,7 @@ func Dial(addr string) (uio.Conn, error) {
 // by nothing, DialContext by its context. The dialed connection is one
 // reliable stream, read through the Handler as any uio connection is; the
 // connection returned is for writing, closing and addressing. For TLS over
-// KCP, use the layer form — ClientLayer above utls.Client in a WithLayers
+// KCP, use the layer form — ClientLayer above utls.ClientLayer in a WithLayers
 // chain — as with any other protocol.
 //
 // The Events-level settings — Handler, MaxBufferSize, Pollers, Executor,

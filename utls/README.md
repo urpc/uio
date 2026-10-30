@@ -17,7 +17,7 @@ the bytes those turns read.
 
 ## Highlights
 
-- **A layer, not a listener.** `Server` and `Client` build a `uio.Layer` for
+- **A layer, not a listener.** `ServerLayer` and `ClientLayer` build a `uio.Layer` for
   `uio.WithLayers`. Put it under a handler, under `uws` (that is how wss
   runs), over KCP, or between two tunnel layers — the stack decides what is
   encrypted, not the endpoint.
@@ -83,7 +83,9 @@ func main() {
 	<-started
 
 	listener, err := events.Listen("tcp://:8443", uio.WithLayers(
-		utls.Server(&tls.Config{Certificates: []tls.Certificate{cert}}),
+		utls.ServerLayer(utls.LayerOptions{
+			TLSConfig: &tls.Config{Certificates: []tls.Certificate{cert}},
+		}),
 	))
 	if err != nil {
 		log.Fatal(err)
@@ -112,7 +114,7 @@ defer client.Close(nil)
 ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 defer cancel()
 conn, err := client.DialContext(ctx, "tcp://example.org:8443", uio.WithLayers(
-	utls.Client(&tls.Config{ServerName: "example.org"}),
+	utls.ClientLayer(utls.LayerOptions{TLSConfig: &tls.Config{ServerName: "example.org"}}),
 ))
 if err != nil {
 	log.Fatal(err) // a handshake that failed or timed out reports its cause here
@@ -128,7 +130,7 @@ stack opened — the TLS handshake included — within the layer's deadline.
 
 ## How it works
 
-1. **A layer between the socket and yours.** `Server` and `Client` install
+1. **A layer between the socket and yours.** `ServerLayer` and `ClientLayer` install
    `crypto/tls` at their place in the chain: bytes arriving from below are
    the ciphertext, bytes written above are the plaintext, and the connection
    your handler holds is the layer's own — encrypted underneath, plaintext to
@@ -153,16 +155,27 @@ stack opened — the TLS handshake included — within the layer's deadline.
 
 ## Configuration
 
-`Config` is `crypto/tls`'s, unchanged. The layer itself has two knobs:
+`Config` is `crypto/tls`'s, unchanged. The layer's own settings are
+`LayerOptions`:
 
-| Option | Default | What it does |
+| Field | Default | What it does |
 | --- | --- | --- |
-| `HandshakeTimeout(d)` | 10 s | Bounds the handshake; its expiry closes the connection. A negative value waits without a bound. |
-| `StagingBound(n)` | 64 KiB | Decrypted bytes the layer holds for the handler above: at the bound it stops taking chunks from below, so a stalled reader stills the wire. A chunk in hand is decrypted whole, so a delivery may pass the bound by that record (up to 16 KiB) and the turn's read; the framework's own delivery bound (64 KiB, or `Events.MaxInboundBuffered`) caps it as well. |
+| `TLSConfig` | required | The `crypto/tls` configuration the connections run with: certificates and ALPN on a server; `ServerName` or `InsecureSkipVerify` on a client. |
+| `HandshakeTimeout` | 10 s | Bounds the handshake; its expiry closes the connection. A negative value waits without a bound. |
+| `StagingBound` | 64 KiB | Decrypted bytes the layer holds for the handler above: at the bound it stops taking chunks from below, so a stalled reader stills the wire. A chunk in hand is decrypted whole, so a delivery may pass the bound by that record (up to 16 KiB) and the turn's read; the framework's own delivery bound (64 KiB, or `Events.MaxInboundBuffered`) caps it as well. |
 
 ```go
-utls.Server(cfg, utls.HandshakeTimeout(5*time.Second), utls.StagingBound(32<<10))
+utls.ServerLayer(utls.LayerOptions{
+	TLSConfig:        cfg,
+	HandshakeTimeout: 5 * time.Second,
+	StagingBound:     32 << 10,
+})
 ```
+
+`LayerOptions.Validate` reports up front what the layer would refuse — a
+missing `TLSConfig`, today; options it refuses fail every connection through
+the layer with `ErrInvalidOptions`. The layer form is the only form: a
+`utls` layer is built only for `uio.WithLayers`.
 
 **Size the transport's reads to the record.** A TLS record carries up to
 16 KiB, and a socket read smaller than that splits one record across several
@@ -200,12 +213,12 @@ TLS is one layer among others; the chain decides what rides on what:
 ```go
 // wss: the WebSocket protocol above TLS (uws does this for you when its
 // Options carry a TLSConfig)
-uio.WithLayers(utls.Server(cfg), uws.ServerLayer(uws.LayerOptions{}))
+uio.WithLayers(utls.ServerLayer(utls.LayerOptions{TLSConfig: cfg}), uws.ServerLayer(uws.LayerOptions{}))
 
 // A TLS stream carried by KCP over UDP, and KCP's segments riding inside
 // TLS over TCP — the same two layers, opposite orders
-uio.WithLayers(ukcp.ServerLayer(ukcp.Options{}), utls.Server(cfg))
-uio.WithLayers(utls.Server(cfg), ukcp.ServerLayer(ukcp.Options{}))
+uio.WithLayers(ukcp.ServerLayer(ukcp.LayerOptions{}), utls.ServerLayer(utls.LayerOptions{TLSConfig: cfg}))
+uio.WithLayers(utls.ServerLayer(utls.LayerOptions{TLSConfig: cfg}), ukcp.ServerLayer(ukcp.LayerOptions{}))
 ```
 
 A TLS layer needs a stream below it: on a packet connection — UDP, IP,

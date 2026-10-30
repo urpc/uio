@@ -34,6 +34,9 @@ var (
 )
 
 func newLayer(opts Options, client bool) uio.Layer {
+	if err := opts.checkLayerOptions(); err != nil {
+		return &kcpLayer{opts: opts, client: client, err: err}
+	}
 	resolved, err := opts.resolve()
 	return &kcpLayer{opts: resolved, client: client, err: err}
 }

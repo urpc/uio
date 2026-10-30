@@ -186,7 +186,7 @@ func TestInteropLargePayload(t *testing.T) {
 	t.Run("our server, stdlib client", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		echo := newCollectEcho(total)
-		transport := serveTLS(t, echo, Server(serverConfig))
+		transport := serveTLS(t, echo, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -208,7 +208,7 @@ func TestInteropLargePayload(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		where := stdEcho(t, serverConfig)
 		sink := newCollector(total)
-		events := startClient(t, sink, Client(clientConfig))
+		events := startClient(t, sink, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 		conn := dialThrough(t, events, string(where))
 		roundTripThrough(t, conn, sink, randomBytes(t, total))
 	})
@@ -222,7 +222,7 @@ func TestInteropRecordBoundaries(t *testing.T) {
 		t.Run(fmt.Sprintf("%d bytes", size), func(t *testing.T) {
 			serverConfig, clientConfig := testConfigs(t)
 			echo := newCollectEcho(int64(size))
-			transport := serveTLS(t, echo, Server(serverConfig))
+			transport := serveTLS(t, echo, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -241,7 +241,7 @@ func TestInteropRecordBoundaries(t *testing.T) {
 		const messages = 512
 		const each = 17
 		echo := newCollectEcho(messages * each)
-		transport := serveTLS(t, echo, Server(serverConfig))
+		transport := serveTLS(t, echo, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -277,7 +277,7 @@ func TestInteropMutualTLS(t *testing.T) {
 
 	t.Run("our server requires, stdlib client presents", func(t *testing.T) {
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -303,7 +303,7 @@ func TestInteropMutualTLS(t *testing.T) {
 	t.Run("stdlib server requires, our client presents", func(t *testing.T) {
 		where := stdEcho(t, serverConfig)
 		sink := newCollector(6)
-		events := startClient(t, sink, Client(clientConfig))
+		events := startClient(t, sink, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 		conn := dialThrough(t, events, string(where))
 		roundTripThrough(t, conn, sink, []byte("mutual"))
 	})
@@ -321,10 +321,10 @@ func TestInteropMutualTLS(t *testing.T) {
 			Open:  func(uio.Conn) { calls++ },
 			Read:  func(uio.Conn) error { return nil },
 			Close: func(uio.Conn, error) { calls++ },
-		}, Client(&tls.Config{
+		}, ClientLayer(LayerOptions{TLSConfig: &tls.Config{
 			ServerName: "localhost", RootCAs: pool,
 			MinVersion: tls.VersionTLS12, MaxVersion: tls.VersionTLS12,
-		}))
+		}}))
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
 		if _, err := events.DialContext(ctx, "tcp://"+string(where)); err == nil {
@@ -342,10 +342,10 @@ func TestInteropMutualTLS(t *testing.T) {
 			Open:  func(uio.Conn) {},
 			Read:  func(uio.Conn) error { return nil },
 			Close: func(_ uio.Conn, err error) { signal(closed, err) },
-		}, Client(&tls.Config{
+		}, ClientLayer(LayerOptions{TLSConfig: &tls.Config{
 			ServerName: "localhost", RootCAs: pool,
 			MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13,
-		}))
+		}}))
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
 		conn, err := events.DialContext(ctx, "tcp://"+string(where))
@@ -391,7 +391,7 @@ func TestInteropExplicitVersions(t *testing.T) {
 
 			// stdlib client over our server.
 			server := newEcho()
-			transport := serveTLS(t, server, Server(serverConfig))
+			transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
@@ -408,7 +408,7 @@ func TestInteropExplicitVersions(t *testing.T) {
 			// Our client over a stdlib server.
 			where := stdEcho(t, serverConfig)
 			sink := newCollector(5)
-			events := startClient(t, sink, Client(clientConfig))
+			events := startClient(t, sink, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 			conn := dialThrough(t, events, string(where))
 			state := uio.LayerOf(conn).(interface{ State() ConnectionState }).State()
 			if state.Version != version.value {
@@ -428,7 +428,7 @@ func TestInteropMatchesStdlibByteForByte(t *testing.T) {
 	payload := randomBytes(t, total)
 
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -444,7 +444,7 @@ func TestInteropMatchesStdlibByteForByte(t *testing.T) {
 
 	// Ours, through the stack, with the same bytes.
 	sink := newCollector(total)
-	events := startClient(t, sink, Client(clientConfig))
+	events := startClient(t, sink, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 	conn := dialThrough(t, events, listener.Addr().String())
 	roundTripThrough(t, conn, sink, payload)
 }
@@ -457,7 +457,7 @@ func TestInteropConcurrentConnections(t *testing.T) {
 	const total = 8 << 10
 
 	handler := &countingEcho{}
-	transport := serveTLS(t, handler, Server(serverConfig))
+	transport := serveTLS(t, handler, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -541,7 +541,7 @@ func TestInteropCloseNotify(t *testing.T) {
 	t.Run("stdlib close_notify, our server", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -563,12 +563,12 @@ func TestInteropCloseNotify(t *testing.T) {
 	t.Run("our close_notify, stdlib client", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		conn, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		if _, err := conn.Write([]byte("bye")); err != nil {
 			t.Fatal(err)
 		}
@@ -590,7 +590,7 @@ func TestInteropCertificateChain(t *testing.T) {
 	clientConfig := &tls.Config{ServerName: "localhost", RootCAs: caPool}
 
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -682,7 +682,7 @@ func TestInteropServerSideResumption(t *testing.T) {
 		ClientSessionCache: tls.NewLRUClientSessionCache(4),
 	}
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)

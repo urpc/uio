@@ -314,10 +314,12 @@ for stacks of your own — TLS, an obfuscation, a tunnel, in any order, on an
 
 ```go
 listener, err := server.Listen(addr, uio.WithLayers(
-	utls.Server(tlsConfig), uws.ServerLayer(uws.LayerOptions{Authorize: checkToken}), tunnel,
+	utls.ServerLayer(utls.LayerOptions{TLSConfig: tlsConfig}),
+	uws.ServerLayer(uws.LayerOptions{Authorize: checkToken}), tunnel,
 ))
 conn, err := client.DialContext(ctx, "tcp://example.org:443", uio.WithLayers(
-	utls.Client(tlsConfig), uws.ClientLayer("wss://example.org/tunnel", uws.LayerOptions{}), tunnel,
+	utls.ClientLayer(utls.LayerOptions{TLSConfig: tlsConfig}),
+	uws.ClientLayer(uws.LayerOptions{Target: "wss://example.org/tunnel"}), tunnel,
 ))
 ```
 
@@ -330,7 +332,9 @@ returns once the handshake succeeded, and reports a refusal as a
 transport's — `Handler`, `Pollers`, `ReusePort`, `Executor`, `TLSConfig`,
 `MaxOutboundBuffered` — belong to the Events, and options that name them fail
 every connection with `ErrInvalidOptions` (`LayerOptions.Validate` reports it
-up front). For messages, keep to `Server` and `Dialer`.
+up front). A client layer takes the URL its upgrade request names as
+`LayerOptions.Target`, one target per layer; a server layer refuses a Target.
+For messages, keep to `Server` and `Dialer`.
 
 ## Rules of the road
 

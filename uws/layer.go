@@ -51,6 +51,12 @@ type LayerOptions struct {
 	Authorize   func(r *http.Request) (userdata any, err error)
 	// Header is added to a ClientLayer's upgrade request, as a Dialer's is.
 	Header http.Header
+	// Target is the ws:// or wss:// URL a ClientLayer's upgrade request
+	// names: the host and path the request carries. One layer dials one
+	// target; the transport address itself is the dial's, and the scheme
+	// names no transport — TLS under the layer is another layer's. A
+	// ServerLayer refuses it.
+	Target string
 }
 
 // ServerLayer runs the server side of the WebSocket protocol as a uio.Layer,
@@ -85,7 +91,7 @@ type LayerOptions struct {
 //	if ws, ok := uio.FindLayer[interface{ Userdata() any }](conn); ok { … }
 //	if ws, ok := uio.FindLayer[interface{ Subprotocol() string }](conn); ok { … }
 func ServerLayer(opts LayerOptions) uio.Layer {
-	resolved, err := opts.resolve()
+	resolved, err := opts.resolveServer()
 	if err != nil {
 		return &wsLayer{err: err}
 	}
@@ -93,15 +99,15 @@ func ServerLayer(opts LayerOptions) uio.Layer {
 }
 
 // ClientLayer runs the client side of the WebSocket protocol as a uio.Layer:
-// it sends the upgrade request for target, a ws:// or wss:// URL whose host
+// it sends the upgrade request for Target, a ws:// or wss:// URL whose host
 // and path the request names, and opens the layers above once the server
 // accepted it. A dial through it returns once the handshake succeeded, and
 // reports a refusal or a failure as its error — a *HandshakeError when the
 // server answered. The scheme names no transport: TLS under the layer is
 // another layer's, installed below it. One layer dials one target. See
 // ServerLayer for the byte stream the layer carries and for invalid options.
-func ClientLayer(target string, opts LayerOptions) uio.Layer {
-	parsed, header, resolved, err := opts.resolveClient(target)
+func ClientLayer(opts LayerOptions) uio.Layer {
+	parsed, header, resolved, err := opts.resolveClient()
 	if err != nil {
 		return &wsLayer{err: err}
 	}
@@ -112,26 +118,35 @@ func ClientLayer(target string, opts LayerOptions) uio.Layer {
 	}
 }
 
-// Validate reports what ServerLayer, and ClientLayer for target when it is
-// not empty, would refuse: the error every connection through the layer
-// would fail with.
-func (o LayerOptions) Validate(target string) error {
-	if target == "" {
-		_, err := o.resolve()
+// Validate reports what ServerLayer, and ClientLayer when Target is set,
+// would refuse: the error every connection through the layer would fail
+// with.
+func (o LayerOptions) Validate() error {
+	if o.Target == "" {
+		_, err := o.resolveServer()
 		return err
 	}
-	_, _, _, err := o.resolveClient(target)
+	_, _, _, err := o.resolveClient()
 	return err
 }
 
-func (o LayerOptions) resolveClient(target string) (*url.URL, http.Header, Options, error) {
+// resolveServer is resolve for the server side, which takes no Target.
+func (o LayerOptions) resolveServer() (Options, error) {
+	if o.Target != "" {
+		return Options{}, fmt.Errorf("%w: Target belongs to ClientLayer", ErrInvalidOptions)
+	}
+	return o.resolve()
+}
+
+func (o LayerOptions) resolveClient() (*url.URL, http.Header, Options, error) {
 	resolved, err := o.resolve()
 	if err != nil {
 		return nil, nil, Options{}, err
 	}
+	target := o.Target
 	parsed, err := url.Parse(target)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "ws" && parsed.Scheme != "wss") {
-		return nil, nil, Options{}, fmt.Errorf("%w: ClientLayer needs a ws:// or wss:// URL, got %q", ErrInvalidOptions, target)
+		return nil, nil, Options{}, fmt.Errorf("%w: ClientLayer needs Target as a ws:// or wss:// URL, got %q", ErrInvalidOptions, target)
 	}
 	if err := handshake.CheckRequestHeader(o.Header); err != nil {
 		return nil, nil, Options{}, fmt.Errorf("%w: Header: %v", ErrInvalidOptions, err)

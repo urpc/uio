@@ -55,7 +55,7 @@ func TestInteropWithStdlib(t *testing.T) {
 	t.Run("our client over a stdlib server", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		where := stdEcho(t, serverConfig)
-		conn, client := dialTLS(t, Client(clientConfig), "tcp://"+string(where))
+		conn, client := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+string(where))
 		if _, err := conn.Write([]byte("interop")); err != nil {
 			t.Fatal(err)
 		}
@@ -68,7 +68,7 @@ func TestInteropWithStdlib(t *testing.T) {
 	t.Run("stdlib client over our server", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -106,7 +106,7 @@ func TestInteropWithStdlib(t *testing.T) {
 			MaxVersion: tls.VersionTLS12,
 		}
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -136,12 +136,12 @@ func TestInteropWithStdlib(t *testing.T) {
 			NextProtos: []string{"h2"},
 		}
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		conn, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		state := uio.LayerOf(conn).(interface{ State() tls.ConnectionState }).State()
 		if state.NegotiatedProtocol != "h2" {
 			t.Fatalf("ALPN negotiated %q, want h2", state.NegotiatedProtocol)
@@ -157,12 +157,12 @@ func TestInteropWithStdlib(t *testing.T) {
 			ClientSessionCache: tls.NewLRUClientSessionCache(4),
 		}
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		first, firstEcho := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		first, firstEcho := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		// A round trip before the close: both ends finished the handshake and
 		// the ticket reached the client, whatever the backend does with
 		// output still queued at a close.
@@ -172,7 +172,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		wait(t, firstEcho.data, "the first connection's echo")
 		_ = first.Close()
 		wait(t, server.closed, "first close")
-		second, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		second, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		defer func() { _ = second.Close() }()
 		state := uio.LayerOf(second).(interface{ State() tls.ConnectionState }).State()
 		if !state.DidResume {
@@ -185,7 +185,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		// A client that trusts nothing: every certificate is refused.
 		clientConfig := &tls.Config{ServerName: "localhost", RootCAs: nil}
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
@@ -211,7 +211,7 @@ func TestInteropWithStdlib(t *testing.T) {
 		<-started
 		ctx, cancel := context.WithTimeout(context.Background(), testWait)
 		defer cancel()
-		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), uio.WithLayers(Client(clientConfig))); err == nil {
+		if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String(), uio.WithLayers(ClientLayer(LayerOptions{TLSConfig: clientConfig}))); err == nil {
 			t.Fatal("a refused certificate reported no error")
 		}
 		if callbacks != 0 {
@@ -233,12 +233,12 @@ func TestTLSOverTLS(t *testing.T) {
 	outerServer, outerClient := testConfigs(t)
 	innerServer, innerClient := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(outerServer), Server(innerServer))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: outerServer}), ServerLayer(LayerOptions{TLSConfig: innerServer}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, echo := dialTLS(t, Client(outerClient), Client(innerClient), "tcp://"+listener.Addr().String())
+	client, echo := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: outerClient}), ClientLayer(LayerOptions{TLSConfig: innerClient}), "tcp://"+listener.Addr().String())
 	if _, err := client.Write([]byte("nested")); err != nil {
 		t.Fatal(err)
 	}
@@ -254,12 +254,12 @@ func TestTLSOverTLS(t *testing.T) {
 func TestTLSOverGateLayer(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig), gate)
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}), gate)
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client, echo := dialTLS(t, Client(clientConfig), gate, "tcp://"+listener.Addr().String())
+	client, echo := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), gate, "tcp://"+listener.Addr().String())
 	if _, err := client.Write([]byte("through the gate")); err != nil {
 		t.Fatal(err)
 	}

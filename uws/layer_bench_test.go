@@ -53,7 +53,7 @@ func BenchmarkSocketEcho(b *testing.B) {
 				var chain []uio.Layer
 				if secure {
 					events.MaxBufferSize = 16 << 10
-					chain = append(chain, utls.Server(serverTLS))
+					chain = append(chain, utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}))
 				}
 				chain = append(chain, ServerLayer(LayerOptions{}))
 				done := make(chan error, 1)

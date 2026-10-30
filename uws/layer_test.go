@@ -113,6 +113,12 @@ func (e *layeredEvents) DialContext(ctx context.Context, addr string, opts ...ui
 
 // layerEvents serves events whose endpoints carry the layers and handler on
 // top, listening when listen is set; it returns the events and the address.
+// targetOf is a ClientLayer options value with the target filled in.
+func targetOf(opts LayerOptions, target string) LayerOptions {
+	opts.Target = target
+	return opts
+}
+
 func layerEvents(t *testing.T, handler uio.Handler, listen bool, layers ...uio.Layer) (*layeredEvents, string) {
 	t.Helper()
 	started := make(chan struct{})
@@ -164,7 +170,7 @@ func dialLayer(t *testing.T, events *layeredEvents, addr string) uio.Conn {
 func TestClientLayerTalksToAServer(t *testing.T) {
 	addr := startEchoServer(t, robustEchoHandler{})
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", LayerOptions{})))
+	client, _ := layerEvents(t, peer, false, (ClientLayer(LayerOptions{Target: "ws://" + addr + "/"})))
 	conn := dialLayer(t, client, addr)
 	if _, err := conn.Write([]byte("through the layer")); err != nil {
 		t.Fatal(err)
@@ -248,10 +254,10 @@ func TestWebSocketLayerInAStack(t *testing.T) {
 	serverTLS, clientTLS := wssConfigs(t)
 	echo := newStreamPeer(true)
 	_, addr := layerEvents(t, echo, true,
-		utls.Server(serverTLS), (ServerLayer(LayerOptions{})), xorLayerOf())
+		utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}), (ServerLayer(LayerOptions{})), xorLayerOf())
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
-		utls.Client(clientTLS), (ClientLayer("wss://"+addr+"/", LayerOptions{})), xorLayerOf())
+		utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}), (ClientLayer(LayerOptions{Target: "wss://" + addr + "/"})), xorLayerOf())
 	conn := dialLayer(t, client, addr)
 
 	payload := make([]byte, 1<<20)
@@ -279,7 +285,7 @@ func TestLayerHandshakeRefusal(t *testing.T) {
 		},
 	})))
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", LayerOptions{})))
+	client, _ := layerEvents(t, peer, false, (ClientLayer(LayerOptions{Target: "ws://" + addr + "/"})))
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	_, err := client.DialContext(ctx, "tcp://"+addr)
@@ -306,7 +312,7 @@ func TestServerLayerUserdataAndSubprotocol(t *testing.T) {
 		Authorize: func(r *http.Request) (any, error) { return "user:" + r.URL.Path, nil },
 	})))
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/room", LayerOptions{
+	client, _ := layerEvents(t, peer, false, (ClientLayer(LayerOptions{Target: "ws://" + addr + "/room",
 		Options: Options{Subprotocols: []string{"chat"}},
 	})))
 	conn := dialLayer(t, client, addr)
@@ -330,7 +336,7 @@ func TestLayerCloseSendsACloseFrame(t *testing.T) {
 	watcher := &connCloseWatcher{closeWatcher: newCloseWatcher(), conns: make(chan *Conn, 1)}
 	addr := startEchoServer(t, watcher)
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", LayerOptions{})))
+	client, _ := layerEvents(t, peer, false, (ClientLayer(LayerOptions{Target: "ws://" + addr + "/"})))
 	conn := dialLayer(t, client, addr)
 	wssWait(t, watcher.conns, "the server's open")
 	_ = conn.Close()
@@ -353,14 +359,14 @@ func TestLayerHeartbeat(t *testing.T) {
 	t.Run("silent peer", func(t *testing.T) {
 		addr := silentWebSocketPeer(t)
 		peer := newStreamPeer(false)
-		client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", heartbeat)))
+		client, _ := layerEvents(t, peer, false, (ClientLayer(targetOf(heartbeat, "ws://"+addr+"/"))))
 		dialLayer(t, client, addr)
 		wssWait(t, peer.closed, "the heartbeat close")
 	})
 	t.Run("answering peer", func(t *testing.T) {
 		addr := startEchoServer(t, robustEchoHandler{})
 		peer := newStreamPeer(false)
-		client, _ := layerEvents(t, peer, false, (ClientLayer("ws://"+addr+"/", heartbeat)))
+		client, _ := layerEvents(t, peer, false, (ClientLayer(targetOf(heartbeat, "ws://"+addr+"/"))))
 		dialLayer(t, client, addr)
 		select {
 		case err := <-peer.closed:
@@ -415,16 +421,22 @@ func TestLayerOptionsRefuseTransportSettings(t *testing.T) {
 		"TLSConfig":           {Options: Options{TLSConfig: &tls.Config{}}},
 		"MaxOutboundBuffered": {Options: Options{MaxOutboundBuffered: 1 << 20}},
 	} {
-		if err := opts.Validate(""); !errors.Is(err, ErrInvalidOptions) {
+		if err := opts.Validate(); !errors.Is(err, ErrInvalidOptions) {
 			t.Fatalf("Validate with %s = %v, want ErrInvalidOptions", name, err)
 		}
 	}
-	if err := (LayerOptions{}).Validate("http://example.org/"); !errors.Is(err, ErrInvalidOptions) {
+	if err := (LayerOptions{Target: "http://example.org/"}).Validate(); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatalf("Validate of an http URL = %v, want ErrInvalidOptions", err)
+	}
+	if _, err := (LayerOptions{Target: "ws://example.org/"}).resolveServer(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("ServerLayer with a Target = %v, want ErrInvalidOptions", err)
+	}
+	if _, _, _, err := (LayerOptions{}).resolveClient(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("ClientLayer without Target = %v, want ErrInvalidOptions", err)
 	}
 	addr := startEchoServer(t, robustEchoHandler{})
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+addr+"/", LayerOptions{Options: Options{Pollers: 2}}))
+	client, _ := layerEvents(t, peer, false, ClientLayer(LayerOptions{Target: "ws://" + addr + "/", Options: Options{Pollers: 2}}))
 	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
 	defer cancel()
 	if _, err := client.DialContext(ctx, "tcp://"+addr); !errors.Is(err, ErrInvalidOptions) {
@@ -439,7 +451,7 @@ func TestWebSocketLayerStopsForTheLayerAbove(t *testing.T) {
 	holder := &holdingPeer{held: make(chan int, 1024), release: make(chan struct{}), conn: make(chan uio.Conn, 1)}
 	_, addr := layerEvents(t, holder, true, ServerLayer(LayerOptions{}))
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+addr+"/", LayerOptions{}))
+	client, _ := layerEvents(t, peer, false, ClientLayer(LayerOptions{Target: "ws://" + addr + "/"}))
 	conn := dialLayer(t, client, addr)
 
 	const total = 4 << 20
@@ -514,7 +526,7 @@ func TestLayerAbortSendsInternalError(t *testing.T) {
 	watcher := &connCloseWatcher{closeWatcher: newCloseWatcher(), conns: make(chan *Conn, 1)}
 	addr := startEchoServer(t, watcher)
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+addr+"/", LayerOptions{}))
+	client, _ := layerEvents(t, peer, false, ClientLayer(LayerOptions{Target: "ws://" + addr + "/"}))
 	conn := dialLayer(t, client, addr)
 	wssWait(t, watcher.conns, "the server's open")
 	_ = conn.CloseWith(errors.New("gave up"))
@@ -529,7 +541,7 @@ func TestLayerSplitsWritesAtTheMessageLimit(t *testing.T) {
 	sizes := make(chan int, 16)
 	addr := startEchoServer(t, sizeRecorder{sizes})
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+addr+"/", LayerOptions{
+	client, _ := layerEvents(t, peer, false, ClientLayer(LayerOptions{Target: "ws://" + addr + "/",
 		Options: Options{MaxMessageSize: 1000},
 	}))
 	conn := dialLayer(t, client, addr)
@@ -574,7 +586,7 @@ func TestServerLayerKeepsUserdataAuthorizeLeaves(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = listener.Close() })
 	peer := newStreamPeer(false)
-	client, _ := layerEvents(t, peer, false, ClientLayer("ws://"+listener.Addr().String()+"/", LayerOptions{}))
+	client, _ := layerEvents(t, peer, false, ClientLayer(LayerOptions{Target: "ws://" + listener.Addr().String() + "/"}))
 	dialLayer(t, client, listener.Addr().String())
 	if got := wssWait(t, server.opened, "the server's open").Userdata(); got != "listener's" {
 		t.Fatalf("userdata = %v, want the listener's kept", got)
@@ -678,7 +690,7 @@ func TestClientLayerOverAHoldingLayer(t *testing.T) {
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &holdUntilFlush{} }),
-		ClientLayer("ws://"+addr+"/", LayerOptions{}))
+		ClientLayer(LayerOptions{Target: "ws://" + addr + "/"}))
 	conn := dialLayer(t, client, addr)
 	if _, err := conn.Write([]byte("held, then flushed")); err != nil {
 		t.Fatal(err)
@@ -770,7 +782,7 @@ func TestLayerPingFollowsTheWire(t *testing.T) {
 	client, _ := layerEvents(t, peer, false,
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return doubling{} }),
-		ClientLayer("ws://"+listener.Addr().String()+"/", LayerOptions{Options: Options{
+		ClientLayer(LayerOptions{Target: "ws://" + listener.Addr().String() + "/", Options: Options{
 			HeartbeatInterval: 100 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
@@ -909,8 +921,8 @@ func TestLayerPingFollowsTheWireOverTLS(t *testing.T) {
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
-		utls.Client(clientTLS),
-		ClientLayer("wss://"+listener.Addr().String()+"/", LayerOptions{Options: Options{
+		utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}),
+		ClientLayer(LayerOptions{Target: "wss://" + listener.Addr().String() + "/", Options: Options{
 			HeartbeatInterval: 100 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
@@ -969,7 +981,7 @@ func TestPingBelowAHoldingLayer(t *testing.T) {
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
 		passThroughLayerOf(),
-		ClientLayer("ws://"+addr+"/", LayerOptions{Options: Options{
+		ClientLayer(LayerOptions{Target: "ws://" + addr + "/", Options: Options{
 			HeartbeatInterval: 50 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}),
@@ -1024,7 +1036,7 @@ func TestPingBelowAShrinkingLayer(t *testing.T) {
 	peer := newStreamPeer(false)
 	client, _ := layerEvents(t, peer, false,
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return gate }),
-		ClientLayer("ws://"+addr+"/", LayerOptions{Options: Options{
+		ClientLayer(LayerOptions{Target: "ws://" + addr + "/", Options: Options{
 			HeartbeatInterval: 50 * time.Millisecond,
 			HeartbeatTimeout:  10 * time.Second,
 		}}))
@@ -1193,7 +1205,7 @@ func TestLayerHeartbeatWhileTheLayerAboveHolds(t *testing.T) {
 		HeartbeatTimeout:  200 * time.Millisecond,
 	}}
 	addr := listener.Addr().String()
-	client, _ := layerEvents(t, idle, false, ClientLayer("ws://"+addr+"/", heartbeat))
+	client, _ := layerEvents(t, idle, false, ClientLayer(targetOf(heartbeat, "ws://"+addr+"/")))
 	dialLayer(t, client, addr)
 	select {
 	case <-closed:

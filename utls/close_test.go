@@ -63,7 +63,7 @@ func TestStagingBoundStillsTheWire(t *testing.T) {
 	case <-time.After(testWait):
 		t.Fatal("Serve did not start")
 	}
-	listener, err := events.Listen("tcp://127.0.0.1:0", uio.WithLayers(Server(serverConfig, StagingBound(16<<10))))
+	listener, err := events.Listen("tcp://127.0.0.1:0", uio.WithLayers(ServerLayer(LayerOptions{TLSConfig: serverConfig, StagingBound: 16 << 10})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,12 +118,12 @@ func TestCloseAndHalfClose(t *testing.T) {
 	t.Run("close", func(t *testing.T) {
 		serverConfig, clientConfig := testConfigs(t)
 		server := newEcho()
-		transport := serveTLS(t, server, Server(serverConfig))
+		transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, _ := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		conn, _ := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		if _, err := conn.Write([]byte("last words")); err != nil {
 			t.Fatal(err)
 		}
@@ -141,12 +141,12 @@ func TestCloseAndHalfClose(t *testing.T) {
 		server := newEcho()
 		// The server stays open past the client's close_notify, as a socket
 		// stays open past its peer's end of stream, only with AllowHalfOpen.
-		transport := serveTLSWith(t, server, func(ev *uio.Events) { ev.AllowHalfOpen = true }, Server(serverConfig))
+		transport := serveTLSWith(t, server, func(ev *uio.Events) { ev.AllowHalfOpen = true }, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 		listener, err := transport.Listen("tcp://127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		conn, client := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+		conn, client := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 		if _, err := conn.Write([]byte("one way")); err != nil {
 			t.Fatal(err)
 		}
@@ -191,7 +191,7 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	sentinel := errors.New("connection cut")
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -209,7 +209,7 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 	go func() { done <- events.Serve() }()
 	t.Cleanup(func() { _ = events.Close(nil); <-done })
 	<-started
-	raw, err := events.Dial("tcp://"+listener.Addr().String(), uio.WithLayers(Client(clientConfig)))
+	raw, err := events.Dial("tcp://"+listener.Addr().String(), uio.WithLayers(ClientLayer(LayerOptions{TLSConfig: clientConfig})))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -232,7 +232,7 @@ func TestAbruptCloseKeepsItsCause(t *testing.T) {
 func TestHandshakeTimeout(t *testing.T) {
 	serverConfig, _ := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig, HandshakeTimeout(150*time.Millisecond)))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig, HandshakeTimeout: 150 * time.Millisecond}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -298,7 +298,7 @@ func TestDialCanceledMidHandshake(t *testing.T) {
 	<-started
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
-	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), uio.WithLayers(Client(&tls.Config{InsecureSkipVerify: true})))
+	_, err = events.DialContext(ctx, "tcp://"+silent.Addr().String(), uio.WithLayers(ClientLayer(LayerOptions{TLSConfig: &tls.Config{InsecureSkipVerify: true}})))
 	// The deadline is what asked for the close; a transport error that beat
 	// it to the report tells the same story.
 	if err == nil {
@@ -340,12 +340,12 @@ func TestCloseNotifyEndsTheStream(t *testing.T) {
 				},
 				Close: func(_ uio.Conn, err error) { signal(closed, err) },
 			}
-			transport := serveTLSWith(t, top, func(ev *uio.Events) { ev.AllowHalfOpen = halfOpen }, Server(serverConfig))
+			transport := serveTLSWith(t, top, func(ev *uio.Events) { ev.AllowHalfOpen = halfOpen }, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 			listener, err := transport.Listen("tcp://127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
 			}
-			conn, client := dialTLS(t, Client(clientConfig), "tcp://"+listener.Addr().String())
+			conn, client := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 			if _, err := conn.Write([]byte("before the end")); err != nil {
 				t.Fatal(err)
 			}
@@ -378,14 +378,14 @@ func TestCloseNotifyEndsTheStream(t *testing.T) {
 func TestHandshakeOverAHoldingLayer(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	conn, client := dialTLS(t,
 		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return &holdUntilFlush{} }),
-		Client(clientConfig), "tcp://"+listener.Addr().String())
+		ClientLayer(LayerOptions{TLSConfig: clientConfig}), "tcp://"+listener.Addr().String())
 	if _, err := conn.Write([]byte("through the hold")); err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +440,7 @@ func (h *holdUntilFlush) Flush(ctx uio.LayerContext) error {
 func TestHandshakeFloodIsNotBuffered(t *testing.T) {
 	serverConfig, _ := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig, HandshakeTimeout(10*time.Second)))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig, HandshakeTimeout: 10 * time.Second}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -481,12 +481,12 @@ func TestHandshakeFloodIsNotBuffered(t *testing.T) {
 func TestHandshakeWithATinyStagingBound(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig, StagingBound(512)))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig, StagingBound: 512}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, client := dialTLS(t, Client(clientConfig, StagingBound(512)), "tcp://"+listener.Addr().String())
+	conn, client := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig, StagingBound: 512}), "tcp://"+listener.Addr().String())
 	payload := bytes.Repeat([]byte("x"), 8<<10)
 	if _, err := conn.Write(payload); err != nil {
 		t.Fatal(err)
@@ -505,13 +505,13 @@ func TestHandshakeWithATinyStagingBound(t *testing.T) {
 func TestHandshakeWithTheLeastStagingBound(t *testing.T) {
 	serverConfig, clientConfig := testConfigs(t)
 	server := newEcho()
-	transport := serveTLS(t, server, Server(serverConfig, StagingBound(1)))
+	transport := serveTLS(t, server, ServerLayer(LayerOptions{TLSConfig: serverConfig, StagingBound: 1}))
 	listener, err := transport.Listen("tcp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	began := time.Now()
-	conn, client := dialTLS(t, Client(clientConfig, StagingBound(1)), "tcp://"+listener.Addr().String())
+	conn, client := dialTLS(t, ClientLayer(LayerOptions{TLSConfig: clientConfig, StagingBound: 1}), "tcp://"+listener.Addr().String())
 	if took := time.Since(began); took > time.Second {
 		t.Fatalf("the handshake took %v", took)
 	}
@@ -565,7 +565,7 @@ func TestEndBelowWithoutCloseNotify(t *testing.T) {
 				},
 				Close: func(_ uio.Conn, err error) { signal(ended, err) },
 			}
-			events := serveTLSWith(t, handler, func(ev *uio.Events) { ev.AllowHalfOpen = true }, Client(clientConfig))
+			events := serveTLSWith(t, handler, func(ev *uio.Events) { ev.AllowHalfOpen = true }, ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 			ctx, cancel := context.WithTimeout(context.Background(), testWait)
 			defer cancel()
 			if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
@@ -606,7 +606,7 @@ func TestStateDuringAHandshake(t *testing.T) {
 		time.Sleep(testWait) // never answers
 	}()
 	attached := make(chan *conn, 1)
-	layer := Client(clientConfig)
+	layer := ClientLayer(LayerOptions{TLSConfig: clientConfig})
 	events := serveTLS(t, uio.FuncHandler{}, uio.LayerFunc(func(ctx uio.LayerContext) uio.LayerHandler {
 		c := layer.Attach(ctx).(*conn)
 		attached <- c
@@ -681,7 +681,7 @@ func TestEndBelowAtTheStagingBound(t *testing.T) {
 		Close: func(_ uio.Conn, err error) { signal(ended, err) },
 	}
 	events := serveTLSWith(t, handler, func(ev *uio.Events) { ev.AllowHalfOpen = true },
-		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return below }), Client(clientConfig))
+		uio.LayerFunc(func(uio.LayerContext) uio.LayerHandler { return below }), ClientLayer(LayerOptions{TLSConfig: clientConfig}))
 	ctx, cancel := context.WithTimeout(context.Background(), testWait)
 	defer cancel()
 	if _, err := events.DialContext(ctx, "tcp://"+listener.Addr().String()); err != nil {
