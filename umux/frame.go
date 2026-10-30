@@ -42,6 +42,11 @@ const (
 	typeWindowUpdate
 	typePing
 	typeGoAway
+	// typeSynMetadata opens a stream like a WindowUpdate|SYN frame and carries
+	// the opener's opaque metadata. It is a umux extension outside yamux v1's
+	// type space, so it is only sent when the application attaches metadata
+	// (Session.OpenWith); a yamux peer rejects it.
+	typeSynMetadata
 )
 
 // Frame flags. SYN may carry data and opens a stream; ACK answers it. FIN
@@ -99,7 +104,7 @@ func decodeHeader(b []byte) (frameHeader, error) {
 	if h.version != protoVersion {
 		return frameHeader{}, errFrameVersion
 	}
-	if h.typ > typeGoAway {
+	if h.typ > typeSynMetadata {
 		return frameHeader{}, errFrameType
 	}
 	if h.flags&^allFlags != 0 {
@@ -120,8 +125,9 @@ func encodeHeader(dst []byte, h frameHeader) {
 
 // validateFrame applies the per-type bounds before a session acts on a frame:
 // data frames carry at most maxData payload bytes, window updates name a
-// stream, and a GoAway names the session itself.
-func validateFrame(h frameHeader, maxData uint32) error {
+// stream, a GoAway names the session itself, and a metadata SYN carries its
+// four-byte window delta plus at most maxMeta opaque bytes.
+func validateFrame(h frameHeader, maxData, maxMeta uint32) error {
 	switch h.typ {
 	case typeData:
 		if h.length > maxData {
@@ -134,6 +140,15 @@ func validateFrame(h frameHeader, maxData uint32) error {
 	case typeGoAway:
 		if h.streamID != 0 {
 			return errFrameFlags
+		}
+	case typeSynMetadata:
+		if h.flags != flagSYN || h.streamID == 0 {
+			return errFrameFlags
+		}
+		// The payload is the opener's window delta (4 bytes) followed by its
+		// metadata, whose bytes this end never interprets.
+		if h.length < 4 || h.length-4 > maxMeta {
+			return errFrameLength
 		}
 	}
 	return nil

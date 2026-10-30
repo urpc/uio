@@ -14,22 +14,26 @@
  * limitations under the License.
  */
 
+// Command httpsvr serves net/http handlers on uio: uhttp is a small HTTP/1.1
+// server whose connections are uio's, so no goroutine serves a request.
 package main
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/urpc/uio/examples/httpsvr/uhttp"
 )
 
 func main() {
-
-	// register http handler to http.DefaultServeMux
 	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		//fmt.Println("handle request:", request.URL.Path, request.RemoteAddr, time.Now().String())
-		writer.Write([]byte("hello world!"))
+		_, _ = writer.Write([]byte("hello world!"))
 	})
 
-	// serve uhttp server.
-	uhttp.ListenAndServe(":8080", nil)
+	// uhttp runs net/http handlers on uio connections: the handler above is
+	// reached with no goroutine and no net/http server of its own.
+	fmt.Println("http on :8080")
+	if err := uhttp.ListenAndServe(":8080", nil); err != nil {
+		fmt.Println("server exited with error:", err)
+	}
 }

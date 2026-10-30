@@ -159,6 +159,7 @@ func (s *Session) onTimer(c uio.Conn) error {
 	// deadline, and a deadline computed before them would overwrite it.
 	s.rearmTimer()
 	s.drainCloses()
+	s.maybeFinishDrain()
 	return nil
 }
 
@@ -211,6 +212,7 @@ func (s *Session) onTransportClose(err error) {
 	}
 	s.closed = true
 	s.closeErr = err
+	s.finishDrainLocked(err)
 	// No transport turn can consume these again. Drop their references even
 	// when the final timer/flush pass failed after submitting earlier frames.
 	s.finFlushed = nil

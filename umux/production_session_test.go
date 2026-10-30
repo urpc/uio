@@ -283,7 +283,7 @@ func TestTransportAssemblesFrameBeyondSessionBudget(t *testing.T) {
 	}
 	expectFrame(t, conn, func(h frameHeader) bool { return h.flags&flagACK != 0 })
 	sess := <-srv.Sessions()
-	st := <-sess.Accept()
+	st := (<-sess.Accept()).Stream
 	payload := bytes.Repeat([]byte("f"), 128<<10)
 	if _, err := conn.Write(rawFramed(typeData, 0, 1, uint32(len(payload)), payload)); err != nil {
 		t.Fatal(err)
@@ -369,7 +369,7 @@ func TestSessionDoneAndAcceptFollowTransportLifetime(t *testing.T) {
 	s := newSession(&productionSessionWire{}, Config{KeepAlive: -1}.resolve(), true)
 	st := newStream(s, 2, false, int64(s.cfg.WindowSize))
 	s.streams[st.id] = st
-	s.acceptCh <- st
+	s.acceptCh <- Accepted{Stream: st}
 	if err := s.Err(); err != nil {
 		t.Fatalf("open session Err = %v", err)
 	}
@@ -388,7 +388,7 @@ func TestSessionDoneAndAcceptFollowTransportLifetime(t *testing.T) {
 	if !errors.Is(s.Err(), boom) {
 		t.Fatalf("terminal Err = %v, want %v", s.Err(), boom)
 	}
-	if got, ok := <-s.Accept(); !ok || got != st || got.State()&uio.StateClosed == 0 {
+	if got, ok := <-s.Accept(); !ok || got.Stream != st || got.Stream.State()&uio.StateClosed == 0 {
 		t.Fatal("buffered accepted stream was lost or remained open")
 	}
 	if _, ok := <-s.Accept(); ok {

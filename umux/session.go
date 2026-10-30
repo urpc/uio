@@ -18,6 +18,7 @@ package umux
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"net"
@@ -61,7 +62,7 @@ type Session struct {
 	// waits on it.
 	openWait map[uint32]chan error
 	// acceptCh receives accepted streams when Config.Handler is nil.
-	acceptCh chan *Stream
+	acceptCh chan Accepted
 	// control holds control frames waiting for the transport.
 	control [][]byte
 	// pending lists stream ids with queued frames, in round-robin order.
@@ -75,9 +76,20 @@ type Session struct {
 
 	goAway     bool
 	goAwaySent bool
-	closed     bool
+	// goAwayFlushed reports the transport accepted the GoAway frame, not
+	// merely that it was queued.
+	goAwayFlushed bool
+	closed        bool
 	// closeErr is why the transport went away, for streams closed by it.
 	closeErr error
+	// draining reports a Shutdown in progress: new streams are refused while
+	// the existing ones get to finish.
+	draining bool
+	// drainDone closes once the drain ends, cleanly or not; drainErr then
+	// says how, and nil means every stream settled first.
+	drainDone   chan struct{}
+	drainErr    error
+	drainClosed bool
 
 	lastPing time.Time
 	pingSent time.Time
@@ -117,7 +129,7 @@ func newSession(conn uio.Conn, cfg Config, client bool) *Session {
 		openWait: make(map[uint32]chan error),
 	}
 	if cfg.Handler == nil {
-		s.acceptCh = make(chan *Stream, cfg.AcceptBacklog)
+		s.acceptCh = make(chan Accepted, cfg.AcceptBacklog)
 	}
 	if client {
 		s.nextID = 1 // client streams are odd
@@ -132,11 +144,20 @@ func newSession(conn uio.Conn, cfg Config, client bool) *Session {
 	return s
 }
 
+// Accepted is one inbound stream handed over by Session.Accept, together with
+// the metadata its opener attached to the SYN (nil for a plain open). Nothing
+// in the session refers to the value once it is queued: a caller that wants
+// the metadata beyond dequeuing it keeps it on its own account.
+type Accepted struct {
+	Stream   *Stream
+	Metadata []byte
+}
+
 // Accept returns the queue of accepted streams; it is nil when Config.Handler
 // is set. A full queue refuses the peer's stream with RST. The transport's
 // close closes this queue; buffered streams can still be received, but their
 // transport has ended. Done and Err report that session lifecycle directly.
-func (s *Session) Accept() <-chan *Stream { return s.acceptCh }
+func (s *Session) Accept() <-chan Accepted { return s.acceptCh }
 
 // Done closes when the transport ends. Err then reports the transport's cause.
 func (s *Session) Done() <-chan struct{} { return s.done }
@@ -172,6 +193,7 @@ func (s *Session) Close(cause error) error {
 		s.sendControlLocked(typeGoAway, 0, 0, goAwayNormal)
 	}
 	err := s.flushLocked()
+	s.finishDrainLocked(cause)
 	s.mu.Unlock()
 	s.emitDrained()
 	if err != nil {
@@ -184,6 +206,26 @@ func (s *Session) Close(cause error) error {
 // Open starts a stream and waits for the peer's ACK. The ACK names the peer's
 // initial window.
 func (s *Session) Open(ctx context.Context) (*Stream, error) {
+	return s.open(ctx, nil)
+}
+
+// OpenWith starts a stream like Open and attaches metadata to its SYN: opaque
+// bytes the acceptor receives once, through MetadataHandler.OnMetadata or the
+// Accepted value of Session.Accept. umux neither interprets the bytes nor
+// bounds their meaning beyond Config.MaxMetadata; it is the place for a
+// caller's own routing or identification data. The extension frame is outside
+// yamux v1, so both ends must be umux when metadata is used.
+func (s *Session) OpenWith(ctx context.Context, metadata []byte) (*Stream, error) {
+	if len(metadata) > s.cfg.MaxMetadata {
+		return nil, ErrMetadataTooLarge
+	}
+	if len(metadata) == 0 {
+		return s.open(ctx, nil)
+	}
+	return s.open(ctx, metadata)
+}
+
+func (s *Session) open(ctx context.Context, metadata []byte) (*Stream, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -207,8 +249,22 @@ func (s *Session) Open(ctx context.Context) (*Stream, error) {
 	wait := make(chan error, 1)
 	s.openWait[id] = wait
 	// SYN opens the stream and announces this end's receive window as a delta
-	// above the yamux v1 floor.
-	s.sendControlLocked(typeWindowUpdate, flagSYN, id, uint32(s.cfg.WindowSize-minWindow))
+	// above the yamux v1 floor. Metadata rides in an extension frame whose
+	// payload is the same delta followed by the opener's opaque bytes.
+	if len(metadata) == 0 {
+		s.sendControlLocked(typeWindowUpdate, flagSYN, id, uint32(s.cfg.WindowSize-minWindow))
+	} else {
+		frame := make([]byte, headerSize+4+len(metadata))
+		encodeHeader(frame, frameHeader{
+			typ:      typeSynMetadata,
+			flags:    flagSYN,
+			streamID: id,
+			length:   uint32(4 + len(metadata)),
+		})
+		binary.BigEndian.PutUint32(frame[headerSize:], uint32(s.cfg.WindowSize-minWindow))
+		copy(frame[headerSize+4:], metadata)
+		s.control = append(s.control, frame)
+	}
 	err := s.flushLocked()
 	s.mu.Unlock()
 	st.mu.Lock()
@@ -253,7 +309,7 @@ func (s *Session) onRead(c uio.Conn) error {
 		return nil
 	}
 	for {
-		fr, ok, err := readFrame(c, s.cfg.WindowSize)
+		fr, ok, err := readFrame(c, s.cfg.WindowSize, s.cfg.MaxMetadata)
 		if err != nil {
 			_ = c.CloseWith(err)
 			return err
@@ -331,7 +387,7 @@ type frame struct {
 	consumed bool
 }
 
-func readFrame(c uio.Conn, maxFrame int) (frame, bool, error) {
+func readFrame(c uio.Conn, maxFrame, maxMeta int) (frame, bool, error) {
 	var hb [headerSize]byte
 	got := c.Peek(hb[:])
 	if len(got) < headerSize {
@@ -341,17 +397,17 @@ func readFrame(c uio.Conn, maxFrame int) (frame, bool, error) {
 	if err != nil {
 		return frame{}, false, err
 	}
-	if err := validateFrame(h, uint32(maxFrame)); err != nil {
+	if err := validateFrame(h, uint32(maxFrame), uint32(maxMeta)); err != nil {
 		return frame{}, false, err
 	}
 	total := headerSize
-	if h.typ == typeData {
+	if h.typ == typeData || h.typ == typeSynMetadata {
 		total += int(h.length)
 	}
 	if c.InboundBuffered() < total {
 		return frame{}, false, nil
 	}
-	if h.typ != typeData || h.length == 0 {
+	if (h.typ != typeData && h.typ != typeSynMetadata) || h.length == 0 {
 		return frame{hdr: h, total: total}, true, nil
 	}
 	// A contiguous chunk serves the payload in place; a frame split across
@@ -374,6 +430,10 @@ func (s *Session) handleFrame(h frameHeader, payload []byte, borrowed bool) erro
 		return s.handleWindowUpdate(h)
 	case typePing:
 		return s.handlePing(h)
+	case typeSynMetadata:
+		return s.handleSynMetadata(h, payload)
+	case typeGoAway:
+		return s.handleGoAway(h)
 	default:
 		s.mu.Lock()
 		s.goAway = true
@@ -484,22 +544,45 @@ func (s *Session) handlePing(h frameHeader) error {
 // handleSyn accepts a peer stream. The SYN's length is the peer's initial
 // receive window.
 func (s *Session) handleSyn(h frameHeader) error {
-	if err := s.checkPeerStreamID(h.streamID); err != nil {
+	return s.acceptStream(h.streamID, int64(h.length), nil)
+}
+
+// handleSynMetadata accepts a metadata-bearing SYN: the payload's first four
+// bytes are the opener's window delta, the rest are its opaque metadata,
+// copied out before the transport reuses the buffer.
+func (s *Session) handleSynMetadata(h frameHeader, payload []byte) error {
+	if len(payload) < 4 {
+		return ErrProtocol
+	}
+	delta := int64(binary.BigEndian.Uint32(payload[:4]))
+	meta := append([]byte(nil), payload[4:]...)
+	return s.acceptStream(h.streamID, delta, meta)
+}
+
+// acceptStream admits a peer-opened stream whose SYN announced delta as its
+// receive window and metadata as its opener's opaque bytes.
+func (s *Session) acceptStream(id uint32, delta int64, meta []byte) error {
+	if err := s.checkPeerStreamID(id); err != nil {
 		return err
 	}
 	s.mu.Lock()
-	if s.closed || s.goAway {
+	if s.closed {
 		s.mu.Unlock()
 		return nil
 	}
+	if s.goAway {
+		// The peer opened against our GoAway: reset it at once, so its Open
+		// fails now instead of waiting for its own open timeout.
+		return s.refuseLocked(id)
+	}
 	if len(s.streams) >= s.cfg.MaxStreams {
-		s.sendControlLocked(typeWindowUpdate, flagRST, h.streamID, 0)
+		s.sendControlLocked(typeWindowUpdate, flagRST, id, 0)
 		err := s.flushLocked()
 		s.mu.Unlock()
 		s.emitDrained()
 		return err
 	}
-	if _, ok := s.streams[h.streamID]; ok {
+	if _, ok := s.streams[id]; ok {
 		s.mu.Unlock()
 		return ErrProtocol
 	}
@@ -509,7 +592,7 @@ func (s *Session) handleSyn(h frameHeader) error {
 	if ch != nil && len(ch) >= cap(ch) {
 		// The accept queue is full: refuse before acknowledging, so the
 		// opener sees a failed Open instead of a stream reset after it.
-		s.sendControlLocked(typeWindowUpdate, flagRST, h.streamID, 0)
+		s.sendControlLocked(typeWindowUpdate, flagRST, id, 0)
 		err := s.flushLocked()
 		s.mu.Unlock()
 		s.emitDrained()
@@ -520,7 +603,7 @@ func (s *Session) handleSyn(h frameHeader) error {
 	if accept != nil {
 		if err := accept(); err != nil {
 			s.mu.Lock()
-			s.sendControlLocked(typeWindowUpdate, flagRST, h.streamID, 0)
+			s.sendControlLocked(typeWindowUpdate, flagRST, id, 0)
 			err := s.flushLocked()
 			s.mu.Unlock()
 			s.emitDrained()
@@ -528,19 +611,24 @@ func (s *Session) handleSyn(h frameHeader) error {
 		}
 	}
 
-	st := newStream(s, h.streamID, false, int64(s.cfg.WindowSize))
-	st.sendWin.reset(st.peerWindow(int64(h.length)))
-	st.recvWin.retune(minWindow + int64(h.length))
+	st := newStream(s, id, false, int64(s.cfg.WindowSize))
+	st.sendWin.reset(st.peerWindow(delta))
+	st.recvWin.retune(minWindow + delta)
 	s.mu.Lock()
-	if s.closed || s.goAway {
+	if s.closed {
 		s.mu.Unlock()
 		// The stream has not been published or opened to the handler. There is
 		// no application state to release and no OnClose to deliver for it.
 		return nil
 	}
-	s.streams[h.streamID] = st
+	if s.goAway {
+		// A Shutdown began while Accept vetted this stream: refuse it like
+		// any other open the session will not take.
+		return s.refuseLocked(id)
+	}
+	s.streams[id] = st
 	// The ACK announces this end's receive window the same way the SYN did.
-	s.sendControlLocked(typeWindowUpdate, flagACK, h.streamID, uint32(s.cfg.WindowSize-minWindow))
+	s.sendControlLocked(typeWindowUpdate, flagACK, id, uint32(s.cfg.WindowSize-minWindow))
 	err := s.flushLocked()
 	s.mu.Unlock()
 	s.emitDrained()
@@ -552,6 +640,13 @@ func (s *Session) handleSyn(h frameHeader) error {
 	}
 
 	if handler != nil {
+		// The metadata is handed over once, ahead of OnOpen, and the session
+		// keeps no reference: a handler that wants it later must copy it.
+		if meta != nil {
+			if mh, ok := handler.(MetadataHandler); ok {
+				mh.OnMetadata(st, meta)
+			}
+		}
 		handler.OnOpen(st)
 		return nil
 	}
@@ -564,7 +659,7 @@ func (s *Session) handleSyn(h frameHeader) error {
 		return nil
 	}
 	select {
-	case ch <- st:
+	case ch <- Accepted{Stream: st, Metadata: meta}:
 		s.mu.Unlock()
 	default:
 		s.mu.Unlock()
@@ -673,6 +768,7 @@ func (s *Session) flush() {
 	if err != nil {
 		_ = s.conn.CloseWith(err)
 	}
+	s.maybeFinishDrain()
 }
 
 // queueClose schedules a stream's OnClose on the transport turn and wakes the
@@ -762,6 +858,7 @@ func (s *Session) tryFinish(st *Stream) {
 	st.dropOutLocked()
 	s.mu.Unlock()
 	st.deliverClose(cause)
+	s.maybeFinishDrain()
 }
 
 func (s *Session) flushLocked() error {
@@ -769,6 +866,9 @@ func (s *Session) flushLocked() error {
 		return nil
 	}
 	for budget := 0; budget < maxFlushFrames; budget++ {
+		if s.goAwaySent && len(s.control) == 0 {
+			s.goAwayFlushed = true
+		}
 		if len(s.control) > 0 {
 			frame := s.control[0]
 			if _, err := s.conn.Write(frame); err != nil {
@@ -935,6 +1035,16 @@ func (s *Session) heldReads() bool {
 
 // ------------------------------------------------------------------- state
 
+// refuseLocked resets a peer stream this session will not accept, releases the
+// lock and reports the flush error. The caller holds s.mu.
+func (s *Session) refuseLocked(id uint32) error {
+	s.sendControlLocked(typeWindowUpdate, flagRST, id, 0)
+	err := s.flushLocked()
+	s.mu.Unlock()
+	s.emitDrained()
+	return err
+}
+
 // removeStream drops a stream from the table and releases its queued frames.
 func (s *Session) removeStream(st *Stream) {
 	s.mu.Lock()
@@ -946,6 +1056,7 @@ func (s *Session) removeStream(st *Stream) {
 	// The round-robin queue may still name this id; flush skips ids it no
 	// longer finds.
 	s.mu.Unlock()
+	s.maybeFinishDrain()
 }
 
 // abortStream resets a stream from the local side: pending data is dropped and
@@ -972,6 +1083,7 @@ func (s *Session) abortStream(st *Stream, cause error) {
 	if err != nil {
 		_ = s.conn.CloseWith(err)
 	}
+	s.maybeFinishDrain()
 }
 
 // abortRemote resets a stream the peer reset.
@@ -991,6 +1103,7 @@ func (s *Session) abortRemote(st *Stream, cause error) {
 		}
 	}
 	st.resetRemote(cause)
+	s.maybeFinishDrain()
 }
 
 // dispatchRead runs the stream's read callback: data arrived, the peer ended

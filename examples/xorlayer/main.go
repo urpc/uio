@@ -14,188 +14,143 @@
  * limitations under the License.
  */
 
-// Xorlayer shows uio's protocol layers with a stack of two, on both ends of
-// one connection in this process:
+// Xorlayer shows a uio layer stack with a plain TCP peer that does the same
+// XOR by hand, so what each layer does is visible from both ends of the wire:
 //
-//	       client                               server
-//	handler: Write("hello")              handler: reads "hello", echoes it
-//	   │                                       ▲
-//	layer 2 xor:     plaintext → ciphertext   ciphertext → plaintext
-//	   │                                       ▲
-//	layer 1 wiretap: prints the bytes        prints the bytes
-//	   │                                       ▲
-//	socket ═══════════════ wire ═══════════════ socket
+//	     plain client                      server (uio)
+//	net.Dial, XOR by hand     handler: reads "hello", echoes it
+//	       │                                  ▲
+//	       │                   layer 2 xor: ciphertext ⇄ plaintext
+//	       │                                  ▲
+//	       │                 layer 1 wiretap: prints every byte
+//	       │                                  ▲
+//	       └────────────── wire ──────────────┘ socket
 //
 // The first layer installed sits next to the socket, so the wiretap prints
-// what really crosses the wire — the XOR'd bytes — while the handlers above
-// the xor layer read and write plaintext. The echo travels back the same way,
-// through the same two layers in reverse.
+// what actually crosses the wire — the XOR'd bytes — while the handler above
+// the xor layer reads and writes plaintext. The echo travels back through
+// both layers in reverse. A uio client installs the same stack with
+// uio.WithLayers on its Dial; this example uses a plain peer so the wire is
+// visible on both sides.
 //
 // Run it:
 //
-//	go run ./xorlayer -key 0x5a
+//	go run ./xorlayer
 package main
 
 import (
-	"context"
-	"flag"
 	"fmt"
-	"os"
-	"time"
+	"io"
+	"log"
+	"net"
 
 	"github.com/urpc/uio"
 )
 
-// xorLayer obfuscates a connection's bytes with a one-byte key, both ways.
-// It is the Layer: configured once, it builds one xorConn per connection.
-type xorLayer struct{ key byte }
+// key is the one-byte XOR key; the client applies it by hand.
+const key = 0x5a
 
-func (l xorLayer) Attach(uio.LayerContext) uio.LayerHandler { return &xorConn{key: l.key} }
-
-// xorConn is the layer on one connection. PassThrough gives it the callbacks
-// it does not change — OnOpen opens the layer above at once, OnTimer and
-// OnClose do nothing — so it writes only the two that transform bytes.
-type xorConn struct {
-	uio.PassThrough
-	key byte
+func xor(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		out[i] = c ^ key
+	}
+	return out
 }
 
-// OnRead runs when bytes arrived from below: it XORs them straight into
-// the space the layer above reads from, and consumes them below.
-func (x *xorConn) OnRead(ctx uio.LayerContext) error {
+// xorLayer is the Layer: configured once, it builds one LayerHandler per
+// connection. It transforms bytes both ways.
+type xorLayer struct{}
+
+func (xorLayer) Attach(uio.LayerContext) uio.LayerHandler { return xorConn{} }
+
+// xorConn writes only the two callbacks that transform bytes; PassThrough
+// supplies the rest (OnOpen opens the layer above at once).
+type xorConn struct{ uio.PassThrough }
+
+// OnRead runs when bytes arrived from below: it XORs them into the space the
+// layer above reads from, and consumes them below.
+func (xorConn) OnRead(ctx uio.LayerContext) error {
 	lower := ctx.Down()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
 	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
-	for i, b := range chunk {
-		out[i] = b ^ x.key
-	}
-	ctx.Up().Commit(len(chunk)) // hand the plaintext up
+	copy(out, xor(chunk))
+	ctx.Up().Commit(len(chunk))
 	_, err := lower.Discard(len(chunk))
 	return err
 }
 
 // OnWrite runs when the layer above writes: it XORs the bytes and writes
-// them below. p belongs to the writer, so the result goes in a buffer of its
-// own.
-func (x *xorConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
-	out := make([]byte, len(p))
-	for i, b := range p {
-		out[i] = b ^ x.key
-	}
-	if _, err := ctx.Down().Write(out); err != nil {
+// them below.
+func (xorConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
+	if _, err := ctx.Down().Write(xor(p)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
 }
 
 // wiretap prints the bytes that cross it and changes none of them.
-type wiretap struct{ name string }
+type wiretap struct{}
 
-func (w wiretap) Attach(uio.LayerContext) uio.LayerHandler { return tapConn{name: w.name} }
+func (wiretap) Attach(uio.LayerContext) uio.LayerHandler { return tapConn{} }
 
-type tapConn struct {
-	uio.PassThrough
-	name string
-}
+type tapConn struct{ uio.PassThrough }
 
 func (t tapConn) OnRead(ctx uio.LayerContext) error {
 	if chunk := ctx.Down().PeekChunk(); len(chunk) > 0 {
-		fmt.Printf("%-6s wire in   % x\n", t.name, chunk)
+		fmt.Printf("wire in   % x\n", chunk)
 	}
 	return t.PassThrough.OnRead(ctx) // deliver them as they are
 }
 
 func (t tapConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
-	fmt.Printf("%-6s wire out  % x\n", t.name, p)
+	fmt.Printf("wire out  % x\n", p)
 	return ctx.Down().Write(p)
 }
 
 func main() {
-	key := flag.Uint("key", 0x5a, "the XOR key, one byte")
-	flag.Parse()
-	stack := func(name string) []uio.Layer {
-		// Bottom up: the first installed sits next to the socket.
-		return []uio.Layer{wiretap{name: name}, xorLayer{key: byte(*key)}}
-	}
-
 	// The server echoes what its handler reads: plaintext, above the layers.
-	server := &uio.Events{Pollers: 1, Handler: uio.FuncHandler{
-		Open: func(uio.Conn) {},
-		Read: func(c uio.Conn) error {
-			chunk := c.PeekChunk()
-			if len(chunk) == 0 {
-				return nil
-			}
-			fmt.Printf("server handler reads %q, echoes it\n", chunk)
-			if _, err := c.Write(chunk); err != nil {
-				return err
-			}
-			_, err := c.Discard(len(chunk))
-			return err
-		},
-		Close: func(uio.Conn, error) {},
-	}}
-	start(server)
-	defer server.Close(nil)
-	listener, err := server.Listen("tcp://127.0.0.1:0", uio.WithLayers(stack("server")...))
-	if err != nil {
-		fail(err)
-	}
+	// WriteTo(c) moves the inbound bytes to this same connection, so the echo
+	// travels back down through the xor layer and the wiretap.
+	events := &uio.Events{Handler: uio.FuncHandler{Read: func(c uio.Conn) error {
+		_, err := c.WriteTo(c)
+		return err
+	}}}
 
-	// The client prints the echoes its handler reads.
-	echoes := make(chan string, 1)
-	client := &uio.Events{Pollers: 1, Handler: uio.FuncHandler{
-		Open: func(uio.Conn) {},
-		Read: func(c uio.Conn) error {
-			chunk := c.PeekChunk()
-			if len(chunk) == 0 {
-				return nil
-			}
-			echoes <- string(chunk)
-			_, err := c.Discard(len(chunk))
-			return err
-		},
-		Close: func(uio.Conn, error) {},
-	}}
-	start(client)
-	defer client.Close(nil)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	// The connection DialContext returns is the top layer's: what is written
-	// to it passes the xor layer, then the wiretap, then the socket.
-	conn, err := client.DialContext(ctx, "tcp://"+listener.Addr().String(), uio.WithLayers(stack("client")...))
-	if err != nil {
-		fail(err)
-	}
-	fmt.Printf("key 0x%02x\n", byte(*key))
-	for _, message := range []string{"hello", "layers"} {
-		fmt.Printf("\nclient handler writes %q\n", message)
-		if _, err := conn.Write([]byte(message)); err != nil {
-			fail(err)
-		}
-		select {
-		case echo := <-echoes:
-			fmt.Printf("client handler reads %q\n", echo)
-		case <-ctx.Done():
-			fail(ctx.Err())
-		}
-	}
-	_ = conn.Close()
-}
-
-// start runs events in the background and returns once it serves.
-func start(events *uio.Events) {
+	// Events.Listen/Dial need the runtime up: serve first, join its start.
 	started := make(chan struct{})
 	events.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
 	go func() { _ = events.Serve() }()
 	<-started
-}
+	defer events.Close(nil)
 
-func fail(err error) {
-	fmt.Fprintln(os.Stderr, err)
-	os.Exit(1)
+	// Bottom up: the first layer installed sits next to the socket.
+	listener, err := events.Listen("tcp://127.0.0.1:0",
+		uio.WithLayers(wiretap{}, xorLayer{}))
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("server on %s, wire key 0x%02x\n", listener.Addr(), key)
+
+	// A plain TCP client, XORing by hand: the bytes on the wire are exactly
+	// what the xor layer produces on the server.
+	conn, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer conn.Close()
+
+	message := []byte("hello")
+	fmt.Printf("client writes %q, wire % x\n", message, xor(message))
+	if _, err := conn.Write(xor(message)); err != nil {
+		log.Fatal(err)
+	}
+	echo := make([]byte, len(message))
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("client reads %q from wire % x\n", xor(echo), echo)
 }

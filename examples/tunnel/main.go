@@ -16,126 +16,64 @@
 
 // Tunnel forwards every connection it accepts to an upstream TCP server: a
 // relay with end-to-end backpressure, half-close passthrough and aborts that
-// stay aborts.
+// stay aborts. uio.Bridge is exactly that shape, so the example is the bridge
+// and its configuration.
+//
+//	  client                        tunnel                      upstream
+//	  │                            (uio.Bridge)                  │
+//	  │  accept  ┌──────────────────────┐                        │
+//	  └─────────►│ client leg   upstream│────────────────────────►│
+//	   reply ◄───┤    leg         leg   │◄───────────────────────│
+//	             └──────────────────────┘                        │
+//	                 ▲       ▲   │
+//	                 │       │   │ both legs speak the same four callbacks:
+//	                 │       │   └── OnRead ── WriteTo(peer) ──►
+//	                 │       └────── OnBytesWritten: queue drained below
+//	                 │               half the limit → Wake the paused leg
+//	                 └────────────── the other leg's OnRead, mirroring
+//
+// One client leg, one dialed upstream leg, paired as the client arrives:
+//
+// OnOpen          dials the upstream once per client connection, then pairs
+//                 the legs. A failed dial reaches the client as a reset.
+// OnRead          forwards what arrived with WriteTo(peer) — unless the
+//                 peer's queue already holds InboundLimit bytes. Leaving
+//                 the bytes unconsumed pauses this leg's socket reads and
+//                 lets TCP slow the sender: that is the backpressure.
+// OnBytesWritten  once the queue drains below half the limit, wakes the
+//                 leg that paused on it and forwarding resumes.
+// OnClose         a graceful end already traveled as a FIN from OnRead; an
+//                 abort travels as an RST, so the far end sees a reset.
+//
+// A request and its half-close, in wire order:
+//
+//	client ── request ──► client leg ══ WriteTo ══► upstream leg ──► service
+//	client ◄── reply ───── client leg ◄══ WriteTo ═══ upstream leg ◄── service
+//	client ── FIN ───────► client leg ── CloseWrite ─► upstream leg ─► FIN
+//	client ◄── EOF ──────── client leg ◄─ FIN ─────── upstream leg ◄── FIN
+
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
-	"io"
-	"os"
-	"os/signal"
-	"sync/atomic"
 
 	"github.com/urpc/uio"
 )
 
-// leg pairs the two connections of one tunnel: the accepted client leg and
-// the dialed upstream leg point at each other.
-type leg struct {
-	peer atomic.Value // uio.Conn
-}
-
 func main() {
 	listen := flag.String("listen", ":9528", "address the tunnel listens on")
 	upstream := flag.String("upstream", "127.0.0.1:9527", "address of the upstream server")
-	pollers := flag.Int("pollers", 0, "event loops, 0 for the uio default")
-	bufferSize := flag.Int("buffer", 64<<10, "bytes per socket read")
-	inbound := flag.Int("inbound", 256<<10, "unconsumed bytes that pause a leg's reads")
 	flag.Parse()
 
-	events := &uio.Events{
-		Pollers:            *pollers,
-		MaxBufferSize:      *bufferSize,
-		MaxInboundBuffered: *inbound,
-		AllowHalfOpen:      true,
-	}
-	var handler uio.FuncHandler
-	peerOf := func(c uio.Conn) uio.Conn {
-		l, _ := c.Userdata().(*leg)
-		if l == nil {
-			return nil
-		}
-		p, _ := l.peer.Load().(uio.Conn)
-		return p
-	}
-
-	handler.Open = func(c uio.Conn) {
-		if c.Userdata() != nil {
-			return // the upstream leg, paired by the client leg's OnOpen
-		}
-		client := &leg{}
-		c.SetUserdata(client)
-		up, err := events.Dial("tcp://"+*upstream, uio.WithUserdata(&leg{}))
-		if err != nil {
-			fmt.Println("dial", *upstream, "failed:", err)
-			// A failed dial reaches the client as a reset, as a proxy would.
-			_ = c.SetLinger(0)
-			_ = c.CloseWith(err)
-			return
-		}
-		up.Userdata().(*leg).peer.Store(c)
-		client.peer.Store(up)
-		// The upstream may have spoken first and found no peer yet; its bytes
-		// wait unconsumed, so have them forwarded now.
-		_ = up.Wake()
-	}
-
-	handler.Read = func(c uio.Conn) error {
-		peer := peerOf(c)
-		if peer == nil {
-			return nil // the upstream is not up yet: hold
-		}
-		// Forward unless the peer's queue is backed up. Leaving the bytes
-		// unconsumed is the backpressure: once enough of them pile up, uio
-		// stops reading this leg and TCP flow control slows whoever feeds it.
-		if peer.OutboundBuffered() < *inbound {
-			if _, err := c.WriteTo(peer); err != nil {
-				return err
-			}
-		}
-		// Pass the end of the stream on. Check it even when the peer was
-		// backed up: bytes left unconsumed reach OnRead again anyway.
-		if _, err := c.Read(nil); err == io.EOF {
-			return peer.CloseWrite()
-		}
-		return nil
-	}
-
-	handler.BytesWritten = func(c uio.Conn, _ int) {
-		// The far leg may have stopped reading because this queue was full;
-		// wake it once enough of the queue has drained.
-		if c.OutboundBuffered() < *inbound/2 {
-			if peer := peerOf(c); peer != nil {
-				_ = peer.Wake()
-			}
-		}
-	}
-
-	handler.Close = func(c uio.Conn, err error) {
-		peer := peerOf(c)
-		if peer == nil || errors.Is(err, io.EOF) {
-			return // a graceful close: both halves already went on to the peer
-		}
-		// An abort: pass it on as an abort, not as a clean end of stream.
-		_ = peer.SetLinger(0)
-		_ = peer.Close()
-	}
-
-	// The relay observes its own writes, so one FuncHandler serves as both
-	// the Handler and the Observer.
-	events.Handler, events.Observer = handler, handler
-
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt)
-		<-sig
-		_ = events.Close(nil)
-	}()
-
+	// The bridge dials one upstream per client leg and relays both ways; its
+	// defaults (a 256 KiB InboundLimit and the Events they configure) are all
+	// this relay needs.
+	br := &uio.Bridge{Upstream: *upstream}
 	fmt.Println("tunnel", *listen, "->", *upstream)
-	if err := events.Serve(*listen); err != nil {
-		fmt.Println("server exited with error:", err)
+	// Serve blocks on the user listener; every accepted connection is
+	// relayed by the bridge until the process stops.
+	if err := br.Events().Serve(*listen); err != nil {
+		fmt.Println("tunnel exited with error:", err)
 	}
 }

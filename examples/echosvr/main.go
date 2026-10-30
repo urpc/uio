@@ -14,18 +14,17 @@
  * limitations under the License.
  */
 
+// Command echosvr echoes every connection, prints its lifecycle, and shows
+// the smallest working handler: WriteTo(c) moves what arrived straight back.
 package main
 
 import (
 	"fmt"
-	"os"
-	"os/signal"
 
 	"github.com/urpc/uio"
 )
 
 func main() {
-
 	var events uio.Events
 
 	events.Handler = uio.FuncHandler{
@@ -33,6 +32,8 @@ func main() {
 			fmt.Println("connection opened:", c.RemoteAddr())
 		},
 		Read: func(c uio.Conn) error {
+			// WriteTo(c) writes the inbound bytes back to this same
+			// connection: the smallest echo, and what the load tools run.
 			_, err := c.WriteTo(c)
 			return err
 		},
@@ -41,13 +42,7 @@ func main() {
 		},
 	}
 
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, os.Kill)
-		s := <-sig
-		events.Close(fmt.Errorf("received signal: %v", s))
-	}()
-
+	fmt.Println("echo on :9527")
 	if err := events.Serve(":9527"); nil != err {
 		fmt.Println("server exited with error:", err)
 	}

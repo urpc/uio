@@ -32,6 +32,9 @@ var (
 	ErrStreamReset = errors.New("umux: stream reset")
 	// ErrGoAway reports an open attempted after the peer's GoAway.
 	ErrGoAway = errors.New("umux: session is going away")
+	// ErrShutdownTimeout reports a stream a graceful Shutdown stopped waiting
+	// for: it is reset with this cause once the shutdown context ends.
+	ErrShutdownTimeout = errors.New("umux: shutdown timeout")
 	// ErrMaxStreams reports the peer's stream limit or accept backlog full.
 	ErrMaxStreams = errors.New("umux: stream limit reached")
 	// ErrProtocol reports a frame the peer must not send.
@@ -40,6 +43,8 @@ var (
 	ErrStreamOpenTimeout = errors.New("umux: stream open timed out")
 	// ErrKeepAlive reports a session that stopped answering pings.
 	ErrKeepAlive = errors.New("umux: keepalive timeout")
+	// ErrMetadataTooLarge reports OpenWith metadata past Config.MaxMetadata.
+	ErrMetadataTooLarge = errors.New("umux: stream metadata exceeds MaxMetadata")
 )
 
 // QueueDrainedObserver receives a stream whose outbound frames have all been
@@ -48,6 +53,17 @@ var (
 // stream's queue. The callback must not block.
 type QueueDrainedObserver interface {
 	OnQueueDrained(uio.Conn)
+}
+
+// MetadataHandler is an optional capability of Config.Handler. When the
+// handler implements it, the session calls OnMetadata just before OnOpen with
+// the opaque bytes the opener attached to the stream's SYN through
+// Session.OpenWith. The slice is only valid for the duration of the call: the
+// session keeps no reference, and a handler that wants it later copies it. A
+// handler without the capability never sees metadata. In pull mode the bytes
+// travel in the Accepted value instead.
+type MetadataHandler interface {
+	OnMetadata(c uio.Conn, meta []byte)
 }
 
 // Config shapes one Session. Zero values take the defaults shown.
@@ -65,7 +81,9 @@ type Config struct {
 	// stream's queue from it.
 	Observer uio.TrafficObserver
 	// Accept, when set, vets an inbound stream before it is accepted; a
-	// non-nil error rejects it with RST.
+	// non-nil error rejects it with RST. It sees no metadata: the frame is
+	// read for the Stream that follows, so the decision is the handler's (in
+	// MetadataHandler.OnMetadata) or the puller's (in the Accepted value).
 	Accept func() error
 
 	// ReadBufferSize sizes each transport socket read (default 256 KiB); a data
@@ -87,6 +105,14 @@ type Config struct {
 	MaxStreams int
 	// MaxFrame bounds a data frame's payload (default 32 KiB, at most 64 KiB).
 	MaxFrame int
+	// MaxMetadata bounds the opaque bytes a stream's opener may attach to its
+	// SYN through Session.OpenWith (default 4 KiB, at most 1 MiB). The
+	// extension frame is outside yamux v1; both ends must be umux when it is
+	// used. The session holds the bytes only until it hands them over — for
+	// the duration of MetadataHandler.OnMetadata, or until the Accepted value
+	// leaves the accept queue — so in pull mode retained metadata is bounded
+	// by AcceptBacklog × MaxMetadata.
+	MaxMetadata int
 	// AcceptBacklog bounds the accept queue when Handler is nil (default 256).
 	AcceptBacklog int
 	// StreamOpenTimeout bounds a SYN awaiting its ACK (default 75s).
@@ -114,12 +140,13 @@ const (
 	defaultMaxStreams    = 1024
 	defaultMaxFrame      = 32 << 10
 	maxMaxFrame          = 64 << 10
+	defaultMaxMetadata   = 4 << 10
+	maxMaxMetadata       = 1 << 20
 	defaultAcceptBacklog = 256
 	defaultStreamOpen    = 75 * time.Second
 	defaultStreamClose   = 5 * time.Minute
 	defaultKeepAlive     = 30 * time.Second
 	defaultKeepAliveMax  = 60 * time.Second
-	defaultGoAwayDrain   = 5 * time.Second
 )
 
 // resolve fills every unset field with its default and clamps the frame size.
@@ -143,6 +170,12 @@ func (c Config) resolve() Config {
 	}
 	if c.MaxFrame > maxMaxFrame {
 		c.MaxFrame = maxMaxFrame
+	}
+	if c.MaxMetadata <= 0 {
+		c.MaxMetadata = defaultMaxMetadata
+	}
+	if c.MaxMetadata > maxMaxMetadata {
+		c.MaxMetadata = maxMaxMetadata
 	}
 	if c.AcceptBacklog <= 0 {
 		c.AcceptBacklog = defaultAcceptBacklog

@@ -344,7 +344,8 @@ func TestPullModeEcho(t *testing.T) {
 	}
 	var serverStream *Stream
 	select {
-	case serverStream = <-srvSess.Accept():
+	case in := <-srvSess.Accept():
+		serverStream = in.Stream
 	case <-time.After(5 * time.Second):
 		t.Fatal("server did not accept the stream")
 	}
@@ -711,18 +712,20 @@ func TestRawProtocolErrorsClose(t *testing.T) {
 			t.Fatalf("ACK for stream %d", ack.streamID)
 		}
 	})
-	t.Run("goaway ignores new streams", func(t *testing.T) {
+	t.Run("goaway resets new streams", func(t *testing.T) {
 		conn := dialTCP(t, addr)
 		defer conn.Close()
 		if _, err := conn.Write(rawFramed(typeGoAway, 0, 0, goAwayNormal, nil)); err != nil {
 			t.Fatal(err)
 		}
+		// A SYN against a going-away session is refused with RST, so the
+		// opener fails now instead of waiting for its own open timeout.
 		if _, err := conn.Write(rawFramed(typeWindowUpdate, flagSYN, 7, 0, nil)); err != nil {
 			t.Fatal(err)
 		}
-		if h, ok := readRawFrame(t, conn, 200*time.Millisecond); ok {
-			t.Fatalf("server answered a SYN after GoAway: %+v", h)
-		}
+		expectFrame(t, conn, func(h frameHeader) bool {
+			return h.flags&flagRST != 0 && h.streamID == 7
+		})
 	})
 	t.Run("window overrun tolerated", func(t *testing.T) {
 		conn := dialTCP(t, addr)

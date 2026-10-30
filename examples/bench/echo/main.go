@@ -42,6 +42,7 @@ func main() {
 
 	events.Handler = uio.FuncHandler{
 		Read: func(c uio.Conn) error {
+			// Echo the inbound bytes back on the same connection.
 			_, err := c.WriteTo(c)
 			return err
 		},
@@ -49,11 +50,12 @@ func main() {
 
 	go func() {
 		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, os.Interrupt, os.Kill)
+		signal.Notify(sig, os.Interrupt)
 		<-sig
 		events.Close(nil)
 	}()
 
+	fmt.Println("echo on", *addr)
 	if err := events.Serve(*addr); nil != err {
 		fmt.Println("server exited with error:", err)
 		os.Exit(1)

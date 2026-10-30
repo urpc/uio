@@ -63,7 +63,7 @@ func TestDecodeHeaderErrors(t *testing.T) {
 		}(), errFrameVersion},
 		{"unknown type", func() []byte {
 			b := encoded(frameHeader{typ: typeData, streamID: 1})
-			b[1] = typeGoAway + 1
+			b[1] = typeSynMetadata + 1
 			return b
 		}(), errFrameType},
 		{"undefined flag", func() []byte {
@@ -81,6 +81,7 @@ func TestDecodeHeaderErrors(t *testing.T) {
 
 func TestValidateFrame(t *testing.T) {
 	const maxData = 64 << 10
+	const maxMeta = 64
 	cases := []struct {
 		name string
 		h    frameHeader
@@ -92,9 +93,14 @@ func TestValidateFrame(t *testing.T) {
 		{"window update without a stream", frameHeader{typ: typeWindowUpdate, streamID: 0, length: 1}, errFrameFlags},
 		{"goaway names the session", frameHeader{typ: typeGoAway, streamID: 0, length: goAwayNormal}, nil},
 		{"goaway names a stream", frameHeader{typ: typeGoAway, streamID: 3, length: goAwayNormal}, errFrameFlags},
+		{"metadata syn", frameHeader{typ: typeSynMetadata, flags: flagSYN, streamID: 1, length: 4 + maxMeta}, nil},
+		{"metadata syn without its delta", frameHeader{typ: typeSynMetadata, flags: flagSYN, streamID: 1, length: 3}, errFrameLength},
+		{"metadata syn beyond the limit", frameHeader{typ: typeSynMetadata, flags: flagSYN, streamID: 1, length: 4 + maxMeta + 1}, errFrameLength},
+		{"metadata syn without the open flag", frameHeader{typ: typeSynMetadata, flags: flagACK, streamID: 1, length: 4}, errFrameFlags},
+		{"metadata syn without a stream", frameHeader{typ: typeSynMetadata, flags: flagSYN, streamID: 0, length: 4}, errFrameFlags},
 	}
 	for _, tc := range cases {
-		if err := validateFrame(tc.h, maxData); !errors.Is(err, tc.want) {
+		if err := validateFrame(tc.h, maxData, maxMeta); !errors.Is(err, tc.want) {
 			t.Fatalf("%s: err = %v, want %v", tc.name, err, tc.want)
 		}
 	}

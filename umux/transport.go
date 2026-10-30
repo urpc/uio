@@ -170,6 +170,13 @@ func transportReadLimit(cfg Config) int {
 	if frame := bufferLimitSum(cfg.WindowSize, headerSize); limit < frame {
 		limit = frame
 	}
+	// A metadata SYN is a single frame larger than any data frame, and
+	// readFrame parses nothing until the frame lies whole in the buffer: the
+	// transport must be able to hold it, or a small session budget would
+	// stall the read forever.
+	if meta := bufferLimitSum(cfg.MaxMetadata, headerSize+4); limit < meta {
+		limit = meta
+	}
 	return limit
 }
 

@@ -118,11 +118,35 @@ close with their transport:
 ```go
 go srv.Serve("tcp://:9000")
 for sess := range srv.Sessions() {
-	for st := range sess.Accept() {
-		go serve(st) // Read/WriteTo from any goroutine, one reader per stream
+	for in := range sess.Accept() {
+		go serve(in.Stream) // in.Metadata carries the opener's SYN bytes
 	}
 }
 ```
+
+## Stream metadata
+
+`Session.OpenWith(ctx, meta)` attaches opaque bytes to the stream's SYN:
+
+```go
+st, err := sess.OpenWith(ctx, []byte("proxy=web dst=10.0.0.7:8080"))
+```
+
+The acceptor receives them once, at accept time, and the session keeps no
+reference afterwards. A handler implements the `MetadataHandler` capability —
+`OnMetadata(c uio.Conn, meta []byte)`, called just before `OnOpen` — and a
+pulled stream carries them in its `Accepted` value (`in.Stream`,
+`in.Metadata`). The slice is valid during `OnMetadata` and, in pull mode,
+for as long as you keep the value; a caller that needs the bytes later copies
+them.
+
+umux never interprets them: they are the caller's own routing or
+identification data (a proxy name, a destination, a trace id), binary-safe
+and copied out of the transport buffer before delivery. `Config.MaxMetadata`
+bounds their size (default 4 KiB); a larger `OpenWith` is refused locally with
+`ErrMetadataTooLarge`, and a receiver with a smaller cap rejects the frame and
+the session. A stream opened without metadata — plain `Open` — puts exactly
+the same bytes on the wire as before.
 
 ## How it works
 
@@ -148,6 +172,17 @@ accepted the FIN and both directions drained. Aborts are immediate and
 independent: `CloseWith(err)` queues an `RST`, and the peer sees
 `ErrStreamReset` through `OnClose`.
 
+Sessions close two ways. `Close(cause)` is immediate: GoAway, then the
+transport goes, and every stream closes with the cause. `Shutdown(ctx)` is the
+graceful path: it sends GoAway, refuses new streams — `Open` fails with
+`ErrGoAway`, and a peer that races an open is reset at once instead of waiting
+for its own open timeout — while the existing streams keep reading, writing
+and half-closing normally. When the last stream ends on its own the transport
+closes and `Shutdown` returns nil; when ctx ends first the survivors are reset
+with `ErrShutdownTimeout` and `Shutdown` returns the context's error. It is
+cooperative on purpose: umux cannot know when an application's byte stream is
+complete, so a stream nobody ends is the shutdown context's to cut.
+
 ## Configuration
 
 `Config` holds every setting; the zero value is the defaults.
@@ -162,6 +197,7 @@ independent: `CloseWith(err)` queues an `RST`, and the peer sees
 | `SessionWindow` | 4 MiB | Bytes buffered across all streams of one session; more pauses transport reads until consumption catches up. |
 | `MaxStreams` | 1024 | Concurrent streams per session. |
 | `MaxFrame` | 32 KiB | Largest data-frame payload (at most 64 KiB), outgoing frames only. |
+| `MaxMetadata` | 4 KiB | Largest `OpenWith` metadata (at most 1 MiB); held only until it is handed over, and a larger SYN is rejected by the receiver. |
 | `AcceptBacklog` | 256 | Accept-queue depth in pull mode; a full queue refuses the peer's stream. |
 | `StreamOpenTimeout` | 75 s | How long an `Open` waits for its ACK. |
 | `StreamCloseTimeout` | 5 m | How long a half-closed stream may stay before it is reset. |
@@ -210,6 +246,13 @@ interoperates with [hashicorp/yamux](https://github.com/hashicorp/yamux)
 flowing either way, and the frame layout needs no private extensions to carry
 one. The implementation is independent: no yamux code is part of umux, and the
 protocol's layout above is the only thing the two share.
+
+One opt-in exception: a stream opened with `OpenWith` metadata announces
+itself with frame type 4 — the umux SYN-metadata frame, outside yamux's type
+space — carrying the usual window delta followed by the opener's opaque
+bytes; its ACK stays a plain `WindowUpdate`. A yamux peer rejects that frame,
+so metadata requires umux on both ends; a session that never uses `OpenWith`
+never sends it.
 
 ## License
 
