@@ -223,8 +223,13 @@ complete, so a stream nobody ends is the shutdown context's to cut.
 - **Borrowed slices.** `PeekChunk`'s slice is valid for the current handler
   callback (or until a consuming call). `WriteTo` copies out of a borrowed
   transport frame before handing it to the writer, so its bytes stay put.
-- **Socket-only methods** — deadlines, `SetLinger`, `Sendmsg` paths,
-  `ReserveOutbound` — return `uio.ErrUnsupported` on a stream.
+- **Socket-only methods** — `SetLinger`, `Sendmsg` paths and
+  `ReserveOutbound` — return `uio.ErrUnsupported` on a stream. The three
+  deadline methods are supported as absolute stream deadlines: when one
+  expires, the stream resets with an error wrapping
+  `os.ErrDeadlineExceeded`; a zero time clears it. Reads and writes remain
+  non-blocking, so a deadline closes the stream rather than interrupting a
+  blocked operation.
 
 ## Composing
 

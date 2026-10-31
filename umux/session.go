@@ -1063,14 +1063,18 @@ func (s *Session) removeStream(st *Stream) {
 // the peer is told with RST.
 func (s *Session) abortStream(st *Stream, cause error) {
 	s.mu.Lock()
-	if s.streams[st.id] == st {
+	live := s.streams[st.id] == st
+	if live {
 		delete(s.streams, st.id)
 	}
 	wait := s.openWait[st.id]
 	delete(s.openWait, st.id)
 	st.dropOutLocked()
-	s.sendControlLocked(typeWindowUpdate, flagRST, st.id, 0)
-	err := s.flushLocked()
+	var err error
+	if live {
+		s.sendControlLocked(typeWindowUpdate, flagRST, st.id, 0)
+		err = s.flushLocked()
+	}
 	s.mu.Unlock()
 	s.emitDrained()
 	if wait != nil {

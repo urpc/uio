@@ -17,7 +17,9 @@
 package umux
 
 import (
+	"fmt"
 	"io"
+	"os"
 	"time"
 
 	"github.com/urpc/uio"
@@ -73,13 +75,28 @@ func (s *Session) onTimer(c uio.Conn) error {
 	s.timerMu.Unlock()
 	now := time.Now()
 	var (
-		due        []*Stream
-		openFails  []chan error
-		resetCause = make(map[*Stream]error)
+		due            []*Stream
+		deadlineResets []deadlineReset
+		openFails      []chan error
+		resetCause     = make(map[*Stream]error)
 	)
 	s.mu.Lock()
 	for id, st := range s.streams {
 		st.mu.Lock()
+		readDeadline, writeDeadline := st.readDeadline, st.writeDeadline
+		readExpired := !readDeadline.IsZero() && !now.Before(readDeadline)
+		writeExpired := !writeDeadline.IsZero() && !now.Before(writeDeadline)
+		if readExpired || writeExpired {
+			st.mu.Unlock()
+			cause := streamDeadlineError(readExpired, writeExpired)
+			delete(s.streams, id)
+			wait := s.openWait[id]
+			delete(s.openWait, id)
+			st.dropOutLocked()
+			s.sendControlLocked(typeWindowUpdate, flagRST, id, 0)
+			deadlineResets = append(deadlineResets, deadlineReset{st: st, wait: wait, cause: cause})
+			continue
+		}
 		if !st.wakeAt.IsZero() && !now.Before(st.wakeAt) {
 			st.wakeAt = time.Time{}
 			if st.wakeDu > 0 {
@@ -138,6 +155,15 @@ func (s *Session) onTimer(c uio.Conn) error {
 	for st, cause := range resetCause {
 		st.resetLocal(cause)
 	}
+	for _, expired := range deadlineResets {
+		if expired.wait != nil {
+			select {
+			case expired.wait <- expired.cause:
+			default:
+			}
+		}
+		expired.st.resetLocal(expired.cause)
+	}
 	if keepaliveDead {
 		s.drainCloses()
 		_ = c.CloseWith(ErrKeepAlive)
@@ -178,6 +204,8 @@ func (s *Session) nextTimerLocked(now time.Time) time.Time {
 	for _, st := range s.streams {
 		st.mu.Lock()
 		after(st.wakeAt)
+		after(st.readDeadline)
+		after(st.writeDeadline)
 		if st.opening {
 			after(st.openedAt.Add(s.cfg.StreamOpenTimeout))
 		}
@@ -198,6 +226,23 @@ func (s *Session) nextTimerLocked(now time.Time) time.Time {
 		next = now.Add(time.Millisecond)
 	}
 	return next
+}
+
+type deadlineReset struct {
+	st    *Stream
+	wait  chan error
+	cause error
+}
+
+func streamDeadlineError(read, write bool) error {
+	switch {
+	case read && write:
+		return fmt.Errorf("umux: deadline: %w", os.ErrDeadlineExceeded)
+	case read:
+		return fmt.Errorf("umux: read deadline: %w", os.ErrDeadlineExceeded)
+	default:
+		return fmt.Errorf("umux: write deadline: %w", os.ErrDeadlineExceeded)
+	}
 }
 
 // onTransportClose closes every stream with the transport's cause.

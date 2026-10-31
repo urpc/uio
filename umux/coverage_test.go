@@ -79,14 +79,23 @@ func TestStreamSurface(t *testing.T) {
 		"Control":            st.Control(func(uintptr) {}),
 		"SetReadBuffer":      st.SetReadBuffer(1),
 		"SetWriteBuffer":     st.SetWriteBuffer(1),
-		"SetDeadline":        st.SetDeadline(time.Time{}),
-		"SetReadDeadline":    st.SetReadDeadline(time.Time{}),
-		"SetWriteDeadline":   st.SetWriteDeadline(time.Time{}),
 	}
 	for name, err := range unsupported {
 		if !errors.Is(err, uio.ErrUnsupported) {
 			t.Fatalf("%s: err = %v, want ErrUnsupported", name, err)
 		}
+	}
+	if err := st.SetDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("SetDeadline: %v", err)
+	}
+	if err := st.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetReadDeadline(clear): %v", err)
+	}
+	if err := st.SetWriteDeadline(time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	if err := st.SetWriteDeadline(time.Time{}); err != nil {
+		t.Fatalf("SetWriteDeadline(clear): %v", err)
 	}
 
 	// Echo through the byte and string writers.

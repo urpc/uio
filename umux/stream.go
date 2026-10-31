@@ -191,6 +191,11 @@ type Stream struct {
 	// wakeAt and wakeDu are this stream's uio timer.
 	wakeAt time.Time
 	wakeDu time.Duration
+	// readDeadline and writeDeadline are absolute stream deadlines. Unlike
+	// wakeAt, they close the stream when they expire, matching uio.Conn's
+	// socket deadline contract.
+	readDeadline  time.Time
+	writeDeadline time.Time
 
 	userdata any
 	// wakePending asks the session to run an empty read turn on the next
@@ -867,11 +872,50 @@ func (st *Stream) SetReadBuffer(size int) error { return uio.ErrUnsupported }
 // SetWriteBuffer is unsupported on a stream.
 func (st *Stream) SetWriteBuffer(size int) error { return uio.ErrUnsupported }
 
-// SetDeadline is unsupported on a stream.
-func (st *Stream) SetDeadline(t time.Time) error { return uio.ErrUnsupported }
+// SetDeadline sets both stream deadlines. A deadline that passes resets the
+// stream with os.ErrDeadlineExceeded, matching uio.Conn's socket semantics.
+// A zero time clears both deadlines.
+func (st *Stream) SetDeadline(t time.Time) error {
+	return st.setDeadlines(t, t, true, true)
+}
 
-// SetReadDeadline is unsupported on a stream.
-func (st *Stream) SetReadDeadline(t time.Time) error { return uio.ErrUnsupported }
+// SetReadDeadline sets the absolute read deadline. Streams do not block in
+// Read, so expiry closes the stream rather than interrupting a blocked call.
+// A zero time clears the deadline.
+func (st *Stream) SetReadDeadline(t time.Time) error {
+	return st.setDeadlines(t, time.Time{}, true, false)
+}
 
-// SetWriteDeadline is unsupported on a stream.
-func (st *Stream) SetWriteDeadline(t time.Time) error { return uio.ErrUnsupported }
+// SetWriteDeadline sets the absolute write deadline. A zero time clears the
+// deadline.
+func (st *Stream) SetWriteDeadline(t time.Time) error {
+	return st.setDeadlines(time.Time{}, t, false, true)
+}
+
+// setDeadlines updates the selected deadline fields while the stream remains
+// in its session. The session lock first matches timer scans and prevents a
+// deadline from being armed on a stream that has already left the session.
+func (st *Stream) setDeadlines(read, write time.Time, setRead, setWrite bool) error {
+	s := st.sess
+	s.mu.Lock()
+	if s.closed || s.streams[st.id] != st {
+		s.mu.Unlock()
+		return net.ErrClosed
+	}
+	st.mu.Lock()
+	if st.closedLocal {
+		st.mu.Unlock()
+		s.mu.Unlock()
+		return net.ErrClosed
+	}
+	if setRead {
+		st.readDeadline = read
+	}
+	if setWrite {
+		st.writeDeadline = write
+	}
+	st.mu.Unlock()
+	s.mu.Unlock()
+	s.rearmTimer()
+	return nil
+}
