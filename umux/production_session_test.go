@@ -241,6 +241,9 @@ func TestSessionDialContextCancelsUnopenedLayer(t *testing.T) {
 	}()
 	cli := NewClient(Config{KeepAlive: -1})
 	defer cli.Close(nil)
+	if err := cli.start(); err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 	_, err = cli.Dial(ctx, "tcp://"+ln.Addr().String(), uio.WithLayers(productionBlockedHandshake{}))

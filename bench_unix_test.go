@@ -88,8 +88,9 @@ func BenchmarkIOTaskSchedulers(b *testing.B) {
 		name  string
 		batch int
 	}{
-		{name: "Saturated", batch: 16 << 10},
+		{name: "EventBatch", batch: eventBatch},
 		{name: "Burst", batch: workers},
+		{name: "OverflowStress", batch: 16 << 10},
 	} {
 		b.Run(workload.name, func(b *testing.B) {
 			for _, factory := range ioSchedulerFactories(workers) {
@@ -118,7 +119,8 @@ func BenchmarkIOTaskSchedulers(b *testing.B) {
 
 type ioBenchmarkScheduler interface {
 	bind(*fdConn)
-	submitBatch([]IOTask) int
+	openKey()
+	submitBatch([]*fdConn, []IOTask) int
 	stop()
 }
 
@@ -186,11 +188,12 @@ func (executor *channelExecutor) stop() {
 type internalIOScheduler struct{ pool *ioTaskPool }
 
 func (scheduler *internalIOScheduler) bind(conn *fdConn) {
-	conn.loop = &eventLoop{ioPool: scheduler.pool}
+	conn.loop = &eventLoop{ioPool: scheduler.pool, count: 1}
 }
-func (scheduler *internalIOScheduler) submitBatch(tasks []IOTask) int {
-	if scheduler.pool.submitBatch(tasks) {
-		return len(tasks)
+func (scheduler *internalIOScheduler) openKey() { scheduler.pool.connOpened() }
+func (scheduler *internalIOScheduler) submitBatch(conns []*fdConn, _ []IOTask) int {
+	if scheduler.pool.submitConnBatch(conns, nil) {
+		return len(conns)
 	}
 	return 0
 }
@@ -202,9 +205,10 @@ type executorIOScheduler struct {
 }
 
 func (scheduler *executorIOScheduler) bind(conn *fdConn) {
-	conn.loop = &eventLoop{ioPool: scheduler.pool}
+	conn.loop = &eventLoop{ioPool: scheduler.pool, count: 1}
 }
-func (scheduler *executorIOScheduler) submitBatch(tasks []IOTask) int {
+func (scheduler *executorIOScheduler) openKey() {}
+func (scheduler *executorIOScheduler) submitBatch(_ []*fdConn, tasks []IOTask) int {
 	if scheduler.pool.submitBatch(tasks) {
 		return len(tasks)
 	}
@@ -226,14 +230,18 @@ func newIOTaskBenchmarkRunner(batch int, scheduler ioBenchmarkScheduler) *ioTask
 	runner := &ioTaskBenchmarkRunner{scheduler: scheduler}
 	events := &Events{}
 	funcs(events).Read = func(Conn) error { runner.active.Load().Done(); return nil }
+	entry := events.plainEntry()
 	runner.connections = make([]*fdConn, batch)
 	runner.tasks = make([]IOTask, batch)
 	for index := range runner.connections {
 		// Distinct descriptors spread the turns over the scheduler's shards,
 		// as real connections' do; no socket is touched.
-		runner.connections[index] = &fdConn{fd: int32(index)}
+		runner.connections[index] = &fdConn{commonConn: commonConn{entry: entry}, fd: int32(index)}
 		runner.tasks[index] = runner.connections[index]
 		scheduler.bind(runner.connections[index])
+		// Keep the owned scheduler's shard count in sync with production: each
+		// registered connection calls connOpened before its first turn.
+		scheduler.openKey()
 	}
 	return runner
 }
@@ -251,7 +259,7 @@ func (runner *ioTaskBenchmarkRunner) runBatch() {
 			panic("I/O benchmark loop stopped")
 		}
 	}
-	if accepted := runner.scheduler.submitBatch(runner.tasks); accepted != len(runner.tasks) {
+	if accepted := runner.scheduler.submitBatch(runner.connections, runner.tasks); accepted != len(runner.tasks) {
 		panic("I/O task scheduler rejected benchmark task")
 	}
 	wait.Wait()

@@ -60,19 +60,21 @@ var bridgeEchoHandler = FuncHandler{Read: func(c Conn) error {
 	return nil
 }}
 
-// startBridgeEcho runs an echo upstream and returns its address.
+// startBridgeEcho returns its upstream address once the listener is bound.
 func startBridgeEcho(t *testing.T, handler Handler) string {
 	t.Helper()
 	if handler == nil {
 		handler = bridgeEchoHandler
 	}
-	ev := &Events{Handler: handler, AllowHalfOpen: true}
+	ready := make(chan struct{})
+	ev := &Events{
+		Handler:       handler,
+		AllowHalfOpen: true,
+		Hooks:         FuncHandler{Start: func(*Events) { close(ready) }},
+	}
 	addr := bridgeFreeAddr(t)
 	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
+	var serveErr error
 	t.Cleanup(func() {
 		_ = ev.Close(nil)
 		select {
@@ -80,6 +82,17 @@ func startBridgeEcho(t *testing.T, handler Handler) string {
 		case <-time.After(5 * time.Second):
 		}
 	})
+	go func() {
+		defer close(stopped)
+		serveErr = ev.Serve("tcp://" + addr)
+	}()
+	select {
+	case <-ready:
+	case <-stopped:
+		t.Fatalf("upstream Serve exited before startup: %v", serveErr)
+	case <-time.After(5 * time.Second):
+		t.Fatal("upstream did not start")
+	}
 	return addr
 }
 
