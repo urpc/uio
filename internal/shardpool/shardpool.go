@@ -117,6 +117,7 @@ type Pool[T any] struct {
 	active atomic.Int32
 	base   int32
 	keys   atomic.Int64
+	keyMu  sync.Mutex // orders key count changes with their active-tier updates
 	_      [cacheLineSize]byte
 	// starving is set when a shard with queued tasks found no worker
 	// anywhere; the next worker to park clears it and notifies every shard.
@@ -218,22 +219,29 @@ func New[T any](procs, capacity int, key func(T) uint32, run func(T)) *Pool[T] {
 // AddKey and RemoveKey count the keys the pool serves, such as open
 // connections, and switch the number of active shards when the count reaches
 // a threshold.
+// Count and tier updates are one lifecycle operation: a delayed threshold
+// update must not overwrite a later split or merge. Queue submission only
+// reads active and never takes keyMu.
 func (pool *Pool[T]) AddKey() {
+	pool.keyMu.Lock()
 	switch pool.keys.Add(1) {
 	case int64(pool.base) * SplitKeysPerShard:
 		pool.active.Store(2 * pool.base)
 	case int64(pool.base) * SplitKeysPerShard4:
 		pool.active.Store(int32(len(pool.shards)))
 	}
+	pool.keyMu.Unlock()
 }
 
 func (pool *Pool[T]) RemoveKey() {
+	pool.keyMu.Lock()
 	switch pool.keys.Add(-1) {
 	case int64(pool.base) * MergeKeysPerShard4:
 		pool.active.Store(2 * pool.base)
 	case int64(pool.base) * MergeKeysPerShard:
 		pool.active.Store(pool.base)
 	}
+	pool.keyMu.Unlock()
 }
 
 func (pool *Pool[T]) shard(task T) *shard[T] {
@@ -531,7 +539,10 @@ func (w *worker[T]) run(target *shard[T]) {
 	exited := false
 	defer func() {
 		if !exited {
+			// Account for the replacement before releasing the worker that
+			// Goexit removed, so the target always has one coming or running.
 			target.coming.Add(1)
+			target.running.Add(-1)
 			go w.run(target)
 		}
 	}()

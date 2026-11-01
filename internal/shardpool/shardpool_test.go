@@ -292,23 +292,93 @@ func TestOverflowRunsTasksAFullShardRefused(t *testing.T) {
 	waitFor(t, "every task", func() bool { return ran.Load() == DefaultCapacity+2 })
 }
 
-// A task that ends its goroutine with runtime.Goexit loses the pool no worker.
+// A task that ends its goroutine with runtime.Goexit loses the pool no worker
+// and leaves no running count behind, even when the worker served another shard.
 func TestGoexitInATaskKeepsTheWorker(t *testing.T) {
-	done := make(chan struct{}, 1)
-	pool := New(1, 0, func(*task) uint32 { return 0 }, func(one *task) {
-		if one.key == 0 {
-			runtime.Goexit()
+	for _, borrowed := range []bool{false, true} {
+		name := "home"
+		procs := 1
+		if borrowed {
+			name, procs = "borrowed", 2
 		}
-		done <- struct{}{}
+		t.Run(name, func(t *testing.T) {
+			done := make(chan struct{}, 1)
+			pool := New(procs, 0, func(*task) uint32 { return 0 }, func(one *task) {
+				if one.key == 0 {
+					runtime.Goexit()
+				}
+				done <- struct{}{}
+			})
+			defer pool.Stop()
+			target, home := &pool.shards[0], &pool.shards[0]
+			if borrowed {
+				// The target cannot start a worker, so it borrows from shard 1.
+				target.mu.Lock()
+				target.live = MaxWorkers
+				target.mu.Unlock()
+				home = &pool.shards[1]
+			}
+			for round := range 4 {
+				pool.Submit(&task{key: 0})
+				waitFor(t, "the replacement to park", func() bool { return home.idleCount.Load() == 1 })
+				if running, coming := target.running.Load(), target.coming.Load(); running != 0 || coming != 0 {
+					t.Fatalf("after Goexit %d, target running/coming = %d/%d, want 0/0", round+1, running, coming)
+				}
+				if borrowed && home.running.Load() != 0 {
+					t.Fatalf("home running = %d, want 0", home.running.Load())
+				}
+				if !pool.SubmitBehind(&task{key: 1}) {
+					t.Fatal("SubmitBehind left a task behind a worker that Goexit removed")
+				}
+				receive(t, done, "a task after Goexit")
+				waitFor(t, "the worker to park again", func() bool { return home.idleCount.Load() == 1 })
+				if live := home.liveWorkers(); live != 1 {
+					t.Fatalf("live workers = %d, want 1", live)
+				}
+			}
+		})
+	}
+}
+
+// After replacing a task that called Goexit, a blocked callback still counts as
+// one running worker and a task left behind it is served by the monitor.
+func TestMonitorServesTasksBehindAGoexitReplacement(t *testing.T) {
+	release := make(chan struct{})
+	started := make(chan struct{}, 1)
+	fast := make(chan struct{}, 1)
+	pool := New(1, 0, func(*task) uint32 { return 0 }, func(one *task) {
+		switch one.key {
+		case 0:
+			runtime.Goexit()
+		case 1:
+			started <- struct{}{}
+			<-release
+		default:
+			fast <- struct{}{}
+		}
 	})
 	defer pool.Stop()
+	defer close(release)
 	s := &pool.shards[0]
 	pool.Submit(&task{key: 0})
 	waitFor(t, "the replacement to park", func() bool { return s.idleCount.Load() == 1 })
-	pool.Submit(&task{key: 1})
-	receive(t, done, "a task after Goexit")
-	if live := s.liveWorkers(); live != 1 {
-		t.Fatalf("live workers = %d, want 1", live)
+	if !pool.SubmitBehind(&task{key: 1}) {
+		t.Fatal("SubmitBehind woke no replacement worker")
+	}
+	receive(t, started, "the replacement's blocking task")
+	if running := s.running.Load(); running != 1 {
+		t.Fatalf("running workers = %d, want 1", running)
+	}
+	if pool.SubmitBehind(&task{key: 2}) {
+		t.Fatal("SubmitBehind woke a worker while the replacement was running")
+	}
+	if !pool.watching.Load() {
+		t.Fatal("no monitor for the task left behind the blocked replacement")
+	}
+	receive(t, fast, "the task queued behind the blocked replacement")
+	waitFor(t, "the monitor's worker to park", func() bool { return s.idleCount.Load() == 1 })
+	if running := s.running.Load(); running != 1 {
+		t.Fatalf("running workers after monitor rescue = %d, want the blocked replacement only", running)
 	}
 }
 
