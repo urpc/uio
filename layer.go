@@ -661,31 +661,47 @@ func (h *stackDriver) OnOpen(socket Conn) {
 	layers := h.layers
 	c.userdata.Store(&held)
 	c.layers = make([]*layerNode, len(layers))
+	// Nodes share one allocation; the pointer slice keeps their indexed faces.
+	nodes := make([]layerNode, len(layers))
 	var below Conn = socketLower{Conn: socket, stack: c}
 	for i := range layers {
-		node := &layerNode{stack: c, index: i, lower: below}
+		node := &nodes[i]
+		node.stack = c
+		node.index = i
+		node.lower = below
 		node.up = layerUp{node}
 		c.layers[i] = node
 		below = node
 	}
 	socket.SetUserdata(c)
+	var flushCount int
 	for i, layer := range layers {
 		node := c.layers[i]
 		node.conn = layer.Attach(layerCtx{node})
 		node.ops = opsOf(node.conn)
 		if node.ops.wireSent != nil {
+			// Later Attach calls may write below and synchronously report a
+			// send. Register this observer before attaching the next layer.
 			c.sends = append(c.sends, node)
+		}
+		if node.ops.flush != nil {
+			flushCount++
 		}
 		if node.ops.held != nil {
 			c.holders = true
 		}
 	}
+	// Flushers are first used after attachment, so their list can be sized once.
+	if flushCount > 0 {
+		c.flushers = make([]*layerNode, 0, flushCount)
+	}
 	c.firstHeld = -1
 	for i := len(c.layers) - 1; i >= 0; i-- {
-		if c.layers[i].ops.flush != nil {
-			c.flushers = append(c.flushers, c.layers[i])
+		node := c.layers[i]
+		if node.ops.flush != nil {
+			c.flushers = append(c.flushers, node) // flushes run top down
 		}
-		if c.layers[i].ops.held != nil {
+		if node.ops.held != nil {
 			c.firstHeld = i
 		}
 	}
@@ -799,8 +815,9 @@ type stack struct {
 
 	// timers holds the timer of every layer, and in its last slot the one
 	// the Handler armed with SetWakeDeadline; the socket's own wake slot
-	// carries the earliest of them. hasTimers spares a turn the lock while
-	// none was ever armed.
+	// carries the earliest of them. hasTimers is cleared again when every
+	// slot is stopped, so ordinary turns do not reacquire timerMu after a
+	// one-shot timer has fired or a timer is cancelled.
 	hasTimers atomic.Bool
 	timerMu   sync.Mutex
 	timers    []timerSlot
@@ -1507,10 +1524,27 @@ func (c *stack) setTimer(slot int, when time.Time, every time.Duration) error {
 			return nil
 		}
 		c.timers = make([]timerSlot, len(c.layers)+1)
+	}
+	wasActive := !c.timers[slot].when.IsZero()
+	c.timers[slot] = timerSlot{when: when, every: every}
+	if when.IsZero() {
+		c.refreshTimersActiveLocked()
+	} else if !wasActive {
 		c.hasTimers.Store(true)
 	}
-	c.timers[slot] = timerSlot{when: when, every: every}
 	return c.aimLocked(time.Time{})
+}
+
+// refreshTimersActiveLocked updates the lock-free guard used by takeDue and
+// reaim. It is called only while timerMu is held, after a timer was cleared
+// or consumed, so a zero value means no slot can wake the connection.
+func (c *stack) refreshTimersActiveLocked() {
+	for _, slot := range c.timers {
+		if !slot.when.IsZero() {
+			return // clearing one slot cannot deactivate another
+		}
+	}
+	c.hasTimers.Store(false)
 }
 
 // aimLocked aims the socket's wake slot at the earliest timer. fired is the
@@ -1558,6 +1592,7 @@ func (c *stack) takeDue() uint64 {
 	}
 	now := time.Now()
 	var due uint64
+	cleared := false
 	for i := range c.timers {
 		slot := &c.timers[i]
 		if slot.when.IsZero() || slot.when.After(now) || !c.slotOpen(i) {
@@ -1571,7 +1606,11 @@ func (c *stack) takeDue() uint64 {
 			}
 		} else {
 			slot.when = time.Time{}
+			cleared = true
 		}
+	}
+	if cleared {
+		c.refreshTimersActiveLocked()
 	}
 	fired := time.Time{}
 	if !c.armed.IsZero() && !c.armed.After(now) {
@@ -1598,6 +1637,7 @@ func (c *stack) slotOpen(slot int) bool {
 func (c *stack) stopTimers() {
 	c.timerMu.Lock()
 	c.timers = nil
+	c.hasTimers.Store(false)
 	c.timerMu.Unlock()
 }
 
@@ -2241,6 +2281,12 @@ func (l *layerNode) Writev(vec [][]byte) (int, error) {
 	var err error
 	if len(vec) == 1 {
 		n, err = l.conn.OnWrite(layerCtx{l}, vec[0])
+	} else if _, transparent := l.conn.(passThroughHandler); transparent && len(vec) > 1 &&
+		(l.index > 0 || !l.stack.packetBottom) {
+		// Only the built-in transparent handler can skip OnWrite: a user
+		// layer may embed PassThrough and override its write transform.
+		// A packet bottom must join: socket Writev sends separate datagrams.
+		n, err = l.lower.Writev(vec)
 	} else {
 		// One write whole, as the socket's Writev is: segments passed one by
 		// one would interleave with another writer's.
