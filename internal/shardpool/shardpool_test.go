@@ -570,9 +570,8 @@ func TestIdleWorkersRetireOverTime(t *testing.T) {
 	receive(t, done, "a task after the burst")
 }
 
-// A host with more than 32 Ps, once its keys are many, has more than 64
-// active shards, past what SubmitBatch's bitmap tracks: it submits one by
-// one instead, and every task still runs.
+// A host with more than 32 Ps can grow beyond the single-word batch bitmap.
+// Every task still runs and reaches its shard across that boundary.
 func TestSubmitBatchOverMoreThan64Shards(t *testing.T) {
 	const procs, total = 40, 400
 	var ran atomic.Int32

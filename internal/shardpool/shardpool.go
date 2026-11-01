@@ -356,14 +356,13 @@ func (pool *Pool[T]) anyQueued() bool {
 	return false
 }
 
-// SubmitBatch queues tasks and notifies each shard they touched once. It does
-// not retain the slice.
+// SubmitBatch queues tasks and notifies each shard they touched once, as
+// Submit does: a batch never waits behind a task its shard's worker is running.
+// It does not retain the slice.
 func (pool *Pool[T]) SubmitBatch(tasks []T) {
 	active := uint32(pool.active.Load())
 	if active > 64 {
-		for _, task := range tasks {
-			pool.Submit(task)
-		}
+		pool.submitWideBatch(tasks, active)
 		return
 	}
 	var touched uint64
@@ -379,6 +378,38 @@ func (pool *Pool[T]) SubmitBatch(tasks []T) {
 		index := bits.TrailingZeros64(touched)
 		touched &= touched - 1
 		pool.shards[index].notify()
+	}
+}
+
+// submitWideBatch keeps batching on hosts with more than 64 active shards.
+// Its fixed scratch covers up to 256 Ps at the pool's widest tier, and is
+// separate so the common single-word path needs no larger stack frame.
+//
+//go:noinline
+func (pool *Pool[T]) submitWideBatch(tasks []T, active uint32) {
+	const limit = 1024
+	if active > limit {
+		for _, task := range tasks {
+			pool.Submit(task)
+		}
+		return
+	}
+	var touched [limit / 64]uint64
+	for _, task := range tasks {
+		index := pool.key(task) % active
+		if !pool.shards[index].push(task) {
+			pool.runOverflow(&pool.shards[index], task)
+			continue
+		}
+		touched[index>>6] |= uint64(1) << (index & 63)
+	}
+	for wordIndex := range (active + 63) / 64 {
+		word := touched[wordIndex]
+		for word != 0 {
+			bit := bits.TrailingZeros64(word)
+			word &= word - 1
+			pool.shards[int(wordIndex)*64+bit].notify()
+		}
 	}
 }
 
