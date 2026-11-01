@@ -883,8 +883,19 @@ func (conn *fdConn) skipsEdge(events poller.Events) bool {
 // its server's: the server's turns read every child's datagrams and run their
 // callbacks.
 func (conn *fdConn) directOwner() bool {
+	// Most external writes arrive while no connection turn is running. Avoid
+	// the relatively expensive goroutine-id lookup in that case; an active
+	// owner is the only state that can make this goroutine's write direct.
+	connectionOwner := conn.ioOwner.Load()
+	serverOwner := int64(0)
+	if conn.udp != nil && conn.udp.server != nil {
+		serverOwner = conn.udp.server.ioOwner.Load()
+	}
+	if connectionOwner == 0 && serverOwner == 0 {
+		return false
+	}
 	owner := currentGoroutineID()
-	return conn.ioOwner.Load() == owner || (conn.udp != nil && conn.udp.server != nil && conn.udp.server.ioOwner.Load() == owner)
+	return connectionOwner == owner || serverOwner == owner
 }
 
 // Readiness bits are the poller's own: noteIO folds them in unchanged.

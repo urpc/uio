@@ -215,7 +215,9 @@ func (c *Conn) readAvailable() error {
 	if c.batching.Load() {
 		c.endWriteBatch()
 	}
-	c.heartbeatTick(time.Now())
+	if c.heartbeat != nil {
+		c.heartbeatTick(time.Now())
+	}
 	return err
 }
 
