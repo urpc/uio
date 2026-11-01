@@ -19,12 +19,61 @@
 package socket
 
 import (
+	"fmt"
 	"syscall"
 	"testing"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+func BenchmarkUDPBatchRoundTrip(b *testing.B) {
+	for _, batchSize := range []int{1, 8, 32, 64} {
+		b.Run(fmt.Sprintf("batch=%d", batchSize), func(b *testing.B) {
+			server, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer unix.Close(server)
+			if err := unix.Bind(server, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+				b.Fatal(err)
+			}
+			bound, err := unix.Getsockname(server)
+			if err != nil {
+				b.Fatal(err)
+			}
+			serverAddr := bound.(*unix.SockaddrInet4)
+
+			client, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+			if err != nil {
+				b.Fatal(err)
+			}
+			defer unix.Close(client)
+			remote := &syscall.SockaddrInet4{Addr: serverAddr.Addr, Port: serverAddr.Port}
+			packets := make([][]byte, batchSize)
+			receives := make([]UDPReceive, batchSize)
+			buffers := make([][]byte, batchSize)
+			for i := range packets {
+				packets[i] = make([]byte, 128)
+				buffers[i] = make([]byte, 128)
+			}
+
+			b.SetBytes(int64(batchSize * 128))
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				sent, err := SendUDPBatch(client, packets, remote)
+				if err != nil || sent != batchSize*128 {
+					b.Fatalf("sendmmsg sent %d/%d: %v", sent, batchSize*128, err)
+				}
+				got, err := RecvUDPBatch(server, buffers, receives)
+				if err != nil || got != batchSize {
+					b.Fatalf("recvmmsg got %d/%d: %v", got, batchSize, err)
+				}
+			}
+		})
+	}
+}
 
 // The port in a raw sockaddr is network order whatever the host's byte
 // order: a fixed byte swap was right on the little-endian architectures and

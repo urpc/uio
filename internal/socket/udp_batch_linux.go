@@ -120,33 +120,18 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	return got, nil
 }
 
-// sendmmsg is the raw syscall: x/sys wraps neither sendmmsg nor recvmmsg.
+// sendmmsg and recvmmsg use the platform wrapper so large Linux hosts can
+// keep non-blocking UDP batches on their current P, while race builds retain
+// the runtime-accounted path.
 func sendmmsg(fd int, messages []mmsghdr) (int, error) {
-	sent, _, errno := unix.Syscall6(unix.SYS_SENDMMSG,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&messages[0])),
-		uintptr(len(messages)),
-		0, 0, 0)
-	if errno != 0 {
-		return int(sent), errno
-	}
-	return int(sent), nil
+	return sendmmsgSyscall(fd, messages)
 }
 
-// recvmmsg is the raw syscall, without a timeout: the sockets wait in the
-// poller, so the call itself never blocks. MSG_TRUNC makes each short buffer
-// report its datagram's original length, where the caller can tell the
-// truncation from a short packet.
+// recvmmsg receives without a timeout: the socket waits in the poller, so
+// the call itself never blocks. MSG_TRUNC preserves the original datagram
+// length for callers that need to detect truncation.
 func recvmmsg(fd int, messages []mmsghdr) (int, error) {
-	got, _, errno := unix.Syscall6(unix.SYS_RECVMMSG,
-		uintptr(fd),
-		uintptr(unsafe.Pointer(&messages[0])),
-		uintptr(len(messages)),
-		uintptr(unix.MSG_TRUNC), 0, 0)
-	if errno != 0 {
-		return int(got), errno
-	}
-	return int(got), nil
+	return recvmmsgSyscall(fd, messages)
 }
 
 // sockaddrName fills storage with remote's raw form and returns the name a
