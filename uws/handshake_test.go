@@ -3,6 +3,7 @@ package uws
 import (
 	"bufio"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -393,6 +394,66 @@ func TestServerNativeOnOpenRequestVisible(t *testing.T) {
 	}
 }
 
+// reuseRequestHandler records each connection's Conn.Request during OnOpen.
+type reuseRequestHandler struct {
+	request chan *http.Request
+	conn    chan *Conn
+}
+
+func (h *reuseRequestHandler) OnOpen(conn *Conn) {
+	h.request <- conn.Request()
+	h.conn <- conn
+}
+
+func (h *reuseRequestHandler) OnMessage(*Conn, Message) {}
+
+func (h *reuseRequestHandler) OnClose(*Conn, CloseEvent) {}
+
+// A native handshake is recycled once OnOpen returns: each connection still
+// sees its own upgrade request during OnOpen, and a request a handler kept
+// stays its own after the state went to the next connection.
+func TestServerNativeRequestSurvivesHandshakeReuse(t *testing.T) {
+	handler := &reuseRequestHandler{
+		request: make(chan *http.Request, 16),
+		conn:    make(chan *Conn, 16),
+	}
+	addr := startNativeTestServer(t, handler, nil)
+	var kept []*http.Request
+	for i := range 8 {
+		client, reader := dialNativeTestServer(t, addr)
+		token := fmt.Sprintf("token-%d", i)
+		request := "GET /n/" + token + " HTTP/1.1\r\nHost: " + addr + "\r\n" +
+			"X-Business-Token: " + token + "\r\n" +
+			"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
+			"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
+		if _, err := client.Write([]byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		if line := readStatusLine(t, reader); !strings.HasPrefix(line, "HTTP/1.1 101 ") {
+			t.Fatalf("handshake response = %q", line)
+		}
+		seen := <-handler.request
+		if seen == nil || seen.Header.Get("X-Business-Token") != token || seen.RequestURI != "/n/"+token {
+			t.Fatalf("connection %d saw request %+v", i, seen)
+		}
+		kept = append(kept, seen)
+		conn := <-handler.conn
+		deadline := time.Now().Add(testIOTimeout())
+		for conn.Request() != nil {
+			if time.Now().After(deadline) {
+				t.Fatal("request retained after OnOpen")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		_ = client.Close()
+	}
+	for i, request := range kept {
+		if token := fmt.Sprintf("token-%d", i); request.Header.Get("X-Business-Token") != token {
+			t.Fatalf("kept request %d now carries %q", i, request.Header.Get("X-Business-Token"))
+		}
+	}
+}
+
 func TestServerNativeRequestWithCheckOrigin(t *testing.T) {
 	handler := &nativeRequestHandler{
 		open:    make(chan struct{}),
@@ -517,5 +578,39 @@ func TestHandshakeOpenStopAndExpiryRace(t *testing.T) {
 		if conn.opened.Load() && raw.closes != 0 {
 			t.Fatalf("iteration %d: opened connection expired", i)
 		}
+	}
+}
+
+// awaitClientHandler holds OnOpen until the test has seen the 101.
+type awaitClientHandler struct{ release chan struct{} }
+
+func (h *awaitClientHandler) OnOpen(*Conn) {
+	select {
+	case <-h.release:
+	case <-time.After(testIOTimeout()):
+	}
+}
+
+func (h *awaitClientHandler) OnMessage(*Conn, Message) {}
+
+func (h *awaitClientHandler) OnClose(*Conn, CloseEvent) {}
+
+// The 101 leaves before OnOpen runs, so an OnOpen that waits on the client —
+// here, for the client to have seen its upgrade accepted — does not hold up
+// the handshake it waits for.
+func TestServerAcceptsUpgradeBeforeOnOpen(t *testing.T) {
+	handler := &awaitClientHandler{release: make(chan struct{})}
+	defer close(handler.release)
+	addr := startNativeTestServer(t, handler, nil)
+	client, reader := dialNativeTestServer(t, addr)
+	request := "GET / HTTP/1.1\r\nHost: " + addr + "\r\n" +
+		"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
+		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
+	if _, err := client.Write([]byte(request)); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(testIOTimeout() / 2))
+	if line := readStatusLine(t, reader); !strings.HasPrefix(line, "HTTP/1.1 101 ") {
+		t.Fatalf("handshake response = %q", line)
 	}
 }

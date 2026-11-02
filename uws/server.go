@@ -201,7 +201,7 @@ func (s *Server) onOpen(raw uio.Conn) {
 		}
 	}
 	conn := s.newConnection(raw)
-	conn.handshake.Store(&handshakeState{})
+	conn.handshake.Store(newServerHandshake())
 	raw.SetUserdata(conn)
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 }

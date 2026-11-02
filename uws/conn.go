@@ -23,6 +23,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
@@ -284,6 +285,64 @@ type handshakeState struct {
 	shard       uint8 // deadline shard the handshake timeout lives in
 	shardSet    bool  // the shard is picked once and then never changes
 	expired     bool
+	pooled      bool // a native server handshake, recycled once OnOpen returns
+}
+
+// serverHandshake is a native server connection's handshake state together
+// with the upgrade request it parses, allocated as one object and recycled
+// once OnOpen returns, so accepting a connection costs neither of them.
+type serverHandshake struct {
+	state   handshakeState
+	request handshake.Request
+}
+
+var serverHandshakes = sync.Pool{New: func() any { return new(serverHandshake) }}
+
+// maxPooledHandshakeData bounds the gathered header bytes a recycled
+// handshake keeps the buffer of: a split upgrade request is rare, and a large
+// one is not worth holding on to.
+const maxPooledHandshakeData = 4 << 10
+
+func newServerHandshake() *handshakeState {
+	h := serverHandshakes.Get().(*serverHandshake)
+	h.state.pooled = true
+	return &h.state
+}
+
+// requestSlot returns the request a parsed upgrade is kept in: the pooled
+// handshake's own, or a new one.
+func (state *handshakeState) requestSlot() *handshake.Request {
+	if state.pooled {
+		return &(*serverHandshake)(unsafe.Pointer(state)).request
+	}
+	return new(handshake.Request)
+}
+
+// recycle returns a pooled handshake its connection no longer publishes. A
+// goroutine that loaded it before then — a handshake deadline, or a
+// Conn.Request racing OnOpen's return — takes mu and finds its connection's
+// handshake gone, and reads nothing else; mu itself is never reset.
+func (state *handshakeState) recycle() {
+	if !state.pooled {
+		return
+	}
+	h := (*serverHandshake)(unsafe.Pointer(state))
+	state.mu.Lock()
+	data := state.data[:0]
+	if cap(data) > maxPooledHandshakeData {
+		data = nil
+	}
+	state.data = data
+	state.upgrade = nil
+	state.request = nil
+	state.clientKey = ""
+	state.contextStop = nil
+	state.cleanup = nil
+	state.epoch++
+	state.shard, state.shardSet, state.expired = 0, false, false
+	h.request = handshake.Request{}
+	state.mu.Unlock()
+	serverHandshakes.Put(h)
 }
 
 // LocalAddr returns the local transport address.
@@ -348,15 +407,18 @@ func (c *Conn) Request() *http.Request {
 	if c == nil {
 		return nil
 	}
-	return handshakeHTTPRequest(c.handshake.Load())
+	return c.handshakeHTTPRequest(c.handshake.Load())
 }
 
-func handshakeHTTPRequest(state *handshakeState) *http.Request {
+func (c *Conn) handshakeHTTPRequest(state *handshakeState) *http.Request {
 	if state == nil {
 		return nil
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if c.handshake.Load() != state {
+		return nil // OnOpen returned meanwhile; the state may be another's now
+	}
 	if state.upgrade != nil {
 		return state.upgrade.request.HTTP
 	}

@@ -200,8 +200,8 @@ func (c *Conn) ensureHandshakeState() *handshakeState {
 }
 
 func (c *Conn) releaseHandshakeState(state *handshakeState) {
-	if state != nil {
-		c.handshake.CompareAndSwap(state, nil)
+	if state != nil && c.handshake.CompareAndSwap(state, nil) {
+		state.recycle()
 	}
 }
 
@@ -615,7 +615,9 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	// the state when the callback returns.
 	state.mu.Lock()
 	if c.handshake.Load() == state {
-		state.request = &req
+		slot := state.requestSlot()
+		*slot = req
+		state.request = slot
 	}
 	state.mu.Unlock()
 	protocol := handshake.SelectSubprotocol(req.Subprotocols, c.config.subprotocols)
