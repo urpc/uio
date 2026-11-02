@@ -360,22 +360,23 @@ var lingerTimeout = LingerTimeout
 
 // commonConn contains transport-independent identity and inbound storage.
 // inboundTail is a borrowed current-read slice; inbound owns only bytes that a
-// callback left unread before that slice had to be reused. Fields every data
-// callback touches come first so they share a cache line; the addresses are
-// read only on request.
+// callback left unread before that slice had to be reused. The fields that
+// rarely change come first: a native connection puts them on the cache line a
+// poller reads for every event (see fdConn), away from the inbound state its
+// turns write. The remote address is read only on request.
 type commonConn struct {
-	loop  *eventLoop // event loop
-	entry *entry     // this connection's endpoint: its Events, callbacks and chain
-	inboundScope
-	userdata    atomic.Pointer[any]     // user-defined data; see Conn.SetUserdata
-	inboundTail []byte                  // inbound tail buffer
-	inbound     bytebuf.CompositeBuffer // inbound buffer
+	loop     *eventLoop          // event loop
+	entry    *entry              // this connection's endpoint: its Events, callbacks and chain
+	userdata atomic.Pointer[any] // user-defined data; see Conn.SetUserdata
 	// addr carries the address objects LocalAddr and RemoteAddr hand back.
 	// Accepted connections share the listener's single pair, and a connection
 	// whose peer is not an IP address (Unix sockets) gets its own pair through
 	// copy-on-write, so a shared pair is never mutated in place.
-	addr       *addrPair
-	remoteAddr netip.AddrPort // IP peer address, kept by value
+	addr *addrPair
+	inboundScope
+	inboundTail []byte                  // inbound tail buffer
+	inbound     bytebuf.CompositeBuffer // inbound buffer
+	remoteAddr  netip.AddrPort          // IP peer address, kept by value
 }
 
 // addrPair holds the address objects a connection returns for LocalAddr and

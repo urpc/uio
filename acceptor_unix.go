@@ -52,22 +52,38 @@ type listener struct {
 	udpSvr  *fdConn        // udp server
 	loop    *eventLoop     // the loop that accepts on a stream listener
 
-	// userdata is every accepted connection's initial Userdata.
-	userdata any
+	// userdata is every accepted connection's initial Userdata, and
+	// userdataBox the boxed value the connections share, so accepting one
+	// allocates no box of its own: a connection's SetUserdata stores a new box,
+	// so the shared one is never written.
+	userdata    any
+	userdataBox *any
+	// acceptLocal keeps what this listener accepts on its own loop: its
+	// ReusePort group gives every loop a listener, the kernel spreads the
+	// connections over them, and the connection is registered with the
+	// poller of the loop whose runner accepted it. See addGroupLocked.
+	acceptLocal bool
 	// entry is what every connection this listener accepts runs: its
 	// callbacks and chain.
 	entry   *entry
 	started bool // registered with its loop; guarded by acceptor.mux
-	// The gate counts the waiters accepting on the listener. A waiter may
-	// have looked l up just before it left its loop, so its descriptor is
-	// closed only after retire returns: closed earlier, the number could be
-	// reused by another socket that waiter would then accept on.
+	// The gate counts the accepts in progress on the listener. Its loop's
+	// accept runner may have looked l up just before it left the loop, so
+	// its descriptor is closed only after retire returns: closed earlier, the
+	// number could be reused by another socket the runner would then accept
+	// on.
 	descriptorGate
 	// acceptPaused marks a stream listener taken out of its poller after an
 	// accept ran out of descriptors or memory, and acceptDelay is the pause
 	// that took, zero again once an accept succeeds; see pauseAccept.
 	acceptPaused atomic.Bool
 	acceptDelay  atomic.Int64
+	// acceptState is the listener's hand-over to its loop's acceptRunner:
+	// acceptIdle, acceptRunning or acceptAgain.
+	acceptState atomic.Int32
+	// controlled records a SocketControl run on the listening socket, whose
+	// options the accepted sockets inherit; they close in their own turns.
+	controlled bool
 }
 
 // descriptorGate counts the goroutines using a descriptor, below a closed
@@ -132,8 +148,8 @@ func (g *descriptorGate) waitDrain(within time.Duration) bool {
 }
 
 // acceptor owns the listeners. Stream listeners are spread over the event
-// loops, whose waiters accept on them; a UDP listener is a connection of its
-// own, whose turns read every peer's datagrams.
+// loops, whose accept runners accept on them; a UDP listener is a connection
+// of its own, whose turns read every peer's datagrams.
 type acceptor struct {
 	mux       sync.Mutex
 	listeners map[int]*listener
@@ -153,10 +169,16 @@ var listenersOverride int
 // accepting work — a few microseconds of accept and hand-off per connection —
 // over more loops. The count grows with the machine, capped where a
 // connection's own accept cost stops being the scarce resource and each
-// listener's share would shrink its batches.
-func reusePortListeners(procs int) int {
+// listener's share would shrink its batches. A wide host gives every loop a
+// listener: its loops' waiters each block on a poller of their own, and with
+// four listeners over eight loops the accepting four held a connection-churn
+// load 7-9% below one listener per loop.
+func reusePortListeners(procs, loops int) int {
 	if listenersOverride > 0 {
 		return listenersOverride
+	}
+	if procs >= wideHostProcs && loops > 0 {
+		return loops
 	}
 	return min(max(2, procs/12), 4)
 }
@@ -202,7 +224,7 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 
 	count := 1
 	if ld.events.ReusePort && l.tcp {
-		count = reusePortListeners(runtime.GOMAXPROCS(0))
+		count = reusePortListeners(runtime.GOMAXPROCS(0), len(ld.events.loops))
 	}
 	// The others bind the concrete address l resolved, so a port of zero
 	// still yields one shared port. The scheme goes along: without it the
@@ -248,6 +270,10 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 	}
 	for _, l := range group {
 		l.userdata = userdata
+		if userdata != nil {
+			box := userdata
+			l.userdataBox = &box
+		}
 		if l.udp != nil {
 			family, err := socket.SocketFamily(l.fd)
 			if err != nil {
@@ -280,6 +306,16 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			ld.assignLoop(l)
 		}
 		ld.listeners[l.fd] = l
+	}
+	// A stream group with a listener per loop covers every loop once, since
+	// assignLoop goes round them in turn. Registering an accepted connection
+	// on another loop's poller contends with that loop's waiter for the
+	// poller's lock; a connection-churn load at 4096 connections ran 10%
+	// faster with each listener's connections kept on its own loop.
+	if loops := len(ld.events.loops); reusePortBalances && loops > 1 && len(group) == loops && group[0].udp == nil {
+		for _, l := range group {
+			l.acceptLocal = true
+		}
 	}
 	return nil
 }
@@ -343,7 +379,7 @@ func (ld *acceptor) startLocked(l *listener) error {
 
 // stopLocked takes l out of the registry and releases it while Serve runs;
 // it requires ld.mux. A stream listener leaves its loop first, and its
-// descriptor closes only once no waiter accepts on it any more. A UDP
+// descriptor closes only once no accept is in progress on it any more. A UDP
 // listener's server connection closes in its own turn, and its peers with it;
 // its socket may close sooner, see closeGroup.
 func (ld *acceptor) stopLocked(l *listener) {
@@ -437,8 +473,8 @@ func (ld *acceptor) closeListener(l *listener) {
 	}
 }
 
-// close releases every listener. Serve calls it after the loops' waiters have
-// returned, so nothing accepts on a listener it closes.
+// close releases every listener. Serve calls it after the loops' waiters and
+// accept runners have returned, so nothing accepts on a listener it closes.
 func (ld *acceptor) close() {
 	ld.mux.Lock()
 	// User OnClose callbacks run while closing UDP children, so release the
@@ -472,6 +508,7 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	if ld.events != nil {
 		l.entry = ld.events.plainEntry()
 	}
+	l.controlled = control != nil
 	lnConfig := netListenConfigFor(reusePort, control)
 
 	switch u.Scheme {

@@ -104,7 +104,11 @@ const (
 	// its shard before another worker is brought in for them.
 	watchTick      = time.Millisecond
 	watchIdleTicks = 50
-	idleTicks      = int64(MaxIdle / janitorTick)
+	// rescueEvery spaces Rescue's scans, and rescueStalls is how many scans
+	// in a row must find a queue stalled before Rescue brings it a worker.
+	rescueEvery  = int64(time.Millisecond)
+	rescueStalls = 2
+	idleTicks    = int64(MaxIdle / janitorTick)
 )
 
 // Pool runs tasks of type T. Create it with New.
@@ -125,6 +129,8 @@ type Pool[T any] struct {
 	_        [cacheLineSize - 4]byte
 	stopped  atomic.Bool
 	clock    atomic.Int64 // janitor ticks, read when a worker parks
+	rescueAt atomic.Int64 // the caller's clock at the last Rescue scan
+	rescuing atomic.Bool  // a Rescue scan is running; it alone touches rescueHead
 	done     chan struct{}
 	janitor  sync.Once      // started with the first shard that grows past one worker
 	workers  sync.WaitGroup // every started worker until it exits
@@ -163,7 +169,12 @@ type shard[T any] struct {
 	mu        sync.Mutex
 	idle      []*worker[T] // parked workers, the most recently parked last
 	live      int32        // started workers not yet exited; guarded by mu
-	_         [cacheLineSize]byte
+	// rescueHead is head at the last Rescue scan and stalls the scans in a
+	// row that found the queue stalled; only a scan touches them, one at a
+	// time (see Pool.rescuing).
+	rescueHead uint64
+	stalls     int32
+	_          [cacheLineSize]byte
 }
 
 // slot is one cell of a shard's queue: seq equal to the position means it can
@@ -489,6 +500,62 @@ func (s *shard[T]) notify() bool {
 		}
 	}
 	return false
+}
+
+// Rescue brings a worker to a shard whose queue has stalled: it held tasks
+// through rescueStalls scans in a row without moving, with no worker draining
+// it while one woken for it had not arrived. The runtime queues a woken
+// goroutine on its waker's P, behind the goroutine running there, and a
+// worker draining a busy shard can hold that P for up to 10ms: on a 64-P host
+// at 16384 echoing connections such stalls put the 99th percentile round trip
+// near 60ms. One worker per scan is brought in, so the caller's P, where they
+// queue, runs it next instead of stacking them as the stall did; with that,
+// scans a millisecond apart brought the 99th percentile to 26-31ms and cost
+// no throughput. now is the caller's clock; scans are at least rescueEvery
+// apart and never overlap. Rescue reports whether it brought in a worker,
+// which the caller should yield for.
+func (pool *Pool[T]) Rescue(now int64) bool {
+	last := pool.rescueAt.Load()
+	if now-last < rescueEvery || !pool.rescuing.CompareAndSwap(false, true) {
+		return false
+	}
+	defer pool.rescuing.Store(false)
+	if !pool.rescueAt.CompareAndSwap(last, now) {
+		return false
+	}
+	woke := false
+	for i := range pool.shards[:pool.active.Load()] {
+		s := &pool.shards[i]
+		head := s.head.Load()
+		if head != s.rescueHead {
+			s.rescueHead = head
+			s.stalls = 0
+			continue
+		}
+		if !s.hasTask() {
+			if s.stalls != 0 {
+				s.stalls = 0
+			}
+			continue
+		}
+		if s.stalls++; woke || s.stalls < rescueStalls || s.running.Load() != 0 || s.coming.Load() == 0 {
+			continue
+		}
+		s.stalls = 0
+		s.coming.Add(1)
+		if s.wakeIdle(s) || s.start(s) || pool.borrow(s) {
+			woke = true
+			continue
+		}
+		// Submitters and the worker that was coming skipped their notify
+		// while this count was raised: take their part now. A worker that
+		// brings in counts as this scan's.
+		s.coming.Add(-1)
+		if s.notify() {
+			woke = true
+		}
+	}
+	return woke
 }
 
 // wakeIdle sends the most recently parked worker of s, whose stack is the

@@ -576,6 +576,11 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   leftover output as `UnflushedError` appended to the cause. A `CloseWith`
   ends the wait at once.
 - `OnBytesWritten` can run concurrently with the connection's other callbacks.
+- `OnClose` means the connection is released, not that its socket is closed.
+  With `GOMAXPROCS` of 33 or more, or `Pollers` above 8, an accepted
+  connection's socket is closed on a goroutine of its event loop, so the peer
+  can see the end shortly after `OnClose`. A positive `SetLinger`, a `Control`
+  call or a listener `SocketControl` keeps the close before `OnClose`.
 - `Events.Close` only requests shutdown and returns at once; `Serve` returns
   once everything has stopped, or call `Events.Wait` from another goroutine.
 - `Dial` blocks the goroutine that calls it. From a callback, prefer dialing on

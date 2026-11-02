@@ -63,6 +63,11 @@ func loopWaiters(procs, loops int) int {
 	if loopWaitersOverride > 0 {
 		return loopWaitersOverride
 	}
+	if procs >= wideHostProcs {
+		// A wide host's loops each run one waiter: a second one on the
+		// same poller split its batches and cost echo 5-10% at 48 Ps.
+		return 1
+	}
 	if procs < 4 {
 		// One or two Ps run a single loop, and its waiters are what feed
 		// the executor: a lone waiter's next hand-off waits for that waiter
@@ -76,6 +81,16 @@ func loopWaiters(procs, loops int) int {
 	}
 	return max(1, max(2, procs/4)/loops)
 }
+
+// wideHostProcs is the smallest GOMAXPROCS treated as a wide host. There a
+// loop runs one waiter that blocks in the kernel, every loop accepts on a
+// listener of its own, and connections close on a goroutine of their loop
+// (see eventLoop.deferClose). Measured on a 96-core host at 48 Ps, against
+// the parked or adaptive wait the narrower sizing picks: echo +30-40% and
+// churn +35%. At 40 Ps blocking still won (echo at 512 connections +18%,
+// churn +31%); at 32 the parked wait kept a small lead on echo, and at 24 it
+// led by 4-6%, as on the 24-P host it was tuned on.
+const wideHostProcs = 33
 
 // parkedWaiters is the most waiters that still benefit from a parked wait.
 // The runtime's netpoller wakes a parked goroutine only when a P runs out of
@@ -133,7 +148,7 @@ const (
 // everything else parks.
 func loopWaitMode(procs, loops, waiters int) waitMode {
 	switch {
-	case waiters*loops > parkedWaiters:
+	case procs >= wideHostProcs, waiters*loops > parkedWaiters:
 		return waitBlock
 	case waiters == 1 && procs >= adaptiveMinProcs:
 		return waitAdaptive
@@ -150,8 +165,8 @@ const flushEvery = 16
 
 // eventLoop is one poller and the goroutines that wait on it. Connections,
 // stream listeners and UDP sockets are spread over the loops in turn; a
-// loop's waiters collect their readiness, accept on its listeners, and hand
-// runnable connections to the executor. A waiter never
+// loop's waiters collect their readiness, hand its listeners' to the loop's
+// acceptRunner, and hand runnable connections to the executor. A waiter never
 // runs a callback and never waits for a connection: everything a connection
 // does, its registration and its close included, happens in its own turn.
 // The fd table is process-wide, so every loop resolves events through the
@@ -193,6 +208,12 @@ type eventLoop struct {
 	// reaching a listener before OnStart returns. Only create/close use it.
 	udpMu      sync.Mutex
 	udpServers map[*fdConn]struct{}
+
+	// accepts accepts on the loop's listeners. closer closes the
+	// descriptors its turns release where its waiters block in the kernel,
+	// and is nil elsewhere; see deferClose.
+	accepts *acceptRunner
+	closer  *loopCloser
 }
 
 // loopWaiter is one waiter goroutine's private dispatch state.
@@ -209,9 +230,13 @@ type loopWaiter struct {
 	adaptive bool
 	quiet    int
 
-	// accepted counts the connections the waiter accepted, which go round
-	// the loops in turn (see Events.loopAt); a count of its own keeps the
-	// accepting waiters off one shared counter.
+	// rescueIn counts down the rounds to the next look for stalled turn
+	// queues; see ioTaskPool.rescue.
+	rescueIn int
+
+	// accepted counts the connections an accept runner's scratch accepted,
+	// which go round the loops in turn (see Events.loopAt); a count of its
+	// own keeps the runners off one shared counter.
 	accepted uint32
 }
 
@@ -354,6 +379,10 @@ func (loop *eventLoop) newWaiter() *loopWaiter {
 
 // start runs count waiters on the poller, waiting as mode says.
 func (loop *eventLoop) start(count int, mode waitMode, lockOSThread bool) {
+	loop.accepts = newAcceptRunner(loop)
+	if mode == waitBlock {
+		loop.closer = newLoopCloser()
+	}
 	// A waiter yields unless it is the process's only one.
 	yield := count > 1 || len(loop.events.loops) > 1
 	for range count {
@@ -414,16 +443,22 @@ func (loop *eventLoop) serve(waiter *loopWaiter, yield bool) error {
 		if loop.submit(waiter) {
 			submitted = true
 		}
+		if waiter.rescueIn--; waiter.rescueIn <= 0 {
+			waiter.rescueIn = rescueRounds
+			if loop.ioPool.rescue() {
+				submitted = true
+			}
+		}
 		if submitted && yield {
 			runtime.Gosched()
 		}
 	}
 }
 
-// dispatch folds readiness into the connections it names and accepts on the
-// listeners it names, handing runnable connections over every flushEvery
-// events. It reports whether anything was submitted before the trailing
-// submit, so serve keeps yielding for the workers it woke.
+// dispatch folds readiness into the connections it names and hands the
+// listeners it names to the accept runner, handing runnable connections over
+// every flushEvery events. It reports whether anything was submitted before
+// the trailing submit, or the runner woken, so serve yields for them.
 //
 // A connection's events carry the tag it was registered with where the
 // backend reports one: its descriptor may have been closed, and the number
@@ -436,11 +471,10 @@ func (loop *eventLoop) dispatch(waiter *loopWaiter, events []poller.Event) bool 
 	for _, event := range events {
 		if event.Tag == 0 {
 			if l := loop.listener(event.FD); l != nil {
-				if err := loop.accept(l, waiter); err != nil {
-					loop.events.initiateClose(err)
+				if loop.accepts.handOff(l) {
+					// Yielding runs the runner at once.
+					submitted = true
 				}
-				submitted = loop.submit(waiter) || submitted
-				countdown = flushEvery
 				continue
 			}
 		}
@@ -493,8 +527,7 @@ func (loop *eventLoop) listener(fd int) *listener {
 	return nil
 }
 
-// addListener starts accepting on l. Listener readiness is level-triggered,
-// so a backlog left after one bounded batch is reported again.
+// addListener starts accepting on l.
 func (loop *eventLoop) addListener(l *listener) error {
 	var next []*listener
 	if current := loop.listeners.Load(); current != nil {
@@ -502,11 +535,17 @@ func (loop *eventLoop) addListener(l *listener) error {
 	}
 	next = append(next, l)
 	loop.listeners.Store(&next)
-	if err := loop.poller.Add(l.fd, poller.Readable); err != nil {
+	if err := loop.watchListener(l); err != nil {
 		loop.removeListener(l)
 		return err
 	}
 	return nil
+}
+
+// watchListener registers l with the poller, edge-triggered: the accept
+// runner accepts until the socket would block.
+func (loop *eventLoop) watchListener(l *listener) error {
+	return loop.poller.Register(l.fd, poller.Readable, true, 0)
 }
 
 // removeListener stops accepting on l. Its descriptor is a duplicate of the
@@ -566,33 +605,39 @@ func (loop *eventLoop) resumeAccept(l *listener) {
 	if loop.listener(l.fd) != l {
 		return
 	}
-	_ = loop.poller.Add(l.fd, poller.Readable)
+	_ = loop.watchListener(l)
+	// Take the backlog now rather than wait for its edge: an accept that
+	// paused again while this pause ran out may have left l registered, and
+	// then registering it reports nothing.
+	if loop.accepts != nil {
+		loop.accepts.handOff(l)
+	}
 }
 
-// accept takes a bounded batch of connections from l and queues each one's
-// first turn on the waiter, which hands them over with the readiness it
-// collected. The bound keeps a busy listener from holding up the other
-// events of this loop for long; the level-triggered listener reports the rest
-// again.
-func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
+// accept takes a bounded batch of connections from l for the accept runner
+// and queues each one's first turn on scratch, which the runner hands over
+// before the next batch, so the first connections of a burst do not wait for
+// its last. more reports a batch that ended at the bound rather than at a
+// socket that would block, a pause or a closing listener.
+func (loop *eventLoop) accept(l *listener, scratch *loopWaiter) (more bool, err error) {
 	if !l.enter() {
-		return nil // closing: its descriptor may close once nobody accepts
+		return false, nil // closing: its descriptor may close once nobody accepts
 	}
 	defer l.leave()
 	for range acceptBatchSize {
-		nfd, sa, err := socket.Accept(l.fd)
+		nfd, peer, sa, err := socket.AcceptPeer(l.fd, l.tcp)
 		if err != nil {
 			if isWouldBlock(err) {
-				return nil
+				return false, nil
 			}
 			switch socket.ClassifyAcceptError(err) {
 			case socket.AcceptRetry:
 				continue
 			case socket.AcceptBackoff:
 				loop.pauseAccept(l)
-				return nil
+				return false, nil
 			}
-			return err
+			return false, err
 		}
 		if l.acceptDelay.Load() != 0 {
 			l.acceptDelay.Store(0)
@@ -600,22 +645,31 @@ func (loop *eventLoop) accept(l *listener, waiter *loopWaiter) error {
 		conn := &fdConn{}
 		conn.entry = l.entry
 		conn.fd = int32(nfd)
-		conn.loop = loop.events.loopAt(waiter.accepted)
-		waiter.accepted++
+		if !l.controlled {
+			conn.flags.Store(offTurnCloseFlag)
+		}
+		if l.acceptLocal {
+			conn.loop = loop
+		} else {
+			conn.loop = loop.events.loopAt(scratch.accepted)
+			scratch.accepted++
+		}
 		conn.addr = l.pair
-		conn.SetUserdata(l.userdata)
+		if l.userdataBox != nil {
+			conn.userdata.Store(l.userdataBox)
+		}
 		if l.tcp {
-			conn.remoteAddr = socket.SockaddrToAddrPort(sa)
+			conn.remoteAddr = peer
 		} else {
 			// Unix peers keep their address object; only IP peers have a
 			// value form.
 			conn.setRemoteAddr(socket.SockaddrToAddr(sa, false))
 		}
 		if conn.admitAccepted(l.tcp) {
-			waiter.ready = append(waiter.ready, conn)
+			scratch.ready = append(scratch.ready, conn)
 		}
 	}
-	return nil
+	return true, nil
 }
 
 // registerConn watches a dialed or adopted connection on the caller's
@@ -789,8 +843,16 @@ func (loop *eventLoop) shutdown(err error) {
 	}
 }
 
-// closePoller stops the loop's waiters and waits for them to return.
+// closePoller stops the loop's waiters and waits for them to return, and
+// closes the descriptors its closer still holds; turns that release a
+// connection from then on close its descriptor themselves.
 func (loop *eventLoop) closePoller(err error) {
 	_ = loop.poller.Close(err)
 	loop.waiters.Wait()
+	if loop.accepts != nil {
+		loop.accepts.stop()
+	}
+	if loop.closer != nil {
+		loop.closer.stop()
+	}
 }

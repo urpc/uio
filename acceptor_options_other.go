@@ -27,3 +27,7 @@ const inheritAcceptedOptions = false
 
 // setListenerOptions has nothing to arm here.
 func setListenerOptions(net.Listener) {}
+
+// reusePortBalances is false here: the BSDs hand a SO_REUSEPORT group's
+// connections to one of its sockets rather than spreading them.
+const reusePortBalances = false

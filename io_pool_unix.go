@@ -23,6 +23,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/urpc/uio/internal/shardpool"
 )
@@ -103,6 +104,23 @@ func (pool *ioTaskPool) connClosed() {
 	if pool.writes != nil {
 		pool.writes.RemoveKey()
 	}
+}
+
+// rescueRounds is how many rounds a waiter collects between looks for turn
+// queues stalled behind a worker that has not arrived; the pool itself spaces
+// its scans by time (see shardpool.Pool.Rescue).
+const rescueRounds = 16
+
+// rescueEpoch is the origin of the monotonic clock rescue passes the pool.
+var rescueEpoch = time.Now()
+
+// rescue lets the owned scheduler bring workers to turn queues whose woken
+// worker is stuck behind another goroutine. It reports whether it woke one.
+func (pool *ioTaskPool) rescue() bool {
+	if pool == nil || pool.turns == nil {
+		return false
+	}
+	return pool.turns.Rescue(int64(time.Since(rescueEpoch)))
 }
 
 // submitWrite schedules one write turn. Unlike connection turns, a refused

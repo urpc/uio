@@ -2457,11 +2457,17 @@ func TestEventAndListenerHelperBranches(t *testing.T) {
 		t.Fatal("admitAccepted accepted a connection without a loop")
 	}
 
-	// A listener's accept error closes the Events.
+	// A listener's accept error, met by the loop's accept runner, closes the
+	// Events.
 	badEvents := &Events{}
 	bad := &eventLoop{events: badEvents, fdMap: newFdMap()}
 	bad.listeners.Store(&[]*listener{{fd: -1}})
+	bad.accepts = newAcceptRunner(bad)
 	bad.dispatch(&loopWaiter{}, []poller.Event{{FD: -1, Events: poller.ReadEvents}})
+	for deadline := time.Now().Add(5 * time.Second); !badEvents.closing.Load() && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	bad.accepts.stop()
 	if !badEvents.closing.Load() {
 		t.Fatal("accept error did not close Events")
 	}

@@ -47,10 +47,13 @@ import (
 // sent by a write turn that runs beside the reading one.
 //
 // The declaration order packs the state exactly into the 256-byte size class
-// whose objects are cache-line aligned: the descriptor and the turn's byte
-// fields share one word, the four 32-bit words close the struct, and
-// everything wider sits between them with no padding. Do not add or reorder a
-// field without checking TestUnixConnectionColdStateIsLazy.
+// whose objects are cache-line aligned. The first line holds what a poller
+// reads and writes for every event it dispatches — the descriptor, its
+// registration tag, the read flags, the close phase and the scheduling word,
+// then commonConn's loop, entry, userdata and addresses — so dispatching an
+// event touches one line, and the turn's own state, written on every turn by
+// another CPU, stays off it. Do not add or reorder a field without checking
+// TestUnixConnectionColdStateIsLazy.
 const (
 	// readStalledFlag marks ET read work owed after a yield or a read round
 	// that ran out of budget.
@@ -68,13 +71,25 @@ const (
 	// removes this socket's poller registration before closing its original
 	// descriptor, since an alias can keep the socket alive beyond that close.
 	controlAliasFlag
+	// offTurnCloseFlag marks an accepted descriptor whose close cannot block,
+	// so it may close on the loop's closer (see eventLoop.deferClose). The
+	// accept sets it unless the listener ran a SocketControl; SetLinger with a
+	// linger time and Control clear it, as a lingering close would hold up
+	// every other descriptor the closer has queued.
+	offTurnCloseFlag
 )
 
 type fdConn struct {
+	fd int32
+	// taskState coalesces readiness and synthetic events in its low bits and
+	// carries, in its top bit, the claim that exactly one task is queued or
+	// running: a producer sets both with one atomic and only the first setter
+	// submits, and the running turn keeps the bit while it takes the events.
+	taskState atomic.Uint32
+	pollTag   atomic.Uint32 // registration generation echoed by the poller
+	flags     atomic.Uint32 // readStalledFlag, readHeldFlag; see below
+	close     connCloseState
 	commonConn
-	fd       int32
-	turn     uint8 // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
-	internal bool  // framework-owned endpoint, not a user connection
 
 	ioOwner atomic.Int64 // current task goroutine, zero while idle
 	pending atomic.Int64 // accepted payload not yet written
@@ -82,7 +97,6 @@ type fdConn struct {
 	// submitMu orders cross-goroutine submissions and protects outbound while a
 	// worker round and an external producer overlap.
 	submitMu sync.Mutex
-	close    connCloseState
 	outbound bytebuf.CompositeBuffer // protected by submitMu
 	udp      *unixUDPState           // nil for stream connections
 
@@ -103,14 +117,9 @@ type fdConn struct {
 	// the round ends; see ReserveOutbound. It belongs to the turn.
 	scratch *readBuffer
 
-	// taskState coalesces readiness and synthetic events in its low bits and
-	// carries, in its top bit, the claim that exactly one task is queued or
-	// running: a producer sets both with one atomic and only the first setter
-	// submits, and the running turn keeps the bit while it takes the events.
-	taskState  atomic.Uint32
 	writeState atomic.Uint32 // send state and the write claim; see writeOwnerFlag
-	pollTag    atomic.Uint32 // registration generation echoed by the poller
-	flags      atomic.Uint32 // readStalledFlag, readHeldFlag; see below
+	turn       uint8         // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
+	internal   bool          // framework-owned endpoint, not a user connection
 }
 
 // unixUDPState contains fields that TCP connections never use. A UDP
@@ -1360,6 +1369,12 @@ func (conn *fdConn) closeUnregistered() {
 	}
 }
 
+// closesOffTurn reports a descriptor the loop's closer may close: accepted,
+// with no linger time set and no Control run on it.
+func (conn *fdConn) closesOffTurn() bool {
+	return conn.flags.Load()&(controlAliasFlag|offTurnCloseFlag) == offTurnCloseFlag
+}
+
 func (conn *fdConn) SetLinger(seconds int) error {
 	return conn.setSocketOption(optionLinger, seconds)
 }
@@ -1459,6 +1474,7 @@ func (conn *fdConn) applyControl(fn func(fd uintptr)) error {
 		return net.ErrClosed
 	}
 	defer gate.leave()
+	conn.descriptorOwner().flags.And(^offTurnCloseFlag)
 	fn(uintptr(conn.fd))
 	return nil
 }
@@ -1559,6 +1575,9 @@ func (conn *fdConn) applySocketOption(kind socketOptionKind, value int) error {
 	defer gate.leave()
 	switch kind {
 	case optionLinger:
+		if value > 0 {
+			conn.flags.And(^offTurnCloseFlag)
+		}
 		return socket.SetLinger(int(conn.fd), value)
 	case optionNoDelay:
 		return socket.SetNoDelay(int(conn.fd), value != 0)
@@ -2295,7 +2314,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 			conn.loop.forget(conn)
 			if conn.udp != nil && conn.udp.file != nil {
 				_ = conn.udp.file.Close()
-			} else {
+			} else if !conn.closesOffTurn() || !conn.loop.deferClose(int(conn.fd)) {
 				_ = syscall.Close(int(conn.fd))
 			}
 		}

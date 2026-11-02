@@ -132,7 +132,8 @@ type Handler interface {
 	OnOpen(*Conn)
 	// OnMessage receives complete messages in wire order.
 	OnMessage(*Conn, Message)
-	// OnClose is called once after the transport closes. A client handshake
-	// failure may call it without a preceding OnOpen.
+	// OnClose is called once after the transport is released. A client
+	// handshake failure may call it without a preceding OnOpen. The socket
+	// itself may close shortly after; see uio.Handler's OnClose.
 	OnClose(*Conn, CloseEvent)
 }

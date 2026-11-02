@@ -48,6 +48,15 @@ type Handler interface {
 	// OnOpen or OnRead callback; only a connection that got OnOpen gets it.
 	// Close only requests the close: the connection is released, and OnClose
 	// runs, once the callback that closed it has returned.
+	//
+	// OnClose reports the connection released, not its socket closed. Where
+	// the native backend's event loops block in the kernel — GOMAXPROCS of 33
+	// or more, or Pollers above 8 — an accepted connection's socket is closed
+	// on a goroutine of its loop, so the peer can see the end shortly after
+	// OnClose ran; its descriptor number is not reused before then. A
+	// connection with a positive linger time (SetLinger), one that ran
+	// Control, and one accepted from a listener with a SocketControl close
+	// their socket before OnClose, as do dialed and adopted connections.
 	OnClose(c Conn, err error)
 }
 

@@ -630,6 +630,57 @@ func TestAcceptedConnectionsGoRoundTheLoops(t *testing.T) {
 	}
 }
 
+// A ReusePort group with a listener per loop keeps what each listener
+// accepts on its own loop; the kernel spreads connections over the group.
+func TestReusePortGroupAcceptsOnItsOwnLoops(t *testing.T) {
+	if !reusePortBalances {
+		t.Skip("this kernel does not spread a SO_REUSEPORT group's connections")
+	}
+	if procs := runtime.GOMAXPROCS(0); procs < 4 {
+		runtime.GOMAXPROCS(4)
+		t.Cleanup(func() { runtime.GOMAXPROCS(procs) })
+	}
+	listenersOverride = 4
+	t.Cleanup(func() { listenersOverride = 0 })
+	const conns = 64
+	opened := make(chan *fdConn, conns)
+	events := &Events{Pollers: 4, ReusePort: true}
+	funcs(events).Open = func(c Conn) { opened <- c.(*fdConn) }
+	addr := startEchoEvents(t, events)
+	byLoop := map[*eventLoop]bool{}
+	for _, l := range events.acceptor.listeners {
+		if !l.acceptLocal {
+			t.Fatalf("a listener of a group covering every loop does not accept locally")
+		}
+		byLoop[l.loop] = true
+	}
+	if len(byLoop) != 4 {
+		t.Fatalf("the group's listeners sit on %d loops, want 4", len(byLoop))
+	}
+	perLoop := map[*eventLoop]int{}
+	for range conns {
+		client, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer client.Close()
+		select {
+		case conn := <-opened:
+			perLoop[conn.loop]++
+		case <-time.After(5 * time.Second):
+			t.Fatal("connection was not opened")
+		}
+	}
+	for loop := range perLoop {
+		if !byLoop[loop] {
+			t.Fatalf("a connection went to a loop without a listener")
+		}
+	}
+	if len(perLoop) < 2 {
+		t.Fatalf("all %d connections landed on one loop: %v", conns, perLoop)
+	}
+}
+
 // TestSelectLoopGoesRoundTheLoops pins the same spread for connections that
 // are dialed or adopted rather than accepted.
 func TestSelectLoopGoesRoundTheLoops(t *testing.T) {
@@ -679,9 +730,10 @@ func TestTurnKeyKeepsALoopOnItsOwnShards(t *testing.T) {
 }
 
 // TestLoopWaitModeFollowsTheMeasuredRange pins where each wait is used under
-// the default sizing and with Pollers set: the adaptive wait only where a
-// loop has a single waiter on a host of adaptiveMinProcs Ps or more, the
-// blocking wait past parkedWaiters waiters, and parking everywhere else.
+// the default sizing and with Pollers set: the blocking wait on a wide host
+// and past parkedWaiters waiters, the adaptive wait where a loop has a single
+// waiter on a host of adaptiveMinProcs Ps or more, and parking everywhere
+// else.
 func TestLoopWaitModeFollowsTheMeasuredRange(t *testing.T) {
 	names := map[waitMode]string{waitAdaptive: "adaptive", waitPark: "park", waitBlock: "block"}
 	cases := []struct {
@@ -689,10 +741,11 @@ func TestLoopWaitModeFollowsTheMeasuredRange(t *testing.T) {
 		want           waitMode
 	}{
 		{1, 0, waitPark}, {2, 0, waitPark}, {4, 0, waitPark}, {6, 0, waitPark},
-		{8, 0, waitAdaptive}, {24, 0, waitAdaptive}, {32, 0, waitAdaptive}, {48, 0, waitAdaptive},
-		{64, 0, waitBlock}, {128, 0, waitBlock},
-		{4, 4, waitPark},  // one waiter per loop, but too few Ps to block
-		{24, 1, waitPark}, // six waiters sharing one loop
+		{8, 0, waitAdaptive}, {24, 0, waitAdaptive}, {32, 0, waitAdaptive},
+		{40, 0, waitBlock}, {48, 0, waitBlock}, {64, 0, waitBlock}, {128, 0, waitBlock},
+		{48, 16, waitBlock}, // a wide host blocks whatever its loops
+		{4, 4, waitPark},    // one waiter per loop, but too few Ps to block
+		{24, 1, waitPark},   // six waiters sharing one loop
 	}
 	for _, c := range cases {
 		loops := c.pollers
@@ -777,4 +830,30 @@ func stopTestLoop(loop *eventLoop, err error) <-chan struct{} {
 		}()
 	})
 	return stop.done
+}
+
+// A wide host runs one waiter per loop and a ReusePort listener per loop;
+// narrower hosts keep their sizing.
+func TestWideHostGeometry(t *testing.T) {
+	cases := []struct {
+		procs, loops       int
+		waiters, listeners int
+	}{
+		{8, 2, 1, 2},
+		{24, 6, 1, 2},
+		{32, 8, 1, 2},
+		{33, 8, 1, 8},
+		{48, 8, 1, 8},
+		{64, 8, 1, 8},
+		{64, 16, 1, 16},
+		{128, 8, 1, 8},
+	}
+	for _, c := range cases {
+		if got := loopWaiters(c.procs, c.loops); c.procs >= wideHostProcs && got != c.waiters {
+			t.Errorf("%d Ps, %d loops: %d waiters per loop, want %d", c.procs, c.loops, got, c.waiters)
+		}
+		if got := reusePortListeners(c.procs, c.loops); got != c.listeners {
+			t.Errorf("%d Ps, %d loops: %d listeners, want %d", c.procs, c.loops, got, c.listeners)
+		}
+	}
 }

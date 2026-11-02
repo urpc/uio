@@ -29,6 +29,10 @@ import (
 // setsockopt of its own; see setListenerOptions.
 const inheritAcceptedOptions = true
 
+// reusePortBalances reports that the kernel spreads the connections of a
+// SO_REUSEPORT group over its listeners, hashing each connection's addresses.
+const reusePortBalances = true
+
 // setListenerOptions arms a listening socket with the options every stream
 // connection wants. Linux copies these — and the keepalive timers — from the
 // listener to each accepted socket, so accepting a connection costs no
