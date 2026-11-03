@@ -88,8 +88,9 @@ finished.
    callbacks of one connection are ordered and never overlap.
 4. **Reply.** What the handler sends is queued; small replies to one read's
    frames are batched into one write. Sends from other goroutines join the same
-   queue in order. When a peer stops reading and the queue reaches the high
-   watermark, the connection stops reading its socket until the queue drains.
+   queue in order. When a peer stops reading its replies and they back the
+   queue up to the high watermark, the connection stops reading its socket
+   until the queue drains.
 
 ## Behind `net/http`
 
@@ -202,7 +203,7 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `WriteCoalesce` | 4 KiB | Writes smaller than this join the connection's outbound batch instead of taking a send of their own; a negative value turns size-based buffering off. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `Executor` | uio default | Runs connection and write turns on the native backend; the `stdio` backend does not use it. |
-| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection stops reading, so TCP flow control slows its peer instead of the replies piling up. A negative value disables the pause. |
+| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection whose own replies fill it stops reading, so TCP flow control slows its peer instead of the replies piling up. Output sent from elsewhere never pauses reads. A negative value disables the pause. |
 | `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
 | `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
@@ -216,17 +217,65 @@ one, a high watermark above `MaxOutboundBuffered`, or a compression level
 outside 1-9, make `Serve` and `Dial` return `ErrInvalidOptions`.
 
 **Backpressure.** The watermarks pace what a connection's own reads produce
-while its peer is slow. A connection whose queue reaches the high watermark
-stops consuming; the bytes pile up in the transport's inbound buffer until it
-stops reading the socket, and the peer's TCP window closes. Draining to the
-low watermark resumes reads; no message is dropped. `Server.Stats` and
-`Dialer.Stats` count the pauses and resumes.
+while its peer is slow: the replies its `OnMessage` sends on the same
+connection, and the Pongs that answer the peer's Pings. A connection whose
+queue reaches the high watermark with its own replies filling at least the
+band between the watermarks stops consuming; the bytes pile up in the
+transport's inbound buffer until it stops reading the socket, and the peer's
+TCP window closes. Draining to the low watermark resumes reads; no message is
+dropped. `Server.Stats` and `Dialer.Stats` count the pauses and resumes. The
+pause is a plain transport's: a tracked one — a layer stack, TLS under the
+protocol — reports its sends in wire bytes, which are not the frame bytes
+replies are counted in, so over such a stack the watermarks pace nothing and
+`MaxOutboundBuffered` alone bounds the queue.
 
-Output that does not come from the connection's reads — a broadcast, a
-subscription push, any send from another goroutine — is not paced by the
-pause. Set `MaxOutboundBuffered` to bound it: past the limit `SendText`,
-`SendBinary` and `Ping` return `ErrBackpressure`, and the caller decides to
-drop, retry later or close.
+Output that does not come from the connection's own reads — a broadcast, a
+subscription push, a client uploading from its own goroutine, messages another
+connection forwards — is queued all the same but never pauses reads: stopping
+them would not slow that output, only keep the peer from being read, and two
+ends that both did so would wait on each other for good. Bound it at the
+sender: set `MaxOutboundBuffered`, and past the limit `SendText`, `SendBinary`
+and `Ping` return `ErrBackpressure`, and the caller decides to drop, retry
+later or close.
+
+For a relay or an application work queue, `Conn.PauseReads()` and
+`Conn.ResumeReads()` provide an independent, concurrency-safe read switch.
+Pause from `OnMessage` stops before the next frame, including frames in the
+same socket read; an already running callback may finish. Resume wakes the
+connection to consume buffered input, while automatic watermark backpressure
+remains in effect. Calls are idempotent and are not reference counted, so one
+flow controller should own the switch. Both return `ErrNotReady` before the
+WebSocket opens and `ErrClosed` after closing begins.
+
+`Conn.OutboundBuffered()` reports the WebSocket write batch plus the queue
+below it, including framing and lower-layer overhead. It is a concurrent
+snapshot: during a handoff it may briefly count bytes twice. Use it for watermarks;
+`MaxOutboundBuffered` provides the hard write limit. It is safe to query from
+`TrafficObserver.OnOutbound`, where a controller can resume the upstream
+connection after its destination drains. When pausing upstream, publish the
+pause before rechecking the destination queue so a simultaneous drain cannot
+leave input stranded:
+
+```go
+func pace(upstream, destination *uws.Conn, high, low int) {
+	if destination.OutboundBuffered() < high {
+		return
+	}
+	if err := upstream.PauseReads(); err != nil {
+		return
+	}
+	if destination.OutboundBuffered() <= low {
+		_ = upstream.ResumeReads()
+	}
+}
+```
+
+Explicit pauses also work over TLS. They delay Ping/Pong and other incoming
+control frames; heartbeat deadlines continue to run, and a local Close
+overrides an explicit pause to finish its handshake. Disabling automatic
+watermarks retains a 64 KiB transport receive bound for explicit pauses.
+A custom layer stack must configure its own `Events.MaxInboundBuffered`.
+`Stats` counts automatic pauses and resumes only.
 
 **Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
 transport bytes in both directions. Both callbacks are observation only: do
@@ -236,7 +285,8 @@ feeds the report it answers; `OnOutbound` can also run while the write lock a
 send holds is held, so a send there deadlocks the connection. `OnInbound` runs
 in the connection's turn like the other callbacks; `OnOutbound` runs wherever
 a send completes and may overlap them, so keep what it touches safe for
-concurrent use:
+concurrent use. `OutboundBuffered`, `PauseReads` and `ResumeReads` are safe in
+these callbacks:
 
 ```go
 func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }

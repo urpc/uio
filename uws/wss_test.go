@@ -472,16 +472,16 @@ func TestBatchedFrameStaysOwed(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	conn.writes.mu.Lock()
-	conn.batching.Store(true) // as a read round does
+	conn.round.Store(roundBatching) // as a read round does
 	payload := []byte("batched")
 	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
-		conn.batching.Store(false)
+		conn.round.Store(0)
 		conn.writes.mu.Unlock()
 		t.Fatal(err)
 	}
 	conn.transportSent(1) // the queue below is empty: all handed down left
-	owed := conn.writes.close.pendingBytes.Load() + int64(conn.batchUntracked)
-	conn.batching.Store(false)
+	owed := conn.writes.close.pendingBytes.Load() + int64(conn.batch.Len())
+	conn.round.Store(0)
 	conn.unlockWrite()
 	if want := int64(frameWireSize(len(payload), true)); owed < want {
 		t.Fatalf("%d bytes owed with a %d-byte frame still in the batch", owed, want)

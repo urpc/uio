@@ -629,10 +629,10 @@ func TestCloseDoesNotRecreateTimerAfterTransportClose(t *testing.T) {
 	if !conn.closed.Load() {
 		t.Fatal("transport close did not mark connection closed")
 	}
-	if state := conn.closeTimer.Load(); state != nil {
-		state.mu.Lock()
-		shard := state.shard
-		state.mu.Unlock()
+	if metadata := conn.metadata.Load(); metadata != nil && metadata.closeTimer != nil {
+		metadata.closeTimer.mu.Lock()
+		shard := metadata.closeTimer.shard
+		metadata.closeTimer.mu.Unlock()
 		if deadlineShardAt(shard).has(conn, deadlineKindClose) {
 			t.Fatal("closed connection recreated its close timer")
 		}
@@ -644,7 +644,7 @@ func TestClosedConnectionDoesNotCreateCloseTimer(t *testing.T) {
 	conn.closed.Store(true)
 	conn.startCloseTimer()
 	conn.ensureCloseTimer()
-	if conn.closeTimer.Load() != nil {
+	if metadata := conn.metadata.Load(); metadata != nil && metadata.closeTimer != nil {
 		t.Fatal("closed connection allocated close timer state")
 	}
 }

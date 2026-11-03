@@ -82,6 +82,7 @@ var (
 	// ErrProtocol reports a WebSocket protocol violation.
 	ErrProtocol   = frame.ErrProtocol
 	errReadBudget = errors.New("uws: read budget exhausted")
+	errReadPaused = errors.New("uws: reads paused")
 )
 
 // Message is one complete text or binary WebSocket message.

@@ -19,8 +19,10 @@ package uws
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
@@ -43,17 +46,59 @@ func newBackpressureConn(high, low int) (*limitedWire, *Conn, *Server) {
 	return raw, conn, server
 }
 
-// Queued output at the high watermark stops the read round without consuming;
+// queueReplies adds n bytes of the connection's own replies to the probe's
+// queue, as a read round's Handler sending them would: they count toward the
+// pause until the transport reports them sent.
+func queueReplies(raw *limitedWire, conn *Conn, n int) {
+	raw.queued += n
+	conn.writes.mu.Lock()
+	defer conn.writes.mu.Unlock()
+	replies := conn.replies.Load()
+	if replies == nil {
+		replies = newReplyLedger()
+		conn.replies.Store(replies)
+	}
+	replies.add(int64(n), conn.queueEnd(replies))
+}
+
+// drainTo empties the probe's queue down to n bytes and reports what left,
+// as the transport's outbound callback does.
+func drainTo(raw *limitedWire, conn *Conn, n int) {
+	sent := raw.queued - n
+	raw.queued = n
+	conn.transportSent(sent)
+}
+
+// ownQueued is how many of the connection's reply bytes it counts as queued.
+func ownQueued(conn *Conn) int64 {
+	conn.writes.mu.Lock()
+	defer conn.writes.mu.Unlock()
+	if replies := conn.replies.Load(); replies != nil {
+		return replies.queued()
+	}
+	return 0
+}
+
+// pendingBatchReplies observes reply accounting only from the serialized test
+// read path, just as the protocol's batch handoff does under writes.mu.
+func pendingBatchReplies(conn *Conn) int64 {
+	if replies := conn.replies.Load(); replies != nil {
+		return replies.batched
+	}
+	return 0
+}
+
+// Replies queued to the high watermark stop the read round without consuming;
 // dropping below the low watermark resumes it and wakes the connection.
 func TestOutboundHighWatermarkPausesReads(t *testing.T) {
 	raw, conn, server := newBackpressureConn(64, 16)
 	raw.inbound = maskedFrames("one", "two", "three")
-	raw.queued = 64
+	queueReplies(raw, conn, 64)
 
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if !conn.readPaused.Load() {
+	if !conn.internalReadsPaused() {
 		t.Fatal("reads were not paused at the high watermark")
 	}
 	if got := len(conn.raw.PeekChunk()); got == 0 {
@@ -66,14 +111,14 @@ func TestOutboundHighWatermarkPausesReads(t *testing.T) {
 	// Still above the low watermark: no wake, no resume.
 	raw.queued = 17
 	conn.resumeReadsAfterDrain()
-	if !conn.readPaused.Load() || raw.wakes != 0 {
-		t.Fatalf("resumed above the low watermark: paused=%v wakes=%d", conn.readPaused.Load(), raw.wakes)
+	if !conn.internalReadsPaused() || raw.wakes != 0 {
+		t.Fatalf("resumed above the low watermark: paused=%v wakes=%d", conn.internalReadsPaused(), raw.wakes)
 	}
 
 	// At the low watermark reads resume.
 	raw.queued = 16
 	conn.resumeReadsAfterDrain()
-	if conn.readPaused.Load() {
+	if conn.internalReadsPaused() {
 		t.Fatal("reads stayed paused at the low watermark")
 	}
 	if raw.wakes != 1 {
@@ -106,8 +151,8 @@ func TestBackpressureBoundsInbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := opts.transportEvents().MaxInboundBuffered; got != 0 {
-		t.Fatalf("MaxInboundBuffered = %d, want disabled", got)
+	if got := opts.transportEvents().MaxInboundBuffered; got != DefaultOutboundHighWatermark {
+		t.Fatalf("MaxInboundBuffered = %d, want the manual pause's receive bound", got)
 	}
 }
 
@@ -116,7 +161,7 @@ func TestBackpressureBoundsInbound(t *testing.T) {
 func TestBackpressureResumesWithFramesIntact(t *testing.T) {
 	raw, conn, _ := newBackpressureConn(32, 8)
 	raw.inbound = maskedFrames("alpha", "beta")
-	raw.queued = 32
+	queueReplies(raw, conn, 32)
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
@@ -158,17 +203,17 @@ func TestZeroLowWatermarkResumes(t *testing.T) {
 		t.Fatalf("low watermark = %d, want 0", conn.config.outboundLow)
 	}
 	raw.inbound = maskedFrames("one")
-	raw.queued = 3
+	queueReplies(raw, conn, 3)
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if !conn.readPaused.Load() {
+	if !conn.internalReadsPaused() {
 		t.Fatal("reads were not paused at the high watermark")
 	}
 	raw.queued = 0
 	conn.resumeReadsAfterDrain()
-	if conn.readPaused.Load() || raw.wakes != 1 {
-		t.Fatalf("a drained queue left reads paused: paused=%v wakes=%d", conn.readPaused.Load(), raw.wakes)
+	if conn.internalReadsPaused() || raw.wakes != 1 {
+		t.Fatalf("a drained queue left reads paused: paused=%v wakes=%d", conn.internalReadsPaused(), raw.wakes)
 	}
 }
 
@@ -205,12 +250,16 @@ func TestPauseRacingADrainDoesNotStrandReads(t *testing.T) {
 	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
 	raw.conn = conn
 	conn.opened.Store(true)
+	// The round's own replies reached the watermark.
+	replies := newReplyLedger()
+	replies.add(64, 64)
+	conn.replies.Store(replies)
 	inner.inbound = maskedFrames("one", "two")
 
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if conn.readPaused.Load() {
+	if conn.internalReadsPaused() {
 		t.Fatalf("reads stayed paused after the queue drained: wakes=%d", inner.wakes)
 	}
 	if got := len(inner.inbound); got != 0 {
@@ -260,11 +309,11 @@ func TestMaxOutboundBufferedBoundsBackgroundSends(t *testing.T) {
 func TestPausedReadsWaitForTheLowWatermark(t *testing.T) {
 	raw, conn, server := newBackpressureConn(64, 16)
 	raw.inbound = maskedFrames("one")
-	raw.queued = 64
+	queueReplies(raw, conn, 64)
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if !conn.readPaused.Load() {
+	if !conn.internalReadsPaused() {
 		t.Fatal("reads were not paused at the high watermark")
 	}
 
@@ -276,7 +325,7 @@ func TestPausedReadsWaitForTheLowWatermark(t *testing.T) {
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if !conn.readPaused.Load() {
+	if !conn.internalReadsPaused() {
 		t.Fatal("a round between the watermarks lifted the pause")
 	}
 	if got := len(raw.inbound); got != held {
@@ -288,7 +337,7 @@ func TestPausedReadsWaitForTheLowWatermark(t *testing.T) {
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if conn.readPaused.Load() {
+	if conn.internalReadsPaused() {
 		t.Fatal("reads stayed paused at the low watermark")
 	}
 	if got := len(raw.inbound); got != 0 {
@@ -554,7 +603,7 @@ func TestReadRoundBatchesRepliesIntoOneHandoff(t *testing.T) {
 	if got := raw.payloads(t); len(got) != 4 || got[0] != "a" || got[3] != "dddd" {
 		t.Fatalf("replies = %q", got)
 	}
-	if conn.batch != nil || conn.batching.Load() {
+	if conn.batch != nil || conn.round.Load()&roundBatching != 0 {
 		t.Fatal("read round left its write batch open")
 	}
 }
@@ -566,7 +615,7 @@ func TestSingleFrameRoundDoesNotBatch(t *testing.T) {
 	if err := conn.readAvailable(); err != nil {
 		t.Fatal(err)
 	}
-	if conn.batching.Load() || conn.batch != nil {
+	if conn.round.Load()&roundBatching != 0 || conn.batch != nil {
 		t.Fatal("a single frame opened a write batch")
 	}
 	if got := raw.payloads(t); len(got) != 1 || got[0] != "only" {
@@ -943,5 +992,888 @@ func TestPongWaitsForInFlightBatchHandoff(t *testing.T) {
 	}
 	if string(frames[0].Payload) != "batched" {
 		t.Fatalf("first payload = %q", frames[0].Payload)
+	}
+}
+
+// maskedPings is count masked client Pings, each with an 8-byte payload.
+func maskedPings(count int) []byte {
+	var wire []byte
+	for i := range count {
+		payload := binary.BigEndian.AppendUint64(nil, uint64(i))
+		wire = frame.Append(wire, frame.Frame{Fin: true, Opcode: frame.Ping, Masked: true, Payload: payload}, [4]byte{1, 2, 3, 4})
+	}
+	return wire
+}
+
+// A connection's own replies are what pause it: once the queue holds more
+// than the low watermark, a round whose Handler answers into it up to the high
+// watermark stops reading, and input that arrives later waits.
+func TestOwnRepliesPauseReads(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	queueReplies(raw, conn, 20)
+	raw.inbound = maskedFrames(strings.Repeat("r", 70))
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatalf("replies queued to %d bytes did not pause reads", raw.queuedBytes())
+	}
+	raw.inbound = maskedFrames("next")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.inbound) == 0 {
+		t.Fatal("a paused connection consumed input")
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 {
+		t.Fatalf("stats = %+v, want one pause", stats)
+	}
+}
+
+// A round tells its replies apart only while the queue holds more than the
+// low watermark: what a chunk read with the queue drained answers is not
+// counted, and the next chunk's is.
+func TestRepliesCountOnceTheQueueIsAboveLow(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	raw.inbound = maskedFrames(strings.Repeat("r", 70))
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.internalReadsPaused() || conn.replies.Load() != nil || conn.round.Load() != 0 {
+		t.Fatalf("a chunk read with the queue drained: paused %v, replies %d, round %#x",
+			conn.internalReadsPaused(), ownQueued(conn), conn.round.Load())
+	}
+	raw.inbound = maskedFrames(strings.Repeat("s", 70))
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatalf("replies into a queue of %d bytes did not pause reads: counted %d", raw.queuedBytes(), ownQueued(conn))
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 {
+		t.Fatalf("stats = %+v, want one pause", stats)
+	}
+}
+
+// Output that is not the round's own reply never pauses reads, however full
+// the queue: a backlog queued from elsewhere, a send another goroutine makes
+// while the round runs, and a send the round's goroutine makes once the round
+// has ended.
+func TestOutputFromElsewhereDoesNotPauseReads(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	conn.handler.(*batchEchoHandler).onMessage = func(c *Conn, _ Message) {
+		done := make(chan error, 1)
+		go func() { done <- c.SendBinary(make([]byte, 200)) }()
+		if err := <-done; err != nil {
+			t.Errorf("external send = %v", err)
+		}
+	}
+	raw.queued = 1 << 20 // a broadcast backlog
+	raw.inbound = maskedFrames("one", "two")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.SendBinary(make([]byte, 200)); err != nil {
+		t.Fatal(err)
+	}
+	raw.inbound = maskedFrames("three")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.inbound) != 0 || conn.internalReadsPaused() {
+		t.Fatalf("output from elsewhere paused reads: inbound left %d, paused %v", len(raw.inbound), conn.internalReadsPaused())
+	}
+	if conn.replies.Load() != nil {
+		t.Fatalf("replies counted = %d, want none", ownQueued(conn))
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 0 {
+		t.Fatalf("stats = %+v, want no pause", stats)
+	}
+}
+
+// Pongs answer the peer, so a peer that floods Pings and never reads the
+// answers is paused like one that never reads replies.
+func TestPingFloodPausesReads(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	raw.inbound = maskedPings(10)
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatalf("Pongs queued to %d bytes did not pause reads", raw.queuedBytes())
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 {
+		t.Fatalf("stats = %+v, want one pause", stats)
+	}
+}
+
+// A Ping flood is paused however the queue got full: Pongs answered into a
+// queue that output from elsewhere already holds past the high watermark
+// count as they do anywhere else, so a peer that floods Pings behind a
+// backlog cannot keep reads going.
+func TestPingFloodBehindABacklogPausesReads(t *testing.T) {
+	for _, backlog := range []int{60, 1 << 20} { // between the watermarks, and far past them
+		t.Run(fmt.Sprint(backlog), func(t *testing.T) {
+			raw, conn, server := newBackpressureConn(64, 16)
+			raw.queued = backlog
+			raw.inbound = maskedPings(200)
+			for range 5 {
+				if err := conn.readAvailable(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if !conn.internalReadsPaused() {
+				t.Fatalf("a Ping flood behind a %d-byte backlog never paused reads: replies %d", backlog, ownQueued(conn))
+			}
+			if stats := server.Stats(); stats.ReadsPaused != 1 {
+				t.Fatalf("stats = %+v, want one pause", stats)
+			}
+		})
+	}
+}
+
+// A few Pongs behind a backlog from elsewhere do not pause: an uploading
+// client its server pings now and then keeps reading.
+func TestKeepalivePongsBehindABacklogDoNotPauseReads(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	raw.queued = 1 << 20
+	raw.inbound = maskedPings(3)
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	raw.inbound = maskedPings(1)
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.inbound) != 0 || conn.internalReadsPaused() {
+		t.Fatalf("keepalive Pongs paused reads: inbound left %d, replies %d", len(raw.inbound), ownQueued(conn))
+	}
+	if got := ownQueued(conn); got != 40 {
+		t.Fatalf("replies counted = %d, want the four Pongs' 40 bytes", got)
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 0 {
+		t.Fatalf("stats = %+v, want no pause", stats)
+	}
+}
+
+// bulkMessages and bulkPayload size the end-to-end transfers below: enough
+// that the kernel's socket buffers cannot absorb them, so the queues reach
+// their watermarks.
+const (
+	bulkMessages = 8192
+	bulkPayload  = 4 << 10
+)
+
+// pumpAndDrain sends bulkMessages from one goroutine while reading the echoes
+// on another, as an uploading client does, and fails once the echoes stop
+// arriving.
+func pumpAndDrain(t *testing.T, client *Client, stats func() string) {
+	t.Helper()
+	go func() {
+		payload := make([]byte, bulkPayload)
+		for i := range bulkMessages {
+			payload[0] = byte(i)
+			if client.SendBinary(payload) != nil {
+				return
+			}
+		}
+	}()
+	for i := range bulkMessages {
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+		message, err := client.ReadMessage(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("echo %d of %d: %v (%s)", i, bulkMessages, err, stats())
+		}
+		if len(message.Payload) != bulkPayload || message.Payload[0] != byte(i) {
+			t.Fatalf("echo %d: %d bytes starting %d", i, len(message.Payload), message.Payload[0])
+		}
+	}
+}
+
+// A client sending from its own goroutine while it reads must not stop
+// reading because of what it sends: with an echo server that pauses on its
+// replies, the two used to wait on each other for good. The server's Pings
+// answered meanwhile must not pause it either.
+func TestUploadingClientKeepsReadingAnEchoServer(t *testing.T) {
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Handler: echoAllHandler{},
+			HeartbeatInterval: 5 * time.Millisecond, HeartbeatTimeout: time.Minute})
+	})
+	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
+	dialer := NewDialer(Options{})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	client, err := dialer.DialClient(ctx, "ws://"+addr+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pumpAndDrain(t, client, func() string {
+		return fmt.Sprintf("client %+v, server %+v", dialer.Stats(), server.Stats())
+	})
+}
+
+// relayLeg pairs one connection of a relay with its partner, which the dial
+// fills in once the upstream leg opened.
+type relayLeg struct {
+	client   *Conn
+	upstream atomic.Pointer[Conn]
+	linked   chan struct{}
+}
+
+// relayHandler forwards each client message to the upstream leg it dials.
+type relayHandler struct {
+	dialer *Dialer
+	target string
+	legs   chan *relayLeg
+}
+
+func (h *relayHandler) OnOpen(c *Conn) {
+	leg := &relayLeg{client: c, linked: make(chan struct{})}
+	c.SetUserdata(leg)
+	h.legs <- leg
+	go func() { _ = h.dialer.Dial(context.Background(), h.target, leg) }()
+}
+
+func (*relayHandler) OnMessage(c *Conn, m Message) {
+	if up := c.Userdata().(*relayLeg).upstream.Load(); up != nil {
+		_ = up.Send(m.Type, m.Payload)
+	}
+}
+
+func (*relayHandler) OnClose(*Conn, CloseEvent) {}
+
+// relayUpstream forwards what the upstream answers back to the client leg.
+type relayUpstream struct{}
+
+func (relayUpstream) OnOpen(c *Conn) {
+	leg := c.Userdata().(*relayLeg)
+	leg.upstream.Store(c)
+	close(leg.linked)
+}
+
+func (relayUpstream) OnMessage(c *Conn, m Message) {
+	_ = c.Userdata().(*relayLeg).client.Send(m.Type, m.Payload)
+}
+
+func (relayUpstream) OnClose(*Conn, CloseEvent) {}
+
+// slowStartEcho echoes, but holds its first message long enough for the relay's
+// upstream queue to back up behind it.
+type slowStartEcho struct{ slept atomic.Bool }
+
+func (*slowStartEcho) OnOpen(*Conn) {}
+
+func (h *slowStartEcho) OnMessage(c *Conn, m Message) {
+	if h.slept.CompareAndSwap(false, true) {
+		time.Sleep(300 * time.Millisecond)
+	}
+	_ = c.Send(m.Type, m.Payload)
+}
+
+func (*slowStartEcho) OnClose(*Conn, CloseEvent) {}
+
+// A relay leg whose queue fills with what the other leg forwards must not
+// stop reading because of it: its upstream, an echo server that pauses on its
+// replies, would wait on it for good, as both relay legs would wait on the
+// client.
+func TestRelayLegsKeepReadingAgainstAnEchoUpstream(t *testing.T) {
+	upstream, upstreamAddr, upstreamDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Handler: &slowStartEcho{}})
+	})
+	t.Cleanup(func() { stopTestServer(t, upstream, upstreamDone) })
+	upstreamDialer := NewDialer(Options{Handler: relayUpstream{}})
+	t.Cleanup(func() { _ = upstreamDialer.Close(nil) })
+	relay := &relayHandler{dialer: upstreamDialer, target: "ws://" + upstreamAddr + "/", legs: make(chan *relayLeg, 1)}
+	relayServer, relayAddr, relayDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Handler: relay})
+	})
+	t.Cleanup(func() { stopTestServer(t, relayServer, relayDone) })
+
+	dialer := NewDialer(Options{})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	client, err := dialer.DialClient(ctx, "ws://"+relayAddr+"/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case leg := <-relay.legs:
+		select {
+		case <-leg.linked:
+		case <-ctx.Done():
+			t.Fatal("the relay never opened its upstream leg")
+		}
+	case <-ctx.Done():
+		t.Fatal("the relay never accepted the client")
+	}
+	pumpAndDrain(t, client, func() string {
+		return fmt.Sprintf("client %+v, relay %+v, relay upstream %+v, upstream %+v",
+			dialer.Stats(), relayServer.Stats(), upstreamDialer.Stats(), upstream.Stats())
+	})
+}
+
+// A connection that answers a little into a backlog queued from elsewhere
+// does not pause: its replies have to fill the band between the watermarks
+// themselves.
+func TestSmallRepliesIntoABacklogDoNotPauseReads(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	raw.queued = 1 << 20
+	raw.inbound = maskedFrames("hi")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	raw.inbound = maskedFrames("again")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.inbound) != 0 || conn.internalReadsPaused() {
+		t.Fatalf("small replies into a backlog paused reads: inbound left %d, paused %v", len(raw.inbound), conn.internalReadsPaused())
+	}
+	if got := ownQueued(conn); got != 11 {
+		t.Fatalf("replies counted = %d, want the two replies' 11 bytes", got)
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 0 {
+		t.Fatalf("stats = %+v, want no pause", stats)
+	}
+}
+
+// Replies that have left the queue stop counting, as the transport reports
+// them sent, whether or not a read round runs in between: a backlog from
+// elsewhere that arrives later finds nothing of the connection's own to pause
+// for.
+func TestRepliesThatLeftDoNotCount(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		drainTo int
+		own     int64
+	}{
+		{"partly drained", 100, 100}, // what is left of the replies
+		{"drained to low", 64, 64},
+		{"drained", 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, conn, server := newBackpressureConn(256, 64)
+			conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+			queueReplies(raw, conn, 202) // past the band, under the high watermark
+			drainTo(raw, conn, tc.drainTo)
+			if got := ownQueued(conn); got != tc.own {
+				t.Fatalf("replies counted = %d after the drain, want %d", got, tc.own)
+			}
+			raw.queued += 1 << 20 // a backlog from elsewhere
+			raw.inbound = maskedFrames("y")
+			if err := conn.readAvailable(); err != nil {
+				t.Fatal(err)
+			}
+			if len(raw.inbound) != 0 || conn.internalReadsPaused() {
+				t.Fatalf("replies that left paused reads: inbound left %d, replies %d", len(raw.inbound), ownQueued(conn))
+			}
+			if stats := server.Stats(); stats.ReadsPaused != 0 {
+				t.Fatalf("stats = %+v, want no pause", stats)
+			}
+		})
+	}
+}
+
+// Replies queued behind a backlog stay counted until the backlog ahead of
+// them and they themselves have left: a drain that sends only the backlog
+// leaves them in full.
+func TestRepliesBehindABacklogCountUntilTheyLeave(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	raw.queued = 1000 // a backlog from elsewhere
+	queueReplies(raw, conn, 50)
+	drainTo(raw, conn, 60) // 990 of the backlog left: all 50 replies are queued
+	if got := ownQueued(conn); got != 50 {
+		t.Fatalf("replies counted = %d, want all 50 still queued", got)
+	}
+	drainTo(raw, conn, 10) // the backlog and 40 bytes of the replies left
+	if got := ownQueued(conn); got != 10 {
+		t.Fatalf("replies counted = %d, want the 10 bytes still queued", got)
+	}
+	raw.queued += 1000          // more output from elsewhere
+	queueReplies(raw, conn, 50) // and more replies behind it
+	drainTo(raw, conn, 30)      // the first replies, the backlog and 20 bytes of the new ones left
+	if got := ownQueued(conn); got != 30 {
+		t.Fatalf("replies counted = %d, want 30 of the new 50 still queued", got)
+	}
+}
+
+// A pause starts the count over: once the queue drained and reads resumed, a
+// backlog from elsewhere that arrives before the next round does not pause
+// again on replies that already left.
+func TestResumedReadsDoNotPauseOnRepliesThatLeft(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	queueReplies(raw, conn, 64)
+	raw.inbound = maskedFrames("one")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatal("replies at the high watermark did not pause reads")
+	}
+	drainTo(raw, conn, 16)
+	conn.resumeReadsAfterDrain()
+	raw.queued += 1 << 20
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(raw.inbound) != 0 || conn.internalReadsPaused() {
+		t.Fatalf("a backlog from elsewhere paused resumed reads: inbound left %d", len(raw.inbound))
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 || stats.ReadsResumed != 1 {
+		t.Fatalf("stats = %+v, want one pause and one resume", stats)
+	}
+}
+
+// A round whose queue drains to the low watermark withdraws its mark: the
+// rounds after it run without telling their sends apart, which is what keeps
+// the echo path free of the goroutine-id lookup.
+func TestDrainedRoundsStopMarkingReplies(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	var seen []uint32
+	conn.handler.(*batchEchoHandler).onMessage = func(c *Conn, m Message) {
+		seen = append(seen, c.round.Load())
+		_ = c.SendBinary(m.Bytes()) // counted in the marked round, so the next one decides
+	}
+	raw.queued = 20
+	raw.inbound = maskedFrames("a")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	raw.queued = 16
+	raw.inbound = maskedFrames("b")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] <= roundBatching || seen[1] != 0 {
+		t.Fatalf("round words seen = %#x, want the first round marked and the drained one not", seen)
+	}
+}
+
+// A compressed reply counts what it queued, not what the Handler handed to
+// the send: a long repetitive message that compresses to a few bytes does not
+// pause reads.
+func TestCompressedRepliesCountTheirWireSize(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64, OutboundLowWatermark: 16,
+		EnableCompression: true})
+	raw := &limitedWire{}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	conn.compression = &compressionState{encoder: compress.NewEncoder(-1, true)}
+	raw.queued = 60 // above the low watermark: the round's replies are counted
+	raw.inbound = maskedFrames(strings.Repeat("a", 1000))
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	reply := raw.queuedBytes() - 60
+	if reply <= 0 || reply >= 100 {
+		t.Fatalf("the reply queued %d bytes, want it compressed", reply)
+	}
+	if got := ownQueued(conn); got != int64(reply) {
+		t.Fatalf("replies counted = %d, want the %d bytes queued", got, reply)
+	}
+	raw.inbound = maskedFrames("x")
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.internalReadsPaused() {
+		t.Fatal("a compressed reply paused reads for its uncompressed size")
+	}
+}
+
+// Every frame of a fragmented reply counts, at its own wire size.
+func TestFragmentedRepliesCountEveryFrame(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 1 << 10, OutboundLowWatermark: 16,
+		MaxFramePayload: 100})
+	raw := &limitedWire{}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	raw.queued = 20
+	raw.inbound = maskedFrames(strings.Repeat("f", 90))
+	conn.handler.(*batchEchoHandler).onMessage = func(c *Conn, _ Message) {
+		if err := c.SendBinary(make([]byte, 250)); err != nil {
+			t.Errorf("send = %v", err)
+		}
+	}
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(raw.queuedBytes() - 20); ownQueued(conn) != want || want != 3*2+250 {
+		t.Fatalf("replies counted = %d, want the three frames' %d bytes", ownQueued(conn), want)
+	}
+}
+
+// A watermark band past what an int32 holds still pauses: the replies are
+// counted in full.
+func TestWideWatermarkBandStillPauses(t *testing.T) {
+	const high, low = 3 << 30, 1 << 30
+	raw, conn, server := newBackpressureConn(high, low)
+	queueReplies(raw, conn, high)
+	raw.inbound = maskedFrames("one")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatalf("replies of %d bytes did not pause reads with a %d-byte band", ownQueued(conn), high-low)
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 {
+		t.Fatalf("stats = %+v, want one pause", stats)
+	}
+}
+
+// A heartbeat Ping is this end speaking first, not a reply, even when a pull
+// Client's full queue runs the heartbeat inside a read round.
+func TestHeartbeatPingIsNoReply(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	conn.heartbeat = &heartbeatState{}
+	conn.round.Store(roundToken()) // a marked round's goroutine
+	if err := conn.sendHeartbeatPing(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if raw.queuedBytes() == 0 || conn.replies.Load() != nil {
+		t.Fatalf("queued %d, replies %d: want the Ping queued and not counted", raw.queuedBytes(), ownQueued(conn))
+	}
+}
+
+// reservingWire is limitedWire with the reservation a connection's own turn
+// gets from the native transport, so replies take the short send path.
+type reservingWire struct {
+	*limitedWire
+	reserved int
+}
+
+func (w *reservingWire) ReserveOutbound(n int) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.queued += n
+	w.reserved += n
+	return make([]byte, n), nil
+}
+
+// The short send path — a reply encoded straight into the transport's queue —
+// counts the reply too.
+func TestShortPathRepliesCount(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64, OutboundLowWatermark: 16})
+	raw := &reservingWire{limitedWire: &limitedWire{}}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	raw.queued = 20
+	raw.inbound = maskedFrames(strings.Repeat("s", 50))
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if raw.reserved != 52 {
+		t.Fatalf("reserved %d bytes, want the reply's 52 on the short path", raw.reserved)
+	}
+	if got := ownQueued(conn); got != 52 {
+		t.Fatalf("replies counted = %d, want 52", got)
+	}
+}
+
+// Replies the round batches count once the batch is handed over, where they
+// sit in the queue then.
+func TestBatchedRepliesCount(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	raw.queued = 20
+	raw.inbound = maskedFrames("aaaaaaaaaa", "bbbbbbbbbb", "cccccccccc", "dddddddddd", "eeeeeeeeee")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ownQueued(conn); got != 60 || raw.queuedBytes() != 80 {
+		t.Fatalf("replies counted = %d with %d queued, want the batch's 60 of 80", got, raw.queuedBytes())
+	}
+	raw.inbound = maskedFrames("next")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if !conn.internalReadsPaused() {
+		t.Fatal("batched replies past the band did not pause reads")
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 1 {
+		t.Fatalf("stats = %+v, want one pause", stats)
+	}
+}
+
+// A connection whose replies have all left drops its ledger once a round
+// finds the queue drained, so an idle connection keeps none.
+func TestDrainedLedgerIsReleased(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	queueReplies(raw, conn, 30)
+	drainTo(raw, conn, 0)
+	raw.inbound = maskedFrames("x")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.replies.Load() != nil {
+		t.Fatal("a drained connection kept its reply ledger")
+	}
+
+	// A ledger is not dropped while replies are still queued.
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	queueReplies(raw, conn, 30)
+	raw.queued += 100 // output from elsewhere behind the replies
+	raw.inbound = maskedFrames("y")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if got := ownQueued(conn); got != 30 {
+		t.Fatalf("replies counted = %d after the round, want the 30 still queued", got)
+	}
+	if conn.replies.Load() == nil {
+		t.Fatal("the round dropped a ledger whose replies were still queued")
+	}
+}
+
+// trackedLimitedWire is limitedWire over a layer stack: it takes tracked
+// writes and reports wire bytes, which are not the frame bytes queued.
+type trackedLimitedWire struct {
+	limitedWire
+}
+
+func (w *trackedLimitedWire) WriteTracked(p []byte) (int, uio.SendReceipt, error) {
+	n, err := w.Write(p)
+	return n, uio.SendReceipt{}, err
+}
+
+// A tracked transport — a layer stack, TLS under the protocol — reports wire
+// bytes, not the frame bytes replies are counted in, so it tracks no replies
+// and never pauses on them: the watermark is a plain transport's.
+func TestTrackedTransportTracksNoReplies(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64, OutboundLowWatermark: 16})
+	raw := &trackedLimitedWire{}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.setRaw(raw)
+	conn.opened.Store(true)
+	if !conn.wireTracked() {
+		t.Fatal("the probe does not read as a tracked transport")
+	}
+	raw.queued = 60
+	raw.inbound = maskedPings(200)
+	for range 5 {
+		if err := conn.readAvailable(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	raw.inbound = maskedFrames(strings.Repeat("r", 70))
+	for range 5 {
+		if err := conn.readAvailable(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if conn.internalReadsPaused() || conn.replies.Load() != nil || pendingBatchReplies(conn) != 0 {
+		t.Fatalf("a tracked transport tracked replies: paused %v, ledger %v, batched %d",
+			conn.internalReadsPaused(), conn.replies.Load() != nil, pendingBatchReplies(conn))
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 0 {
+		t.Fatalf("stats = %+v, want no pause over a tracked transport", stats)
+	}
+}
+
+// Replies queued among output from elsewhere count exactly: each group the
+// external bytes separate is a run of its own, and a drain retires no more
+// than what left.
+func TestInterleavedRepliesCountExactly(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(4096, 64)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	// Three groups of 30 reply bytes, 100 external bytes between them.
+	for range 3 {
+		queueReplies(raw, conn, 30)
+		raw.queued += 100
+	}
+	if got := ownQueued(conn); got != 90 {
+		t.Fatalf("replies counted = %d, want the three groups' 90", got)
+	}
+	// The first external block and the first group leave: 60 remain.
+	drainTo(raw, conn, 300)
+	if got := ownQueued(conn); got != 60 {
+		t.Fatalf("replies counted = %d after 130 bytes left, want 60", got)
+	}
+	// Everything but the last group leaves: 30 remain.
+	drainTo(raw, conn, 130)
+	if got := ownQueued(conn); got != 30 {
+		t.Fatalf("replies counted = %d, want the last group's 30", got)
+	}
+	drainTo(raw, conn, 0)
+	if got := ownQueued(conn); got != 0 {
+		t.Fatalf("replies counted = %d after a full drain, want 0", got)
+	}
+}
+
+// A drained connection drops its ledger without waiting for input: the
+// drain's report asks for the round that drops it.
+func TestDrainedLedgerReleasesWithoutInput(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	queueReplies(raw, conn, 30)
+	drainTo(raw, conn, 0)
+	raw.wakes = 0
+	conn.resumeReadsAfterDrain() // the drain's report, as the callback makes it
+	if raw.wakes != 1 {
+		t.Fatalf("wakes = %d, want the round that drops the ledger", raw.wakes)
+	}
+	raw.inbound = maskedFrames("x")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.replies.Load() != nil {
+		t.Fatal("the woken round left the ledger in place")
+	}
+}
+
+// A Pong into a drained queue allocates nothing: no ledger is kept for it.
+func TestPongIntoADrainedQueueKeepsNoLedger(t *testing.T) {
+	raw, conn, _ := newBackpressureConn(64, 16)
+	raw.inbound = maskedPings(1)
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.replies.Load() != nil || pendingBatchReplies(conn) != 0 {
+		t.Fatalf("a Pong into a drained queue kept a ledger: %v, batched %d",
+			conn.replies.Load() != nil, pendingBatchReplies(conn))
+	}
+}
+
+// BenchmarkPongAnswer measures the control-frame reply path: one masked Ping
+// answered while the queue is drained, the shape a heartbeat exchange has.
+//
+//	go test -run '^$' -bench '^BenchmarkPongAnswer$' -benchmem ./uws
+func BenchmarkPongAnswer(b *testing.B) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64 << 10})
+	raw := &limitedWire{}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	wire := maskedPings(1)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		raw.inbound = wire
+		if err := conn.readAvailable(); err != nil {
+			b.Fatal(err)
+		}
+		// The peer reads the answer, as the drain reports it: without this
+		// the queue fills and the round pauses, which is the flood the
+		// watermark answers, not the pong.
+		drainTo(raw, conn, 0)
+	}
+}
+
+// A write batch the outbound limit refuses queued nothing, so its replies
+// count nowhere: a refused hand-over must not place them.
+func TestRefusedBatchCountsNoReplies(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 24, OutboundLowWatermark: 8,
+		MaxOutboundBuffered: 30})
+	raw := &limitedWire{limit: 30}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	conn.opened.Store(true)
+	raw.queued = 25 // near the outbound limit
+	raw.inbound = maskedFrames("aa", "bb")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if raw.queuedBytes() > 30 {
+		t.Fatalf("queued = %d past the limit", raw.queuedBytes())
+	}
+	// The second reply fit the limit and went straight in, so it counts; the
+	// batch the limit refused queued nothing and must not.
+	if got := ownQueued(conn); got != 4 {
+		t.Fatalf("replies counted = %d, want only the accepted frame's 4 bytes", got)
+	}
+}
+
+// racingDrainWire reports the queue as it was, then drains part of it with
+// the report a send makes — the completion lands between the position's two
+// readings, as a real report can between queueEnd's.
+type racingDrainWire struct {
+	*limitedWire
+	conn     *Conn
+	drains   int // bytes each armed report retires
+	armed    bool
+	reported atomic.Int32
+}
+
+func (w *racingDrainWire) OutboundBuffered() int {
+	v := w.queued
+	if w.armed {
+		w.armed = false
+		w.limitedWire.queued = v - w.drains
+		w.reported.Add(1)
+		w.conn.transportSent(w.drains)
+	}
+	return v
+}
+
+// A send report landing between the position's two readings must not place a
+// reply past its bytes: the ledger would keep counting it after it left, and
+// output from elsewhere alone would pause reads.
+func TestReportBetweenPositionReadsInflatesNoReply(t *testing.T) {
+	server := NewServer(Options{Handler: &batchEchoHandler{}, OutboundHighWatermark: 64, OutboundLowWatermark: 16})
+	inner := &limitedWire{}
+	raw := &racingDrainWire{limitedWire: inner, drains: 60}
+	conn := &Conn{raw: raw, handler: &batchEchoHandler{}, config: testServerConfig(server)}
+	raw.conn = conn
+	conn.opened.Store(true)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+
+	// 60 bytes of replies queued and counted, then 55 more whose position is
+	// read across a report retiring the first 60.
+	raw.queued = 60
+	replies := newReplyLedger()
+	replies.add(60, 60)
+	conn.replies.Store(replies)
+	raw.queued = 115
+	raw.armed = true
+	conn.writes.mu.Lock()
+	replies.add(55, conn.queueEnd(replies))
+	conn.writes.mu.Unlock()
+	if raw.reported.Load() != 1 {
+		t.Fatal("the probe never made its report")
+	}
+	// Everything the transport still holds leaves: whatever the ledger counts
+	// now must be gone with it.
+	drainTo(raw.limitedWire, conn, 0)
+	if got := ownQueued(conn); got != 0 {
+		t.Fatalf("replies counted = %d after everything left, want 0", got)
+	}
+	raw.queued = 1 << 20 // output from elsewhere alone
+	raw.inbound = maskedFrames("x")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.internalReadsPaused() {
+		t.Fatal("output from elsewhere alone paused reads")
+	}
+}
+
+// More separated groups than the ledger's initial storage still count
+// exactly: growing the queue neither forgets replies nor merges them across
+// output it does not hold.
+func TestMoreGroupsThanRunsDoNotInflate(t *testing.T) {
+	raw, conn, server := newBackpressureConn(64, 16)
+	conn.handler.(*batchEchoHandler).onMessage = func(*Conn, Message) {}
+	for range 15 {
+		queueReplies(raw, conn, 6)
+		raw.queued += 20 // output from elsewhere between the groups
+	}
+	// All but the last 30 bytes leave: the last group's 6 reply bytes and 24
+	// of the output around them.
+	drainTo(raw, conn, 30)
+	if got := ownQueued(conn); got != 6 {
+		t.Fatalf("replies counted = %d with 6 reply bytes truly queued, want 6", got)
+	}
+	raw.queued = 1 << 20
+	raw.inbound = maskedFrames("x")
+	if err := conn.readAvailable(); err != nil {
+		t.Fatal(err)
+	}
+	if conn.internalReadsPaused() {
+		t.Fatalf("reads paused with %d of the connection's own bytes queued", ownQueued(conn))
+	}
+	if stats := server.Stats(); stats.ReadsPaused != 0 {
+		t.Fatalf("stats = %+v, want no pause", stats)
 	}
 }

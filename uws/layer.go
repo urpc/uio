@@ -42,7 +42,11 @@ type LayerOptions struct {
 	// own — Handler, Pollers, ReusePort, Executor, TLSConfig and
 	// MaxOutboundBuffered — belong to the Events the layer is installed on
 	// and must be left zero: a stack's TLS is a layer of its own, and its
-	// outbound limit is the Events' MaxOutboundBuffered.
+	// outbound limit is the Events' MaxOutboundBuffered. The watermarks pace
+	// nothing here — the stack reports its sends in wire bytes, not the frame
+	// bytes replies are counted in — so everything the stack outputs is
+	// output from elsewhere: pace it at the layer above, as uio.Bridge does
+	// by leaving bytes unread.
 	Options
 	// CheckOrigin and Authorize decide a ServerLayer's upgrade requests as
 	// they do a Server's; what Authorize returns is the layer's to report,
@@ -368,8 +372,7 @@ func (w *wsLayerHandler) OnClose(uio.LayerContext, error) {
 	if conn == nil {
 		return
 	}
-	conn.releaseParser()
-	conn.releaseAssembler()
+	conn.releaseReadState()
 	if !conn.opened.Load() {
 		conn.stopHandshakeTimer()
 	}

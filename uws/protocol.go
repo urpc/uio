@@ -209,11 +209,13 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 // frames. It yields after the connection's frame budget for one chunk so a
 // hot connection returns to the scheduler and cannot monopolize one worker.
 // A round that carries several frames batches the small replies they send and
-// hands them to the transport together when it ends.
+// hands them to the transport together when it ends. While its queue holds
+// more than the low watermark, the round also marks itself in the round word,
+// so the sends it makes count as its replies (watchReplies).
 func (c *Conn) readAvailable() error {
 	err := c.readRound()
-	if c.batching.Load() {
-		c.endWriteBatch()
+	if round := c.round.Load(); round != 0 {
+		c.endRound(round)
 	}
 	if c.heartbeat != nil {
 		c.heartbeatTick(time.Now())
@@ -223,18 +225,31 @@ func (c *Conn) readAvailable() error {
 
 func (c *Conn) readRound() error {
 	c.readFrames = 0
-	high := 0
+	high, low := 0, 0
 	if c.config != nil {
-		high = c.config.outboundHigh
+		high, low = c.config.outboundHigh, c.config.outboundLow
 	}
+	metadata := c.metadata.Load()
 	for {
-		// Queued output at the high watermark, or a pause that has not
-		// drained to the low watermark: stop consuming, so the bytes build up
-		// in UIO's inbound and its hold stops the socket reads.
-		if high > 0 && (c.readPaused.Load() || c.raw.OutboundBuffered() >= high) && c.holdReads() {
+		// The connection's own replies backed up to the high watermark, or a
+		// pause that has not drained to the low watermark: stop consuming, so
+		// the bytes build up in UIO's inbound and its hold stops the socket
+		// reads. The steady state — not paused, no replies followed, the
+		// queue at the low watermark or below — has nothing to decide.
+		if high > 0 && (c.internalReadsPaused() || c.raw.OutboundBuffered() > low || c.replies.Load() != nil) &&
+			c.holdsReplies(high) {
 			return nil
 		}
-		data := c.raw.PeekChunk()
+		// A handshake can carry frames in its final read. Those bytes have
+		// already left the transport buffer and must precede subsequent input,
+		// even if OnOpen or one of their callbacks paused consumption.
+		staged := metadata != nil && len(metadata.staged) != 0
+		var data []byte
+		if staged {
+			data = metadata.staged
+		} else {
+			data = c.raw.PeekChunk()
+		}
 		if len(data) == 0 {
 			return nil
 		}
@@ -245,14 +260,25 @@ func (c *Conn) readRound() error {
 				return c.rejectHandshake(err)
 			}
 			_, _ = c.raw.Discard(len(data))
+			metadata = c.metadata.Load()
 			continue
 		}
 
 		consumed, err := c.consumeFrames(data)
 		if consumed > 0 {
-			_, _ = c.raw.Discard(consumed)
+			if staged {
+				metadata.staged = metadata.staged[consumed:]
+				if len(metadata.staged) == 0 {
+					metadata.staged = nil
+				}
+			} else {
+				_, _ = c.raw.Discard(consumed)
+			}
 		}
 		if err != nil {
+			if err == errReadPaused {
+				return nil
+			}
 			if err == errReadBudget || errors.Is(err, errReadBudget) {
 				if yieldErr := c.raw.YieldRead(); yieldErr != nil {
 					return fmt.Errorf("uws: yield buffered read: %w", yieldErr)
@@ -396,6 +422,9 @@ func unmaskShort(payload []byte, key uint32) bool {
 // countFrame charges a delivered frame against the round's budget.
 func (c *Conn) countFrame() error {
 	c.readFrames++
+	if c.externalReadsPaused() {
+		return errReadPaused
+	}
 	frameBudget := int32(minFramesPerDataEvent)
 	if c.config != nil && c.config.maxFramesPerDataEvent > 0 {
 		frameBudget = int32(c.config.maxFramesPerDataEvent)
@@ -413,6 +442,9 @@ func (c *Conn) countFrame() error {
 // in flight, so most reads of a busy round start inside a frame, and the
 // frames after it belong on the paths below like any others.
 func (c *Conn) consumeFrames(data []byte) (int, error) {
+	if c.externalReadsPaused() {
+		return 0, errReadPaused
+	}
 	sink := (*connFrameSink)(c)
 	consumed := 0
 	if c.parser != nil {
@@ -555,6 +587,17 @@ func (c *Conn) releaseParser() {
 	c.parser = nil
 }
 
+// releaseReadState runs in the serialized terminal callback. A connection
+// aborted while explicitly paused must release its retained handshake tail
+// even when no read turn consumed that tail.
+func (c *Conn) releaseReadState() {
+	c.releaseParser()
+	c.releaseAssembler()
+	if metadata := c.metadata.Load(); metadata != nil {
+		metadata.staged = nil
+	}
+}
+
 // consumeHandshake incrementally accumulates the bounded HTTP header, installs
 // negotiated compression, writes the server response, and then feeds any
 // bytes received after the header as WebSocket frames.
@@ -667,7 +710,17 @@ func (c *Conn) feedBehindHandshake(extra []byte) error {
 		sink.w.staged = append(sink.w.staged, extra...)
 		return nil
 	}
-	if _, err := c.feedFrames(extra, c.acceptFrame); err != nil {
+	consumed, err := c.consumeFrames(extra)
+	if err == errReadPaused || err == errReadBudget {
+		if consumed < len(extra) {
+			c.ensureMetadata().staged = extra[consumed:]
+		}
+		if err == errReadBudget {
+			return c.raw.YieldRead()
+		}
+		return nil
+	}
+	if err != nil {
 		if errors.Is(err, ErrClosed) {
 			// OnOpen closed this end: stop consuming rather than treat it as
 			// a protocol error, which would end the transport before the peer
@@ -864,13 +917,26 @@ func (c *Conn) abortTransport(err error) {
 func (c *Conn) markClosing() {
 	c.closing.Store(true)
 	c.releasePullClient()
+	if c.readPauses.And(^readPauseExternal)&readPauseExternal != 0 && c.raw != nil {
+		// A local Close must read the peer's answer even when no further
+		// input would otherwise schedule the paused protocol again.
+		_ = c.raw.Wake()
+	}
 }
 
 func (c *Conn) stopCloseTimer() {
-	state := c.closeTimer.Load()
+	metadata := c.metadata.Load()
+	if metadata == nil {
+		return
+	}
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	state := metadata.closeTimer
 	if state == nil {
 		return
 	}
+	// The state's own lock, as an arm holds it: the registration is written
+	// under it, not under the metadata's.
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if !state.hasShard {
@@ -879,16 +945,16 @@ func (c *Conn) stopCloseTimer() {
 	deadlineShardAt(state.shard).cancel(c, deadlineKindClose, 0)
 }
 
+// ensureCloseTimerState keeps the close timer in the connection's metadata,
+// created with it and reached under its lock.
 func (c *Conn) ensureCloseTimerState() *closeTimerState {
-	for {
-		if state := c.closeTimer.Load(); state != nil {
-			return state
-		}
-		state := &closeTimerState{}
-		if c.closeTimer.CompareAndSwap(nil, state) {
-			return state
-		}
+	metadata := c.ensureMetadata()
+	metadata.mu.Lock()
+	defer metadata.mu.Unlock()
+	if metadata.closeTimer == nil {
+		metadata.closeTimer = &closeTimerState{}
 	}
+	return metadata.closeTimer
 }
 
 // acceptFrame bypasses assembler allocation for complete messages and control
@@ -956,7 +1022,7 @@ func (c *Conn) acceptMessage(message frame.Message) error {
 func (c *Conn) acceptControl(f frame.Frame) error {
 	switch f.Opcode {
 	case frame.Ping:
-		err := c.sendFrame(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: f.Payload})
+		err := c.sendPong(f.Payload)
 		if errors.Is(err, ErrBackpressure) {
 			// The outbound limit is full: the Pong cannot be sent now and must
 			// not close the connection over it. Dropping it loses only this

@@ -125,9 +125,16 @@ type Options struct {
 	// OutboundHighWatermark is the queued output at which a connection stops
 	// reading its socket, so TCP flow control slows its peer instead of the
 	// replies to its requests piling up. It paces only what the connection's
-	// own reads produce; output sent from elsewhere, such as a broadcast, is
-	// bounded by MaxOutboundBuffered. A negative value disables the pause.
-	// Zero uses 64 KiB.
+	// own reads produce — what OnMessage sends on the same connection, and
+	// the Pongs answering the peer's Pings — and pauses once those replies
+	// fill at least the band between the two watermarks. Output sent from
+	// elsewhere, such as a broadcast or another connection forwarding, is
+	// queued too but never pauses reads; MaxOutboundBuffered bounds it. A
+	// tracked transport — a layer stack, TLS under the protocol — is not
+	// paced either: its send reports are wire bytes, not the frame bytes
+	// replies are counted in. A negative value disables the pause. Zero uses
+	// 64 KiB. Disabling this automatic pause still leaves a 64 KiB transport
+	// receive bound, so an explicit Conn.PauseReads can stop socket reads.
 	OutboundHighWatermark int
 	// OutboundLowWatermark is the queued level at or below which a paused
 	// connection reads again. Zero uses a quarter of the high watermark.
@@ -149,13 +156,16 @@ type Options struct {
 // the report it answers — it retires more bytes, which reports again. In uws
 // the report can also run while the write lock a send holds is still held, so
 // a write here deadlocks the connection. They must not block either.
+// OutboundBuffered, PauseReads and ResumeReads are safe here: they do not
+// acquire the write lock or write to the transport.
 //
 // OnInbound runs in the connection's turn and never overlaps its Handler
 // callbacks. OnOutbound runs wherever the transport finishes a send — a write
 // turn, a writer goroutine, or the goroutine closing the connection, possibly
 // with internal locks held — and may overlap the connection's Handler
 // callbacks and OnInbound, so state it shares with them must be safe for
-// concurrent use.
+// concurrent use. Reports made inside a WebSocket batch handoff may be
+// combined and delivered just after handoff, preserving their byte total.
 type TrafficObserver interface {
 	OnInbound(*Conn, int)
 	OnOutbound(*Conn, int)
@@ -273,6 +283,12 @@ func (r *Options) validate() error {
 // value belongs to the Server or Dialer after this call; nothing else may
 // keep or mutate it.
 func (o Options) transportEvents() *uio.Events {
+	inboundLimit := o.OutboundHighWatermark
+	if inboundLimit <= 0 {
+		// Disabling automatic reply watermarks does not disable the receive
+		// bound that an explicit PauseReads relies on.
+		inboundLimit = DefaultOutboundHighWatermark
+	}
 	return &uio.Events{
 		Pollers:                o.Pollers,
 		MaxBufferSize:          o.ReadBufferSize,
@@ -280,9 +296,9 @@ func (o Options) transportEvents() *uio.Events {
 		ReusePort:              o.ReusePort,
 		Executor:               o.Executor,
 		MaxOutboundBuffered:    o.MaxOutboundBuffered,
-		// The read pause of OutboundHighWatermark relies on UIO's inbound
-		// hold: stopping consumption past this bound stops socket reads.
-		MaxInboundBuffered: o.OutboundHighWatermark,
+		// Automatic and explicit read pauses leave bytes here until UIO's
+		// inbound hold stops socket reads.
+		MaxInboundBuffered: inboundLimit,
 	}
 }
 

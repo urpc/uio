@@ -793,7 +793,13 @@ func CloseCode(payload []byte) uint16 {
 
 func validCloseCode(code uint16) bool {
 	switch code {
-	case 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011:
+	// 1000-1011 are RFC 6455 §7.4.1. 1012 Service Restart, 1013 Try Again
+	// Later and 1014 Bad Gateway are IANA-registered after the RFC, by the
+	// WebSocket registry. 1004, 1005, 1006 and 1015 stay reserved — 1005 and
+	// 1006 are receive-only pseudo-codes that never ride a Close frame — so
+	// they remain invalid on the wire in both directions.
+	case 1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011,
+		1012, 1013, 1014:
 		return true
 	default:
 		return code >= 3000 && code <= 4999

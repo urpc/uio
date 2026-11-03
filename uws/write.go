@@ -323,7 +323,9 @@ func (c *Conn) sendHeartbeatPing(now time.Time) error {
 			heartbeat.setPingReceipt(r)
 		}
 	} else {
-		err = c.sendFrameLocked(ping)
+		// The heartbeat speaks first: its Ping is no reply, even when a pull
+		// Client runs it from inside a read round.
+		_, _, err = c.queueFrameLocked(ping)
 	}
 	if err == nil {
 		err = c.flushLocked()
@@ -349,7 +351,7 @@ func (c *Conn) sendHeartbeatClose(code uint16, reason string) {
 		return
 	}
 	c.setCloseReason(code, reason)
-	err := c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
+	_, _, err := c.queueFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 	if err == nil {
 		err = c.flushLocked()
 	}
@@ -520,18 +522,21 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 		return frame.ErrProtocol
 	}
 	c.writes.mu.Lock()
-	if c.batching.Load() {
-		if batched, err := c.batchMessageLocked(opcode, payload); batched {
+	// Each path counts the round's replies itself (countReply), so nothing
+	// here lives across their calls.
+	round := c.round.Load()
+	if round&roundBatching != 0 {
+		if batched, err := c.batchMessageLocked(opcode, payload, round); batched {
 			// A message the batch takes proves no close is in progress: the
 			// close checks above reject one. A Close begun concurrently runs
 			// its own unlockWrite under this lock, and the round's hand-over
-			// (endWriteBatch) checks close progress again, so the check
+			// (endRound) checks close progress again, so the check
 			// unlockWrite would repeat here cannot fire; skipping it measured
 			// 3% of a 256-byte pipeline.
 			c.writes.mu.Unlock()
 			return err
 		}
-	} else if sent, err := c.sendShortLocked(opcode, payload); sent {
+	} else if sent, err := c.sendShortLocked(opcode, payload, round); sent {
 		c.unlockWrite()
 		return err
 	}
@@ -614,18 +619,59 @@ func (c *Conn) sendFrame(f frame.Frame) error {
 	return c.flushLocked()
 }
 
-// sendFrameLocked requires writes.mu. Server frames use header+borrowed
-// payload writev above the coalescing threshold; client frames are materialized
-// because RFC masking must not mutate caller-owned payload.
+// sendPong answers a Ping with a Pong carrying its payload. The Pong is a
+// reply wherever the queue stands, counted without asking which goroutine
+// sends it (noteReply): a peer that floods Pings and never reads the answers
+// is paused like any other, and one whose first Pings arrive in one chunk
+// with the queue drained is paused all the same.
+func (c *Conn) sendPong(payload []byte) error {
+	if !c.opened.Load() {
+		return ErrNotReady
+	}
+	c.writes.mu.Lock()
+	defer c.unlockWrite()
+	wireSize, _, err := c.queueFrameLocked(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: payload})
+	if err != nil {
+		return err
+	}
+	// This call flushes its Pong before returning. Count it at that position,
+	// rather than allocating a batch ledger for an isolated keepalive.
+	if err := c.flushLocked(); err != nil {
+		return err
+	}
+	if c.config != nil && c.config.outboundHigh > 0 {
+		c.noteReply(wireSize, false)
+	}
+	return nil
+}
+
+// sendFrameLocked queues one frame; see queueFrameLocked. A frame the read
+// round's goroutine sends is the round's reply, and is counted as one; see
+// countReply. It requires writes.mu.
 func (c *Conn) sendFrameLocked(f frame.Frame) error {
+	round := c.round.Load()
+	wireSize, batched, err := c.queueFrameLocked(f)
+	if err == nil && round > roundBatching {
+		c.countReply(round, wireSize, batched)
+	}
+	return err
+}
+
+// queueFrameLocked hands one frame to the transport, or to the read round's
+// write batch, and reports its wire size and whether it was batched; a Close
+// frame already queued is not queued again and reports no size. It requires
+// writes.mu. Server frames use header+borrowed payload writev above the
+// coalescing threshold; client frames are materialized because RFC masking
+// must not mutate caller-owned payload.
+func (c *Conn) queueFrameLocked(f frame.Frame) (wireSize int, batched bool, err error) {
 	if c.closed.Load() || (c.closing.Load() && f.Opcode != frame.Close) {
-		return ErrClosed
+		return 0, false, ErrClosed
 	}
 	if maxPayload := c.maxFramePayload(); maxPayload > 0 && uint64(len(f.Payload)) > maxPayload {
-		return frame.ErrMessageTooBig
+		return 0, false, frame.ErrMessageTooBig
 	}
 	if f.Opcode == frame.Close && c.writes.close.closeFrameQueued() {
-		return nil
+		return 0, false, nil
 	}
 	if f.Opcode == frame.Close && c.wireTracked() {
 		// Over a tracked transport the Close frame's place on the wire is
@@ -633,42 +679,41 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 		// OnSent prove it left.
 		r, err := c.writeTrackedFrame(f)
 		if err != nil {
-			return err
+			return 0, false, err
 		}
 		c.writes.close.setReceipt(r)
 		c.writes.close.markCloseFrameSent()
-		return nil
+		return frameWireSize(len(f.Payload), c.isClient()), false, nil
 	}
 	var maskKey [4]byte
 	if c.isClient() {
 		if _, err := rand.Read(maskKey[:]); err != nil {
-			return err
+			return 0, false, err
 		}
 		f.Masked = true
 	}
-	wireSize := frameWireSize(len(f.Payload), f.Masked)
+	wireSize = frameWireSize(len(f.Payload), f.Masked)
 	threshold := c.writeBufferedThreshold()
 	small := threshold > 0 && wireSize < threshold
-	if small && c.batching.Load() && c.outboundHasRoom(wireSize) {
+	if small && c.round.Load()&roundBatching != 0 && c.outboundHasRoom(wireSize) {
 		if err := c.batchFrame(f, maskKey, wireSize); err != nil {
-			return err
+			return 0, false, err
 		}
 		// Pending once the batch is handed over, as batchMessageLocked's
 		// frames are: until then the bytes sit above the transport, and a
 		// transport report — "its queue is empty" over layers — must not
 		// retire them. A tracked transport has no pending count.
 		if !c.wireTracked() {
-			c.batchUntracked += wireSize
 			if heartbeat := c.heartbeat; heartbeat != nil {
 				heartbeat.outboundAccepted.Add(uint64(wireSize))
 			}
 		}
 		c.markHeartbeatPingTarget(f)
-		return c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
+		return wireSize, true, c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
 	}
 	// Frames batched earlier go first, so this one cannot overtake them.
 	if err := c.flushBatchLocked(); err != nil {
-		return err
+		return 0, false, err
 	}
 	c.trackOutbound(wireSize)
 	c.markHeartbeatPingTarget(f)
@@ -680,13 +725,13 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 			dst, err := c.raw.ReserveOutbound(wireSize)
 			if err == nil {
 				frame.Append(dst[:0], f, maskKey)
-				return c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
+				return wireSize, false, c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
 			}
 			if err != uio.ErrReserveUnsupported {
-				return c.finishFrameWrite(f.Opcode, 0, wireSize, err)
+				return wireSize, false, c.finishFrameWrite(f.Opcode, 0, wireSize, err)
 			}
 		}
-		return c.writeFrameOwned(f, maskKey, wireSize)
+		return wireSize, false, c.writeFrameOwned(f, maskKey, wireSize)
 	}
 	scratch := acquireServerFrameScratch()
 	header := frame.AppendHeader(scratch.header[:0], f, maskKey)
@@ -694,7 +739,7 @@ func (c *Conn) sendFrameLocked(f frame.Frame) error {
 	scratch.vec[1] = f.Payload
 	n, err := c.raw.Writev(scratch.vec[:])
 	releaseServerFrameScratch(scratch)
-	return c.finishFrameWrite(f.Opcode, n, wireSize, err)
+	return wireSize, false, c.finishFrameWrite(f.Opcode, n, wireSize, err)
 }
 
 // writeFrameOwned encodes f into a buffer the transport takes over. The caller
@@ -786,12 +831,13 @@ func (c *Conn) outboundRefuses(wireSize int) bool {
 // small, uncompressed, from a server with no heartbeat or close in progress.
 // It makes send's checks and appends the frame to the batch in one step. It
 // reports false, having done nothing, for any message it does not cover.
+// round is the round word send loaded; see countReply.
 //
 // The frame's bytes join the pending count when the batch is handed over, in
 // one addition for the whole batch. Until then they cannot retire, and no
 // graceful close can claim the transport: its Close frame is counted, and it
 // either follows them in the batch or hands the batch over first.
-func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, error) {
+func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte, round uint32) (bool, error) {
 	config := c.config
 	if config == nil || c.heartbeat != nil || c.compression != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
@@ -816,9 +862,6 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 			return true, err
 		}
 	}
-	if !c.wireTracked() {
-		c.batchUntracked += wireSize
-	}
 	dst := batch.AvailableBuffer()[:wireSize]
 	// The header is written in place for the lengths a batch carries: built
 	// as a frame.Frame for AppendHeader, the struct's byte stores were read
@@ -836,6 +879,10 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 		copy(dst[len(header):], payload)
 	}
 	batch.CommitWrite(wireSize)
+	c.batchBuffered.Store(int64(batch.Len()))
+	if round > roundBatching {
+		c.countReply(round, wireSize, true)
+	}
 	return true, nil
 }
 
@@ -846,7 +893,8 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, er
 // queue, which the connection's own task can reserve. It reports false,
 // having done nothing, for any message it does not cover, including one sent
 // from outside that task and every message of a client, whose limit is -1.
-func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error) {
+// round is the round word send loaded; see countReply.
+func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte, round uint32) (bool, error) {
 	size := len(payload)
 	if c.config == nil || size > c.config.shortSendDirect || c.heartbeat != nil || c.compression != nil || c.batch != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
@@ -868,6 +916,9 @@ func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error
 	}
 	if err != nil {
 		return true, c.finishFrameWrite(opcode, 0, wireSize, err)
+	}
+	if round > roundBatching {
+		c.countReply(round, wireSize, false)
 	}
 	if head == 4 {
 		dst[0], dst[1] = 0x80|byte(opcode), 126
@@ -914,6 +965,7 @@ func (c *Conn) batchFrame(f frame.Frame, maskKey [4]byte, wireSize int) error {
 	}
 	frame.Append(batch.AvailableBuffer()[:0], f, maskKey)
 	batch.CommitWrite(wireSize)
+	c.batchBuffered.Store(int64(batch.Len()))
 	return nil
 }
 
@@ -937,14 +989,17 @@ func (c *Conn) flushBatchLocked() error {
 		return nil
 	}
 	c.batch = nil
-	if c.batchUntracked != 0 {
-		if !c.wireTracked() {
-			c.writes.close.pendingBytes.Add(int64(c.batchUntracked))
-		}
-		c.batchUntracked = 0
-	}
 	want := batch.Len()
+	if !c.wireTracked() {
+		// Every batched frame joins the pending count here, at once.
+		c.writes.close.pendingBytes.Add(int64(want))
+	}
+	// Completion may run inside WriteOwned. Its observer must see retired
+	// transport bytes, rather than also counting the batch being submitted.
+	c.batchBuffered.Store(^int64(want))
 	n, err := c.raw.WriteOwned(batch)
+	c.batchBuffered.Store(0)
+	c.flushOutboundObservation()
 	if errors.Is(err, uio.ErrOutboundOverflow) {
 		uio.ReleaseBuffer(batch)
 		err = errBatchRefused
@@ -952,6 +1007,8 @@ func (c *Conn) flushBatchLocked() error {
 	if err = c.finishFrameWrite(frame.Continuation, n, want, err); err != nil && !errors.Is(err, ErrClosed) {
 		c.failStream(err)
 	}
+	// The round's replies in the batch take their place in the queue.
+	c.placeReplyBatch(want, err == nil)
 	return err
 }
 
@@ -966,26 +1023,30 @@ func (c *Conn) flushLocked() error {
 
 // beginWriteBatch makes the small frames sent from now on join the write
 // batch until the read round ends. Only the connection's own read path calls
-// it, so a plain load sees whether this round already did.
+// it, and only the round writes the round word, so a plain load sees whether
+// this round already did and a store keeps the round's mark.
 func (c *Conn) beginWriteBatch() {
-	if !c.batching.Load() {
-		c.batching.Store(true)
+	if round := c.round.Load(); round&roundBatching == 0 {
+		c.round.Store(round | roundBatching)
 	}
 }
 
-// endWriteBatch closes a read round's write batch and hands it over. A lock
-// holder that released during the round left the batch in place, so this
+// endRound clears the round word as the read round ends — later sends are no
+// longer its replies — and, when the round batched, hands its batch over. A
+// lock holder that released during the round left the batch in place, so this
 // waits for the lock, which is only ever held for one message or frame.
-func (c *Conn) endWriteBatch() {
-	c.batching.Store(false)
-	c.writes.mu.Lock()
-	c.unlockWrite()
+func (c *Conn) endRound(round uint32) {
+	c.round.Store(0)
+	if round&roundBatching != 0 {
+		c.writes.mu.Lock()
+		c.unlockWrite()
+	}
 }
 
 // unlockWrite hands over a batch no read round will close any more, releases
 // the lock, and claims a transport close that a rolled-back write completed.
 func (c *Conn) unlockWrite() {
-	if c.batch != nil && !c.batching.Load() {
+	if c.batch != nil && c.round.Load()&roundBatching == 0 {
 		_ = c.flushBatchLocked()
 	}
 	c.writes.mu.Unlock()
@@ -1131,6 +1192,11 @@ func (c *Conn) transportSent(n int) {
 		return
 	}
 	c.releaseOutbound(n)
+	// Only a plain transport's report is frame bytes, the unit the replies
+	// are counted in; see Conn.replies.
+	if replies := c.replies.Load(); replies != nil {
+		replies.sent.Add(int64(n))
+	}
 }
 
 // releaseOutbound advances protocol send progress only for UIO's OnOutbound

@@ -497,11 +497,7 @@ func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 			conn.tryCloseTransport()
 		}
 		conn.resumeReadsAfterDrain()
-		if conn.config != nil && conn.config.observeTraffic {
-			if observer, ok := conn.handler.(TrafficObserver); ok {
-				observer.OnOutbound(conn, n)
-			}
-		}
+		conn.observeOutbound(n)
 	}
 }
 
@@ -525,8 +521,7 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		}
 		raw.SetUserdata(conn)
 	}
-	conn.releaseParser()
-	conn.releaseAssembler()
+	conn.releaseReadState()
 	if !conn.opened.Load() {
 		conn.stopHandshakeTimer()
 		if !conn.closed.CompareAndSwap(false, true) {

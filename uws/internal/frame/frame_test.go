@@ -588,12 +588,22 @@ func TestIncrementalParserResetsBeforeCallbackError(t *testing.T) {
 func TestClosePayloadValidation(t *testing.T) {
 	valid := make([]byte, 2)
 	binary.BigEndian.PutUint16(valid, 1000)
-	for _, payload := range [][]byte{nil, valid, append(valid, []byte("bye")...)} {
+	valids := [][]byte{nil, valid, append(valid, []byte("bye")...)}
+	// 1012 Service Restart, 1013 Try Again Later and 1014 Bad Gateway are
+	// IANA-registered close codes.
+	for _, code := range []uint16{1012, 1013, 1014} {
+		payload := make([]byte, 2)
+		binary.BigEndian.PutUint16(payload, code)
+		valids = append(valids, payload)
+	}
+	for _, payload := range valids {
 		if err := ValidateClosePayload(payload); err != nil {
 			t.Fatalf("ValidateClosePayload(%x) = %v", payload, err)
 		}
 	}
-	for _, payload := range [][]byte{{1}, {0, 1}, {3, 236}, {3, 232, 0xff}} {
+	// {3, 236} is 1004 Reserved; 1005 and 1006 are receive-only pseudo-codes
+	// and 1015 TLS Handshake stays reserved, so none may ride a Close frame.
+	for _, payload := range [][]byte{{1}, {0, 1}, {3, 236}, {3, 232, 0xff}, {3, 237}, {3, 238}, {3, 247}} {
 		if err := ValidateClosePayload(payload); err == nil {
 			t.Fatalf("ValidateClosePayload(%x) accepted invalid payload", payload)
 		}

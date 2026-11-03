@@ -25,6 +25,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/petermattis/goid"
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
@@ -48,25 +49,33 @@ type Conn struct {
 	closed  atomic.Bool
 	closing atomic.Bool
 
-	readFrames int32       // frames delivered in the current read round
-	batching   atomic.Bool // a read round is batching the small frames it sends
-	// readPaused marks a connection that stopped consuming because its queued
-	// output reached the high watermark; resumeReadsAfterDrain, or a read
-	// round that finds the queue drained, clears it once the queue falls to
-	// the low watermark.
-	readPaused atomic.Bool
+	readFrames int32 // frames delivered in the current read round
+	// round is the read round's word, written only by the round and read by
+	// senders: the mark of the goroutine running it (roundToken) while it
+	// tells its replies apart (watchReplies), and roundBatching while it
+	// batches the small frames it sends.
+	round atomic.Uint32
+	// readPauses holds independent automatic and application pause bits.
+	// A transport drain clears only the automatic bit; ResumeReads clears
+	// only the application's. See backpressure.go.
+	readPauses atomic.Uint32
 
 	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
-	// batchUntracked is the part of batch that batchMessageLocked appended
-	// and the pending count does not hold yet; guarded by writes.mu.
-	batchUntracked int
-	heartbeat      *heartbeatState
-	writes         connWriteState
+	// batchBuffered publishes the write batch's size for lock-free public
+	// observations, including synchronous transport completion callbacks.
+	// A negative value marks a batch being handed to the transport.
+	batchBuffered atomic.Int64
+	// replies follows the read rounds' replies while they are queued; nil
+	// while none is followed. See replyLedger. A tracked transport — a layer
+	// stack, TLS under the protocol — reports bytes on the wire, which are
+	// not the frame bytes replies are counted in, so it tracks none.
+	replies   atomic.Pointer[replyLedger]
+	heartbeat *heartbeatState
+	writes    connWriteState
 
-	userData   any
-	metadata   atomic.Pointer[connMetadata]
-	handshake  atomic.Pointer[handshakeState]
-	closeTimer atomic.Pointer[closeTimerState]
+	userData  any
+	metadata  atomic.Pointer[connMetadata]
+	handshake atomic.Pointer[handshakeState]
 }
 
 // setRaw installs the transport the connection runs on and records whether
@@ -160,11 +169,151 @@ const (
 	transportPhaseMask  = uint32(3 << transportPhaseShift)
 )
 
+// roundBatching marks a read round that batches the small frames it sends;
+// the bits above it hold the round's goroutine mark.
+const roundBatching uint32 = 1
+
+// roundToken is the calling goroutine's mark in the round word: its id,
+// shifted past roundBatching. The id is truncated, as UIO's write claims
+// truncate it: two live goroutines would have to be two billion apart to
+// share a mark. A goroutine whose mark is zero is never told apart, and its
+// rounds count no replies.
+func roundToken() uint32 { return uint32(goid.Get()) << 1 }
+
+// countReply records a frame of wireSize bytes the read round's goroutine
+// queued as one of the round's replies: the Handler answering what the round
+// delivered, or the protocol answering a Ping. round is the round word its
+// sender loaded, with the round's mark in it. A batched frame takes its place
+// in the queue when the batch is handed over. Sends from anywhere else —
+// another goroutine, another connection's round — are not replies, whatever
+// they queue. It requires writes.mu.
+func (c *Conn) countReply(round uint32, wireSize int, batched bool) {
+	if !c.wireTracked() && round&^roundBatching == roundToken() {
+		c.noteReply(wireSize, batched)
+	}
+}
+
+// noteReply records a reply frame of wireSize bytes; see countReply. A
+// batched reply is already appended, so its batch offset is available here.
+// It requires writes.mu.
+func (c *Conn) noteReply(wireSize int, batched bool) {
+	if wireSize <= 0 || c.wireTracked() {
+		return
+	}
+	replies := c.replies.Load()
+	if replies == nil {
+		if !batched && c.raw.OutboundBuffered() <= c.config.outboundLow {
+			// A reply into a drained queue: the next round's check starts
+			// the count over anyway.
+			return
+		}
+		replies = newReplyLedger()
+		c.replies.Store(replies)
+	}
+	if batched {
+		replies.addBatched(int64(wireSize), int64(c.batch.Len()))
+		return
+	}
+	replies.add(int64(wireSize), c.queueEnd(replies))
+}
+
+// placeReplyBatch counts the batched replies of a write batch just handed
+// over. Each run keeps its offset within the batch, including gaps written
+// by external senders. A refused batch queued nothing. Requires writes.mu.
+func (c *Conn) placeReplyBatch(size int, accepted bool) {
+	replies := c.replies.Load()
+	if replies != nil && replies.batched != 0 {
+		replies.placeBatch(int64(size), c.queueEnd(replies), accepted)
+	}
+}
+
+// queueEnd is the position the transport's queue ends at, in the terms of
+// replies: what it reported sent and what it still holds. The sent is read
+// first: a send report retires the queue's bytes before it raises the sent
+// count, so a report that lands between the two readings leaves the sum no
+// higher than the truth — a reply placed short retires early, while one
+// placed past its bytes would keep counting after it left. It requires
+// writes.mu.
+func (c *Conn) queueEnd(replies *replyLedger) int64 {
+	sent := replies.sent.Load()
+	return sent + int64(c.raw.OutboundBuffered())
+}
+
+// holdsReplies reports whether a read round stops consuming because its
+// connection's replies back up: the queue reached the high watermark, and the
+// replies still in it make up at least the band between the two watermarks.
+// A connection that only answers pauses where its queue reaches the high
+// watermark. Output queued from anywhere else — a broadcast, a pull Client's
+// sends, a relay's forwards — never pauses reads: stopping them would not slow
+// it, and would only keep the peer from being read.
+func (c *Conn) holdsReplies(high int) bool {
+	if c.wireTracked() {
+		// A tracked transport reports wire bytes, not the frame bytes the
+		// replies are counted in; see Conn.replies.
+		return false
+	}
+	if c.internalReadsPaused() {
+		return c.holdReads()
+	}
+	low := c.config.outboundLow
+	queued := c.raw.OutboundBuffered()
+	if queued <= low {
+		c.watchReplies(false)
+		if c.replies.Load() != nil {
+			c.releaseReplies()
+		}
+		return false
+	}
+	c.watchReplies(true)
+	replies := c.replies.Load()
+	if queued < high || replies == nil {
+		return false
+	}
+	c.writes.mu.Lock()
+	own := replies.queued()
+	c.writes.mu.Unlock()
+	if own < int64(high-low) {
+		return false
+	}
+	return c.holdReads()
+}
+
+// releaseReplies drops the ledger once every reply it followed has left, so
+// a connection whose queue is drained keeps none. The drain's report asks
+// for a round to run it: see resumeReadsAfterDrain.
+func (c *Conn) releaseReplies() {
+	c.writes.mu.Lock()
+	if replies := c.replies.Load(); replies != nil && replies.batched == 0 && replies.queued() == 0 {
+		c.replies.Store(nil)
+	}
+	c.writes.mu.Unlock()
+}
+
+// watchReplies publishes the round's mark in the round word, or withdraws
+// it. Telling a send apart costs it a goroutine-id lookup, so a round tells
+// its sends apart only while the queue holds more than the low watermark: the
+// replies to a chunk read with the queue drained are not counted, and the
+// count starts with the next chunk, once a check finds the queue above the low
+// watermark — a connection that only answers pauses at most one chunk later
+// than counting every reply would. A mark whose queue drains stays until the
+// round's next check or its end.
+func (c *Conn) watchReplies(on bool) {
+	round := c.round.Load()
+	if watched := round > roundBatching; watched == on {
+		return
+	}
+	if on {
+		c.round.Store(round | roundToken())
+	} else {
+		c.round.Store(round & roundBatching)
+	}
+}
+
 // holdReads reports whether a read round stops consuming, so UIO's inbound
-// hold stops the socket reads. A connection pauses once its queued output
-// reaches the high watermark and stays paused until the queue drains to the
-// low watermark, whatever runs its next round: input that arrives in between
-// is left for later. It counts both transitions.
+// hold stops the socket reads. A connection pauses once holdsReplies finds
+// its replies backed up and stays paused until the queue drains to the low
+// watermark, whatever runs its next round: input that arrives in between is
+// left for later. It counts both transitions.
 //
 // The pause is published before the queue is looked at again, and
 // resumeReadsAfterDrain reads the pause after the transport has retired the
@@ -173,21 +322,21 @@ const (
 // and the round goes on reading.
 func (c *Conn) holdReads() bool {
 	low := c.config.outboundLow
-	if c.readPaused.Load() {
+	if c.internalReadsPaused() {
 		if c.raw.OutboundBuffered() > low {
 			return true
 		}
 		// Drained: resume here. Losing the race to resumeReadsAfterDrain
 		// means it resumed, and woke the connection, already.
-		if c.readPaused.CompareAndSwap(true, false) && c.config.stats != nil {
+		if c.setInternalReadPause(false) && c.config.stats != nil {
 			c.config.stats.resumed.Add(1)
 		}
 		return false
 	}
-	if !c.readPaused.CompareAndSwap(false, true) {
+	if !c.setInternalReadPause(true) {
 		return true
 	}
-	if c.raw.OutboundBuffered() <= low && c.readPaused.CompareAndSwap(true, false) {
+	if c.raw.OutboundBuffered() <= low && c.setInternalReadPause(false) {
 		return false
 	}
 	if c.config.stats != nil {
@@ -198,18 +347,27 @@ func (c *Conn) holdReads() bool {
 
 // resumeReadsAfterDrain wakes a paused connection once its queued output has
 // fallen to the low watermark. The transport's outbound callback calls it.
+// A connection that was never paused, or already resumed, gets a round only
+// when it still follows replies: the round drops the ledger once the queue
+// has drained (releaseReplies), which no other callback can run.
 func (c *Conn) resumeReadsAfterDrain() {
 	config := c.config
-	if config == nil || config.outboundHigh <= 0 || !c.readPaused.Load() {
+	if config == nil || config.outboundHigh <= 0 {
 		return
 	}
-	if c.raw.OutboundBuffered() > config.outboundLow {
-		return
-	}
-	if c.readPaused.CompareAndSwap(true, false) {
-		if config.stats != nil {
-			config.stats.resumed.Add(1)
+	if c.internalReadsPaused() {
+		if c.raw.OutboundBuffered() > config.outboundLow {
+			return
 		}
+		if c.setInternalReadPause(false) {
+			if config.stats != nil {
+				config.stats.resumed.Add(1)
+			}
+			_ = c.raw.Wake()
+		}
+		return
+	}
+	if c.replies.Load() != nil && c.raw.OutboundBuffered() <= config.outboundLow {
 		_ = c.raw.Wake()
 	}
 }
@@ -267,6 +425,16 @@ type connMetadata struct {
 	closeErr    error
 	closeCode   uint16
 	closeReason string
+	closeTimer  *closeTimerState // the graceful-close deadline's registration
+	// User send reports made inside a batch handoff are delivered once the
+	// handoff ends, so observers can see its final queue state.
+	outboundDeferred atomic.Int64
+	// Deferred reports may be delivered by the submitting goroutine rather
+	// than the transport callback. Preserve serialization with other reports.
+	outboundMu sync.Mutex
+	// staged is a handshake's unconsumed frame tail. Only protocol read
+	// turns access it, as they do the parser and assembler.
+	staged []byte
 }
 
 // handshakeState contains every resource whose lifetime ends at handshake

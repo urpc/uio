@@ -124,8 +124,8 @@ func TestOutboundWatermarkResolution(t *testing.T) {
 		t.Fatalf("negative high watermark resolved to %d/%d, want 0/0 (pause disabled)",
 			disabled.OutboundHighWatermark, disabled.OutboundLowWatermark)
 	}
-	if got := disabled.transportEvents().MaxInboundBuffered; got != 0 {
-		t.Fatalf("transport inbound bound = %d, want 0 (pause disabled)", got)
+	if got := disabled.transportEvents().MaxInboundBuffered; got != DefaultOutboundHighWatermark {
+		t.Fatalf("transport inbound bound = %d, want the manual pause's %d bound", got, DefaultOutboundHighWatermark)
 	}
 	if cfg := newServerConnConfig(disabled, nil, nil, &statsCounters{}); cfg.outboundHigh != 0 {
 		t.Fatalf("server connection high watermark = %d, want 0", cfg.outboundHigh)

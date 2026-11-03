@@ -262,11 +262,7 @@ func (s *Server) onOutbound(raw uio.Conn, n int) {
 			conn.tryCloseTransport()
 		}
 		conn.resumeReadsAfterDrain()
-		if conn.config != nil && conn.config.observeTraffic {
-			if observer, ok := conn.handler.(TrafficObserver); ok {
-				observer.OnOutbound(conn, n)
-			}
-		}
+		conn.observeOutbound(n)
 	}
 }
 
@@ -277,8 +273,7 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 	if !ok || conn == nil {
 		return
 	}
-	conn.releaseParser()
-	conn.releaseAssembler()
+	conn.releaseReadState()
 	if !conn.opened.Load() {
 		conn.stopHandshakeTimer()
 		if !conn.closed.CompareAndSwap(false, true) {
