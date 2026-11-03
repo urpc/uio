@@ -163,13 +163,18 @@ func TestBridgeRelaysBothWays(t *testing.T) {
 func TestBridgeDialOverride(t *testing.T) {
 	first := startBridgeEcho(t, nil)
 	second := startBridgeEcho(t, nil)
-	var sawClient bool
-	var dialedTo string
+	// Dial runs on a uio goroutine; the echo reaching the client orders
+	// nothing in Go's memory model (the stdio backend writes it without the
+	// race detector's syscall annotation), so its report travels by channel.
+	type dialSeen struct {
+		client bool
+		to     string
+	}
+	seen := make(chan dialSeen, 1)
 	br := &Bridge{
 		Upstream: first, // wrong on purpose: Dial must win
 		Dial: func(ctx context.Context, client Conn, dial DialFunc) (Conn, error) {
-			sawClient = client != nil
-			dialedTo = second
+			seen <- dialSeen{client: client != nil, to: second}
 			return dial(ctx, second)
 		},
 	}
@@ -193,8 +198,13 @@ func TestBridgeDialOverride(t *testing.T) {
 	if got := readN(t, conn, len(payload)); !bytes.Equal(got, payload) {
 		t.Fatal("dial-override echo mismatched")
 	}
-	if !sawClient || dialedTo != second {
-		t.Fatalf("Dial saw client=%v dialedTo=%q", sawClient, dialedTo)
+	select {
+	case got := <-seen:
+		if !got.client || got.to != second {
+			t.Fatalf("Dial saw client=%v dialedTo=%q", got.client, got.to)
+		}
+	default:
+		t.Fatal("the echo arrived without Dial having run")
 	}
 }
 

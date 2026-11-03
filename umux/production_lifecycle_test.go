@@ -79,10 +79,15 @@ func TestSessionAnnouncementQueueRefusesUnreachableTransports(t *testing.T) {
 	t.Cleanup(func() { _ = cli.Close(nil); _ = cli.Wait(); _ = srv.Close(nil); _ = srv.Wait() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	// Dial returns once the client's side opened; the server announces each
+	// session from its own OnOpen, concurrently and in no set order. Wait for
+	// each announcement so the queue is full before the last transport, and
+	// that one, not an earlier, is refused.
 	for i := 0; i < cap(srv.session); i++ {
 		if _, err := cli.Dial(ctx, "tcp://"+ln.Addr().String()); err != nil {
 			t.Fatalf("dial %d: %v", i, err)
 		}
+		waitFor(t, "session announcement", func() bool { return len(srv.session) == i+1 })
 	}
 	sess, err := cli.Dial(ctx, "tcp://"+ln.Addr().String())
 	if err == nil {
