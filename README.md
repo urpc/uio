@@ -459,9 +459,61 @@ nothing; the three are read once, when `Serve` starts.
 
 ## Backpressure
 
-When a connection's data goes somewhere slower — a relay leg, an upstream
-call, another peer — stop consuming once that destination is behind, and go
-on when it drains. `Bridge` runs that loop for a relay:
+When a connection's data goes somewhere slower — a peer it forwards to, an
+upstream call, a work queue — stop its input once that destination is behind,
+and release it when the destination has room again. `PauseReads` and
+`ResumeReads` are that switch:
+
+```go
+relay := uio.FuncHandler{
+	Read: func(c uio.Conn) error {
+		peer := peerOf(c) // the destination this connection forwards to
+		if peer.OutboundBuffered() >= high {
+			_ = c.PauseReads() // the destination is behind: stop the source
+		}
+		_, err := c.WriteTo(peer)
+		return err
+	},
+}
+// The destination drained: let the source's input through again.
+relay.BytesWritten = func(dest uio.Conn, _ int) {
+	if dest.OutboundBuffered() <= low {
+		_ = sourceOf(dest).ResumeReads()
+	}
+}
+```
+
+While a plain stream is paused its socket is not read, so TCP flow control
+slows the peer at once and what was already read stays in the connection:
+`ResumeReads` schedules the turn that hands it to OnRead, and a write past
+the destination's own `MaxOutboundBuffered` fails with `ErrOutboundOverflow`,
+so the pause above keeps memory bounded without closing anyone. Pausing keeps
+timers, writes, send reports and close work running; it never releases
+another owner's pause (protocol layers and helpers hold pauses of their own),
+and it is safe from any goroutine. A full `Wake`-based variant of the same
+loop — leave the bytes unconsumed until `MaxInboundBuffered` stops the
+socket, then `Wake` the source when the destination drains — needs no API
+beyond `OutboundBuffered`, and a destination whose queue drains without a
+write to report it tells an Observer that implements `QueueDrainedObserver`.
+
+`PauseReads` is the application's one switch, idempotent rather than
+reference counted. What was read is kept and handed to the first OnRead
+after `ResumeReads`, and the peer's end of the stream waits behind it: a
+paused connection does not close for its peer's end until it resumed and saw
+what it kept. A reset, a fatal error or a local close ends it regardless (on
+the portable stdio backend a reset behind a pause is seen once reads resume
+or a read deadline passes: the socket is not read while paused). A layered
+stack keeps reading its socket into its bounds (`MaxInboundBuffered`, or
+64 KiB when that is zero) while its Handler is paused. A callback or socket
+read already in flight finishes, so a protocol handling several messages in
+one callback checks `ReadsPaused()` between them. Raw datagram connections
+report `ErrUnsupported`: their peers share a socket.
+
+`Bridge` is this loop packaged for one shape: a relay whose every accepted
+connection is dialed to one upstream. A leg whose destination queue reaches
+`InboundLimit` (256 KiB by default) leaves its input unconsumed, forwards
+again once the queue drains to half, and splits a read larger than the
+destination's write budget:
 
 ```go
 bridge := &uio.Bridge{Upstream: "tcp://127.0.0.1:9527"}
@@ -469,59 +521,8 @@ events := bridge.Events()
 err := events.Serve("tcp://:9528")
 ```
 
-It forwards what a leg reads while the destination's queue is below
-`InboundLimit` (256 KiB by default), leaves the rest unconsumed while it is
-not, and forwards again once the queue drains to half the limit; a read
-larger than the destination's write budget goes in smaller pieces. A leg's
-unconsumed input stops its socket reads at the same limit, so TCP flow
-control slows the peer and memory stays bounded without closing anyone.
-
-A custom relay does the same with `OutboundBuffered()` and `Wake()`:
-
-```go
-relay := uio.FuncHandler{
-	Read: func(c uio.Conn) error {
-		peer := peerOf(c) // the paired connection, e.g. from Userdata
-		if peer.OutboundBuffered() >= 256<<10 {
-			return nil // the far side is behind: leave the bytes unconsumed
-		}
-		_, err := c.WriteTo(peer)
-		return err
-	},
-	BytesWritten: func(c uio.Conn, _ int) {
-		if c.OutboundBuffered() < 128<<10 {
-			_ = peerOf(c).Wake() // the far side drained: run the source again
-		}
-	},
-}
-events := &uio.Events{MaxInboundBuffered: 256 << 10, Handler: relay, Observer: relay}
-```
-
-Once the unconsumed bytes reach `MaxInboundBuffered`, the connection stops
-reading its socket. While reads are held no I/O event arrives to run the
-callback that would consume them, so it takes a `Wake` — it carries no
-data — to trigger it. A write past the destination's own `MaxOutboundBuffered`
-fails with `ErrOutboundOverflow` instead; the check above stays below it. A
-destination whose queue drains without a write to report it — output a layer
-holds until its peer acknowledges it, a umux stream's queue — tells an
-Observer that implements `QueueDrainedObserver`.
-
-**Pausing reads.** `PauseReads()` stops a connection's input outright: OnRead
-does not run, and a plain stream stops reading its socket at once, while
-timers, writes, send reports and close work go on. What was read is kept and
-handed to the first OnRead after `ResumeReads()`, and the peer's end of the
-stream waits behind it: a paused connection does not close for its peer's
-end until it resumed and saw what it kept. A reset, a fatal error or a local
-close ends it regardless (on the portable stdio backend a reset behind a
-pause is seen once reads resume or a read deadline passes: the socket is not
-read while paused). A layered stack keeps reading its socket into its
-bounds (`MaxInboundBuffered`, or 64 KiB when that is zero) while its Handler
-is paused. `ResumeReads()` releases only the application's own pause, and
-without one does nothing; protocol layers and `Bridge` hold pauses of their
-own, which it never releases. Pause and resume are safe from any goroutine; a
-callback or socket read already in flight finishes, so a protocol handling
-several messages in one callback checks `ReadsPaused()` between them. Raw
-datagram connections report `ErrUnsupported`: their peers share a socket.
+For anything else — many destinations per source, a choice of upstream per
+connection, a store between the sides — drive the pause yourself, as above.
 
 **Yielding.** `YieldRead()` splits work across turns: the callback returns,
 and a later turn calls OnRead again with what it left, before the end of the
