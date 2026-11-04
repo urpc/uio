@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/urpc/uio"
 )
@@ -147,6 +148,12 @@ func (s *Server) Serve(addrs ...string) error {
 		BytesWritten: s.onOutbound,
 		Sent:         s.onSentReceipt,
 	}
+	if s.config.heartbeatInterval > 0 {
+		// Only the heartbeat needs a timer callback: OnRead ticks it on
+		// every data turn, and the timer reaches a connection whose reads
+		// are paused, which runs no OnRead.
+		handler.Timer = s.onTimer
+	}
 	if s.config.observeTraffic {
 		handler.BytesRead = s.onInbound
 	}
@@ -236,6 +243,13 @@ func (s *Server) onData(raw uio.Conn) error {
 		return nil
 	}
 	return err
+}
+
+func (s *Server) onTimer(raw uio.Conn) error {
+	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
+		conn.timerTick(time.Now(), raw.InboundBuffered() > 0 || conn.stagedInput())
+	}
+	return nil
 }
 
 // onInbound reports transport bytes to a Handler that observes traffic.

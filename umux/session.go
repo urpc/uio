@@ -136,7 +136,12 @@ func newSession(conn uio.Conn, cfg Config, client bool) *Session {
 	} else {
 		s.nextID = 2 // server streams are even
 	}
-	s.drainObs, _ = cfg.Observer.(QueueDrainedObserver)
+	// A Handler that hears drains — a uio.Bridge — needs no Observer set too.
+	if obs, ok := cfg.Observer.(QueueDrainedObserver); ok {
+		s.drainObs = obs
+	} else {
+		s.drainObs, _ = cfg.Handler.(QueueDrainedObserver)
+	}
 	if cfg.KeepAlive > 0 {
 		s.lastPing = time.Now()
 	}
@@ -341,10 +346,19 @@ func (s *Session) onRead(c uio.Conn) error {
 // runWakes runs the empty read turns streams scheduled with Wake.
 func (s *Session) runWakes() {
 	handler := s.cfg.Handler
+	s.mu.Lock()
 	if handler == nil {
+		// Pull mode runs no read turns; drop what asked for one rather than
+		// keep closed streams queued.
+		for _, st := range s.wakeQ {
+			st.mu.Lock()
+			st.wakePending = false
+			st.mu.Unlock()
+		}
+		s.wakeQ = nil
+		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
 	wakes := s.wakeQ
 	s.wakeQ = nil
 	live := wakes[:0]
@@ -362,14 +376,10 @@ func (s *Session) runWakes() {
 	}
 	s.mu.Unlock()
 	for _, st := range live {
-		if err := handler.OnRead(st); err != nil {
-			s.abortStream(st, err)
-			continue
-		}
 		// A wake turn drains like an arrival turn: a stream whose FIN arrived
 		// while it was backed up settles here, once the callback consumed the
 		// rest.
-		s.tryFinish(st)
+		s.dispatchRead(st)
 	}
 }
 
@@ -516,6 +526,15 @@ func (s *Session) handleWindowUpdate(h frameHeader) error {
 		// a socket connection.
 		if obs := s.cfg.Observer; obs != nil {
 			obs.OnBytesWritten(st, 0)
+			if _, carries := obs.(QueueDrainedObserver); !carries && s.drainObs != nil {
+				// An Observer without drain reports cannot reach one
+				// waiting on the Handler; the reopened window is room.
+				s.drainObs.OnQueueDrained(st)
+			}
+		} else if s.drainObs != nil {
+			// A Handler hearing drains in the Observer's place hears the
+			// reopened window as one.
+			s.drainObs.OnQueueDrained(st)
 		}
 		s.dispatchRead(st)
 	}
@@ -838,7 +857,12 @@ func (s *Session) tryFinish(st *Stream) {
 		return
 	}
 	st.mu.Lock()
-	if st.closedLocal || !st.peerFIN || !st.localFIN || st.finState != finSent || len(st.out) != 0 || st.in.len() != 0 {
+	// FIN completion waits for the consumer: unread input, a callback
+	// running, a pause or the resume turn its release owes, or a
+	// continuation it asked for with YieldRead — its final callback sees the
+	// end first. Pull readers have no callback to wait for.
+	owed := s.cfg.Handler != nil && (st.yieldOwed || st.readControl.Load().Held())
+	if st.closedLocal || st.callbackActive || !st.peerFIN || !st.localFIN || st.finState != finSent || len(st.out) != 0 || st.in.len() != 0 || owed {
 		st.mu.Unlock()
 		s.mu.Unlock()
 		return
@@ -1114,14 +1138,41 @@ func (s *Session) abortRemote(st *Stream, cause error) {
 // its direction, or a window update woke writers.
 func (s *Session) dispatchRead(st *Stream) {
 	handler := s.cfg.Handler
-	if handler == nil {
-		// Pull mode: the Accept owner reads directly.
+	if handler == nil || st.ReadsPaused() {
+		// Pull mode reads directly; a paused callback retains its receive credit.
 		s.tryFinish(st)
 		return
 	}
-	if err := handler.OnRead(st); err != nil {
-		s.abortStream(st, err)
+	s.invokeCallback(st, func() error {
+		st.readControl.Load().ConsumerRuns()
+		return handler.OnRead(st)
+	}, true)
+	s.tryFinish(st)
+}
+
+// invokeCallback holds the consumer's lifetime through its callback. Read and
+// Discard can drain the last bytes inline, while a concurrent FIN flush can
+// also attempt completion, so the callback is published as active before it
+// runs — it is also the continuation an earlier YieldRead asked for. Abort
+// errors before releasing it, so EOF cannot win the race with a callback
+// failure. The deferred release covers a panic too.
+func (s *Session) invokeCallback(st *Stream, callback func() error, read bool) {
+	st.mu.Lock()
+	if st.closedLocal {
+		st.mu.Unlock()
 		return
 	}
-	s.tryFinish(st)
+	st.callbackActive = true
+	if read {
+		st.yieldOwed = false
+	}
+	st.mu.Unlock()
+	defer func() {
+		st.mu.Lock()
+		st.callbackActive = false
+		st.mu.Unlock()
+	}()
+	if err := callback(); err != nil {
+		s.abortStream(st, err)
+	}
 }

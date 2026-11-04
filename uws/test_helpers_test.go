@@ -82,7 +82,9 @@ type reentrantCloseHandler struct {
 }
 
 type writeProbeConn struct {
+	probeReadAccess
 	uio.Conn
+	probeReadControl
 	writes        int
 	writevs       int
 	flushes       int

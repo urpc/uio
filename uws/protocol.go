@@ -422,7 +422,10 @@ func unmaskShort(payload []byte, key uint32) bool {
 // countFrame charges a delivered frame against the round's budget.
 func (c *Conn) countFrame() error {
 	c.readFrames++
-	if c.externalReadsPaused() {
+	if c.heartbeat != nil {
+		c.heartbeat.parsed.Add(1)
+	}
+	if c.readPaused.Load() != 0 {
 		return errReadPaused
 	}
 	frameBudget := int32(minFramesPerDataEvent)
@@ -442,7 +445,7 @@ func (c *Conn) countFrame() error {
 // in flight, so most reads of a busy round start inside a frame, and the
 // frames after it belong on the paths below like any others.
 func (c *Conn) consumeFrames(data []byte) (int, error) {
-	if c.externalReadsPaused() {
+	if c.readPaused.Load() != 0 {
 		return 0, errReadPaused
 	}
 	sink := (*connFrameSink)(c)
@@ -917,11 +920,7 @@ func (c *Conn) abortTransport(err error) {
 func (c *Conn) markClosing() {
 	c.closing.Store(true)
 	c.releasePullClient()
-	if c.readPauses.And(^readPauseExternal)&readPauseExternal != 0 && c.raw != nil {
-		// A local Close must read the peer's answer even when no further
-		// input would otherwise schedule the paused protocol again.
-		_ = c.raw.Wake()
-	}
+	c.releaseReadPauses()
 }
 
 func (c *Conn) stopCloseTimer() {

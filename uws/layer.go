@@ -325,10 +325,12 @@ func (w *wsLayerHandler) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 
 // OnTimer runs the heartbeat, which OnRead runs too: a turn skips
 // OnRead while the layer above has not read what it holds, and a peer
-// gone meanwhile must still be found out.
-func (w *wsLayerHandler) OnTimer(uio.LayerContext) error {
+// gone meanwhile must still be found out. It runs before this turn's
+// OnRead, so input still waiting below may hold the Pong; see timerTick.
+func (w *wsLayerHandler) OnTimer(ctx uio.LayerContext) error {
 	if conn := w.conn.Load(); conn != nil {
-		conn.heartbeatTick(time.Now())
+		unparsed := ctx.Down().InboundBuffered() > 0 || len(w.staged) > 0 || conn.stagedInput()
+		conn.timerTick(time.Now(), unparsed)
 	}
 	return nil
 }

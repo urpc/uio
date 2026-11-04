@@ -77,6 +77,33 @@ func (c *Conn) armHeartbeatWake(next time.Time) {
 	c.heartbeat.mu.Unlock()
 }
 
+// timerTick is the heartbeat on the transport's timer callback, which runs
+// before the turn parses what it read. A Pong may be in that input: an
+// expiry found while unparsed input waits for a consumer that is not paused
+// is put off, the timer re-aimed at now, so the input is parsed first — by
+// this turn's OnRead, whose tick then decides, or, should a pause land in
+// between, by nobody, and the timer's next turn expires the Ping as a paused
+// connection's. The wait is bounded by one further timeout; see deferExpiry.
+// unparsed reports input waiting for this connection's parser.
+func (c *Conn) timerTick(now time.Time, unparsed bool) {
+	heartbeat := c.heartbeat
+	if heartbeat == nil || c.closed.Load() || c.closing.Load() {
+		return
+	}
+	if unparsed && c.readPaused.Load() == 0 && heartbeat.deferExpiry(now, c.config.heartbeatTimeout, true) {
+		c.armHeartbeatWake(now)
+		return
+	}
+	c.heartbeatTick(now)
+}
+
+// stagedInput reports frames the handshake's last read carried that wait
+// outside the transport for the parser.
+func (c *Conn) stagedInput() bool {
+	metadata := c.metadata.Load()
+	return metadata != nil && len(metadata.staged) != 0
+}
+
 // heartbeatTick runs on every turn, at the turn's moment: the timed turns
 // the wake timer guarantees and the data turns that arrive on their own. It
 // expires the states the timeout ends, sends a Ping at the interval while
@@ -98,6 +125,12 @@ func (c *Conn) heartbeatTick(now time.Time) {
 		return
 	}
 	heartbeat.mu.Unlock()
+	if heartbeat.deferExpiry(now, c.config.heartbeatTimeout, c.stagedInput()) {
+		// The deadline passed with input waiting or the parser making
+		// progress — a Pong may still be behind it: wait, and come back.
+		c.armHeartbeatWake(now)
+		return
+	}
 	if heartbeat.expirePing(now, c.config.heartbeatTimeout) {
 		c.expireHeartbeat()
 		return

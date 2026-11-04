@@ -55,10 +55,11 @@ type Conn struct {
 	// tells its replies apart (watchReplies), and roundBatching while it
 	// batches the small frames it sends.
 	round atomic.Uint32
-	// readPauses holds independent automatic and application pause bits.
-	// A transport drain clears only the automatic bit; ResumeReads clears
-	// only the application's. See backpressure.go.
-	readPauses atomic.Uint32
+	// readPaused mirrors which of this connection's pauses of the transport
+	// are held — the application's and the automatic reply watermark's —
+	// so a read round checks them between frames with one load. The
+	// transport's own controller holds the pauses; see backpressure.go.
+	readPaused atomic.Uint32
 
 	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
 	// batchBuffered publishes the write batch's size for lock-free public
@@ -247,6 +248,9 @@ func (c *Conn) queueEnd(replies *replyLedger) int64 {
 // sends, a relay's forwards — never pauses reads: stopping them would not slow
 // it, and would only keep the peer from being read.
 func (c *Conn) holdsReplies(high int) bool {
+	if c.closing.Load() {
+		return false
+	}
 	if c.wireTracked() {
 		// A tracked transport reports wire bytes, not the frame bytes the
 		// replies are counted in; see Conn.replies.
@@ -363,7 +367,6 @@ func (c *Conn) resumeReadsAfterDrain() {
 			if config.stats != nil {
 				config.stats.resumed.Add(1)
 			}
-			_ = c.raw.Wake()
 		}
 		return
 	}
@@ -407,6 +410,12 @@ type heartbeatState struct {
 	outboundRetired  atomic.Uint64
 	pingOutstanding  atomic.Bool
 	pingReceipt      uio.SendReceipt // guarded by mu
+	// parsed counts frames delivered to the handler, any Ping's deferrals
+	// apart; deferredAt is the count at the last deferral, set to the
+	// count at the Ping's start. Guarded by mu, parsed excluded: it moves
+	// on turns.
+	parsed     atomic.Int64
+	deferredAt int64
 }
 
 // closeTimerState protects lazy creation, replacement, and cancellation of the
@@ -420,6 +429,9 @@ type closeTimerState struct {
 // connMetadata groups infrequently used negotiated and close information so a
 // normal connection does not pay for separate synchronization fields.
 type connMetadata struct {
+	// The transport pauses of the application and of the reply watermark,
+	// allocated when a pause is first needed.
+	readPauses  atomic.Pointer[connReadPauses]
 	mu          sync.Mutex
 	protocol    string
 	closeErr    error

@@ -26,16 +26,31 @@ import (
 	"time"
 )
 
-// bridgeFreeAddr reserves a loopback port for a listener.
-func bridgeFreeAddr(t *testing.T) string {
+// bridgeServe serves ev and listens on an ephemeral loopback port it binds
+// itself: a port chosen first and bound later can be taken meanwhile by
+// another process — a parallel test run, say.
+func bridgeServe(t *testing.T, ev *Events) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		_ = ev.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = ev.Close(nil)
+		<-stopped
+	})
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		ln, err := ev.Listen("tcp://127.0.0.1:0")
+		if err == nil {
+			return ln.Addr().String()
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("listen: %v", err)
+		}
+		time.Sleep(time.Millisecond)
 	}
-	addr := ln.Addr().String()
-	_ = ln.Close()
-	return addr
 }
 
 // bridgeEchoHandler echoes and half-closes when its peer ends.
@@ -72,7 +87,6 @@ func startBridgeEcho(t *testing.T, handler Handler) string {
 		AllowHalfOpen: true,
 		Hooks:         FuncHandler{Start: func(*Events) { close(ready) }},
 	}
-	addr := bridgeFreeAddr(t)
 	stopped := make(chan struct{})
 	var serveErr error
 	t.Cleanup(func() {
@@ -84,7 +98,7 @@ func startBridgeEcho(t *testing.T, handler Handler) string {
 	})
 	go func() {
 		defer close(stopped)
-		serveErr = ev.Serve("tcp://" + addr)
+		serveErr = ev.Serve()
 	}()
 	select {
 	case <-ready:
@@ -93,7 +107,11 @@ func startBridgeEcho(t *testing.T, handler Handler) string {
 	case <-time.After(5 * time.Second):
 		t.Fatal("upstream did not start")
 	}
-	return addr
+	ln, err := ev.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln.Addr().String()
 }
 
 // bridgeDial retries until the listener accepts.
@@ -127,16 +145,7 @@ func TestBridgeRelaysBothWays(t *testing.T) {
 	upstream := startBridgeEcho(t, nil)
 	br := &Bridge{Upstream: upstream}
 	ev := br.Events()
-	addr := bridgeFreeAddr(t)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
-	t.Cleanup(func() {
-		_ = ev.Close(nil)
-		<-stopped
-	})
+	addr := bridgeServe(t, ev)
 
 	conn := bridgeDial(t, addr)
 	defer conn.Close()
@@ -179,16 +188,7 @@ func TestBridgeDialOverride(t *testing.T) {
 		},
 	}
 	ev := br.Events()
-	addr := bridgeFreeAddr(t)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
-	t.Cleanup(func() {
-		_ = ev.Close(nil)
-		<-stopped
-	})
+	addr := bridgeServe(t, ev)
 	conn := bridgeDial(t, addr)
 	defer conn.Close()
 	payload := bytes.Repeat([]byte("route"), 1024)
@@ -218,16 +218,7 @@ func TestBridgePassesAbortOn(t *testing.T) {
 	upstream := startBridgeEcho(t, abortUpstream)
 	br := &Bridge{Upstream: upstream}
 	ev := br.Events()
-	addr := bridgeFreeAddr(t)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
-	t.Cleanup(func() {
-		_ = ev.Close(nil)
-		<-stopped
-	})
+	addr := bridgeServe(t, ev)
 	conn := bridgeDial(t, addr)
 	defer conn.Close()
 	if _, err := conn.Write([]byte("trigger")); err != nil {
@@ -252,16 +243,7 @@ func TestBridgeAbortResetsUpstream(t *testing.T) {
 	})
 	br := &Bridge{Upstream: upstream}
 	ev := br.Events()
-	addr := bridgeFreeAddr(t)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
-	t.Cleanup(func() {
-		_ = ev.Close(nil)
-		<-stopped
-	})
+	addr := bridgeServe(t, ev)
 	conn := bridgeDial(t, addr)
 	if _, err := conn.Write([]byte("x")); err != nil {
 		t.Fatal(err)
@@ -282,16 +264,7 @@ func TestBridgeAbortResetsUpstream(t *testing.T) {
 func TestBridgeWithoutUpstreamResetsClient(t *testing.T) {
 	br := &Bridge{}
 	ev := br.Events()
-	addr := bridgeFreeAddr(t)
-	stopped := make(chan struct{})
-	go func() {
-		defer close(stopped)
-		_ = ev.Serve("tcp://" + addr)
-	}()
-	t.Cleanup(func() {
-		_ = ev.Close(nil)
-		<-stopped
-	})
+	addr := bridgeServe(t, ev)
 	conn := bridgeDial(t, addr)
 	defer conn.Close()
 	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))

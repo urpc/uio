@@ -176,6 +176,8 @@ type Events struct {
 	// reads, so a delivery passes it by one callback's write at most;
 	// DefaultDeliverBound stands in when this is zero. A connection holds at
 	// most twice the limit, and a layer's one delivery more.
+	// When zero, an explicitly consumer-paused layer stack also uses
+	// DefaultDeliverBound for its retained socket input until that hold drains.
 	//
 	// A packet connection has no socket buffer to hold and is never paced by
 	// this limit: its bottom [PacketLayer] carries whatever backpressure its
@@ -375,6 +377,12 @@ func (ev *Events) onRead(fdc *fdConn) error {
 	if skipRead {
 		return nil // the timer callback closed: no read callback follows
 	}
+	if !fdc.entry.layered && fdc.ReadsPaused() {
+		return nil
+	}
+	// The Handler runs now, or the stack that runs it: the continuation a
+	// YieldRead asked for, and the turn a released pause owed.
+	fdc.consumerStarts()
 	if onRead := fdc.callbacks().onRead; onRead != nil {
 		return onRead(fdc)
 	}

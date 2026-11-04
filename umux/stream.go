@@ -21,9 +21,11 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/readcontrol"
 )
 
 // inbound is a stream's unread receive queue. A borrowed run aliases the
@@ -147,8 +149,10 @@ func (b *inbound) drop() {
 // the stream at a time. Their method calls are synchronized with arrivals;
 // slices returned by PeekChunk have the narrower callback lifetime below.
 type Stream struct {
-	sess *Session
-	id   uint32
+	streamReadAccess
+	sess        *Session
+	id          uint32
+	readControl atomic.Pointer[readcontrol.Control]
 
 	mu sync.Mutex
 	// wmu orders a write's credit-taking and frame enqueues against
@@ -158,6 +162,12 @@ type Stream struct {
 	// transport's buffer, and ownInbound copies it before the transport
 	// consumes that buffer.
 	in inbound
+	// callbackActive keeps FIN completion behind the active read/timer callback:
+	// draining its last bytes must leave time to publish a pause, yield, or error.
+	callbackActive bool
+	// yieldOwed marks a YieldRead whose continuation has not run; FIN
+	// completion waits for it.
+	yieldOwed bool
 	// peerFIN reports the peer ended its writing direction.
 	peerFIN bool
 	// localFIN reports this end ended its writing direction.
@@ -799,9 +809,13 @@ func (st *Stream) SetWakeInterval(interval time.Duration) error {
 	return nil
 }
 
-// Wake schedules an empty read turn for the stream.
+// Wake schedules an empty read turn for the stream. A stream in pull mode
+// has no read callback to run.
 func (st *Stream) Wake() error {
 	s := st.sess
+	if s.cfg.Handler == nil {
+		return nil
+	}
 	s.mu.Lock()
 	if s.closed {
 		// Teardown drops the session queues before closing every stream. A
@@ -826,8 +840,14 @@ func (st *Stream) Wake() error {
 	return s.conn.Wake()
 }
 
-// YieldRead is Wake for streams: there is no socket-level read pause.
-func (st *Stream) YieldRead() error { return st.Wake() }
+// YieldRead schedules the next read turn and keeps FIN completion behind
+// it. It never clears a pause. Call from a stream callback and return.
+func (st *Stream) YieldRead() error {
+	st.mu.Lock()
+	st.yieldOwed = true
+	st.mu.Unlock()
+	return st.Wake()
+}
 
 // ------------------------------------------------------------------ surface
 

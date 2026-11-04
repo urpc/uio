@@ -309,6 +309,9 @@ func (d *Dialer) start(ctx context.Context) error {
 			BytesRead:    d.onInbound,
 			Sent:         d.onSentReceipt,
 		}
+		if d.config.heartbeatInterval > 0 {
+			handler.Timer = d.onTimer // see Server.Serve
+		}
 		events.Handler = handler
 		events.Observer, events.Hooks = handler, handler
 		go func() {
@@ -471,6 +474,13 @@ func (d *Dialer) onData(raw uio.Conn) error {
 		return nil
 	}
 	return err
+}
+
+func (d *Dialer) onTimer(raw uio.Conn) error {
+	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
+		conn.timerTick(time.Now(), raw.InboundBuffered() > 0 || conn.stagedInput())
+	}
+	return nil
 }
 
 // onInbound reports transport bytes to a Handler that observes traffic.

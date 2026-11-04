@@ -33,6 +33,7 @@ import (
 
 	"github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/poller"
+	"github.com/urpc/uio/internal/readcontrol"
 )
 
 // Keep tiny writes coalesced while bounding payload work done under mux.
@@ -82,6 +83,11 @@ type stdUDPState struct {
 }
 
 type fdConn struct {
+	inputReadControlAccess
+	readControl atomic.Pointer[readcontrol.Control] // optional consumer pauses, independent of readHeld
+	// yieldPending marks a YieldRead whose continuation callback has not run
+	// yet: the end of the stream waits for it.
+	yieldPending atomic.Bool
 	commonConn
 	conn           net.Conn
 	udp            *stdUDPState
@@ -1614,7 +1620,15 @@ func (fc *fdConn) Wake() error {
 	return nil
 }
 
-func (fc *fdConn) YieldRead() error { return fc.Wake() }
+// YieldRead asks for a continuation callback through the loop's queue. The
+// reader goes on reading meanwhile, so a callback that waits for more bytes
+// gets them; the end of the stream waits for the continuation.
+func (fc *fdConn) YieldRead() error {
+	if !fc.isDatagram() {
+		fc.yieldPending.Store(true)
+	}
+	return fc.Wake()
+}
 
 // runWakeTask runs on the event loop, in submission order, and hands the
 // callback to its own goroutine instead of waiting for the connection's
@@ -1648,19 +1662,26 @@ func (fc *fdConn) deliverWake() {
 	}
 	started := fc.beginInboundCallback()
 	defer fc.endInboundCallback(started)
+	before := fc.inputMark()
 	if err := fc.events().onRead(fc); err != nil {
 		fc.requestClose(err)
 		return
 	}
-	fc.noteReadEnded()
-	if fc.readHeld && fc.inbound.Len() < fc.events().MaxInboundBuffered {
-		fc.readHeld = false
-		// A close may have filled the slot already; either signal resumes.
-		select {
-		case fc.readResume <- struct{}{}:
-		default:
-		}
+	if fc.readEOF.Load() && fc.yieldPending.Load() && fc.inputMark() == before {
+		// The stream ended and this continuation moved nothing: no byte can
+		// arrive to complete the unit its consumer waits for. It had its
+		// chance; its unconsumed input goes as a close's does.
+		fc.requestClose(io.EOF)
+		return
 	}
+	fc.noteReadEnded()
+	fc.closeDeferredReadEOF()
+	if fc.readHeld && fc.inbound.Len() < fc.inputLimit(true) {
+		fc.readHeld = false
+	}
+	// A resume or a drained hold lets a waiting reader go on; a close may
+	// have filled the slot already, and either signal wakes it.
+	fc.signalReadResume()
 }
 
 func (fc *fdConn) flushOnLoop() (int, error)          { return 0, nil }
@@ -1753,7 +1774,7 @@ func (fc *fdConn) shutWriteIfDrained() error {
 // stream. Once callbacks have consumed everything the peer sent, the reading
 // half is over and the connection closes if its writing half is shut too.
 func (fc *fdConn) noteReadEnded() {
-	if !fc.readEOF.Load() || fc.readEnded.Load() || !fc.inbound.Empty() || len(fc.inboundTail) != 0 {
+	if !fc.readEOF.Load() || fc.readEnded.Load() || !fc.inbound.Empty() || len(fc.inboundTail) != 0 || !fc.readCloseReady() {
 		return
 	}
 	fc.readEnded.Store(true)
@@ -1762,14 +1783,24 @@ func (fc *fdConn) noteReadEnded() {
 	}
 }
 
-// onReadEOF ends the read goroutine of a half-open connection whose peer shut
-// its writing half: OnRead runs once more, so the application sees Read
-// report io.EOF, and the connection closes once its own writing half is shut
-// as well and callbacks consumed what the peer sent.
+// onReadEOF ends the read goroutine at the peer's end of stream. A plain
+// connection without half-open closes at once when its consumer has nothing
+// left to see: nothing retained, no pause, no continuation owed. Otherwise
+// the end is recorded and OnRead runs once more, so a consumer sees what it
+// retained and a half-open one sees Read report io.EOF. The connection then
+// closes when the consumer no longer holds the end back (closeDeferredReadEOF),
+// when both halves of a half-open one ended, or — layered — when the stack
+// handed the end up (stack.ended).
 func (fc *fdConn) onReadEOF() {
 	fc.callbackMu.Lock()
 	if fc.isClosing() {
 		fc.callbackMu.Unlock()
+		return
+	}
+	if !fc.events().AllowHalfOpen && !fc.entry.layered && !fc.yieldPending.Load() && !fc.currentReadControl().Held() &&
+		fc.inbound.Empty() && len(fc.inboundTail) == 0 {
+		fc.callbackMu.Unlock()
+		fc.events().closeConn(fc, io.EOF)
 		return
 	}
 	fc.readEOF.Store(true)
@@ -1778,6 +1809,7 @@ func (fc *fdConn) onReadEOF() {
 	fc.endInboundCallback(started)
 	if err == nil {
 		fc.noteReadEnded()
+		fc.closeDeferredReadEOF()
 	}
 	fc.callbackMu.Unlock()
 	if err != nil {
@@ -1856,8 +1888,14 @@ func (fc *fdConn) readLoop() {
 	holder := fc.events().readPool.Get()
 	defer fc.events().readPool.Put(holder)
 	buffer := holder.bytes
+	// OnOpen may have paused before the first read.
+	wait := true
 	for {
+		if wait && !fc.waitReadResume() {
+			return
+		}
 		n, readErr := fc.conn.Read(buffer)
+		wait = false
 		if n > 0 {
 			// A Reader may return payload and a terminal error together. Deliver the
 			// payload before closing so the final stream segment is not lost.
@@ -1880,19 +1918,19 @@ func (fc *fdConn) readLoop() {
 			if len(fc.inboundTail) > 0 {
 				_, _ = fc.inbound.Write(fc.inboundTail)
 				fc.inboundTail = fc.inboundTail[:0]
-				if limit := fc.events().MaxInboundBuffered; limit > 0 && fc.inbound.Len() >= limit {
+				if limit := fc.inputLimit(fc.readHeld); limit > 0 && fc.inbound.Len() >= limit {
 					fc.readHeld = true
 				}
 			}
-			held := fc.readHeld
+			wait = fc.readHeld || fc.ReadsPaused()
 			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
-			if held && !fc.waitHeldRead() {
-				return
-			}
 		}
 		if readErr != nil {
-			if readErr == io.EOF && fc.events().AllowHalfOpen {
+			// The end of the stream is the consumer's to see, paused or not;
+			// a fatal error ends the connection at once, as CloseWith can
+			// discard input not yet consumed.
+			if readErr == io.EOF {
 				fc.onReadEOF()
 				return
 			}
@@ -1902,12 +1940,13 @@ func (fc *fdConn) readLoop() {
 	}
 }
 
-// waitHeldRead keeps a held read in the socket until a Wake consumes below
+// waitReadResume keeps the reader off the socket while the consumer is
+// paused or a held read waits for a callback to consume below
 // MaxInboundBuffered, and reports whether the read loop goes on. A close ends
-// it, and so does the read deadline, which closes the connection as an
-// expired Read would. A changed deadline also signals readResume, so the wait
-// re-times against it.
-func (fc *fdConn) waitHeldRead() bool {
+// the wait, and so does the read deadline, which closes the connection as an
+// expired Read would. A resume, a drained hold and a changed deadline signal
+// readResume, so the wait looks again.
+func (fc *fdConn) waitReadResume() bool {
 	var timer *time.Timer
 	defer func() {
 		if timer != nil {
@@ -1915,6 +1954,15 @@ func (fc *fdConn) waitHeldRead() bool {
 		}
 	}()
 	for {
+		fc.callbackMu.Lock()
+		held := fc.readHeld || fc.ReadsPaused()
+		fc.callbackMu.Unlock()
+		if fc.isClosing() {
+			return false
+		}
+		if !held {
+			return true
+		}
 		var expired <-chan time.Time
 		fc.deadlineMu.Lock()
 		deadline := fc.readDeadline
@@ -1946,12 +1994,6 @@ func (fc *fdConn) waitHeldRead() bool {
 		}
 		if fc.isClosing() {
 			return false
-		}
-		fc.callbackMu.Lock()
-		held := fc.readHeld
-		fc.callbackMu.Unlock()
-		if !held {
-			return true
 		}
 	}
 }

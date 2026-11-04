@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/readcontrol"
 	"sync/atomic"
 )
 
@@ -37,6 +38,8 @@ import (
 // close request is accepted; OnClose is final. Native UDP writes send the
 // datagram before returning, from any goroutine.
 type Conn interface {
+	ReadController
+
 	// LocalAddr is the connection's local socket address.
 	LocalAddr() net.Addr
 
@@ -223,7 +226,11 @@ type Conn interface {
 	// bytes to it and returns.
 	Flush() error
 
-	// Wake schedules one OnRead callback after previously submitted tasks.
+	// Wake schedules one OnRead callback after previously submitted tasks: a
+	// callback that left input unconsumed — its destination was full, say —
+	// gets the next one from it once it can go on. While reads are paused
+	// the turn runs no OnRead, only timers and layer work; Wake never clears
+	// a pause.
 	Wake() error
 
 	// SetWakeDeadline schedules one OnTimer callback for the connection at
@@ -249,9 +256,16 @@ type Conn interface {
 	// came due.
 	SetWakeInterval(interval time.Duration) error
 
-	// YieldRead ends the current read round and schedules remaining buffered or
-	// socket data for a later OnRead callback. It may only be called from a
-	// connection callback.
+	// YieldRead ends the current read round once the callback returns, and a
+	// later turn calls OnRead again with what it left — a continuation, even
+	// with nothing left to read, since a protocol may hold work of its own.
+	// The end of the stream waits for that continuation. A continuation that
+	// consumed nothing reads the socket for more before the next one, so a
+	// callback waiting for a whole message gets it; once the stream has
+	// ended, such a continuation closes the connection, its unconsumed input
+	// going as a close's does. Before that end, yielding without progress
+	// spins. It never clears a pause. Call only from a connection callback,
+	// then return.
 	YieldRead() error
 
 	// CloseWith requests the close and returns. On native Unix the
@@ -300,7 +314,7 @@ type Conn interface {
 // implement CloseWriter; a deadline or an option the backend has no way to
 // honor. A reserve the connection cannot serve reports ErrReserveUnsupported
 // instead.
-var ErrUnsupported = fmt.Errorf("unsupported method")
+var ErrUnsupported = readcontrol.ErrUnsupported
 
 var (
 	ErrOutboundOverflow = errors.New("uio: outbound buffer limit exceeded")

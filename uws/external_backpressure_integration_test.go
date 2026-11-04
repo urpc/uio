@@ -2,6 +2,7 @@ package uws
 
 import (
 	"bufio"
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -48,6 +49,52 @@ func (h *externalReadControlHandler) OnInbound(c *Conn, n int) {
 }
 
 func (*externalReadControlHandler) OnOutbound(*Conn, int) {}
+
+func TestPausedReadsKeepStandaloneHeartbeatTimersRunning(t *testing.T) {
+	for _, side := range []string{"server", "dialer"} {
+		t.Run(side, func(t *testing.T) {
+			externalReadControlCases(t, func(t *testing.T, serverTLS, clientTLS *tls.Config) {
+				paused := make(chan error, 1)
+				closed := make(chan CloseEvent, 1)
+				handler := &externalReadControlHandler{
+					open:   func(c *Conn) { paused <- c.PauseReads() },
+					closed: func(_ *Conn, event CloseEvent) { closed <- event },
+				}
+				server, addr, done := startTestServer(t, func() *Server {
+					opts := Options{TLSConfig: serverTLS, Pollers: 1}
+					if side == "server" {
+						opts.Handler = handler
+						opts.HeartbeatInterval = 10 * time.Millisecond
+						opts.HeartbeatTimeout = 30 * time.Millisecond
+					}
+					return NewServer(opts)
+				})
+				t.Cleanup(func() { stopTestServer(t, server, done) })
+				if side == "server" {
+					// The peer sends no further input and never answers the Ping.
+					_, _ = dialExternalReadControl(t, addr, clientTLS, nil)
+				} else {
+					dialer := NewDialer(Options{Handler: handler, TLSConfig: clientTLS, Pollers: 1,
+						HeartbeatInterval: 10 * time.Millisecond, HeartbeatTimeout: 30 * time.Millisecond})
+					t.Cleanup(func() { _ = dialer.Close(nil) })
+					scheme := "ws://"
+					if clientTLS != nil {
+						scheme = "wss://"
+					}
+					if err := dialer.Dial(context.Background(), scheme+addr+"/", nil); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := waitExternalReadControl(t, paused, "heartbeat read pause"); err != nil {
+					t.Fatal(err)
+				}
+				if event := waitExternalReadControl(t, closed, "heartbeat timeout while reads are paused"); event.Code != 1001 {
+					t.Fatalf("heartbeat close code = %d, want 1001", event.Code)
+				}
+			})
+		})
+	}
+}
 
 func waitExternalReadControl[T any](t *testing.T, ch <-chan T, what string) T {
 	t.Helper()
@@ -346,11 +393,10 @@ func TestExternalPauseBoundsSocketInputWithAutomaticPauseDisabled(t *testing.T) 
 	const count = 128
 	opened := make(chan *Conn, 1)
 	paused := make(chan error, 1)
-	bounded := make(chan int, 1)
 	finished := make(chan struct{})
-	var boundOnce sync.Once
 	var seen atomic.Int32
 	var pausedInput atomic.Bool
+	var pausedBytes atomic.Int64
 	handler := &externalReadControlHandler{
 		open: func(c *Conn) { opened <- c },
 		message: func(c *Conn, m Message) {
@@ -367,11 +413,9 @@ func TestExternalPauseBoundsSocketInputWithAutomaticPauseDisabled(t *testing.T) 
 				close(finished)
 			}
 		},
-		inbound: func(c *Conn, _ int) {
+		inbound: func(_ *Conn, n int) {
 			if pausedInput.Load() {
-				if n := c.raw.InboundBuffered(); n >= DefaultOutboundHighWatermark {
-					boundOnce.Do(func() { bounded <- n })
-				}
+				pausedBytes.Add(int64(n))
 			}
 		},
 	}
@@ -406,9 +450,16 @@ func TestExternalPauseBoundsSocketInputWithAutomaticPauseDisabled(t *testing.T) 
 		}
 		writeDone <- err
 	}()
-	buffered := waitExternalReadControl(t, bounded, "receive hold at the configured bound")
-	if buffered > DefaultOutboundHighWatermark+(4<<10) {
-		t.Fatalf("paused input = %d, exceeds bound plus one read", buffered)
+	// A bare transport stops at once; a layered one fills its bounded
+	// deliveries first. Wait until the paused transport pulled something,
+	// then hold it to the bound: neither may keep pulling the whole burst.
+	deadline := time.Now().Add(2 * time.Second)
+	for pausedBytes.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+	}
+	// A transport that pulls nothing at all satisfies the bound trivially.
+	if received := pausedBytes.Load(); received > DefaultOutboundHighWatermark+(4<<10) {
+		t.Fatalf("paused input = %d, exceeds bound plus one read", received)
 	}
 	if got := seen.Load(); got != 1 {
 		t.Fatalf("manual pause delivered %d messages while buffering", got)

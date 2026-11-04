@@ -459,11 +459,24 @@ nothing; the three are read once, when `Serve` starts.
 
 ## Backpressure
 
-`MaxInboundBuffered` alone does not slow a peer: it acts when a callback
-returns without consuming, and the bytes left behind grow the inbound buffer.
-So when a connection's data goes somewhere slower — a relay leg, an upstream
-call, another peer — stop consuming once that destination is behind, and wake
-the source when it drains:
+When a connection's data goes somewhere slower — a relay leg, an upstream
+call, another peer — stop consuming once that destination is behind, and go
+on when it drains. `Bridge` runs that loop for a relay:
+
+```go
+bridge := &uio.Bridge{Upstream: "tcp://127.0.0.1:9527"}
+events := bridge.Events()
+err := events.Serve("tcp://:9528")
+```
+
+It forwards what a leg reads while the destination's queue is below
+`InboundLimit` (256 KiB by default), leaves the rest unconsumed while it is
+not, and forwards again once the queue drains to half the limit; a read
+larger than the destination's write budget goes in smaller pieces. A leg's
+unconsumed input stops its socket reads at the same limit, so TCP flow
+control slows the peer and memory stays bounded without closing anyone.
+
+A custom relay does the same with `OutboundBuffered()` and `Wake()`:
 
 ```go
 relay := uio.FuncHandler{
@@ -477,22 +490,45 @@ relay := uio.FuncHandler{
 	},
 	BytesWritten: func(c uio.Conn, _ int) {
 		if c.OutboundBuffered() < 128<<10 {
-			_ = peerOf(c).Wake() // the far side drained: resume its held reads
+			_ = peerOf(c).Wake() // the far side drained: run the source again
 		}
 	},
 }
 events := &uio.Events{MaxInboundBuffered: 256 << 10, Handler: relay, Observer: relay}
 ```
 
-Once the unconsumed bytes reach the limit, that connection stops reading and
-TCP flow control blocks whoever is feeding it, so memory stays bounded without
-closing anyone. Reads resume by themselves as soon as a callback consumes below
-the limit; but while they are held no I/O event arrives to run that callback,
-so it takes a `Wake` — it carries no data — to trigger it. A handler that
-always consumes its inbound never reaches the hold and needs none. A write past
-the destination's own `MaxOutboundBuffered` would fail with
-`ErrOutboundOverflow` instead — the check above stays below it, so a full queue
-pauses the source rather than erroring.
+Once the unconsumed bytes reach `MaxInboundBuffered`, the connection stops
+reading its socket. While reads are held no I/O event arrives to run the
+callback that would consume them, so it takes a `Wake` — it carries no
+data — to trigger it. A write past the destination's own `MaxOutboundBuffered`
+fails with `ErrOutboundOverflow` instead; the check above stays below it. A
+destination whose queue drains without a write to report it — output a layer
+holds until its peer acknowledges it, a umux stream's queue — tells an
+Observer that implements `QueueDrainedObserver`.
+
+**Pausing reads.** `PauseReads()` stops a connection's input outright: OnRead
+does not run, and a plain stream stops reading its socket at once, while
+timers, writes, send reports and close work go on. What was read is kept and
+handed to the first OnRead after `ResumeReads()`, and the peer's end of the
+stream waits behind it: a paused connection does not close for its peer's
+end until it resumed and saw what it kept. A reset, a fatal error or a local
+close ends it regardless (on the portable stdio backend a reset behind a
+pause is seen once reads resume or a read deadline passes: the socket is not
+read while paused). A layered stack keeps reading its socket into its
+bounds (`MaxInboundBuffered`, or 64 KiB when that is zero) while its Handler
+is paused. `ResumeReads()` releases only the application's own pause, and
+without one does nothing; protocol layers and `Bridge` hold pauses of their
+own, which it never releases. Pause and resume are safe from any goroutine; a
+callback or socket read already in flight finishes, so a protocol handling
+several messages in one callback checks `ReadsPaused()` between them. Raw
+datagram connections report `ErrUnsupported`: their peers share a socket.
+
+**Yielding.** `YieldRead()` splits work across turns: the callback returns,
+and a later turn calls OnRead again with what it left, before the end of the
+stream is reported. A continuation that consumed nothing reads the socket
+first, so a callback waiting for a whole message gets it; once the stream has
+ended, such a continuation closes the connection. Before that end, yield only
+after making progress, or the callbacks spin.
 
 ## Going faster
 

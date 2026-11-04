@@ -1139,6 +1139,12 @@ func TestPanicAfterYieldedReadKeepsReading(t *testing.T) {
 	funcs(events).Read = func(conn Conn) error {
 		buf := make([]byte, conn.InboundBuffered())
 		_, _ = io.ReadFull(conn, buf)
+		// A yielded continuation can have no transport bytes (protocols may
+		// hold private decoder state). Yield only after actual echo progress,
+		// rather than rescheduling an empty callback forever.
+		if len(buf) == 0 {
+			return nil
+		}
 		if _, err := conn.Write(buf); err != nil {
 			return err
 		}

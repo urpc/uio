@@ -241,10 +241,13 @@ later or close.
 For a relay or an application work queue, `Conn.PauseReads()` and
 `Conn.ResumeReads()` provide an independent, concurrency-safe read switch.
 Pause from `OnMessage` stops before the next frame, including frames in the
-same socket read; an already running callback may finish. Resume wakes the
-connection to consume buffered input, while automatic watermark backpressure
-remains in effect. Calls are idempotent and are not reference counted, so one
-flow controller should own the switch. Both return `ErrNotReady` before the
+same socket read; an already running callback may finish. The frames wait in
+the transport, which stops reading a plain socket at once; resume delivers
+them without new network input, while automatic watermark backpressure
+remains in effect. Resuming without a pause does nothing. The switch and the
+automatic reply pause are independent reasons to pause, and neither releases
+the other. Calls are idempotent and are not reference counted, so one flow
+controller should own the switch. Both return `ErrNotReady` before the
 WebSocket opens and `ErrClosed` after closing begins.
 
 `Conn.OutboundBuffered()` reports the WebSocket write batch plus the queue
@@ -252,17 +255,17 @@ below it, including framing and lower-layer overhead. It is a concurrent
 snapshot: during a handoff it may briefly count bytes twice. Use it for watermarks;
 `MaxOutboundBuffered` provides the hard write limit. It is safe to query from
 `TrafficObserver.OnOutbound`, where a controller can resume the upstream
-connection after its destination drains. When pausing upstream, publish the
-pause before rechecking the destination queue so a simultaneous drain cannot
-leave input stranded:
+connection after its destination drains. Call `pace` after forwarding to the
+destination and from its `OnOutbound` callback; resuming an upstream that is
+not paused costs nothing. The second observation also catches a drain that
+raced with installing the pause:
 
 ```go
 func pace(upstream, destination *uws.Conn, high, low int) {
-	if destination.OutboundBuffered() < high {
-		return
-	}
-	if err := upstream.PauseReads(); err != nil {
-		return
+	if destination.OutboundBuffered() >= high {
+		if err := upstream.PauseReads(); err != nil {
+			return
+		}
 	}
 	if destination.OutboundBuffered() <= low {
 		_ = upstream.ResumeReads()
@@ -272,10 +275,15 @@ func pace(upstream, destination *uws.Conn, high, low int) {
 
 Explicit pauses also work over TLS. They delay Ping/Pong and other incoming
 control frames; heartbeat deadlines continue to run, and a local Close
-overrides an explicit pause to finish its handshake. Disabling automatic
-watermarks retains a 64 KiB transport receive bound for explicit pauses.
-A custom layer stack must configure its own `Events.MaxInboundBuffered`.
-`Stats` counts automatic pauses and resumes only.
+releases UWS's own pauses to finish its handshake. A paused connection also
+keeps its peer's end of stream behind the frames it holds: a peer that sends
+and closes is answered after `ResumeReads`, so without a heartbeat or read
+deadline a paused connection whose peer left stays open until then.
+Disabling automatic watermarks retains a 64 KiB transport receive bound for
+explicit pauses. A custom layer stack uses its configured
+`Events.MaxInboundBuffered`, or UIO's default receive bound while explicit
+reads are paused. `Stats` counts automatic pauses and resumes only; a pause a
+local close ends counts as resumed.
 
 **Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
 transport bytes in both directions. Both callbacks are observation only: do

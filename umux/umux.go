@@ -50,10 +50,9 @@ var (
 // QueueDrainedObserver receives a stream whose outbound frames have all been
 // accepted by the transport. It supplements TrafficObserver's byte counts and
 // window-credit notifications. Relays use it to resume a source paused on a
-// stream's queue. The callback must not block.
-type QueueDrainedObserver interface {
-	OnQueueDrained(uio.Conn)
-}
+// stream's queue. The callback must not block. It is uio's capability of the
+// same name.
+type QueueDrainedObserver = uio.QueueDrainedObserver
 
 // MetadataHandler is an optional capability of Config.Handler. When the
 // handler implements it, the session calls OnMetadata just before OnOpen with
@@ -78,7 +77,8 @@ type Config struct {
 	// implements OnQueueDrained(Conn) hears, additionally, each flush that
 	// emptied a stream's outbound queue — the stream's equivalent of a socket
 	// leg reporting its write progress; a relay wakes a reader paused on the
-	// stream's queue from it.
+	// stream's queue from it. Without such an Observer, a Handler that
+	// implements it hears them instead.
 	Observer uio.TrafficObserver
 	// Accept, when set, vets an inbound stream before it is accepted; a
 	// non-nil error rejects it with RST. It sees no metadata: the frame is

@@ -457,14 +457,12 @@ func TestBridgePairRejectsClosedStream(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = cli.Close(nil) })
 
-	var br *uio.Bridge
-	br = &uio.Bridge{Dial: func(ctx context.Context, client uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
+	br := &uio.Bridge{Dial: func(ctx context.Context, _ uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
 		st, err := sess.Open(ctx)
 		if err != nil {
 			return nil, err
 		}
 		_ = st.CloseWith(errors.New("gone before pairing"))
-		br.Pair(client, st)
 		return st, nil
 	}}
 	ev := br.Events()

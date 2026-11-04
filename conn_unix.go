@@ -80,6 +80,7 @@ const (
 )
 
 type fdConn struct {
+	inputReadControlAccess
 	fd int32
 	// taskState coalesces readiness and synthetic events in its low bits and
 	// carries, in its top bit, the claim that exactly one task is queued or
@@ -108,8 +109,8 @@ type fdConn struct {
 	inflight *bytebuf.CompositeBuffer
 
 	deadlines *deadlineState // allocated by the first nonzero deadline
-	// wake is the connection's wake timer on its loop's wheel, allocated by
-	// the first SetWakeDeadline or SetWakeInterval.
+	// wake lazily holds timer, graceful-drain and input-control state, so
+	// connections using none of them retain the compact hot allocation.
 	wake atomic.Pointer[wakeState]
 
 	// scratch is the read round's reply space while the turn reads: what the
@@ -248,6 +249,14 @@ const (
 	// that may not be this connection's, until a read finds the socket empty
 	// rather than at its end.
 	turnReadToEnd
+	// turnReadPastYield lets the turn's first socket read go ahead although
+	// the consumer owes itself a continuation: its continuation moved no
+	// input, so it waits for bytes, and only a read brings them.
+	turnReadPastYield
+	// turnReadDrained records a read that reached what the socket holds —
+	// would-block, end of stream or an error — so a hangup this turn needs
+	// no separate look at the socket error.
+	turnReadDrained
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -650,7 +659,7 @@ func (conn *fdConn) readHeld() bool { return conn.flags.Load()&readHeldFlag != 0
 // unconsumed, so TCP flow control slows the peer instead of the buffer
 // growing. It runs only after a callback left bytes behind.
 func (conn *fdConn) holdsRead() bool {
-	if limit := conn.events().MaxInboundBuffered; limit > 0 && conn.inbound.Len() >= limit {
+	if limit := conn.inputLimit(conn.readHeld()); limit > 0 && conn.inbound.Len() >= limit {
 		conn.flags.Or(readHeldFlag)
 		return true
 	}
@@ -661,7 +670,7 @@ func (conn *fdConn) holdsRead() bool {
 // below MaxInboundBuffered. Edges that arrived while reads were held were
 // dropped, so the read is scheduled here rather than left to the next edge.
 func (conn *fdConn) resumeHeldRead() {
-	if conn.inbound.Len() >= conn.events().MaxInboundBuffered || conn.isClosing() {
+	if conn.inbound.Len() >= conn.inputLimit(true) || conn.isClosing() {
 		return
 	}
 	conn.flags.And(^readHeldFlag)
@@ -703,7 +712,7 @@ func (conn *fdConn) State() ConnState {
 // closeIfEnded closes a half-open connection whose two halves have both
 // ended, once a callback consumed the last bytes its peer sent.
 func (conn *fdConn) closeIfEnded() {
-	if conn.writeState.Load()&writeShutDoneFlag != 0 && conn.readEnded() {
+	if conn.writeState.Load()&writeShutDoneFlag != 0 && conn.readEnded() && conn.readCloseReady() {
 		conn.requestClose(io.EOF)
 	}
 }
@@ -767,7 +776,7 @@ func (conn *fdConn) shutWrite() {
 		conn.releaseWriteAndKick()
 		return
 	}
-	if conn.readEnded() {
+	if conn.readEnded() && conn.readCloseReady() {
 		// Both halves end: closing sends the FIN behind the output already
 		// sent, without a shutdown whose acknowledgement would wake the
 		// poller for a socket about to be released.
@@ -787,12 +796,18 @@ func (conn *fdConn) shutWrite() {
 	conn.closeIfEnded()
 }
 
-// onReadEOF handles a peer that shut its writing half. Without half-open it
-// ends the connection as before. With it, reads stop, OnRead runs once more so
-// the application sees Read report io.EOF, and the connection closes once its
-// own writing half is shut as well and callbacks consumed what the peer sent.
+// onReadEOF handles a peer that shut its writing half. A plain connection
+// without half-open ends at once when its consumer has nothing left to see:
+// nothing retained, no pause, no continuation owed. Otherwise reads stop, the
+// end is recorded and OnRead runs once more, so a consumer sees what it
+// retained and a half-open one sees Read report io.EOF. The connection then
+// closes when the consumer no longer holds the end back
+// (closeDeferredReadEOF), when both halves of a half-open one ended
+// (closeIfEnded), or — layered — when the stack handed the end up to its
+// Handler (stack.ended).
 func (conn *fdConn) onReadEOF() error {
-	if !conn.events().AllowHalfOpen {
+	if !conn.events().AllowHalfOpen && !conn.entry.layered && !conn.readStalled() &&
+		!conn.currentReadControl().Held() && conn.inbound.Empty() && len(conn.inboundTail) == 0 {
 		return io.EOF
 	}
 	conn.flags.Or(readEOFFlag)
@@ -800,6 +815,7 @@ func (conn *fdConn) onReadEOF() error {
 	if err := conn.fireOnRead(); err != nil {
 		return err
 	}
+	conn.closeDeferredReadEOF()
 	conn.closeIfEnded()
 	return nil
 }
@@ -810,10 +826,8 @@ func (conn *fdConn) onReadEOF() error {
 // socket error, since a receive past the end of the stream keeps returning
 // zero; the BSDs report it on the receive.
 func (conn *fdConn) probeAfterEOF() error {
-	if errno, err := syscall.GetsockoptInt(int(conn.fd), syscall.SOL_SOCKET, syscall.SO_ERROR); err != nil {
+	if err := conn.pendingSocketError(); err != nil {
 		return err
-	} else if errno != 0 {
-		return syscall.Errno(errno)
 	}
 	var b [1]byte
 	n, err := socket.Recv(int(conn.fd), b[:])
@@ -822,6 +836,20 @@ func (conn *fdConn) probeAfterEOF() error {
 	}
 	if n > 0 {
 		return errors.New("uio: data after end of stream")
+	}
+	return nil
+}
+
+// pendingSocketError observes a fatal transport failure without reading any
+// payload. A zero result also covers an orderly FIN, whose queued bytes and
+// EOF must remain subject to the input consumer's pause.
+func (conn *fdConn) pendingSocketError() error {
+	errno, err := syscall.GetsockoptInt(int(conn.fd), syscall.SOL_SOCKET, syscall.SO_ERROR)
+	if err != nil {
+		return err
+	}
+	if errno != 0 {
+		return syscall.Errno(errno)
 	}
 	return nil
 }
@@ -882,7 +910,7 @@ func (conn *fdConn) afterRegister()                   {}
 //     them, so it passes while the claim is held too.
 func (conn *fdConn) skipsEdge(events poller.Events) bool {
 	if events&(poller.WriteEvents|poller.HangupEvents) == 0 {
-		return conn.flags.Load()&(readStalledFlag|readHeldFlag|readEOFFlag) != 0
+		return conn.flags.Load()&(readStalledFlag|readHeldFlag|readEOFFlag) != 0 || conn.ReadsPaused()
 	}
 	return events == poller.WriteEvents && conn.outboundEmpty() &&
 		conn.writeState.Load()&(writeOwnerFlag|writeBlockedFlag) == 0
@@ -929,6 +957,9 @@ const (
 	// ioEventShutWrite asks the connection's turn to shut the writing half a
 	// CloseWrite requested; see shutWrite.
 	ioEventShutWrite uint32 = 1 << 22
+	// ioEventResume delivers retained input before reading the socket again:
+	// an EOF queued behind it must not close the connection before delivery.
+	ioEventResume uint32 = 1 << 23
 	// taskScheduledBit claims the connection's one queued or running task. It
 	// shares taskState with the event bits so a producer sets claim and events
 	// with one atomic.
@@ -1234,6 +1265,7 @@ func (conn *fdConn) runIOTask() {
 		}
 	}()
 	events = conn.takeIOEvents()
+	reportedHangup := events&ioEventHangup != 0
 	if events&ioEventClose != 0 {
 		conn.fireCloseCallback()
 		return
@@ -1268,21 +1300,72 @@ func (conn *fdConn) runIOTask() {
 			conn.requestClose(err)
 		}
 	}
-	if events&ioEventRead != 0 && !conn.isClosing() {
-		if events&ioEventHangup != 0 {
-			conn.turn |= turnHangup
+	if events&ioEventResume != 0 && !conn.isClosing() {
+		// A continuation — one YieldRead asked for, or a spent read budget —
+		// or a released pause: what the consumer retained goes to it before
+		// the socket is read again, so the end of the stream cannot overtake
+		// it. A consumer that moved its input on and yielded again gets its
+		// next continuation before any read. One that moved nothing waits
+		// for bytes: this turn reads them, and it is owed the continuation
+		// still.
+		before := conn.inputMark()
+		conn.turn |= turnCorked
+		if err := conn.fireOnRead(); err != nil {
+			conn.requestClose(err)
 		}
+		conn.turn &^= turnCorked
+		if conn.readHeld() {
+			conn.resumeHeldRead()
+		}
+		conn.closeDeferredReadEOF()
+		conn.closeIfEnded()
+		switch {
+		case conn.ReadsPaused():
+			// The release asks for the next resume turn.
+		case !conn.readStalled():
+			events |= ioEventRead
+		case conn.inputMark() == before:
+			if conn.readEOF() {
+				// The stream ended and this continuation moved nothing: no
+				// byte can arrive to complete the unit its consumer waits
+				// for. It had its chance; its unconsumed input goes as a
+				// close's does.
+				conn.requestClose(io.EOF)
+			} else {
+				conn.turn |= turnReadPastYield
+				events |= ioEventRead
+			}
+		default:
+			events &^= ioEventRead
+		}
+	}
+	if events&ioEventHangup != 0 && !conn.isDatagram() {
+		// Kept even on a turn that reads nothing, so the rounds that later
+		// read the bytes ahead of the hangup read on to its end.
+		conn.turn |= turnHangup
+	}
+	if events&ioEventRead != 0 && !conn.isClosing() {
 		var err error
 		if conn.isDatagram() {
 			err = conn.onRecvUDP()
 		} else if flags := conn.flags.Load(); flags&(readHeldFlag|readEOFFlag) == 0 {
-			err = conn.onRead()
+			err = conn.onRead() // a pause or a yield owed stops the round before its first read
 		} else if flags&readEOFFlag != 0 && events&ioEventHangup != 0 {
+			conn.turn |= turnReadDrained
 			err = conn.probeAfterEOF()
 		}
-		// A held read stays in the socket, a hangup behind it included, until
-		// a callback consumes below the limit; see resumeHeldRead.
 		if err != nil {
+			conn.requestClose(err)
+		}
+	}
+	if reportedHangup && conn.turn&turnReadDrained == 0 && !conn.isDatagram() && !conn.isClosing() {
+		// No read reached the hangup: a pause, a hold or a yield left the
+		// socket unread. A reset must still end the connection, which only
+		// the socket error tells without consuming input; zero leaves an
+		// orderly end of stream to the reads that come for it. It belongs
+		// to this live descriptor even if untagged open stripped a stale
+		// hangup edge.
+		if err := conn.pendingSocketError(); err != nil {
 			conn.requestClose(err)
 		}
 	}
@@ -1297,6 +1380,7 @@ func (conn *fdConn) runIOTask() {
 		} else if flags&readEOFFlag != 0 {
 			conn.closeIfEnded()
 		}
+		conn.closeDeferredReadEOF()
 	}
 	if conn.udp != nil && conn.udp.peers != nil {
 		conn.settlePeers()
@@ -1343,7 +1427,12 @@ func (conn *fdConn) settleInterest() {
 			conn.taskState.Or(ioEventRead)
 			return
 		}
-		conn.taskState.Or(ioEventRead | ioEventWake)
+		if conn.ReadsPaused() {
+			return // the release asks for the resume turn, which continues it
+		}
+		// The continuation runs even when the socket's buffer is empty: a
+		// protocol may hold decoder work of its own behind the yield.
+		conn.taskState.Or(ioEventResume)
 	}
 }
 
@@ -1613,7 +1702,7 @@ func (conn *fdConn) fireOnRead() error {
 	started := conn.beginInboundCallback()
 	var skipRead bool
 	skipRead, err = conn.fireWakeTimer()
-	if err == nil && !skipRead {
+	if err == nil && !skipRead && conn.consumerMayRun() {
 		if callback := conn.callbacks().onRead; callback != nil {
 			err = callback(conn)
 		} else {
@@ -1697,17 +1786,26 @@ func (conn *fdConn) onRead() error {
 // readRound is onRead's body. It has many exits, which would keep deferred
 // cleanup from being open-coded, so onRead does the cleanup around it.
 func (conn *fdConn) readRound(buffer []byte) error {
+	// A pause stops reading the socket; so does a continuation the consumer
+	// owes itself, unless that continuation moved nothing and waits for
+	// bytes. Within the round the callbacks' own pauses and yields are
+	// checked as they return.
+	if conn.ReadsPaused() || conn.readStalled() && conn.turn&turnReadPastYield == 0 {
+		return nil
+	}
 	totalRead := 0
 	for calls := 0; calls < 256 && totalRead < 1<<20; calls++ {
 		n, err := socket.Recv(int(conn.fd), buffer)
 		if err != nil {
 			if isWouldBlock(err) {
-				conn.turn &^= turnReadToEnd
+				conn.turn = conn.turn&^turnReadToEnd | turnReadDrained
 				return nil
 			}
+			conn.turn |= turnReadDrained
 			return err
 		}
 		if n == 0 {
+			conn.turn |= turnReadDrained
 			return conn.onReadEOF()
 		}
 		totalRead += n
@@ -1735,7 +1833,7 @@ func (conn *fdConn) readRound(buffer []byte) error {
 				return nil
 			}
 		}
-		if conn.readStalled() {
+		if conn.readStalled() || conn.ReadsPaused() {
 			return nil
 		}
 		if n < len(buffer) && conn.turn&(turnHangup|turnReadToEnd) == 0 {

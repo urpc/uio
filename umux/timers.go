@@ -176,9 +176,8 @@ func (s *Session) onTimer(c uio.Conn) error {
 	}
 	for _, st := range due {
 		if handler != nil {
-			if terr := handler.OnTimer(st); terr != nil {
-				s.abortStream(st, terr)
-			}
+			s.invokeCallback(st, func() error { return handler.OnTimer(st) }, false)
+			s.tryFinish(st)
 		}
 	}
 	// Re-arm from the state the callbacks left: a callback may have set a new

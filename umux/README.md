@@ -25,6 +25,14 @@ and a FIN that settles only once the transport accepted it.
   `Write`, `Writev`, `WriteOwned`, `CloseWrite`, `CloseWith`, `State`,
   timers, `Wake` — so code written for a socket works on a stream, including
   `uio.Bridge`.
+- **Scoped read pauses.** `PauseReads`, `ResumeReads` and `ReadsPaused` control
+  one stream's `OnRead` delivery; its receive window bounds what it retains
+  meanwhile, and sibling streams and session control frames go on. Resuming
+  hands the retained input to `OnRead`; `Wake` asks for a callback for input
+  a callback left unconsumed without pausing. `YieldRead` schedules the next
+  read turn without clearing a pause. FIN completion waits for the consumer:
+  its running callback, a pause and the turn its release owes, and the
+  continuation a yield asked for.
 - **Zero goroutines, zero timers per stream.** Frames arrive in the
   transport's read turn and are dispatched there; a stream's timer and the
   keepalive share the transport's one wake deadline.
@@ -41,8 +49,9 @@ and a FIN that settles only once the transport accepted it.
   travels through `CloseWith`, and a pairing whose partner is gone is reset,
   not left half-open.
 - **Tunnels out of the box.** A relay is a `uio.Bridge` whose `Dial` opens a
-  stream and `Pair`s it with the user connection; an agent bridges each
-  accepted stream to a local service. See
+  stream, which the bridge pairs with the user connection; an agent bridges
+  each accepted stream to a local service. A session whose Handler is the
+  bridge tells it when a stream's queue drains. See
   [examples/umux-tunnel](../examples/umux-tunnel).
 - **The yamux v1 wire.** The 12-byte header, the SYN/ACK window deltas above
   the 256 KiB floor, the FIN on a `WindowUpdate` frame and the ping sequence

@@ -1278,6 +1278,7 @@ func (heartbeat *heartbeatState) beginPing(now time.Time, nonce uint64) bool {
 	heartbeat.pingTarget = 0
 	heartbeat.pingReceipt = uio.SendReceipt{}
 	heartbeat.pingOutstanding.Store(true)
+	heartbeat.deferredAt = heartbeat.parsed.Load() // progress is measured from the Ping
 	return true
 }
 
@@ -1339,6 +1340,35 @@ func (heartbeat *heartbeatState) expirePing(now time.Time, timeout time.Duration
 	heartbeat.clearPingLocked()
 	heartbeat.sendStalledAt = 0
 	return true
+}
+
+// deferExpiry reports that a sent Ping's run-out deadline should wait: a
+// Pong may be in input not yet parsed — waiting now, or behind a frame
+// budget whose rounds yield to it and deliver frames as they come. The wait
+// is bounded by one further timeout past the deadline, and a wait without
+// waiting input needs parse progress since the last one, so a peer that
+// streams on without answering, and input nobody parses (a paused
+// connection's, a stopped peer's), still end the connection. A refused
+// send's stall has no Pong to wait for and no deferral.
+func (heartbeat *heartbeatState) deferExpiry(now time.Time, timeout time.Duration, inputWaiting bool) bool {
+	heartbeat.mu.Lock()
+	defer heartbeat.mu.Unlock()
+	if !heartbeat.pingOutstanding.Load() || heartbeat.pingSentAt == 0 {
+		return false
+	}
+	deadline := heartbeat.expiryLocked(timeout)
+	if deadline.IsZero() || now.Before(deadline) || !now.Before(deadline.Add(timeout)) {
+		return false
+	}
+	if inputWaiting {
+		heartbeat.deferredAt = heartbeat.parsed.Load()
+		return true
+	}
+	if parsed := heartbeat.parsed.Load(); parsed != heartbeat.deferredAt {
+		heartbeat.deferredAt = parsed
+		return true
+	}
+	return false
 }
 
 // expiry is the moment the current ping state ends at: the timeout past a

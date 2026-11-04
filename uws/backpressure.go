@@ -19,19 +19,56 @@ package uws
 import (
 	"errors"
 	"net"
+	"sync"
+
+	"github.com/urpc/uio/internal/readcontrol"
 )
 
+// The bits of Conn.readPaused.
 const (
-	readPauseInternal uint32 = 1 << iota
-	readPauseExternal
+	readPauseInternal uint32 = 1 << iota // the automatic reply watermark's
+	readPauseExternal                    // the application's
 )
+
+// connReadPauses holds this connection's two pauses of the transport, each
+// its own owner there: neither ever releases the other, nor a pause another
+// owner of the transport holds. The mutex orders each pause's transition and
+// its mirror bit in Conn.readPaused against a local Close; it covers no
+// protocol callback and no socket I/O.
+type connReadPauses struct {
+	mu       sync.Mutex
+	external *readcontrol.Pause
+	internal *readcontrol.Pause
+}
+
+func (c *Conn) ensureReadPauses() *connReadPauses {
+	metadata := c.ensureMetadata()
+	if pauses := metadata.readPauses.Load(); pauses != nil {
+		return pauses
+	}
+	pauses := &connReadPauses{external: readcontrol.NewPause(c.raw), internal: readcontrol.NewPause(c.raw)}
+	if metadata.readPauses.CompareAndSwap(nil, pauses) {
+		return pauses
+	}
+	return metadata.readPauses.Load()
+}
+
+func (c *Conn) loadReadPauses() *connReadPauses {
+	if metadata := c.metadata.Load(); metadata != nil {
+		return metadata.readPauses.Load()
+	}
+	return nil
+}
 
 // PauseReads stops consuming incoming WebSocket frames until ResumeReads.
 // It is safe from any goroutine and from OnOpen or OnMessage. A callback
 // already in progress may finish; a pause made by OnMessage takes effect
 // before the next frame, including frames buffered in the same socket read.
-// Bytes remain buffered, and the transport's inbound bound eventually stops
-// socket reads. Writes continue normally. This also works over TLS.
+// The frames wait in the transport, which stops reading a plain socket at
+// once and keeps the end of the stream behind them: a peer that sends and
+// then closes its side is answered after ResumeReads, so a paused connection
+// whose peer left lingers until then, or until a heartbeat or read deadline
+// ends it. Writes and timers continue normally. This also works over TLS.
 //
 // Pausing delays control frames too, including Ping and Pong. Heartbeat and
 // close deadlines still run; starting a local Close overrides the pause so
@@ -42,29 +79,50 @@ func (c *Conn) PauseReads() error {
 	if err := c.checkReadControl(); err != nil {
 		return err
 	}
-	c.readPauses.Or(readPauseExternal)
+	pauses := c.ensureReadPauses()
+	pauses.mu.Lock()
+	defer pauses.mu.Unlock()
+	if err := c.checkReadControl(); err != nil {
+		return err
+	}
+	if err := pauses.external.Pause(); err != nil {
+		return readControlError(err)
+	}
+	c.readPaused.Or(readPauseExternal)
 	return nil
 }
 
 // ResumeReads clears the pause requested by PauseReads and schedules a read
-// turn, so already buffered frames need no new network input to be delivered.
-// It leaves automatic watermark backpressure in effect. It is safe from any
-// goroutine, including TrafficObserver.OnOutbound, and is idempotent.
+// turn, so already buffered frames need no new network input to be
+// delivered. Without that pause it does nothing. It leaves automatic
+// watermark backpressure in effect. It is safe from any goroutine, including
+// TrafficObserver.OnOutbound, and is idempotent.
 // The connection must have opened and must not be closing or closed.
 func (c *Conn) ResumeReads() error {
 	if err := c.checkReadControl(); err != nil {
 		return err
 	}
-	if c.readPauses.And(^readPauseExternal)&readPauseExternal == 0 {
+	pauses := c.loadReadPauses()
+	if pauses == nil {
 		return nil
 	}
-	if err := c.raw.Wake(); err != nil {
-		if errors.Is(err, net.ErrClosed) {
-			return ErrClosed
-		}
+	pauses.mu.Lock()
+	defer pauses.mu.Unlock()
+	if err := c.checkReadControl(); err != nil {
 		return err
 	}
-	return nil
+	if c.readPaused.Load()&readPauseExternal == 0 {
+		return nil
+	}
+	c.readPaused.And(^readPauseExternal) // cleared first: the turn the release schedules must see it
+	return readControlError(pauses.external.Resume())
+}
+
+func readControlError(err error) error {
+	if errors.Is(err, net.ErrClosed) {
+		return ErrClosed
+	}
+	return err
 }
 
 // OutboundBuffered returns accepted bytes still waiting in this connection's
@@ -141,19 +199,53 @@ func (c *Conn) checkReadControl() error {
 	return nil
 }
 
-func (c *Conn) externalReadsPaused() bool {
-	return c.readPauses.Load()&readPauseExternal != 0 && !c.closing.Load()
-}
-
-func (c *Conn) internalReadsPaused() bool {
-	return c.readPauses.Load()&readPauseInternal != 0
-}
+func (c *Conn) externalReadsPaused() bool { return c.readPaused.Load()&readPauseExternal != 0 }
+func (c *Conn) internalReadsPaused() bool { return c.readPaused.Load()&readPauseInternal != 0 }
 
 // setInternalReadPause changes only the automatic pause and reports whether
 // it changed. In particular, a drain must never clear an application's pause.
 func (c *Conn) setInternalReadPause(paused bool) bool {
-	if paused {
-		return c.readPauses.Or(readPauseInternal)&readPauseInternal == 0
+	pauses := c.loadReadPauses()
+	if pauses == nil {
+		if !paused || c.closing.Load() {
+			return false
+		}
+		pauses = c.ensureReadPauses()
 	}
-	return c.readPauses.And(^readPauseInternal)&readPauseInternal != 0
+	pauses.mu.Lock()
+	defer pauses.mu.Unlock()
+	if c.closing.Load() {
+		paused = false
+	}
+	if c.internalReadsPaused() == paused {
+		return false
+	}
+	if paused {
+		if pauses.internal.Pause() != nil {
+			return false
+		}
+		c.readPaused.Or(readPauseInternal)
+		return true
+	}
+	c.readPaused.And(^readPauseInternal)
+	_ = pauses.internal.Resume()
+	return true
+}
+
+// releaseReadPauses lets the Close handshake consume again. It releases this
+// connection's own pauses only, never one another owner of the transport
+// holds, and counts the automatic one it ends as resumed.
+func (c *Conn) releaseReadPauses() {
+	pauses := c.loadReadPauses()
+	if pauses == nil {
+		return
+	}
+	pauses.mu.Lock()
+	released := c.readPaused.Swap(0)
+	_ = pauses.external.Resume()
+	_ = pauses.internal.Resume()
+	pauses.mu.Unlock()
+	if released&readPauseInternal != 0 && c.config != nil && c.config.stats != nil {
+		c.config.stats.resumed.Add(1)
+	}
 }

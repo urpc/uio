@@ -15,7 +15,9 @@ import (
 // inbound is one borrowed chunk and ReserveOutbound hands out room in a reused
 // slice, so the benchmarks below measure what UWS itself spends per message.
 type echoPathConn struct {
+	probeReadAccess
 	uio.Conn
+	probeReadControl
 	inbound  []byte
 	out      []byte
 	userdata any

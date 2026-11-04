@@ -74,9 +74,8 @@ func runRelay() {
 	// One bridge for the user side: it accepts the user connections, and its
 	// Dial opens each one's upstream leg — a stream on the agent's transport —
 	// instead of dialing a socket.
-	var br *uio.Bridge
 	var sess atomic.Value // *umux.Session: the latest agent transport
-	br = &uio.Bridge{Dial: func(ctx context.Context, client uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
+	br := &uio.Bridge{Dial: func(ctx context.Context, _ uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
 		s, _ := sess.Load().(*umux.Session)
 		if s == nil {
 			return nil, errors.New("umux-tunnel: no agent connected")
@@ -88,9 +87,6 @@ func runRelay() {
 		if err != nil {
 			return nil, err
 		}
-		// Pair instead of letting OnOpen dial: the stream's callbacks reach
-		// this bridge through its session, and the user leg is already here.
-		br.Pair(client, st)
 		return st, nil
 	}}
 

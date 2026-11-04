@@ -296,8 +296,8 @@ func (o Options) transportEvents() *uio.Events {
 		ReusePort:              o.ReusePort,
 		Executor:               o.Executor,
 		MaxOutboundBuffered:    o.MaxOutboundBuffered,
-		// Automatic and explicit read pauses leave bytes here until UIO's
-		// inbound hold stops socket reads.
+		// Bound retained input while delivery is paused, including what a
+		// transport layer below the protocol can still deliver.
 		MaxInboundBuffered: inboundLimit,
 	}
 }

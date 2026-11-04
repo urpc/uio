@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/urpc/uio/internal/readcontrol"
 	"github.com/urpc/uio/internal/timewheel"
 )
 
@@ -31,12 +32,13 @@ import (
 // wheel's own membership is the timer's validity — Arm detaches before it
 // re-arms, so a due entry the wheel reports is the deadline that was armed —
 // and the wake turn's existing guards (isClosing, the held-read pause) carry
-// the rest. The wheel's mutex serializes its lists; submitMu guards only the
-// entry's allocation. A setter that loses the race with the close path —
-// armed after the close's cancel ran — undoes itself by re-checking
-// isClosing after the arm.
+// the rest. The wheel's mutex serializes its lists; an atomic publication
+// shares the cold allocation with optional input-control state. A setter that
+// loses the race with the close path — armed after the close's cancel ran —
+// undoes itself by re-checking isClosing after the arm.
 type wakeState struct {
-	entry *timewheel.Entry[*fdConn]
+	readControl atomic.Pointer[readcontrol.Control] // optional input control; shares cold allocation
+	entry       *timewheel.Entry[*fdConn]
 	// mu holds the wheel's arm and the mirror — armed, due and period — as
 	// one step, so a setter and a consuming turn can never see the pair
 	// split: a due published with a stale period would consume the timer as
@@ -96,17 +98,17 @@ func (conn *fdConn) SetWakeInterval(interval time.Duration) error {
 	return nil
 }
 
-// wakeState returns the connection's wake state, allocated on first use
-// under submitMu so two setters cannot allocate two.
+// wakeState publishes fully initialized cold state once. CAS avoids taking
+// submitMu from read-control setters called inside a connection callback.
 func (conn *fdConn) wakeState() *wakeState {
-	conn.submitMu.Lock()
-	defer conn.submitMu.Unlock()
 	if w := conn.wake.Load(); w != nil {
 		return w
 	}
 	w := &wakeState{entry: &timewheel.Entry[*fdConn]{Val: conn}}
-	conn.wake.Store(w)
-	return w
+	if conn.wake.CompareAndSwap(nil, w) {
+		return w
+	}
+	return conn.wake.Load()
 }
 
 // fireWakeTimer runs the connection's own timer callback when its deadline

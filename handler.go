@@ -31,12 +31,14 @@ type Handler interface {
 	OnOpen(c Conn)
 
 	// OnRead fires on a turn once the connection opened, with inbound data
-	// available or none: a Wake runs one too, so it may arrive with nothing
-	// to read. Inbound access methods are valid only for this callback
-	// invocation. An error closes the connection. A layer hears the same
-	// moment as its OnRead; here, at the top of the stack, outbound is not a
-	// callback but Write, a method the Handler calls — which is why there is
-	// no OnWrite next to it.
+	// available or none: a Wake, a YieldRead's continuation or a released
+	// pause runs one too, so it may arrive with nothing to read. While reads
+	// are paused it does not run; OnTimer and a stack's layer work go on.
+	// Inbound access methods are valid only for this callback invocation. An
+	// error closes the connection.
+	// A layer hears the same moment as its OnRead; here, at the top of the
+	// stack, outbound is Write, a method the Handler calls, which is why there
+	// is no OnWrite next to it.
 	OnRead(c Conn) error
 
 	// OnTimer fires on the turn the connection's own timer came due — the
@@ -58,6 +60,17 @@ type Handler interface {
 	// Control, and one accepted from a listener with a SocketControl close
 	// their socket before OnClose, as do dialed and adopted connections.
 	OnClose(c Conn, err error)
+}
+
+// QueueDrainedObserver is an optional capability of an Observer: it hears a
+// connection whose queue made room without a socket write to report it —
+// output a layer held and its peer acknowledged, a multiplexed stream's
+// queue its transport accepted, or a write the queue refused that a turn's
+// work has made room for again. A relay resumes a source waiting on that
+// queue from it, as from OnBytesWritten. It may run on any goroutine,
+// concurrently with the connection's other callbacks, and must not block.
+type QueueDrainedObserver interface {
+	OnQueueDrained(c Conn)
 }
 
 // TrafficObserver, set as Events.Observer, is told the bytes each connection

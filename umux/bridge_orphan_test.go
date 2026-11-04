@@ -55,12 +55,11 @@ func TestBridgeReleasesStreams(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Cleanup(func() { _ = cli.Close(nil) })
-	br.Dial = func(ctx context.Context, client uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
+	br.Dial = func(ctx context.Context, _ uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
 		st, err := sess.Open(ctx)
 		if err != nil {
 			return nil, err
 		}
-		br.Pair(client, st)
 		return st, nil
 	}
 	ev := br.Events()
