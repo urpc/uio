@@ -177,7 +177,9 @@ func TestStreamSurface(t *testing.T) {
 	if st.State()&uio.StateWriteShut == 0 {
 		t.Fatal("State lacks StateWriteShut after CloseWrite")
 	}
-	if _, err := st.Write([]byte("late")); !errors.Is(err, ErrClosed) {
+	// A close that completed before this write reports its cause instead
+	// of ErrClosed; both sides' FINs can finish that fast.
+	if _, err := st.Write([]byte("late")); !errors.Is(err, ErrClosed) && !errors.Is(err, io.EOF) {
 		t.Fatalf("write after CloseWrite: %v", err)
 	}
 	waitEOF(t, st)

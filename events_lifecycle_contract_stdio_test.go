@@ -72,7 +72,7 @@ func TestStdAdoptFailureAlwaysReleasesTransferredOwnership(t *testing.T) {
 		{"packet-layer", &adoptionContractConn{stdRegistrationConn: newStdRegistrationConn(53102), local: &net.UDPAddr{}}, []AdoptOption{WithLayers(PassThroughLayer)}, context.Background(), ErrLayersNeedStream},
 		{"syscall-connection", &adoptionContractConn{stdRegistrationConn: newStdRegistrationConn(53103), syscallError: failure}, nil, context.Background(), ErrUnsupported},
 		{"descriptor-control", &adoptionContractConn{stdRegistrationConn: newStdRegistrationConn(53104), controlError: failure}, nil, context.Background(), ErrUnsupported},
-		{"invalid-descriptor", &adoptionContractConn{stdRegistrationConn: newStdRegistrationConn(^uintptr(0))}, nil, context.Background(), ErrUnsupported},
+		{"invalid-descriptor", &adoptionContractConn{stdRegistrationConn: newStdRawRegistrationConn(^uintptr(0))}, nil, context.Background(), ErrUnsupported},
 		{"cancelled-registration", &adoptionContractConn{stdRegistrationConn: newStdRegistrationConn(53105)}, nil, ctx, failure},
 	}
 	for _, tc := range cases {
@@ -206,7 +206,7 @@ func TestStdRegistrationRollbackClearsFDPublication(t *testing.T) {
 	}
 	defer loop.poller.Close(nil)
 	for _, fd := range []uintptr{^uintptr(0), uintptr(stdTestFDLimit())} {
-		raw := newStdRegistrationConn(fd)
+		raw := newStdRawRegistrationConn(fd)
 		c := &fdConn{commonConn: commonConn{entry: ev.plainEntry(), loop: loop}, conn: raw}
 		if err := loop.registerConn(c); err == nil {
 			t.Fatal("invalid descriptor registered")
@@ -223,7 +223,7 @@ func TestStdRegistrationRollbackClearsFDPublication(t *testing.T) {
 	if err := loop.registerConn(c); err == nil {
 		t.Fatal("closed poller accepted registration")
 	}
-	if loop.fdMap.Get(53401) != nil {
+	if loop.fdMap.Get(c.Fd()) != nil {
 		t.Fatal("poller failure left a descriptor published")
 	}
 	select {

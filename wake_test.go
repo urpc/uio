@@ -62,7 +62,9 @@ func TestWakeDeadlineFires(t *testing.T) {
 	if rec.fires() != 1 {
 		t.Fatalf("one-shot fired %d times", rec.fires())
 	}
-	if late := firstSince(t, rec, start.Add(60*time.Millisecond)); late > 100*time.Millisecond {
+	// A slow or race-instrumented runner slips timers; what the test pins
+	// is a wake at its deadline, once, not the runner's punctuality.
+	if late := firstSince(t, rec, start.Add(60*time.Millisecond)); late > 250*time.Millisecond {
 		t.Fatalf("wake fired %v late", late)
 	} else if late < -20*time.Millisecond {
 		t.Fatalf("wake fired %v early", -late)

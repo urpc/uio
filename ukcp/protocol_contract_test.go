@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"runtime"
 	"testing"
 	"time"
 
@@ -170,7 +171,11 @@ func TestStandaloneValidationAndFailedListenCleanup(t *testing.T) {
 		t.Fatal("negative buffer settings did not leave the socket unchanged")
 	}
 	control := (Options{SocketReadBuffer: 1024, SocketWriteBuffer: -1}).socketControl()
-	if err := control("udp", "", ^uintptr(0)); err == nil {
-		t.Fatal("invalid socket descriptor was accepted")
+	if runtime.GOOS != "windows" {
+		// Windows applies no kernel socket buffers, so it takes any
+		// descriptor and reports nothing to apply.
+		if err := control("udp", "", ^uintptr(0)); err == nil {
+			t.Fatal("invalid socket descriptor was accepted")
+		}
 	}
 }

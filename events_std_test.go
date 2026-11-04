@@ -41,6 +41,12 @@ type stdRegistrationConn struct {
 }
 
 func newStdRegistrationConn(fd uintptr) *stdRegistrationConn {
+	return newStdRawRegistrationConn(syntheticFD(fd))
+}
+
+// newStdRawRegistrationConn keeps the descriptor as given: tests of the fd
+// table's own bounds need descriptors it cannot hold.
+func newStdRawRegistrationConn(fd uintptr) *stdRegistrationConn {
 	return &stdRegistrationConn{
 		fd: fd, closed: make(chan struct{}), readData: make(chan []byte),
 	}
