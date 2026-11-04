@@ -30,10 +30,10 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 			continue
 		}
 		sent, err := sendDatagram(fd, packet, remote)
-		sentBytes += sent
 		if err != nil {
 			return sentBytes, err
 		}
+		sentBytes += sent
 	}
 	return sentBytes, nil
 }

@@ -77,43 +77,31 @@ func (poller *Poller) Remove(int, Interest) error { return nil }
 // Wait blocks for a command wake, timeout, or terminal close. It never returns
 // socket events on this backend.
 func (poller *Poller) Wait(_ []Event, timeout int) (int, error) {
-	if timeout == 0 {
-		select {
-		case <-poller.closed:
-			poller.mu.Lock()
-			err := poller.closeReason
-			poller.mu.Unlock()
-			return 0, err
-		case <-poller.waker:
-			return 0, nil
-		default:
-			return 0, nil
-		}
-	}
+	var expired <-chan time.Time
 	if timeout > 0 {
 		timer := time.NewTimer(time.Duration(timeout) * time.Millisecond)
 		defer timer.Stop()
+		expired = timer.C
+	}
+	if timeout == 0 {
 		select {
 		case <-poller.closed:
-			poller.mu.Lock()
-			err := poller.closeReason
-			poller.mu.Unlock()
-			return 0, err
 		case <-poller.waker:
-			return 0, nil
-		case <-timer.C:
-			return 0, nil
+		default:
+		}
+	} else {
+		select {
+		case <-poller.closed:
+		case <-poller.waker:
+		case <-expired: // a nil timer channel leaves negative waits unbounded
 		}
 	}
-	select {
-	case <-poller.closed:
-		poller.mu.Lock()
-		err := poller.closeReason
-		poller.mu.Unlock()
-		return 0, err
-	case <-poller.waker:
-		return 0, nil
+	// A queued wake and closure can be ready together. The terminal snapshot
+	// supplies the reason regardless of which select arm won.
+	if poller.Closed() {
+		return 0, poller.Err()
 	}
+	return 0, nil
 }
 
 // Wake coalesces repeated notifications in a capacity-one channel.
@@ -146,6 +134,14 @@ func (poller *Poller) Closed() bool {
 	}
 }
 
+// Err returns the published terminal reason. A nil cause is a normal close;
+// use Closed to distinguish it from a poller which is still running.
+func (poller *Poller) Err() error {
+	poller.mu.Lock()
+	defer poller.mu.Unlock()
+	return poller.closeReason
+}
+
 // Serve is retained as a compatibility wrapper around Wait.
 func (poller *Poller) Serve(lockOSThread bool, handler EventHandler) error {
 	if lockOSThread {
@@ -156,6 +152,9 @@ func (poller *Poller) Serve(lockOSThread bool, handler EventHandler) error {
 	for {
 		n, err := poller.Wait(events, -1)
 		if err != nil || poller.Closed() {
+			if poller.Closed() {
+				err = poller.Err()
+			}
 			handler.OnClose(poller, err)
 			return err
 		}

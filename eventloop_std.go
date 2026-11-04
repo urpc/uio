@@ -316,6 +316,9 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 
 		n, err := loop.poller.Wait(loop.evbuf, timeout)
 		if err != nil || loop.poller.Closed() {
+			if loop.poller.Closed() {
+				err = loop.poller.Err()
+			}
 			result = err
 			loop.beginStop(err)
 			continue

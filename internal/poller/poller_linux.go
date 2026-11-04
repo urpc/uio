@@ -561,6 +561,10 @@ func (poller *Poller) Close(err error) error {
 // Closed reports whether Close has published the terminal state.
 func (poller *Poller) Closed() bool { return poller.closed.Load() }
 
+// Err returns the published terminal reason; Closed distinguishes a nil
+// close cause from a poller which has not closed.
+func (poller *Poller) Err() error { return poller.closeError() }
+
 func (poller *Poller) closeError() error {
 	if reason := poller.closeReason.Load(); reason != nil {
 		return *reason
@@ -622,6 +626,9 @@ func (poller *Poller) Serve(lockOSThread bool, handler EventHandler) error {
 	for {
 		n, err := poller.Wait(events, -1)
 		if err != nil || poller.Closed() {
+			if poller.Closed() {
+				err = poller.Err()
+			}
 			handler.OnClose(poller, err)
 			return err
 		}
