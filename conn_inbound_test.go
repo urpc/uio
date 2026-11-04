@@ -89,32 +89,6 @@ func serveInboundTest(t *testing.T, events *Events) (net.Conn, Conn) {
 	}
 }
 
-// writeUntilStalled writes from the client until the kernel takes nothing for
-// a while, and reports how much it took. With the server holding reads, this
-// is the socket buffers' worth and the rest of total stays unsent.
-func writeUntilStalled(t *testing.T, client net.Conn, total int) int {
-	t.Helper()
-	chunk := make([]byte, 16<<10)
-	sent := 0
-	for sent < total {
-		_ = client.SetWriteDeadline(time.Now().Add(300 * time.Millisecond))
-		n, err := client.Write(chunk[:min(len(chunk), total-sent)])
-		sent += n
-		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
-				break
-			}
-			if isPeerGoneWrite(err) {
-				break // the server closed, as a deadline test may
-			}
-			t.Fatal(err)
-		}
-	}
-	_ = client.SetWriteDeadline(time.Time{})
-	return sent
-}
-
 // A callback that consumes nothing holds the connection's reads once
 // MaxInboundBuffered bytes are buffered: the buffer stops within one read of
 // the limit while the peer's writes stall in TCP flow control, and the
