@@ -577,13 +577,26 @@ func TestClientDeadlineExtendedKeepsDelivery(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = client.Close(1000, "") }()
-	for range 50 {
-		if err := client.SetReadDeadline(time.Now().Add(5 * time.Millisecond)); err != nil {
+	// The first deadline only has to outlive the gap between the two
+	// setter calls: the property under test is that an extension arriving
+	// before the deadline keeps the connection and its delivery. A runner
+	// can stall a goroutine for milliseconds between two adjacent calls, so
+	// give the first deadline room and skip the rounds a stall consumed —
+	// the deadline really passed there, which closes and is correct.
+	const firstDeadline = 100 * time.Millisecond
+	extended := 0
+	for extended < 50 {
+		armed := time.Now()
+		if err := client.SetReadDeadline(armed.Add(firstDeadline)); err != nil {
 			t.Fatal(err)
 		}
 		if err := client.SetReadDeadline(time.Now().Add(time.Hour)); err != nil {
 			t.Fatal(err)
 		}
+		if time.Since(armed) >= firstDeadline {
+			continue // the deadline expired before the extension: not this round
+		}
+		extended++
 		time.Sleep(time.Millisecond)
 		select {
 		case <-client.ended:

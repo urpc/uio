@@ -83,7 +83,7 @@ func (conn *fdConn) ReadsPaused() bool { return conn.currentReadControl().ReadsP
 func (conn *fdConn) readCloseReady() bool {
 	if conn.entry != nil && conn.entry.layered {
 		if c, ok := conn.Userdata().(*stack); ok {
-			return c.drained() && !c.handlerHeld() && !c.yieldOwed() && !c.yieldOwed()
+			return c.drained() && !c.handlerHeld() && !c.yieldOwed()
 		}
 	}
 	return !conn.currentReadControl().Held() && !conn.yieldOwed()

@@ -123,22 +123,53 @@ func encodeHeader(dst []byte, h frameHeader) {
 	binary.BigEndian.PutUint32(dst[8:12], h.length)
 }
 
-// validateFrame applies the per-type bounds before a session acts on a frame:
-// data frames carry at most maxData payload bytes, window updates name a
-// stream, a GoAway names the session itself, and a metadata SYN carries its
-// four-byte window delta plus at most maxMeta opaque bytes.
+// validateFrame applies the per-type bounds before a session acts on a
+// frame: data frames carry at most maxData payload bytes, every frame's
+// flags are a combination its type gives meaning to, window updates and
+// data name a stream, a GoAway names the session itself, and a metadata SYN
+// carries its four-byte window delta plus at most maxMeta opaque bytes.
+//
+// SYN or ACK may share a frame with FIN, as yamux uses when opening or
+// acknowledging a stream while half-closing its sending direction. RST stays
+// exclusive so a hard reset cannot be confused with a data or FIN delivery.
 func validateFrame(h frameHeader, maxData, maxMeta uint32) error {
 	switch h.typ {
 	case typeData:
+		// SYN and ACK may ride on data in yamux. FIN may ride with either
+		// open or acknowledge; RST remains a standalone hard reset.
+		switch h.flags {
+		case 0, flagSYN, flagFIN, flagSYN | flagFIN,
+			flagACK, flagACK | flagFIN, flagRST:
+		default:
+			return errFrameFlags
+		}
+		if h.streamID == 0 {
+			return errFrameFlags
+		}
 		if h.length > maxData {
 			return errFrameLength
 		}
 	case typeWindowUpdate:
+		// SYN and ACK may ride on a window update, and either may carry FIN.
+		// A plain FIN may carry a delta; RST remains a standalone reset.
+		switch h.flags {
+		case 0, flagSYN, flagSYN | flagFIN,
+			flagACK, flagACK | flagFIN, flagFIN, flagRST:
+		default:
+			return errFrameFlags
+		}
 		if h.streamID == 0 {
 			return errFrameFlags
 		}
+	case typePing:
+		// A probe or its answer, on the session.
+		switch h.flags {
+		case flagSYN, flagACK:
+		default:
+			return errFrameFlags
+		}
 	case typeGoAway:
-		if h.streamID != 0 {
+		if h.flags != 0 || h.streamID != 0 {
 			return errFrameFlags
 		}
 	case typeSynMetadata:

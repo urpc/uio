@@ -453,12 +453,31 @@ func (s *Session) handleFrame(h frameHeader, payload []byte, borrowed bool) erro
 }
 
 func (s *Session) handleData(h frameHeader, payload []byte, borrowed bool) error {
-	if h.flags&(flagSYN|flagACK) != 0 {
-		return ErrProtocol // open and acknowledge travel on WindowUpdate frames
+	if h.flags&flagSYN != 0 {
+		// A data SYN carries payload bytes, so its length is not a window
+		// delta. The peer starts at the protocol floor until a later window
+		// update grants more credit.
+		if err := s.handleSyn(frameHeader{typ: typeWindowUpdate, flags: flagSYN, streamID: h.streamID}); err != nil {
+			return err
+		}
+	}
+	if h.flags&flagACK != 0 {
+		// A data ACK carries payload bytes, so it acknowledges with the
+		// protocol-floor window. Never feed h.length to handleAck: there it
+		// means a window delta, while here it is the data length.
+		if err := s.handleAck(frameHeader{typ: typeWindowUpdate, flags: flagACK, streamID: h.streamID}); err != nil {
+			return err
+		}
 	}
 	s.mu.Lock()
 	st := s.streams[h.streamID]
 	if st == nil {
+		if h.flags&flagSYN != 0 {
+			// acceptStream already refused or observed a closed session and
+			// handled the peer-facing reset where appropriate.
+			s.mu.Unlock()
+			return nil
+		}
 		// Data for a stream this end does not know: reset it so the peer
 		// stops sending.
 		s.sendControlLocked(typeWindowUpdate, flagRST, h.streamID, 0)
@@ -488,15 +507,28 @@ func (s *Session) handleData(h frameHeader, payload []byte, borrowed bool) error
 func (s *Session) handleWindowUpdate(h frameHeader) error {
 	switch {
 	case h.flags&flagSYN != 0:
-		return s.handleSyn(h)
+		if err := s.handleSyn(h); err != nil {
+			return err
+		}
 	case h.flags&flagACK != 0:
-		return s.handleAck(h)
+		if err := s.handleAck(h); err != nil {
+			return err
+		}
 	case h.flags&flagRST != 0:
 		s.mu.Lock()
 		st := s.streams[h.streamID]
 		s.mu.Unlock()
 		if st != nil {
 			s.abortRemote(st, ErrStreamReset)
+		}
+		return nil
+	}
+	if h.flags&(flagSYN|flagACK) != 0 {
+		// SYN/ACK length is the opening window delta, not a later credit
+		// grant. If FIN shares the frame, apply the half-close after the
+		// open/ack and do not grant that delta a second time.
+		if h.flags&flagFIN != 0 {
+			return s.handleWindowFIN(h.streamID)
 		}
 		return nil
 	}
@@ -538,6 +570,23 @@ func (s *Session) handleWindowUpdate(h frameHeader) error {
 		}
 		s.dispatchRead(st)
 	}
+	return nil
+}
+
+// handleWindowFIN applies a FIN carried by a SYN|FIN or ACK|FIN window
+// update. The opening/acknowledgement was handled before this call, and its
+// length is therefore never treated as a post-open credit grant.
+func (s *Session) handleWindowFIN(id uint32) error {
+	s.mu.Lock()
+	st := s.streams[id]
+	s.mu.Unlock()
+	if st == nil {
+		return nil
+	}
+	if err := st.pushData(nil, true, false); err != nil {
+		return err
+	}
+	s.dispatchRead(st)
 	return nil
 }
 

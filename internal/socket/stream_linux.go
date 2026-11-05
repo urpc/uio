@@ -75,9 +75,9 @@ func Recv(fd int, p []byte) (int, error) {
 	var n uintptr
 	var errno syscall.Errno
 	if rawCallsEnabled {
-		n, _, errno = syscall.RawSyscall6(syscall.SYS_RECVFROM, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), 0, 0, 0)
+		n, _, errno = syscall.RawSyscall6(unix.SYS_RECVFROM, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), 0, 0, 0)
 	} else {
-		n, _, errno = syscall.Syscall6(syscall.SYS_RECVFROM, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), 0, 0, 0)
+		n, _, errno = syscall.Syscall6(unix.SYS_RECVFROM, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), 0, 0, 0)
 	}
 	if errno != 0 {
 		if errno == syscall.ENOTSOCK {
@@ -93,9 +93,9 @@ func Send(fd int, p []byte) (int, error) {
 	var n uintptr
 	var errno syscall.Errno
 	if rawCallsEnabled {
-		n, _, errno = syscall.RawSyscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
+		n, _, errno = syscall.RawSyscall6(unix.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
 	} else {
-		n, _, errno = syscall.Syscall6(syscall.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
+		n, _, errno = syscall.Syscall6(unix.SYS_SENDTO, uintptr(fd), uintptr(bytesPointer(p)), uintptr(len(p)), unix.MSG_NOSIGNAL, 0, 0)
 	}
 	if errno != 0 {
 		if errno == syscall.ENOTSOCK {

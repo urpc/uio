@@ -696,15 +696,15 @@ func TestRawProtocolErrorsClose(t *testing.T) {
 			t.Fatal("connection stayed open after a bad version")
 		}
 	})
-	t.Run("data with SYN", func(t *testing.T) {
+	t.Run("data with SYN and ACK", func(t *testing.T) {
 		conn := dialTCP(t, addr)
 		defer conn.Close()
-		if _, err := conn.Write(rawFramed(typeData, flagSYN, 3, 1, []byte("x"))); err != nil {
+		if _, err := conn.Write(rawFramed(typeData, flagSYN|flagACK, 3, 1, []byte("x"))); err != nil {
 			t.Fatal(err)
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 		if _, err := io.ReadFull(conn, make([]byte, 1)); err == nil {
-			t.Fatal("connection stayed open after a malformed data frame")
+			t.Fatal("connection stayed open after a contradictory data frame")
 		}
 	})
 	t.Run("split header", func(t *testing.T) {

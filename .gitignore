@@ -25,3 +25,8 @@ go.work
 # OS / IDE
 .DS_Store
 .idea/
+
+# Local coverage reports and Python bytecode
+/.coverage/
+__pycache__/
+*.py[cod]

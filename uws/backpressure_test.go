@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1510,7 +1511,15 @@ func TestFragmentedRepliesCountEveryFrame(t *testing.T) {
 // A watermark band past what an int32 holds still pauses: the replies are
 // counted in full.
 func TestWideWatermarkBandStillPauses(t *testing.T) {
-	const high, low = 3 << 30, 1 << 30
+	if strconv.IntSize < 64 {
+		t.Skip("watermark band exceeds int32 on 32-bit targets")
+	}
+	high64 := int64(3)
+	high64 <<= 30
+	low64 := int64(1)
+	low64 <<= 30
+	high := int(high64)
+	low := int(low64)
 	raw, conn, server := newBackpressureConn(high, low)
 	queueReplies(raw, conn, high)
 	raw.inbound = maskedFrames("one")

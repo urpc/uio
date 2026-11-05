@@ -18,6 +18,7 @@ package umux
 
 import (
 	"errors"
+	"math"
 	"time"
 
 	"github.com/urpc/uio"
@@ -133,7 +134,12 @@ const (
 	// minWindow is the yamux v1 initial stream window: every sender starts
 	// here, and an endpoint's SYN/ACK announces its receive window as the
 	// delta above it.
-	minWindow            = 256 << 10
+	minWindow = 256 << 10
+	// maxWindowSize bounds WindowSize to what the wire carries: the length
+	// field of a data frame and the window delta a SYN announces are uint32,
+	// so a larger configured window would truncate at those boundaries and
+	// turn into a smaller limit.
+	maxWindowSize        = math.MaxUint32
 	defaultReadBuffer    = 256 << 10
 	defaultWindowSize    = 256 << 10
 	defaultSessionWindow = 4 << 20
@@ -158,6 +164,16 @@ func (c Config) resolve() Config {
 	}
 	if c.WindowSize < defaultWindowSize {
 		c.WindowSize = defaultWindowSize
+	}
+	// WindowSize is an int API, while the wire carries a uint32 delta. On
+	// 32-bit targets the largest representable int is below the wire limit;
+	// compute the effective bound at run time so the package still compiles.
+	windowLimit := int64(maxWindowSize)
+	if hostLimit := int64(^uint(0) >> 1); hostLimit < windowLimit {
+		windowLimit = hostLimit
+	}
+	if int64(c.WindowSize) > windowLimit {
+		c.WindowSize = int(windowLimit)
 	}
 	if c.SessionWindow <= 0 {
 		c.SessionWindow = defaultSessionWindow
