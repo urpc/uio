@@ -56,3 +56,15 @@ func (conn *fdConn) notifyBlockClose(err error) {
 		}
 	}
 }
+
+func (conn *fdConn) hasWaitingBlockWriter() bool {
+	if w := conn.wake.Load(); w != nil {
+		return w.block.Load().HasWaitingWriter()
+	}
+	return false
+}
+
+func (conn *fdConn) ensureBlockWriter() *blockio.Writer {
+	st, _ := conn.connBlockState()
+	return st.Writer(0)
+}

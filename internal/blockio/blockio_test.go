@@ -170,6 +170,18 @@ func (f *fakeSource) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (f *fakeSource) Writev(vec [][]byte) (int, error) {
+	total := 0
+	for _, s := range vec {
+		total += len(s)
+	}
+	joined := make([]byte, 0, total)
+	for _, s := range vec {
+		joined = append(joined, s...)
+	}
+	return f.Write(joined)
+}
+
 func (f *fakeSource) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 	f.mu.Lock()
 	if f.writeErr != nil {
@@ -777,5 +789,128 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 	all5, err5 := io.ReadAll(r5)
 	if err5 != nil || len(all5) == 0 {
 		t.Fatalf("EOF after pause ReadAll = %d, %v", len(all5), err5)
+	}
+}
+
+type partialVecSource struct {
+	*fakeSource
+	partial int
+}
+
+func (p *partialVecSource) Writev(vec [][]byte) (int, error) {
+	if p.partial > 0 {
+		n := p.partial
+		p.partial = 0
+		total := 0
+		for _, s := range vec {
+			total += len(s)
+		}
+		joined := make([]byte, 0, total)
+		for _, s := range vec {
+			joined = append(joined, s...)
+		}
+		_, _ = p.fakeSource.Write(joined[:n])
+		return n, ErrOverflow
+	}
+	return p.fakeSource.Writev(vec)
+}
+
+func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
+	var nilState *State
+	if nilState.HasWaitingWriter() {
+		t.Fatal("nil State reported HasWaitingWriter")
+	}
+
+	base := newFakeSource(64, 32)
+	base.hardCap = 32
+	if base.state.HasWaitingWriter() {
+		t.Fatal("fresh State reported HasWaitingWriter")
+	}
+	ps := &partialVecSource{fakeSource: base}
+	st := NewState(ps)
+	w := st.Writer(32)
+
+	// On-turn Writev returns ErrBlockingOnTurn.
+	EnterTurn()
+	if _, err := w.Writev([][]byte{[]byte("x")}); !errors.Is(err, ErrBlockingOnTurn) {
+		t.Fatalf("on-turn Writev = %v", err)
+	}
+	LeaveTurn()
+
+	// Empty Writev
+	if n, err := w.Writev(nil); n != 0 || err != nil {
+		t.Fatalf("empty Writev = %d, %v", n, err)
+	}
+
+	// Fast-path Writev within window
+	if n, err := w.Writev([][]byte{[]byte("fast-"), []byte("vec")}); err != nil || n != 8 {
+		t.Fatalf("fast Writev = %d, %v", n, err)
+	}
+	base.drainOut(32)
+
+	// Partial Writev continuation (like umux partial window accept) + HasWaiters!
+	ps.partial = 5
+	done := make(chan error, 1)
+	go func() {
+		n, err := w.Writev([][]byte{[]byte("ab"), []byte("cde"), []byte("fghij")})
+		if err == nil && n != 10 {
+			err = io.ErrShortWrite
+		}
+		done <- err
+	}()
+	base.drainOut(32)
+	if err := <-done; err != nil {
+		t.Fatalf("partial Writev = %v", err)
+	}
+
+	// Oversized multi-chunk Writev (> window) + HasWaitingWriter observed while blocked!
+	base.drainOut(32)
+	_, _ = w.Write(make([]byte, 32)) // fill window
+	bigDone := make(chan error, 1)
+	go func() {
+		n, err := w.Writev([][]byte{nil, bytes.Repeat([]byte("V"), 40), bytes.Repeat([]byte("W"), 30)})
+		if err == nil && n != 70 {
+			err = io.ErrShortWrite
+		}
+		bigDone <- err
+	}()
+	for deadline := time.Now().Add(time.Second); !st.HasWaitingWriter() && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if !st.HasWaitingWriter() {
+		t.Fatal("expected HasWaitingWriter while Writev is parked")
+	}
+	for range 10 {
+		base.drainOut(32)
+		select {
+		case err := <-bigDone:
+			if err != nil {
+				t.Fatalf("chunked Writev = %v", err)
+			}
+			goto vecDone
+		case <-time.After(3 * time.Millisecond):
+		}
+	}
+	t.Fatal("chunked Writev did not finish")
+vecDone:
+	if st.HasWaitingWriter() {
+		t.Fatal("HasWaitingWriter remained true after Writev completed")
+	}
+
+	// Deadline & error & closed Writev guards
+	_ = w.SetWriteDeadline(time.Now().Add(-time.Millisecond))
+	if _, err := w.Writev([][]byte{[]byte("x")}); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("deadline Writev = %v", err)
+	}
+	_ = w.SetWriteDeadline(time.Time{})
+	boom := errors.New("vec-boom")
+	base.writeErr = boom
+	if _, err := w.Writev([][]byte{[]byte("x")}); !errors.Is(err, boom) {
+		t.Fatalf("error Writev = %v", err)
+	}
+	base.writeErr = nil
+	st.OnClose(true, nil)
+	if _, err := w.Writev([][]byte{[]byte("x")}); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed Writev = %v", err)
 	}
 }

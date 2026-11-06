@@ -396,11 +396,12 @@ func (ev *Events) newEntry(layers []Layer) (*entry, error) {
 			handler = FuncHandler{}
 		}
 		driver := &stackDriver{
-			layers:   append([]Layer(nil), layers...),
-			top:      handler,
-			limit:    ev.MaxOutboundBuffered,
-			inLimit:  ev.MaxInboundBuffered,
-			halfOpen: ev.AllowHalfOpen,
+			layers:        append([]Layer(nil), layers...),
+			top:           handler,
+			limit:         ev.effectiveMaxOutbound(),
+			inLimit:       ev.MaxInboundBuffered,
+			halfOpen:      ev.AllowHalfOpen,
+			blockingWrite: ev.BlockingWrite,
 		}
 		handler = driver
 	}

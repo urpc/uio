@@ -426,3 +426,193 @@ func TestBlockingLocalCloseAndAbortWakeParkedCallers(t *testing.T) {
 		t.Fatalf("ReadFull owned = %q, %v", got, err)
 	}
 }
+
+func TestEventsBlockingWriteOptionFairnessTurnGuardAndDeadline(t *testing.T) {
+	// 1. Default MaxOutboundBuffered == 0 converges to DefaultBlockingBuffer when BlockingWrite: true.
+	defEv := &Events{BlockingWrite: true}
+	if defEv.effectiveMaxOutbound() != DefaultBlockingBuffer {
+		t.Fatalf("effectiveMaxOutbound = %d, want %d", defEv.effectiveMaxOutbound(), DefaultBlockingBuffer)
+	}
+
+	for _, layered := range []bool{false, true} {
+		name := "plain"
+		if layered {
+			name = "layered"
+		}
+		t.Run(name, func(t *testing.T) {
+			var opts []ListenOption
+			var dialOpts []DialOption
+			if layered {
+				opts = []ListenOption{WithLayers(PassThroughLayer)}
+				dialOpts = []DialOption{WithLayers(PassThroughLayer)}
+			}
+
+			srvReaderCh := make(chan *BlockingReader, 1)
+			turnOverflowCh := make(chan error, 1)
+
+			srvEv := &Events{
+				Pollers:             1,
+				AllowHalfOpen:       true,
+				BlockingWrite:       true,
+				MaxOutboundBuffered: 8 << 10,
+				Handler: FuncHandler{
+					Open: func(c Conn) {
+						r, err := NewBlockingReader(c, WithBufferSize(8<<10))
+						if err != nil {
+							t.Errorf("server NewBlockingReader: %v", err)
+							return
+						}
+						// Pause server read briefly to test on-turn non-blocking overflow protection!
+						srvReaderCh <- r
+					},
+				},
+			}
+			stopSrv := startBlockingEvents(t, srvEv)
+			defer stopSrv()
+			ln, err := srvEv.Listen("tcp://127.0.0.1:0", opts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer ln.Close()
+
+			cliEv := &Events{
+				Pollers:             1,
+				AllowHalfOpen:       true,
+				BlockingWrite:       true,
+				MaxOutboundBuffered: 8 << 10,
+				Handler: FuncHandler{
+					Read: func(c Conn) error {
+						// On-turn overflow MUST return ErrOutboundOverflow immediately, NEVER deadlock!
+						_, _ = c.Discard(-1)
+						_, werr := c.Write(make([]byte, 32<<10))
+						select {
+						case turnOverflowCh <- werr:
+						default:
+						}
+						return nil
+					},
+				},
+			}
+			stopCli := startBlockingEvents(t, cliEv)
+			defer stopCli()
+
+			cli, err := cliEv.Dial("tcp://"+ln.Addr().String(), dialOpts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cli.Close()
+			srvR := <-srvReaderCh
+
+			// Business goroutines call cli.Write / cli.Writev / cli.WriteOwned directly with oversized
+			// payloads + concurrent small writers (anti-starvation FIFO check)!
+			bigChunk := bytes.Repeat([]byte("BIG-FRAME-"), 2500) // 25 KiB (> 8 KiB MaxOutboundBuffered!)
+			vecPart1 := bytes.Repeat([]byte("VEC1-"), 1200)      // 6 KiB
+			vecPart2 := bytes.Repeat([]byte("VEC2-"), 1200)      // 6 KiB
+			ownedPayload := bytes.Repeat([]byte("OWND-"), 2400)  // 12 KiB
+			smallFrame := bytes.Repeat([]byte("s"), 128)
+			const smallWorkers = 6
+			const smallIters = 20
+
+			var wg sync.WaitGroup
+			errCh := make(chan error, 16)
+
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if n, err := cli.Write(bigChunk); err != nil || n != len(bigChunk) {
+					errCh <- err
+					return
+				}
+				if n, err := cli.Writev([][]byte{vecPart1, vecPart2}); err != nil || n != len(vecPart1)+len(vecPart2) {
+					errCh <- err
+					return
+				}
+				owned := AcquireBuffer(len(ownedPayload))
+				_, _ = owned.Write(ownedPayload)
+				if n, err := cli.WriteOwned(owned); err != nil || n != len(ownedPayload) {
+					errCh <- err
+					return
+				}
+			}()
+
+			for wIdx := range smallWorkers {
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					for range smallIters {
+						var n int
+						var err error
+						switch idx % 3 {
+						case 0:
+							n, err = cli.Write(smallFrame)
+						case 1:
+							n, err = cli.Writev([][]byte{smallFrame[:64], smallFrame[64:]})
+						default:
+							ob := AcquireBuffer(len(smallFrame))
+							_, _ = ob.Write(smallFrame)
+							n, err = cli.WriteOwned(ob)
+						}
+						if err != nil || n != len(smallFrame) {
+							errCh <- err
+							return
+						}
+					}
+				}(wIdx)
+			}
+
+			go func() {
+				wg.Wait()
+				_ = cli.CloseWrite()
+			}()
+
+			wantTotal := len(bigChunk) + len(vecPart1) + len(vecPart2) + len(ownedPayload) + smallWorkers*smallIters*len(smallFrame)
+			received, err := io.ReadAll(srvR)
+			if err != nil {
+				t.Fatalf("srvR ReadAll = %v", err)
+			}
+			select {
+			case werr := <-errCh:
+				t.Fatalf("concurrent blocking Conn.Write failed: %v", werr)
+			default:
+			}
+			if len(received) != wantTotal {
+				t.Fatalf("received %d bytes, want %d", len(received), wantTotal)
+			}
+			// Verify bigChunk was written whole without smallFrame barging into the middle of it!
+			if !bytes.Contains(received, bigChunk) {
+				t.Fatal("bigChunk was torn/interleaved by concurrent small writers")
+			}
+
+			// Verify SetWriteDeadline wakes a stalled BlockingWrite Conn.Write!
+			silentLn, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer silentLn.Close()
+			acceptedRaw := make(chan net.Conn, 1)
+			go func() {
+				c, _ := silentLn.Accept()
+				if c != nil {
+					acceptedRaw <- c
+				}
+			}()
+			stalledCli, err := cliEv.Dial("tcp://"+silentLn.Addr().String(), dialOpts...)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rawPeer := <-acceptedRaw
+			defer rawPeer.Close()
+			// Trigger OnRead on stalledCli to verify on-turn overflow returns ErrOutboundOverflow!
+			_, _ = rawPeer.Write([]byte("ping"))
+			if onTurnErr := <-turnOverflowCh; !errors.Is(onTurnErr, ErrOutboundOverflow) {
+				t.Fatalf("on-turn Write overflow = %v, want ErrOutboundOverflow", onTurnErr)
+			}
+
+			_ = stalledCli.SetWriteDeadline(time.Now().Add(40 * time.Millisecond))
+			_, werr := stalledCli.Write(make([]byte, 8<<20)) // exceeds kernel + user buffers -> blocks -> deadline closes!
+			if werr == nil {
+				t.Fatal("expected stalled BlockingWrite to fail on SetWriteDeadline expiry")
+			}
+		})
+	}
+}

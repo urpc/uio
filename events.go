@@ -159,6 +159,19 @@ type Events struct {
 	// layers' own control output, a handshake or a ping.
 	MaxOutboundBuffered int
 
+	// BlockingWrite makes stream Conn.Write, WriteString, WriteByte, Writev and
+	// WriteOwned suspend calling application goroutines when the outbound queue
+	// is full (or chunk writes larger than MaxOutboundBuffered) instead of
+	// returning ErrOutboundOverflow, providing standard-library net.Conn write
+	// backpressure semantics. When enabled with MaxOutboundBuffered == 0, the
+	// outbound window defaults to DefaultBlockingBuffer (64 KiB).
+	//
+	// Event-loop and connection-turn callbacks (OnOpen, OnRead, OnTimer,
+	// OnBytesWritten) never block: if an on-turn write overflows the outbound
+	// limit, it still returns ErrOutboundOverflow immediately to prevent turn
+	// self-deadlock.
+	BlockingWrite bool
+
 	// MaxInboundBuffered bounds payload read but not yet consumed. Once
 	// callbacks leave this much unconsumed, the connection stops reading its
 	// socket, so TCP flow control slows the peer instead of the buffer
@@ -357,6 +370,9 @@ func (ev *Events) initConfig() error {
 
 	if ev.ReadBufferSize <= 0 {
 		ev.ReadBufferSize = 1024 * 4
+	}
+	if ev.BlockingWrite && ev.MaxOutboundBuffered == 0 {
+		ev.MaxOutboundBuffered = DefaultBlockingBuffer
 	}
 	if ev.readBufSize == 0 {
 		ev.readBufSize = ev.ReadBufferSize

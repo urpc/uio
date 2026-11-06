@@ -30,14 +30,20 @@ const readFromChunkSize = 32 << 10
 
 // Writer is a stream connection's blocking outbound endpoint.
 type Writer struct {
-	src    Source
-	wmu    sync.Mutex // serializes multi-goroutine Write / ReadFrom calls
-	mu     sync.Mutex // protects closed/closeErr
-	waiter waiter
+	src     Source
+	waiting atomic.Int32 // active or queued blocking writers; prevents fast-path barging
+	wmu     sync.Mutex   // serializes multi-goroutine Write / Writev / ReadFrom calls
+	mu      sync.Mutex   // protects closed/closeErr
+	waiter  waiter
 
 	customWin atomic.Int64
 	closed    bool
 	closeErr  error
+}
+
+// HasWaiters reports whether any blocking write call is currently in progress or waiting.
+func (w *Writer) HasWaiters() bool {
+	return w != nil && w.waiting.Load() > 0
 }
 
 func newWriter(src Source, window int) *Writer {
@@ -144,15 +150,94 @@ func (w *Writer) Flush() error {
 	}
 }
 
+func (w *Writer) enterWrite() {
+	w.waiting.Add(1)
+	w.wmu.Lock()
+}
+
+func (w *Writer) leaveWrite() {
+	w.wmu.Unlock()
+	w.waiting.Add(-1)
+}
+
 // Write writes all of p to the connection, suspending when the outbound window
 // is full. Concurrent calls on the same Writer are serialized atomically.
 func (w *Writer) Write(p []byte) (int, error) {
 	if OnTurn() {
 		return 0, ErrBlockingOnTurn
 	}
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
+	w.enterWrite()
+	defer w.leaveWrite()
 	return w.writeLocked(p)
+}
+
+// Writev writes all segments of vec atomically among blocking writers,
+// suspending when the outbound window is full.
+func (w *Writer) Writev(vec [][]byte) (int, error) {
+	if OnTurn() {
+		return 0, ErrBlockingOnTurn
+	}
+	total := 0
+	for _, seg := range vec {
+		total += len(seg)
+	}
+	w.enterWrite()
+	defer w.leaveWrite()
+	if err := w.terminalErr(); err != nil {
+		return 0, err
+	}
+	if err := w.waiter.checkDeadline(); err != nil {
+		return 0, err
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	limit := w.window()
+	if total <= limit && w.src.OutboundBuffered()+total <= limit {
+		n, err := w.src.Writev(vec)
+		if err == nil && n == total {
+			return n, nil
+		}
+		if err != nil && !w.src.IsOverflow(err) {
+			return n, w.resolveWriteErr(err)
+		}
+		if n > 0 {
+			// Advance past already accepted prefix of vec.
+			rem := n
+			for len(vec) > 0 && rem >= len(vec[0]) {
+				rem -= len(vec[0])
+				vec = vec[1:]
+			}
+			if rem > 0 && len(vec) > 0 {
+				nw, werr := w.writeLocked(vec[0][rem:])
+				n += nw
+				if werr != nil {
+					return n, werr
+				}
+				vec = vec[1:]
+			}
+			for _, seg := range vec {
+				nw, werr := w.writeLocked(seg)
+				n += nw
+				if werr != nil {
+					return n, werr
+				}
+			}
+			return n, nil
+		}
+	}
+	written := 0
+	for _, seg := range vec {
+		if len(seg) == 0 {
+			continue
+		}
+		n, err := w.writeLocked(seg)
+		written += n
+		if err != nil {
+			return written, err
+		}
+	}
+	return written, nil
 }
 
 func (w *Writer) writeLocked(p []byte) (int, error) {
@@ -208,8 +293,8 @@ func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 		bytebuf.ReleaseBuffer(buf)
 		return 0, nil
 	}
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
+	w.enterWrite()
+	defer w.leaveWrite()
 	n, err := w.writeOwnedPreserveLocked(buf)
 	if err != nil && buf.Len() > 0 {
 		bytebuf.ReleaseBuffer(buf)
@@ -218,8 +303,8 @@ func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 }
 
 func (w *Writer) writeOwnedPreserveOnAbort(buf *bytebuf.Buffer) (int, error) {
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
+	w.enterWrite()
+	defer w.leaveWrite()
 	return w.writeOwnedPreserveLocked(buf)
 }
 
@@ -272,8 +357,8 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 	if wt, ok := r.(io.WriterTo); ok {
 		return wt.WriteTo(w)
 	}
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
+	w.enterWrite()
+	defer w.leaveWrite()
 
 	var total int64
 	for {

@@ -27,6 +27,7 @@ import (
 	"net"
 	"unsafe"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
@@ -51,6 +52,20 @@ func (fc *fdConn) coalesceBlockSize() int {
 }
 
 func (fc *fdConn) Write(p []byte) (n int, err error) {
+	if fc.udp == nil && fc.entry != nil && fc.entry.directConsumer && fc.events().BlockingWrite {
+		if fc.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().Write(p)
+		}
+		n, err = fc.writeNonBlocking(p)
+		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().Write(p)
+		}
+		return n, err
+	}
+	return fc.writeNonBlocking(p)
+}
+
+func (fc *fdConn) writeNonBlocking(p []byte) (n int, err error) {
 	if fc.isClosing() {
 		return 0, net.ErrClosed
 	}
@@ -78,7 +93,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 			return 0, ErrOutboundOverflow
 		}
 		owned := bytebuf.CloneBuffer(p)
-		n, err := fc.WriteOwned(owned)
+		n, err := fc.writeOwnedNonBlocking(owned)
 		if errors.Is(err, ErrOutboundOverflow) {
 			// The clone never entered the queue, so Write still owns it.
 			bytebuf.ReleaseBuffer(owned)
@@ -147,7 +162,20 @@ func (fc *fdConn) drainOutboundReports() {
 // fixed writer vector can carry them; larger segment counts collapse into one
 // block to avoid retaining an unbounded pointer list.
 func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
+	if fc.udp == nil && fc.entry != nil && fc.entry.directConsumer && fc.events().BlockingWrite {
+		if fc.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().Writev(vec)
+		}
+		n, err = fc.writevNonBlocking(vec)
+		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().Writev(vec)
+		}
+		return n, err
+	}
+	return fc.writevNonBlocking(vec)
+}
 
+func (fc *fdConn) writevNonBlocking(vec [][]byte) (n int, err error) {
 	if fc.isClosing() {
 		return 0, net.ErrClosed
 	}
@@ -240,6 +268,20 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 }
 
 func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
+	if owned != nil && fc.udp == nil && fc.entry != nil && fc.entry.directConsumer && fc.events().BlockingWrite {
+		if fc.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().WriteOwned(owned)
+		}
+		n, err = fc.writeOwnedNonBlocking(owned)
+		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
+			return fc.ensureBlockWriter().WriteOwned(owned)
+		}
+		return n, err
+	}
+	return fc.writeOwnedNonBlocking(owned)
+}
+
+func (fc *fdConn) writeOwnedNonBlocking(owned *Buffer) (n int, err error) {
 	if owned == nil {
 		return 0, nil
 	}

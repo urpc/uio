@@ -27,16 +27,19 @@ func (s streamBlockSource) WriteEnded() bool           { return s.st.State()&uio
 func (s streamBlockSource) ClosingOrClosed() bool {
 	return s.st.State()&(uio.StateClosing|uio.StateClosed) != 0
 }
-func (s streamBlockSource) Write(p []byte) (int, error)           { return s.st.Write(p) }
-func (s streamBlockSource) WriteOwned(b *uio.Buffer) (int, error) { return s.st.WriteOwned(b) }
-func (s streamBlockSource) Flush() error                          { return s.st.Flush() }
-func (s streamBlockSource) OutboundBuffered() int                 { return s.st.OutboundBuffered() }
-func (s streamBlockSource) MaxInbound() int                       { return s.st.sess.cfg.WindowSize }
-func (s streamBlockSource) MaxOutbound() int                      { return s.st.sess.cfg.WindowSize }
-func (s streamBlockSource) Wake() error                           { return s.st.Wake() }
-func (s streamBlockSource) NewReadPause() *readcontrol.Pause      { return readcontrol.NewPause(s.st) }
-func (s streamBlockSource) WatchWrite(fn func(int)) bool          { return writecontrol.Watch(s.st, fn) }
-func (s streamBlockSource) IsOverflow(err error) bool             { return errors.Is(err, uio.ErrOutboundOverflow) }
+func (s streamBlockSource) Write(p []byte) (int, error)    { return s.st.writeNonBlocking(p) }
+func (s streamBlockSource) Writev(v [][]byte) (int, error) { return s.st.writevNonBlocking(v) }
+func (s streamBlockSource) WriteOwned(b *uio.Buffer) (int, error) {
+	return s.st.writeOwnedNonBlocking(b)
+}
+func (s streamBlockSource) Flush() error                     { return s.st.Flush() }
+func (s streamBlockSource) OutboundBuffered() int            { return s.st.OutboundBuffered() }
+func (s streamBlockSource) MaxInbound() int                  { return s.st.sess.cfg.WindowSize }
+func (s streamBlockSource) MaxOutbound() int                 { return s.st.sess.cfg.WindowSize }
+func (s streamBlockSource) Wake() error                      { return s.st.Wake() }
+func (s streamBlockSource) NewReadPause() *readcontrol.Pause { return readcontrol.NewPause(s.st) }
+func (s streamBlockSource) WatchWrite(fn func(int)) bool     { return writecontrol.Watch(s.st, fn) }
+func (s streamBlockSource) IsOverflow(err error) bool        { return errors.Is(err, uio.ErrOutboundOverflow) }
 
 func (s streamBlockSource) EnablePullRead(onTurn bool) error {
 	s.st.pullRead.Store(true)
@@ -74,4 +77,13 @@ func (st *Stream) notifyBlockClose(err error) {
 	if b := st.blockControl.Load(); b != nil {
 		b.OnClose(st.localClosed.Load(), err)
 	}
+}
+
+func (st *Stream) hasWaitingBlockWriter() bool {
+	return st.blockControl.Load().HasWaitingWriter()
+}
+
+func (st *Stream) ensureBlockWriter() *blockio.Writer {
+	b, _ := st.streamBlockState()
+	return b.Writer(0)
 }

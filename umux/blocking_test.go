@@ -268,3 +268,96 @@ func TestBlockingOverKCPLayerAndUmux(t *testing.T) {
 		t.Fatalf("KCP+umux ReadAll len=%d err=%v", len(got), err)
 	}
 }
+
+func TestUmuxConfigBlockingWriteOption(t *testing.T) {
+	srvStreamCh := make(chan *Stream, 1)
+	onTurnOverflow := make(chan error, 1)
+
+	srv := NewServer(Config{
+		BlockingWrite: true,
+		Handler: uio.FuncHandler{
+			Open: func(c uio.Conn) {
+				// On-turn overflow (> 256 KiB window) MUST return ErrOutboundOverflow without deadlocking!
+				_, err := c.Write(make([]byte, 512<<10))
+				onTurnOverflow <- err
+				srvStreamCh <- c.(*Stream)
+			},
+		},
+	})
+	defer func() {
+		_ = srv.Close(nil)
+		_ = srv.Wait()
+	}()
+
+	ln, err := srv.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cli := NewClient(Config{BlockingWrite: true})
+	defer func() { _ = cli.Close(nil) }()
+
+	cliSess, err := cli.Dial(context.Background(), "tcp://"+ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cliSess.Close(nil)
+
+	cliSt, err := cliSess.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := <-onTurnOverflow; !errors.Is(err, uio.ErrOutboundOverflow) {
+		t.Fatalf("umux on-turn overflow = %v, want ErrOutboundOverflow", err)
+	}
+	srvSt := <-srvStreamCh
+	srvR, err := uio.NewBlockingReader(srvSt)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Drain initial partial bytes accepted during the on-turn test on cliSt.
+	cliR, err := uio.NewBlockingReader(cliSt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _, _ = io.Copy(io.Discard, cliR) }()
+
+	// Business goroutine writes 600 KiB (> 256 KiB stream window!) directly via Stream.Write, Writev, and WriteOwned!
+	p1 := bytes.Repeat([]byte("UMUX-BLK-1-"), 30000) // 330 KiB
+	p2 := bytes.Repeat([]byte("UMUX-BLK-2-"), 20000) // 220 KiB
+	p3 := bytes.Repeat([]byte("UMUX-BLK-3-"), 10000) // 110 KiB
+
+	writeDone := make(chan error, 1)
+	go func() {
+		if _, err := cliSt.Write(p1); err != nil {
+			writeDone <- err
+			return
+		}
+		if _, err := cliSt.Writev([][]byte{p2[:100000], p2[100000:]}); err != nil {
+			writeDone <- err
+			return
+		}
+		owned := uio.AcquireBuffer(len(p3))
+		_, _ = owned.Write(p3)
+		if _, err := cliSt.WriteOwned(owned); err != nil {
+			writeDone <- err
+			return
+		}
+		writeDone <- cliSt.CloseWrite()
+	}()
+
+	got, err := io.ReadAll(srvR)
+	if err != nil {
+		t.Fatalf("srvR ReadAll = %v", err)
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("cliSt BlockingWrite = %v", err)
+	}
+	want := bytes.Join([][]byte{p1, p2, p3}, nil)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("umux BlockingWrite received %d bytes, want %d", len(got), len(want))
+	}
+}

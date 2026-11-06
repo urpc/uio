@@ -28,6 +28,7 @@ import (
 
 	"time"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/readcontrol"
 	"github.com/urpc/uio/internal/writecontrol"
 )
@@ -426,6 +427,21 @@ func (l *layerNode) roomMade() {
 // Write enters the layer, once it opened the layers above; the Handler's
 // writes are admitted against MaxOutboundBuffered first.
 func (l *layerNode) Write(p []byte) (int, error) {
+	if l.isTop() && l.stack.blockingWrite {
+		if l.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return l.ensureBlockWriter().Write(p)
+		}
+		n, err := l.writeNonBlocking(p)
+		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
+			n2, err2 := l.ensureBlockWriter().Write(p[n:])
+			return n + n2, err2
+		}
+		return n, err
+	}
+	return l.writeNonBlocking(p)
+}
+
+func (l *layerNode) writeNonBlocking(p []byte) (int, error) {
 	if err := l.enter(len(p)); err != nil {
 		return 0, err
 	}
@@ -443,6 +459,13 @@ func (l *layerNode) Write(p []byte) (int, error) {
 }
 
 func (l *layerNode) Writev(vec [][]byte) (int, error) {
+	if l.isTop() && l.stack.blockingWrite && !blockio.OnTurn() {
+		return l.ensureBlockWriter().Writev(vec)
+	}
+	return l.writevNonBlocking(vec)
+}
+
+func (l *layerNode) writevNonBlocking(vec [][]byte) (int, error) {
 	size := 0
 	for _, segment := range vec {
 		size += len(segment)
@@ -542,7 +565,17 @@ func (l *layerNode) isTop() bool { return l.index == len(l.stack.layers)-1 }
 // ErrOutboundOverflow leaves the buffer the caller's; any other outcome
 // consumes it, and a partial one reports io.ErrShortWrite.
 func (l *layerNode) WriteOwned(buffer *Buffer) (int, error) {
-	n, err := l.Write(buffer.Bytes())
+	if buffer != nil && l.isTop() && l.stack.blockingWrite && !blockio.OnTurn() {
+		return l.ensureBlockWriter().WriteOwned(buffer)
+	}
+	return l.writeOwnedNonBlocking(buffer)
+}
+
+func (l *layerNode) writeOwnedNonBlocking(buffer *Buffer) (int, error) {
+	if buffer == nil {
+		return 0, nil
+	}
+	n, err := l.writeNonBlocking(buffer.Bytes())
 	if err == nil {
 		n = buffer.Len()
 	} else if errors.Is(err, ErrOutboundOverflow) {

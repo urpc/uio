@@ -556,6 +556,21 @@ func (st *Stream) WriteTo(w io.Writer) (int64, error) {
 // window is exhausted it returns ErrOutboundOverflow; writers retry once the
 // peer's WindowUpdate wakes the stream.
 func (st *Stream) Write(p []byte) (int, error) {
+	if st.sess.cfg.BlockingWrite {
+		if st.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return st.ensureBlockWriter().Write(p)
+		}
+		n, err := st.writeNonBlocking(p)
+		if errors.Is(err, uio.ErrOutboundOverflow) && !blockio.OnTurn() {
+			n2, err2 := st.ensureBlockWriter().Write(p[n:])
+			return n + n2, err2
+		}
+		return n, err
+	}
+	return st.writeNonBlocking(p)
+}
+
+func (st *Stream) writeNonBlocking(p []byte) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -641,9 +656,16 @@ func (st *Stream) WriteByte(c byte) error {
 
 // Writev writes the buffers as one stream segment.
 func (st *Stream) Writev(vec [][]byte) (int, error) {
+	if st.sess.cfg.BlockingWrite && !blockio.OnTurn() {
+		return st.ensureBlockWriter().Writev(vec)
+	}
+	return st.writevNonBlocking(vec)
+}
+
+func (st *Stream) writevNonBlocking(vec [][]byte) (int, error) {
 	total := 0
 	for _, b := range vec {
-		n, err := st.Write(b)
+		n, err := st.writeNonBlocking(b)
 		total += n
 		if err != nil {
 			return total, err
@@ -655,11 +677,21 @@ func (st *Stream) Writev(vec [][]byte) (int, error) {
 	return total, nil
 }
 
-// WriteOwned frames an owned buffer. Streams prepend the frame header, so the
-// payload is copied once and the buffer released; it is not a zero-copy path.
-// Like uio's contract, an overflow refuses the whole write and leaves the
-// buffer with the caller.
 func (st *Stream) WriteOwned(buffer *uio.Buffer) (int, error) {
+	if buffer != nil && st.sess.cfg.BlockingWrite {
+		if st.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return st.ensureBlockWriter().WriteOwned(buffer)
+		}
+		n, err := st.writeOwnedNonBlocking(buffer)
+		if errors.Is(err, uio.ErrOutboundOverflow) && !blockio.OnTurn() {
+			return st.ensureBlockWriter().WriteOwned(buffer)
+		}
+		return n, err
+	}
+	return st.writeOwnedNonBlocking(buffer)
+}
+
+func (st *Stream) writeOwnedNonBlocking(buffer *uio.Buffer) (int, error) {
 	if buffer == nil {
 		return 0, nil
 	}

@@ -241,6 +241,7 @@ type TransportOptions struct {
 	ReadBufferSize         int
 	WriteBufferedThreshold int
 	MaxOutboundBuffered    int
+	BlockingWrite          bool
 	AllowHalfOpen          bool
 	Pollers                int
 	ReusePort              bool
@@ -251,6 +252,7 @@ func (t TransportOptions) isZero() bool {
 	return t.ReadBufferSize == 0 &&
 		t.WriteBufferedThreshold == 0 &&
 		t.MaxOutboundBuffered == 0 &&
+		!t.BlockingWrite &&
 		!t.AllowHalfOpen &&
 		t.Pollers == 0 &&
 		!t.ReusePort &&
@@ -265,6 +267,7 @@ func (t TransportOptions) events(handler uio.Handler) *uio.Events {
 		ReadBufferSize:         t.ReadBufferSize,
 		WriteBufferedThreshold: t.WriteBufferedThreshold,
 		MaxOutboundBuffered:    t.MaxOutboundBuffered,
+		BlockingWrite:          t.BlockingWrite,
 		AllowHalfOpen:          t.AllowHalfOpen,
 		Handler:                handler,
 	}

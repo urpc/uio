@@ -28,12 +28,13 @@ func (s fdBlockSource) InboundBuffered() int              { return s.conn.Inboun
 func (s fdBlockSource) ReadEnded() bool                   { return s.conn.State()&StateReadEnded != 0 }
 func (s fdBlockSource) WriteEnded() bool                  { return s.conn.writeSideClosed() }
 func (s fdBlockSource) ClosingOrClosed() bool             { return s.conn.isClosing() }
-func (s fdBlockSource) Write(p []byte) (int, error)       { return s.conn.Write(p) }
-func (s fdBlockSource) WriteOwned(b *Buffer) (int, error) { return s.conn.WriteOwned(b) }
+func (s fdBlockSource) Write(p []byte) (int, error)       { return s.conn.writeNonBlocking(p) }
+func (s fdBlockSource) Writev(v [][]byte) (int, error)    { return s.conn.writevNonBlocking(v) }
+func (s fdBlockSource) WriteOwned(b *Buffer) (int, error) { return s.conn.writeOwnedNonBlocking(b) }
 func (s fdBlockSource) Flush() error                      { return s.conn.Flush() }
 func (s fdBlockSource) OutboundBuffered() int             { return s.conn.OutboundBuffered() }
 func (s fdBlockSource) MaxInbound() int                   { return s.conn.events().MaxInboundBuffered }
-func (s fdBlockSource) MaxOutbound() int                  { return s.conn.events().MaxOutboundBuffered }
+func (s fdBlockSource) MaxOutbound() int                  { return s.conn.events().effectiveMaxOutbound() }
 func (s fdBlockSource) EnablePullRead(onTurn bool) error  { return s.conn.enablePullRead(onTurn) }
 func (s fdBlockSource) Wake() error                       { return s.conn.Wake() }
 func (s fdBlockSource) NewReadPause() *readcontrol.Pause  { return readcontrol.NewPause(s.conn) }
@@ -49,8 +50,9 @@ func (s stackBlockSource) InboundBuffered() int              { return s.top.Inbo
 func (s stackBlockSource) ReadEnded() bool                   { return s.top.State()&StateReadEnded != 0 }
 func (s stackBlockSource) WriteEnded() bool                  { return s.top.gate.Load()&gateWriteShut != 0 }
 func (s stackBlockSource) ClosingOrClosed() bool             { return s.top.stack.over() }
-func (s stackBlockSource) Write(p []byte) (int, error)       { return s.top.Write(p) }
-func (s stackBlockSource) WriteOwned(b *Buffer) (int, error) { return s.top.WriteOwned(b) }
+func (s stackBlockSource) Write(p []byte) (int, error)       { return s.top.writeNonBlocking(p) }
+func (s stackBlockSource) Writev(v [][]byte) (int, error)    { return s.top.writevNonBlocking(v) }
+func (s stackBlockSource) WriteOwned(b *Buffer) (int, error) { return s.top.writeOwnedNonBlocking(b) }
 func (s stackBlockSource) Flush() error                      { return s.top.Flush() }
 func (s stackBlockSource) OutboundBuffered() int             { return s.top.OutboundBuffered() }
 func (s stackBlockSource) MaxInbound() int                   { return s.top.stack.inLimit }
@@ -81,4 +83,13 @@ func (l *layerNode) connBlockState() (*blockio.State, bool) {
 		return st, true
 	}
 	return c.block.Load(), true
+}
+
+func (l *layerNode) hasWaitingBlockWriter() bool {
+	return l.stack.block.Load().HasWaitingWriter()
+}
+
+func (l *layerNode) ensureBlockWriter() *blockio.Writer {
+	st, _ := l.connBlockState()
+	return st.Writer(0)
 }

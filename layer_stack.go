@@ -60,17 +60,18 @@ func stackOf(socket Conn) *stack {
 // stackDriver is the socket's Handler when layers are installed: it builds
 // each connection's stack on OnOpen and drives it from then on.
 type stackDriver struct {
-	layers   []Layer
-	top      Handler
-	limit    int  // MaxOutboundBuffered, which the stack's top enforces
-	inLimit  int  // MaxInboundBuffered, which bounds what the layers hold too
-	halfOpen bool // AllowHalfOpen: the Handler may outlive its peer's end
+	layers        []Layer
+	top           Handler
+	limit         int  // MaxOutboundBuffered, which the stack's top enforces
+	inLimit       int  // MaxInboundBuffered, which bounds what the layers hold too
+	halfOpen      bool // AllowHalfOpen: the Handler may outlive its peer's end
+	blockingWrite bool // BlockingWrite: top Write/Writev/WriteOwned suspend off-turn callers on overflow
 }
 
 func (h *stackDriver) OnOpen(socket Conn) {
 	packetBottom := len(h.layers) > 0 && isPacketLayer(h.layers[0]) &&
 		socket.LocalAddr() != nil && packetNetwork(socket.LocalAddr().Network())
-	c := &stack{top: h.top, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen, packetBottom: packetBottom}
+	c := &stack{top: h.top, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen, blockingWrite: h.blockingWrite, packetBottom: packetBottom}
 	if probe, ok := stackStateOf(socket).(*dialProbe); ok {
 		c.probe.Store(probe)
 	}
@@ -133,14 +134,15 @@ func (h *stackDriver) OnClose(socket Conn, err error) {
 // stack is one connection's layers, bottom up, with the Handler they serve
 // and the state they share.
 type stack struct {
-	top      Handler
-	socket   Conn
-	layers   []*layerNode
-	probe    atomic.Pointer[dialProbe] // a dial waiting for the stack to open, until it does
-	limit    int                       // MaxOutboundBuffered; see reserve
-	reserved atomic.Int64              // bytes admitted at the top, not yet queued below
-	halfOpen bool                      // AllowHalfOpen
-	inLimit  int                       // MaxInboundBuffered; see inboundFull
+	top           Handler
+	socket        Conn
+	layers        []*layerNode
+	probe         atomic.Pointer[dialProbe] // a dial waiting for the stack to open, until it does
+	limit         int                       // MaxOutboundBuffered; see reserve
+	reserved      atomic.Int64              // bytes admitted at the top, not yet queued below
+	halfOpen      bool                      // AllowHalfOpen
+	blockingWrite bool                      // Events.BlockingWrite
+	inLimit       int                       // MaxInboundBuffered; see inboundFull
 	// writeWatched marks that at least one layer node has a write-progress
 	// watcher; heldPeak is the most output the layers held since the last turn
 	// ended, and writeRefused a write the stack refused for capacity since then.
@@ -922,10 +924,15 @@ func (c *stack) reserve(n int) error {
 }
 
 // release returns what reserve took, once the write it admitted is queued
-// below, or failed.
+// below, or failed. If a concurrent writer was refused while this reservation
+// was in flight, releasing it notifies write-control watchers that transient
+// admission capacity is available again even if the socket already drained.
 func (c *stack) release(n int) {
 	if c.limit > 0 {
 		c.reserved.Add(-int64(n))
+		if c.writeWatched.Load() && c.writeRefused.Load() && c.writeRefused.Swap(false) {
+			c.notifyWrite(0)
+		}
 	}
 }
 

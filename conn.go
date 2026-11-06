@@ -432,6 +432,13 @@ func (fc *commonConn) events() *Events { return fc.entry.ev }
 // callbacks is the callback set this connection runs: its endpoint's.
 func (fc *commonConn) callbacks() *callbacks { return &fc.entry.cb }
 
+func (ev *Events) effectiveMaxOutbound() int {
+	if ev.MaxOutboundBuffered == 0 && ev.BlockingWrite {
+		return DefaultBlockingBuffer
+	}
+	return ev.MaxOutboundBuffered
+}
+
 // payloadLimit is the accepted payload the socket refuses past:
 // MaxOutboundBuffered when the endpoint's consumer reads directly from the
 // socket, zero when an upper driver enforces its own admission budget.
@@ -439,7 +446,7 @@ func (fc *commonConn) payloadLimit() int {
 	if fc.entry == nil || !fc.entry.directConsumer {
 		return 0
 	}
-	return fc.events().MaxOutboundBuffered
+	return fc.events().effectiveMaxOutbound()
 }
 
 func (fc *commonConn) autoCloseOnEOF() bool {

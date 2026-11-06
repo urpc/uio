@@ -115,6 +115,11 @@ type Config struct {
 	// Executor is reserved for per-stream turn scheduling; nil keeps the
 	// synchronous demultiplexing of the transport's turn.
 	Executor uio.Executor
+	// BlockingWrite makes Stream.Write, Writev and WriteOwned suspend calling
+	// application goroutines when the peer's stream receive window is exhausted
+	// instead of returning uio.ErrOutboundOverflow. Writes made directly on a
+	// connection turn remain non-blocking to prevent turn self-deadlock.
+	BlockingWrite bool
 }
 
 const (

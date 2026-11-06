@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"unsafe"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/socket"
 )
@@ -47,6 +48,20 @@ func (conn *fdConn) WriteString(value string) (int, error) {
 }
 
 func (conn *fdConn) Write(data []byte) (int, error) {
+	if !conn.isDatagram() && !conn.directOwner() && conn.entry.directConsumer && conn.events().BlockingWrite {
+		if conn.hasWaitingBlockWriter() && !blockio.OnTurn() {
+			return conn.ensureBlockWriter().Write(data)
+		}
+		n, err := conn.writeNonBlocking(data)
+		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
+			return conn.ensureBlockWriter().Write(data)
+		}
+		return n, err
+	}
+	return conn.writeNonBlocking(data)
+}
+
+func (conn *fdConn) writeNonBlocking(data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -59,8 +74,6 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 	if conn.isDatagram() {
 		return conn.sendUDPOutside(data)
 	}
-	// This fast rejection belongs after the direct path: data sent straight to
-	// the kernel never counts against the user-space payload limit.
 	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
 		return 0, ErrOutboundOverflow
 	}
@@ -77,6 +90,13 @@ func (conn *fdConn) Write(data []byte) (int, error) {
 }
 
 func (conn *fdConn) Writev(vec [][]byte) (int, error) {
+	if !conn.isDatagram() && !conn.directOwner() && conn.entry.directConsumer && conn.events().BlockingWrite && !blockio.OnTurn() {
+		return conn.ensureBlockWriter().Writev(vec)
+	}
+	return conn.writevNonBlocking(vec)
+}
+
+func (conn *fdConn) writevNonBlocking(vec [][]byte) (int, error) {
 	total := 0
 	for _, segment := range vec {
 		if len(segment) > int(^uint(0)>>1)-total {
@@ -114,6 +134,13 @@ func (conn *fdConn) Writev(vec [][]byte) (int, error) {
 }
 
 func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
+	if owned != nil && !conn.isDatagram() && !conn.directOwner() && conn.entry.directConsumer && conn.events().BlockingWrite && !blockio.OnTurn() {
+		return conn.ensureBlockWriter().WriteOwned(owned)
+	}
+	return conn.writeOwnedNonBlocking(owned)
+}
+
+func (conn *fdConn) writeOwnedNonBlocking(owned *Buffer) (int, error) {
 	if owned == nil {
 		return 0, nil
 	}
