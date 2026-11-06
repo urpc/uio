@@ -24,42 +24,41 @@ package kcp
 
 import (
 	"errors"
-	"sync"
+
+	"github.com/urpc/uio/internal/plocal"
 )
 
 // pre-allocated error to avoid repeated allocations
 var errBufferSizeMismatch = errors.New("buffer size mismatch")
 
-// A system-wide packet buffer shared among sending, receiving and FEC
-// to mitigate high-frequency memory allocation of packets.
+// A system-wide packet buffer shared among sending and receiving using per-P
+// lock-free caching of fixed *[mtuLimit]byte pointers (zero slice-header boxing
+// allocations on Put).
 var defaultBufferPool = newBufferPool(mtuLimit)
 
 type bufferPool struct {
-	xmitBuf sync.Pool
+	cache plocal.Cache[*[mtuLimit]byte]
 }
 
-// newBufferPool creates a new buffer pool with buffers of the given size.
-func newBufferPool(size int) *bufferPool {
-	return &bufferPool{
-		xmitBuf: sync.Pool{
-			New: func() any {
-				return make([]byte, size)
-			},
-		},
-	}
+// newBufferPool creates a new buffer pool with mtuLimit-byte packet buffers.
+func newBufferPool(_ int) *bufferPool {
+	bp := &bufferPool{}
+	bp.cache.Init(func() *[mtuLimit]byte {
+		return new([mtuLimit]byte)
+	})
+	return bp
 }
 
 // Get retrieves a buffer from the pool.
 func (bp *bufferPool) Get() []byte {
-	return bp.xmitBuf.Get().([]byte)
+	return bp.cache.Get()[:]
 }
 
-// Put returns a buffer to the pool.
+// Put returns a buffer to the pool without boxing a slice header into any.
 func (bp *bufferPool) Put(buf []byte) error {
-	// Only put back buffers of the correct size.
 	if cap(buf) != mtuLimit {
 		return errBufferSizeMismatch
 	}
-	bp.xmitBuf.Put(buf[:cap(buf)]) // reset slice length to full capacity
+	bp.cache.Put((*[mtuLimit]byte)(buf[:mtuLimit]))
 	return nil
 }

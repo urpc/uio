@@ -33,6 +33,8 @@ import (
 	"github.com/urpc/uio/internal/blockio"
 )
 
+func (fc *fdConn) moreInUDPBatch() bool { return false }
+
 // fdConn uses one blocking reader and one blocking writer per stream. mux
 // protects producer admission and counters; writeMu protects the detached
 // batch while the writer performs blocking net.Conn writes; callbackMu keeps

@@ -25,7 +25,6 @@ package kcp
 import (
 	"container/heap"
 	"encoding/binary"
-	"sync/atomic"
 	"time"
 )
 
@@ -152,7 +151,6 @@ func (seg *segment) encode(ptr []byte) []byte {
 	binary.LittleEndian.PutUint32(ptr[12:], seg.sn)
 	binary.LittleEndian.PutUint32(ptr[16:], seg.una)
 	binary.LittleEndian.PutUint32(ptr[20:], uint32(len(seg.data)))
-	atomic.AddUint64(&DefaultSnmp.OutSegs, 1)
 	return ptr[IKCP_OVERHEAD:]
 }
 
@@ -246,7 +244,11 @@ type KCP struct {
 	snd_buf   *RingBuffer[segment] // send buffer: segments in-flight (sent but unacknowledged)
 	rcv_buf   *segmentHeap         // receive buffer: out-of-order segments awaiting reordering
 
-	acklist []ackItem // pending ACKs to be flushed
+	acklist      []ackItem // pending ACKs to be flushed
+	queuedBytes  int       // O(1) running byte total of snd_queue segments
+	hasFastAck   bool      // true if any segment in snd_buf has 0 < fastack < 0xFFFFFFFF
+	hasResendTs  bool      // true if nextResendTs bounds all xmit>0 segments in snd_buf
+	nextResendTs uint32    // earliest resendts among xmit>0 segments in snd_buf
 
 	buffer []byte          // pre-allocated encoding buffer for flush()
 	output output_callback // callback to write data to the underlying transport
@@ -369,16 +371,10 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 	}
 
 	// move available data from rcv_buf -> rcv_queue
-	for kcp.rcv_buf.Len() > 0 {
+	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
 		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
-		}
+		kcp.rcv_queue.Push(seg)
+		kcp.rcv_nxt++
 	}
 
 	// fast recover
@@ -423,6 +419,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 					oldlen := len(seg.data)
 					seg.data = seg.data[:oldlen+extend]
 					copy(seg.data[oldlen:], buffer)
+					kcp.queuedBytes += extend
 					buffer = buffer[extend:]
 				}
 				break
@@ -460,6 +457,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		}
 
 		kcp.snd_queue.Push(seg)
+		kcp.queuedBytes += size
 		buffer = buffer[size:]
 	}
 	return 0
@@ -497,6 +495,8 @@ func (kcp *KCP) shrink_buf() {
 		kcp.snd_una = seg.sn
 	} else {
 		kcp.snd_una = kcp.snd_nxt
+		kcp.hasFastAck = false
+		kcp.hasResendTs = false
 	}
 }
 
@@ -504,24 +504,15 @@ func (kcp *KCP) shrink_buf() {
 // The segment is not removed immediately; it stays until snd_una advances past it,
 // avoiding expensive shifts in the ring buffer.
 func (kcp *KCP) parse_ack(sn uint32) {
-	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
+	diff := _itimediff(sn, kcp.snd_una)
+	if diff < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return
 	}
-
-	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
-
-		seg := kcp.snd_buf.At(ri)
-		if sn == seg.sn {
-			// mark and free space, but leave the segment here,
-			// and wait until `una` to delete this, then we don't
-			// have to shift the segments behind forward,
-			// which is an expensive operation for large window
+	if idx := int(diff); idx < kcp.snd_buf.Len() {
+		seg := kcp.snd_buf.At(idx)
+		if seg.sn == sn && seg.acked == 0 {
 			seg.acked = 1
 			kcp.recycleSegment(seg)
-			break
-		}
-		if _itimediff(sn, seg.sn) < 0 {
-			break
 		}
 	}
 }
@@ -529,26 +520,26 @@ func (kcp *KCP) parse_ack(sn uint32) {
 // parse_fastack increments the fast-ack counter for segments with sn < the given sn.
 // Returns 1 if any segment's fastack counter has reached the fast retransmit threshold.
 func (kcp *KCP) parse_fastack(sn, ts uint32) int {
-	shouldFastAck := 0
-	if _itimediff(sn, kcp.snd_una) < 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
+	diff := _itimediff(sn, kcp.snd_una)
+	if diff <= 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return 0
 	}
-
-	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
-
+	shouldFastAck := 0
+	limit := min(int(diff), kcp.snd_buf.Len())
+	for ri := 0; ri < limit; ri++ {
 		seg := kcp.snd_buf.At(ri)
 		if _itimediff(sn, seg.sn) < 0 {
 			break
 		} else if sn != seg.sn && _itimediff(seg.ts, ts) <= 0 {
 			if seg.fastack != 0xFFFFFFFF {
 				seg.fastack++
+				kcp.hasFastAck = true
 				if seg.fastack >= uint32(kcp.fastresend) {
 					shouldFastAck = 1
 				}
 			}
 		}
 	}
-
 	return shouldFastAck
 }
 
@@ -582,30 +573,35 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		return true
 	}
 
-	repeat := false
-	if !kcp.rcv_buf.Has(sn) {
-		// replicate the content if it's new
+	// Fast path for in-order segment arrival: bypass container/heap interface boxing!
+	if sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
 		dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
 		copy(dataCopy, newseg.data)
 		newseg.data = dataCopy
+		kcp.rcv_queue.Push(newseg)
+		kcp.rcv_nxt++
+		for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
+			seg := heap.Pop(kcp.rcv_buf).(segment)
+			kcp.rcv_queue.Push(seg)
+			kcp.rcv_nxt++
+		}
+		return false
+	}
 
-		// insert the new segment into rcv_buf
+	repeat := false
+	if !kcp.rcv_buf.Has(sn) {
+		dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
+		copy(dataCopy, newseg.data)
+		newseg.data = dataCopy
 		heap.Push(kcp.rcv_buf, newseg)
 	} else {
 		repeat = true
 	}
 
-	// move available data from rcv_buf -> rcv_queue
-	for kcp.rcv_buf.Len() > 0 {
+	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
 		seg := heap.Pop(kcp.rcv_buf).(segment)
-		if seg.sn == kcp.rcv_nxt && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) {
-			kcp.rcv_queue.Push(seg)
-			kcp.rcv_nxt++
-		} else {
-			// push back segment
-			heap.Push(kcp.rcv_buf, seg)
-			break
-		}
+		kcp.rcv_queue.Push(seg)
+		kcp.rcv_nxt++
 	}
 
 	return repeat
@@ -618,15 +614,28 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 //
 // 'ackNoDelay' will trigger immediate ACK, but surely it will not be efficient in bandwidth
 func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
+	flushSegments, ret := kcp.inputCore(data, pktType)
+	if ret != 0 {
+		return ret
+	}
+	if flushSegments != 0 {
+		kcp.flush(IKCP_FLUSH_FULL)
+	} else if len(kcp.acklist) >= int(kcp.mtu/IKCP_OVERHEAD) {
+		kcp.flush(IKCP_FLUSH_ACKONLY)
+	} else if ackNoDelay && len(kcp.acklist) > 0 {
+		kcp.flush(IKCP_FLUSH_ACKONLY)
+	}
+	return 0
+}
+
+func (kcp *KCP) inputCore(data []byte, pktType PacketType) (flushSegments int, ret int) {
 	snd_una := kcp.snd_una
 	if len(data) < IKCP_OVERHEAD {
-		return -1
+		return 0, -1
 	}
 
 	var latest uint32 // the latest ack packet
 	var updateRTT int
-	var inSegs uint64
-	var flushSegments int // signal to flush segments
 
 	for {
 		if len(data) < int(IKCP_OVERHEAD) {
@@ -645,7 +654,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		data = data[IKCP_OVERHEAD:]
 
 		if conv != kcp.conv {
-			return -1
+			return flushSegments, -1
 		}
 
 		if kcpTrace {
@@ -653,15 +662,14 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		}
 
 		if len(data) < int(length) {
-			return -2
+			return flushSegments, -2
 		}
 
 		if cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK &&
 			cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS {
-			return -3
+			return flushSegments, -3
 		}
 
-		// only trust window updates from regular packets. i.e: latest update
 		if pktType == IKCP_PACKET_REGULAR {
 			kcp.rmt_wnd = uint32(wnd)
 		}
@@ -687,19 +695,14 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 					repeat = kcp.parse_data(segment{
 						conv: conv, cmd: cmd, frg: frg, wnd: wnd,
 						ts: ts, sn: sn, una: una,
-						data: data[:length], // delayed data copying
+						data: data[:length],
 					})
 				}
-			}
-			if pktType == IKCP_PACKET_REGULAR && repeat {
-				atomic.AddUint64(&DefaultSnmp.RepeatSegs, 1)
 			}
 			if kcpTrace {
 				kcp.debugLog(IKCP_LOG_IN_PUSH, "conv", conv, "sn", sn, "una", una, "ts", ts, "packettype", pktType, "repeat", repeat)
 			}
 		case IKCP_CMD_WASK:
-			// ready to send back IKCP_CMD_WINS in Ikcp_flush
-			// tell remote my window size
 			kcp.probe |= IKCP_ASK_TELL
 			if kcpTrace {
 				kcp.debugLog(IKCP_LOG_IN_WASK, "conv", conv, "wnd", wnd, "ts", ts)
@@ -708,17 +711,11 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			if kcpTrace {
 				kcp.debugLog(IKCP_LOG_IN_WINS, "conv", conv, "wnd", wnd, "ts", ts)
 			}
-		default:
-			return -3
 		}
 
-		inSegs++
 		data = data[length:]
 	}
-	atomic.AddUint64(&DefaultSnmp.InSegs, inSegs)
 
-	// update rtt with the latest ts
-	// ignore the FEC packet
 	if updateRTT != 0 && pktType == IKCP_PACKET_REGULAR {
 		current := currentMs()
 		if _itimediff(current, latest) >= 0 {
@@ -726,8 +723,6 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 		}
 	}
 
-	// Congestion window (cwnd) update on ACK arrival.
-	// Uses Reno-style algorithm: slow-start below ssthresh, then AIMD.
 	if kcp.nocwnd == 0 {
 		if _itimediff(kcp.snd_una, snd_una) > 0 {
 			if kcp.cwnd < kcp.rmt_wnd {
@@ -755,24 +750,7 @@ func (kcp *KCP) Input(data []byte, pktType PacketType, ackNoDelay bool) int {
 			}
 		}
 	}
-
-	// Determine if we need to flush data segments or acks
-	if flushSegments != 0 {
-		// If window has slided or, a fastack should be triggered,
-		// Flush immediately. In previous implementations, we only
-		// send out fastacks when interval timeouts, so the resending packets
-		// have to wait until then. Now, we try to flush as soon as we can.
-		kcp.flush(IKCP_FLUSH_FULL)
-	} else if len(kcp.acklist) >= int(kcp.mtu/IKCP_OVERHEAD) { // clocking
-		// This serves as the clock for low-latency network.(i.e. the latency is less than the interval.)
-		// If the other end is waiting for confirmations, it has to want until the interval timeouts then
-		// the flush() is triggered to send out the una & acks. In low-latency network, the interval time is too long to wait,
-		// so acks have to be sent out immediately when there are too many.
-		kcp.flush(IKCP_FLUSH_ACKONLY)
-	} else if ackNoDelay && len(kcp.acklist) > 0 { // testing(xtaci): ack immediately if acNoDelay is set
-		kcp.flush(IKCP_FLUSH_ACKONLY)
-	}
-	return 0
+	return flushSegments, 0
 }
 
 func (kcp *KCP) wnd_unused() uint16 {
@@ -806,9 +784,10 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	// --- Phase 1: Flush pending ACKs ---
 	if flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL {
 		for i, ack := range kcp.acklist {
-			ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
-			// filter jitters caused by bufferbloat
+			// filter jitters caused by bufferbloat: in-order ACKs already
+			// covered by seg.una (rcv_nxt) collapse into the single latest ACK.
 			if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
+				ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
 				seg.sn, seg.ts = ack.sn, ack.ts
 				ptr = seg.encode(ptr)
 				if kcpTrace {
@@ -872,6 +851,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		cwnd = min(kcp.cwnd, cwnd)
 	}
 
+	oldSndBufLen := kcp.snd_buf.Len()
 	newSegsCount := 0
 	// ukcp: an ACK-only flush answers what arrived; it must not move queued
 	// data into the send window without sending it, because the sender above
@@ -887,6 +867,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 			if !ok {
 				break
 			}
+			kcp.queuedBytes -= len(newseg.data)
 
 			newseg.conv = kcp.conv
 			newseg.cmd = IKCP_CMD_PUSH
@@ -904,99 +885,92 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	}
 
 	// --- Phase 5: Retransmit segments from snd_buf ---
-	// Determines which segments need (re)transmission:
-	// - Initial transmit (xmit == 0)
-	// - Fast retransmit (fastack >= fastresend threshold)
-	// - Early retransmit (fastack > 0, no new segments queued)
-	// - RTO-based retransmit (current >= resendts)
 	current := currentMs()
-	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
+	var change, lostSegs uint64
 	nextUpdate = kcp.interval
 
 	if flushType == IKCP_FLUSH_FULL {
-		for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
-			segment := kcp.snd_buf.At(ri)
-			needsend := false
-			if segment.acked == 1 {
-				continue
-			}
-			if segment.xmit == 0 { // initial transmit
-				needsend = true
-				segment.rto = kcp.rx_rto
-				segment.resendts = current + segment.rto
-			} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF { // fast retransmit
-				needsend = true
-				segment.fastack = 0xFFFFFFFF // must wait until RTO to reset
-				segment.rto = kcp.rx_rto
-				segment.resendts = current + segment.rto
-				change++
-				fastRetransSegs++
-			} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 { // early retransmit
-				needsend = true
-				segment.fastack = 0xFFFFFFFF
-				segment.rto = kcp.rx_rto
-				segment.resendts = current + segment.rto
-				change++
-				earlyRetransSegs++
-			} else if _itimediff(current, segment.resendts) >= 0 { // RTO
-				needsend = true
-				if kcp.nodelay == 0 {
-					segment.rto += kcp.rx_rto
-				} else {
-					segment.rto += kcp.rx_rto / 2
-				}
-				segment.fastack = 0
-				segment.resendts = current + segment.rto
-				lostSegs++
-			}
-
-			if needsend {
-				current = currentMs()
-				segment.xmit++
-				segment.ts = current
-				segment.wnd = seg.wnd
-				segment.una = seg.una
-
-				need := IKCP_OVERHEAD + len(segment.data)
-				ptr = kcp.makeSpace(buffer, ptr, need)
-				ptr = segment.encode(ptr)
-				copy(ptr, segment.data)
-				ptr = ptr[len(segment.data):]
-
-				if kcpTrace {
-					kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
-				}
-
-				if segment.xmit >= kcp.dead_link {
-					kcp.state = 0xFFFFFFFF // mark connection as dead
+		// Fast path: when no inflight segment has pending fastack counts and the
+		// earliest resendts across existing inflight segments is still in the
+		// future, only encode newly admitted [oldSndBufLen, Len) segments!
+		if !kcp.hasFastAck && (oldSndBufLen == 0 || (kcp.hasResendTs && _itimediff(current, kcp.nextResendTs) < 0)) {
+			if oldSndBufLen > 0 {
+				if rto := _itimediff(kcp.nextResendTs, current); rto > 0 && uint32(rto) < nextUpdate {
+					nextUpdate = uint32(rto)
 				}
 			}
-
-			// get the nearest rto
-			if rto := _itimediff(segment.resendts, current); rto > 0 && uint32(rto) < nextUpdate {
-				nextUpdate = uint32(rto)
+			for ri := oldSndBufLen; ri < kcp.snd_buf.Len(); ri++ {
+				segment := kcp.snd_buf.At(ri)
+				segment.rto = kcp.rx_rto
+				segment.resendts = current + segment.rto
+				ptr = kcp.transmitSegment(buffer, ptr, segment, current, seg.wnd, seg.una)
+				if !kcp.hasResendTs || _itimediff(segment.resendts, kcp.nextResendTs) < 0 {
+					kcp.nextResendTs = segment.resendts
+					kcp.hasResendTs = true
+				}
+				if rto := _itimediff(segment.resendts, current); rto > 0 && uint32(rto) < nextUpdate {
+					nextUpdate = uint32(rto)
+				}
 			}
+		} else {
+			stillFastAck := false
+			hasEarliest := false
+			var earliest uint32
+			for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
+				segment := kcp.snd_buf.At(ri)
+				needsend := false
+				if segment.acked == 1 {
+					continue
+				}
+				if segment.xmit == 0 {
+					needsend = true
+					segment.rto = kcp.rx_rto
+					segment.resendts = current + segment.rto
+				} else if segment.fastack >= resent && segment.fastack != 0xFFFFFFFF {
+					needsend = true
+					segment.fastack = 0xFFFFFFFF
+					segment.rto = kcp.rx_rto
+					segment.resendts = current + segment.rto
+					change++
+				} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 {
+					needsend = true
+					segment.fastack = 0xFFFFFFFF
+					segment.rto = kcp.rx_rto
+					segment.resendts = current + segment.rto
+					change++
+				} else if _itimediff(current, segment.resendts) >= 0 {
+					needsend = true
+					if kcp.nodelay == 0 {
+						segment.rto += kcp.rx_rto
+					} else {
+						segment.rto += kcp.rx_rto / 2
+					}
+					segment.fastack = 0
+					segment.resendts = current + segment.rto
+					lostSegs++
+				}
+
+				if needsend {
+					ptr = kcp.transmitSegment(buffer, ptr, segment, current, seg.wnd, seg.una)
+				}
+				if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF {
+					stillFastAck = true
+				}
+				if !hasEarliest || _itimediff(segment.resendts, earliest) < 0 {
+					earliest = segment.resendts
+					hasEarliest = true
+				}
+				if rto := _itimediff(segment.resendts, current); rto > 0 && uint32(rto) < nextUpdate {
+					nextUpdate = uint32(rto)
+				}
+			}
+			kcp.hasFastAck = stillFastAck
+			kcp.hasResendTs = hasEarliest
+			kcp.nextResendTs = earliest
 		}
 	}
 
-	// --- Phase 6: Update SNMP counters and congestion window ---
-	sum := lostSegs
-	if lostSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.LostSegs, lostSegs)
-	}
-	if fastRetransSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.FastRetransSegs, fastRetransSegs)
-		sum += fastRetransSegs
-	}
-	if earlyRetransSegs > 0 {
-		atomic.AddUint64(&DefaultSnmp.EarlyRetransSegs, earlyRetransSegs)
-		sum += earlyRetransSegs
-	}
-	if sum > 0 {
-		atomic.AddUint64(&DefaultSnmp.RetransSegs, sum)
-	}
-
-	// cwnd update
+	// --- Phase 6: Update congestion window ---
 	if kcp.nocwnd == 0 {
 		// Update ssthresh after fast retransmit.
 		// Rate halving per RFC 6937: ssthresh = inflight / 2
@@ -1024,10 +998,28 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	if size := len(buffer) - len(ptr); size > 0 {
 		kcp.output(buffer, size)
 	}
-	atomic.StoreUint64(&DefaultSnmp.RingBufferSndQueue, uint64(kcp.snd_queue.Len()))
-	atomic.StoreUint64(&DefaultSnmp.RingBufferRcvQueue, uint64(kcp.rcv_queue.Len()))
-	atomic.StoreUint64(&DefaultSnmp.RingBufferSndBuffer, uint64(kcp.snd_buf.Len()))
 	return nextUpdate
+}
+
+func (kcp *KCP) transmitSegment(buffer, ptr []byte, segment *segment, current uint32, wnd uint16, una uint32) []byte {
+	segment.xmit++
+	segment.ts = current
+	segment.wnd = wnd
+	segment.una = una
+
+	need := IKCP_OVERHEAD + len(segment.data)
+	ptr = kcp.makeSpace(buffer, ptr, need)
+	ptr = segment.encode(ptr)
+	copy(ptr, segment.data)
+	ptr = ptr[len(segment.data):]
+
+	if kcpTrace {
+		kcp.debugLog(IKCP_LOG_OUT_PUSH, "conv", segment.conv, "sn", segment.sn, "frg", segment.frg, "una", segment.una, "ts", segment.ts, "xmit", segment.xmit, "datalen", len(segment.data))
+	}
+	if segment.xmit >= kcp.dead_link {
+		kcp.state = 0xFFFFFFFF
+	}
+	return ptr
 }
 
 // makeSpace sends the buffered bytes if space more would not fit in one MTU,

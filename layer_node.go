@@ -41,6 +41,7 @@ type layerOps struct {
 	closing     func(LayerContext, error) // LayerCloser
 	closeWriter func(LayerContext) error  // CloseWriter
 	held        func(LayerContext) int    // OutboundHolder
+	turnEnd     func(LayerContext)        // post-turn piggyback/batch flush
 }
 
 // opsOf resolves a LayerHandler's optional interfaces.
@@ -54,6 +55,9 @@ func opsOf(h LayerHandler) layerOps {
 	}
 	if holder, ok := h.(OutboundHolder); ok {
 		ops.held = holder.OutboundHeld
+	}
+	if finisher, ok := h.(interface{ OnTurnEnd(LayerContext) }); ok {
+		ops.turnEnd = finisher.OnTurnEnd
 	}
 	return ops
 }
@@ -155,6 +159,8 @@ func (lc layerCtx) Close() error            { return lc.l.endClose(nil, true, fa
 func (lc layerCtx) Abort(cause error) error { return lc.l.endClose(cause, false, false) }
 
 func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
+
+func (lc layerCtx) DeferTurnFlush() bool { return lc.l.stack.inTurn.Load() }
 
 // layerUpper is the layer above's inbound delivery buffer.
 type layerUpper struct{ l *layerNode }
@@ -271,6 +277,13 @@ func (s socketLower) SocketReadSize() int {
 		return c.events().readBufSize
 	}
 	return 0
+}
+
+func (s socketLower) MorePacketsInBatch() bool {
+	if c, ok := s.Conn.(*fdConn); ok {
+		return c.moreInUDPBatch()
+	}
+	return false
 }
 
 func (s socketLower) SetWakeDeadline(when time.Time) error { return s.stack.setTimer(0, when, 0) }

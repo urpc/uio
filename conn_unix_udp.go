@@ -45,7 +45,8 @@ type unixUDPState struct {
 	peers  map[socket.UDPAddress]*fdConn
 	key    socket.UDPAddress
 
-	family uint8 // server only: the socket's address family, 4 or 6
+	family      uint8 // server only: the socket's address family, 4 or 6
+	moreInBatch bool  // true while additional datagrams for this peer wait in the active recvmmsg batch
 
 	// peerMu guards a server's peers, which its turns read for every
 	// datagram and DialPeer adds to from any goroutine, and its queues.
@@ -95,6 +96,8 @@ func (conn *fdConn) onRecvUDP() error {
 	}
 	batch := conn.udp.batch
 
+	var cachedAddr socket.UDPAddress
+	var cachedConn *fdConn
 	totalRead, packets := 0, 0
 	for packets < 256 && totalRead < 1<<20 {
 		want := min(len(batch.slots), 256-packets)
@@ -108,7 +111,9 @@ func (conn *fdConn) onRecvUDP() error {
 			n := min(batch.recvs[i].Len, slot)
 			totalRead += n
 			packets++
-			conn.handleUDPPacket(batch.slots[i][:n], batch.recvs[i].Addr)
+			addr := batch.recvs[i].Addr
+			more := i+1 < got && (conn.udp.peers == nil || batch.recvs[i+1].Addr == addr)
+			cachedConn, cachedAddr = conn.handleUDPPacketCached(batch.slots[i][:n], addr, more, cachedConn, cachedAddr)
 			if conn.isClosing() {
 				return nil
 			}
@@ -154,41 +159,57 @@ func newUDPBatch(slotSize, count int) *udpBatch {
 	return batch
 }
 
+func (conn *fdConn) moreInUDPBatch() bool {
+	return conn.udp != nil && conn.udp.moreInBatch
+}
+
 // handleUDPPacket resolves or creates the logical peer connection and lends
 // the packet buffer only for the duration of its synchronous callbacks.
 func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
+	_, _ = conn.handleUDPPacketCached(packet, source, false, nil, socket.UDPAddress{})
+}
+
+func (conn *fdConn) handleUDPPacketCached(packet []byte, source socket.UDPAddress, more bool, prev *fdConn, prevAddr socket.UDPAddress) (*fdConn, socket.UDPAddress) {
 	packetConn := conn
 	if conn.udp.peers != nil {
-		// UDP children are logical connections that share the server fd.
-		udp := conn.udp
-		udp.peerMu.Lock()
-		packetConn = udp.peers[source]
-		created := false
-		if packetConn == nil && udp.peers != nil {
-			sockaddr := source.Sockaddr()
-			if sockaddr == nil {
-				udp.peerMu.Unlock()
-				return
+		if prev != nil && source == prevAddr && !prev.isClosing() {
+			packetConn = prev
+			if packetConn.udp.openOwed.CompareAndSwap(true, false) {
+				packetConn.fireOnOpen()
 			}
-			packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
-			packetConn.entry = conn.entry
-			packetConn.loop = conn.loop
-			packetConn.SetUserdata(conn.Userdata()) // the listener's
-			packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
-			udp.peers[source] = packetConn
-			created = true
-		}
-		udp.peerMu.Unlock()
-		if packetConn == nil {
-			return
-		}
-		if created || packetConn.udp.openOwed.CompareAndSwap(true, false) {
-			packetConn.fireOnOpen()
+		} else {
+			// UDP children are logical connections that share the server fd.
+			udp := conn.udp
+			udp.peerMu.Lock()
+			packetConn = udp.peers[source]
+			created := false
+			if packetConn == nil && udp.peers != nil {
+				sockaddr := source.Sockaddr()
+				if sockaddr == nil {
+					udp.peerMu.Unlock()
+					return nil, socket.UDPAddress{}
+				}
+				packetConn = &fdConn{fd: conn.fd, udp: &unixUDPState{remote: sockaddr, server: conn, key: source}}
+				packetConn.entry = conn.entry
+				packetConn.loop = conn.loop
+				packetConn.SetUserdata(conn.Userdata()) // the listener's
+				packetConn.addr, packetConn.remoteAddr = conn.addr, source.NetAddr().AddrPort()
+				udp.peers[source] = packetConn
+				created = true
+			}
+			udp.peerMu.Unlock()
+			if packetConn == nil {
+				return nil, socket.UDPAddress{}
+			}
+			if created || packetConn.udp.openOwed.CompareAndSwap(true, false) {
+				packetConn.fireOnOpen()
+			}
 		}
 	}
 	if packetConn.isClosing() {
-		return
+		return nil, socket.UDPAddress{}
 	}
+	packetConn.udp.moreInBatch = more
 	packetConn.inboundTail = packet
 	packetConn.events().onSocketBytesRead(packetConn, len(packet))
 	err := packetConn.fireOnRead()
@@ -196,9 +217,12 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 	_, _ = packetConn.Discard(-1)
 	packetConn.endInboundCallback(started)
 	packetConn.inboundTail = nil
+	packetConn.udp.moreInBatch = false
 	if err != nil {
 		packetConn.requestClose(err)
+		return nil, socket.UDPAddress{}
 	}
+	return packetConn, source
 }
 
 // dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.

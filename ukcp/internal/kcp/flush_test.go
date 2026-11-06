@@ -73,3 +73,60 @@ func TestAckOnlyFlushDoesNotMoveData(t *testing.T) {
 		t.Fatal("the moved data was never sent")
 	}
 }
+
+func TestInputBatchAndPopStreamSegmentZeroCopy(t *testing.T) {
+	var emitted int
+	engine := NewKCP(11, func([]byte, int) { emitted++ })
+	engine.SetStreamMode(true)
+	engine.WndSize(16, 2) // small rcv_wnd = 2 to exercise fastRecover + rcv_buf drain!
+
+	if _, ok := engine.PopStreamSegment(); ok {
+		t.Fatal("empty PopStreamSegment succeeded")
+	}
+	if engine.HasPendingAckOrProbe() || engine.PendingAckCount() != 0 || engine.QueuedBytes() != 0 {
+		t.Fatal("fresh engine reported pending state")
+	}
+
+	// Queue 2 segments + 1 append to verify QueuedBytes + tail fast-path flush!
+	_ = engine.Send([]byte("abc"))
+	_ = engine.Send([]byte("de"))
+	if engine.QueuedBytes() != 5 {
+		t.Fatalf("QueuedBytes = %d, want 5", engine.QueuedBytes())
+	}
+	_ = engine.Flush()
+	_ = engine.Send([]byte("fgh"))
+	_ = engine.Flush() // exercises O(newSegs) tail fast path when oldSndBufLen > 0!
+	if engine.QueuedBytes() != 0 {
+		t.Fatalf("QueuedBytes after Flush = %d, want 0", engine.QueuedBytes())
+	}
+
+	// Feed 3 segments into rcv_wnd=2 via InputBatch (sn=0, sn=1 fill rcv_queue; sn=2 waits in rcv_buf)!
+	emitted = 0
+	batch := append(testSegment(11, IKCP_CMD_PUSH, 0, 16, 0, 2, []byte("s0")),
+		testSegment(11, IKCP_CMD_PUSH, 0, 16, 1, 2, []byte("s1"))...)
+	batch = append(batch, testSegment(11, IKCP_CMD_PUSH, 0, 16, 2, 2, []byte("s2"))...)
+	needFull, ret := engine.InputBatch(batch)
+	if ret != 0 || !needFull {
+		t.Fatalf("InputBatch = (%v, %d), want (true, 0)", needFull, ret)
+	}
+	if emitted != 0 {
+		t.Fatalf("InputBatch flushed %d packets internally, want 0", emitted)
+	}
+	if !engine.HasPendingAckOrProbe() || engine.PendingAckCount() != 3 {
+		t.Fatalf("pending ACKs = %d", engine.PendingAckCount())
+	}
+
+	// PopStreamSegment triggers rcv_buf -> rcv_queue promotion and fastRecover WINS probe!
+	for _, want := range []string{"s0", "s1", "s2"} {
+		payload, ok := engine.PopStreamSegment()
+		if !ok || string(payload) != want {
+			t.Fatalf("PopStreamSegment = %q, %v, want %q", payload, ok, want)
+		}
+		ReleasePayload(payload)
+	}
+	ReleasePayload(nil)
+	engine.FlushAckOnly()
+	if emitted == 0 || engine.HasPendingAckOrProbe() {
+		t.Fatal("FlushAckOnly did not drain ACKs and WINS probe")
+	}
+}

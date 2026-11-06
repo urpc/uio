@@ -50,6 +50,19 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 	if err != nil {
 		return 0, err
 	}
+	if len(packets) == 1 {
+		pkt := packets[0]
+		if len(pkt) == 0 {
+			return 0, nil
+		}
+		iov := unix.Iovec{Base: &pkt[0], Len: uint64(len(pkt))}
+		hdr := [1]mmsghdr{{Hdr: unix.Msghdr{Name: name, Namelen: nameLen, Iov: &iov, Iovlen: 1}}}
+		sent, err := sendmmsg(fd, hdr[:])
+		if sent > 0 {
+			return len(pkt), err
+		}
+		return 0, err
+	}
 	var hdrs [udpBatchBound]mmsghdr
 	var iovs [udpBatchBound]unix.Iovec
 	var idx [udpBatchBound]int
@@ -99,7 +112,7 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	var iovs [udpBatchBound]unix.Iovec
 	for i := 0; i < count; i++ {
 		iovs[i] = unix.Iovec{Base: &packets[i][0], Len: uint64(len(packets[i]))}
-		receives[i].raw = unix.RawSockaddrAny{}
+		receives[i].raw.Addr.Family = 0
 		hdrs[i] = mmsghdr{Hdr: unix.Msghdr{
 			Name:    (*byte)(unsafe.Pointer(&receives[i].raw)),
 			Namelen: unix.SizeofSockaddrAny,

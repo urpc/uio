@@ -20,7 +20,10 @@
 
 package kcp
 
-import "time"
+import (
+	"container/heap"
+	"time"
+)
 
 // mtuLimit is the size of the buffers defaultBufferPool hands out. Upstream
 // keeps the constant in sess.go, which ukcp does not vendor.
@@ -68,6 +71,48 @@ func (kcp *KCP) FlushAckOnly() {
 	kcp.flush(IKCP_FLUSH_ACKONLY)
 }
 
+// InputBatch feeds one or more concatenated KCP segments without running an
+// internal flush mid-batch, returning whether window/fastack progress calls
+// for a full flush at the end of the turn.
+func (kcp *KCP) InputBatch(data []byte) (needFullFlush bool, ret int) {
+	flushSegments, ret := kcp.inputCore(data, IKCP_PACKET_REGULAR)
+	return flushSegments != 0, ret
+}
+
+// HasPendingAckOrProbe reports whether ACKs or window probes are waiting to leave.
+func (kcp *KCP) HasPendingAckOrProbe() bool {
+	return len(kcp.acklist) > 0 || kcp.probe != 0
+}
+
+// PendingAckCount reports the number of queued ACK entries.
+func (kcp *KCP) PendingAckCount() int { return len(kcp.acklist) }
+
+// PopStreamSegment pops the next in-order stream segment without an
+// intermediate scratch copy; the caller returns non-nil data via ReleasePayload.
+func (kcp *KCP) PopStreamSegment() (data []byte, ok bool) {
+	if kcp.rcv_queue.IsEmpty() {
+		return nil, false
+	}
+	fastRecover := kcp.rcv_queue.Len() >= int(kcp.rcv_wnd)
+	seg, _ := kcp.rcv_queue.Pop()
+	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
+		next := heap.Pop(kcp.rcv_buf).(segment)
+		kcp.rcv_queue.Push(next)
+		kcp.rcv_nxt++
+	}
+	if kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && fastRecover {
+		kcp.probe |= IKCP_ASK_TELL
+	}
+	return seg.data, true
+}
+
+// ReleasePayload returns a payload slice obtained from PopStreamSegment to the pool.
+func ReleasePayload(buf []byte) {
+	if buf != nil {
+		defaultBufferPool.Put(buf)
+	}
+}
+
 // IsDead reports the dead link the engine declared: a segment retransmitted
 // dead_link times.
 func (kcp *KCP) IsDead() bool { return kcp.state == 0xFFFFFFFF }
@@ -86,12 +131,7 @@ func (kcp *KCP) SetDeadLink(n int) {
 // exact where segments times the MTU would charge a one-byte write a
 // kilobyte.
 func (kcp *KCP) QueuedBytes() int {
-	n := 0
-	kcp.snd_queue.ForEach(func(seg *segment) bool {
-		n += len(seg.data)
-		return true
-	})
-	return n
+	return kcp.queuedBytes
 }
 
 // Queued is how many segments wait in the send queue, accepted from above and

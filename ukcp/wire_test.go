@@ -565,7 +565,9 @@ func TestEndedSessionHoldsNoState(t *testing.T) {
 	c := &conn{mss: 1376}
 	c.kcp = kcp.NewKCP(7, func([]byte, int) {})
 	c.held.Store(42)
-	c.state.Store(&SessionState{Conv: 7, RemoteWnd: 32})
+	c.stateConv.Store(7)
+	c.stateWnd.Store(32 << 32)
+	c.stateLive.Store(true)
 	c.ended = true
 	c.noteHeld()
 	if held := c.held.Load(); held != 0 {

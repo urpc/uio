@@ -3631,3 +3631,103 @@ type closedAbortTransport struct{ contractTransport }
 func (c *closedAbortTransport) Abort(error) error {
 	return net.ErrClosed
 }
+
+type turnEndPacketLayer struct {
+	turnEnds  atomic.Int32
+	deferSeen atomic.Bool
+	moreSeen  atomic.Bool
+}
+
+func (l *turnEndPacketLayer) CarriesPackets() {}
+
+func (l *turnEndPacketLayer) Attach(LayerContext) LayerHandler {
+	return &turnEndPacketHandler{layer: l}
+}
+
+type turnEndPacketHandler struct {
+	PassThrough
+	layer *turnEndPacketLayer
+}
+
+func (h *turnEndPacketHandler) OnRead(ctx LayerContext) error {
+	if d, ok := ctx.(interface{ DeferTurnFlush() bool }); ok && d.DeferTurnFlush() {
+		h.layer.deferSeen.Store(true)
+	}
+	if m, ok := ctx.Lower().(interface{ MorePacketsInBatch() bool }); ok && m.MorePacketsInBatch() {
+		h.layer.moreSeen.Store(true)
+	}
+	chunk := ctx.Lower().PeekChunk()
+	if len(chunk) > 0 {
+		_, _ = ctx.Upper().Write(chunk)
+		_, _ = ctx.Lower().Discard(len(chunk))
+	}
+	return nil
+}
+
+func (h *turnEndPacketHandler) OnTurnEnd(LayerContext) {
+	h.layer.turnEnds.Add(1)
+}
+
+func TestPacketLayerTurnEndAndUDPCachedBatch(t *testing.T) {
+	pl := &turnEndPacketLayer{}
+	var recvBytes atomic.Int32
+	done := make(chan struct{}, 1)
+
+	ev := &Events{
+		Pollers:        1,
+		ReadBufferSize: 2048,
+		Handler: FuncHandler{
+			Read: func(c Conn) error {
+				n, _ := c.Discard(-1)
+				if recvBytes.Add(int32(n)) >= 120 {
+					select {
+					case done <- struct{}{}:
+					default:
+					}
+				}
+				return nil
+			},
+		},
+	}
+	started := make(chan struct{})
+	ev.Hooks = FuncHandler{Start: func(*Events) { close(started) }}
+	serveDone := make(chan error, 1)
+	go func() { serveDone <- ev.Serve() }()
+	<-started
+	defer func() {
+		_ = ev.Close(nil)
+		<-serveDone
+	}()
+
+	ln, err := ev.Listen("udp://127.0.0.1:0", WithLayers(pl))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cli, err := net.Dial("udp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+
+	// Send a rapid 12-datagram burst from the same peer to exercise udpBatch growth,
+	// consecutive same-peer cache hit in handleUDPPacketCached, MorePacketsInBatch, and OnTurnEnd!
+	pkt := bytes.Repeat([]byte("u"), 10)
+	for range 12 {
+		if _, err := cli.Write(pkt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("UDP burst received %d/120 bytes", recvBytes.Load())
+	}
+	if !pl.deferSeen.Load() || pl.turnEnds.Load() == 0 {
+		t.Fatalf("deferSeen=%v turnEnds=%d", pl.deferSeen.Load(), pl.turnEnds.Load())
+	}
+	if (socketLower{Conn: &contractTransport{}}).MorePacketsInBatch() {
+		t.Fatal("non-fdConn socketLower reported MorePacketsInBatch")
+	}
+}

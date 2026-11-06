@@ -101,6 +101,9 @@ func (h *stackDriver) OnOpen(socket Conn) {
 				c.firstHeld = i
 			}
 		}
+		if node.ops.turnEnd != nil {
+			c.hasTurnEnd = true
+		}
 	}
 	c.inTurn.Store(true)
 	defer c.inTurn.Store(false)
@@ -142,6 +145,7 @@ type stack struct {
 	reserved      atomic.Int64              // bytes admitted at the top, not yet queued below
 	halfOpen      bool                      // AllowHalfOpen
 	blockingWrite bool                      // Events.BlockingWrite
+	hasTurnEnd    bool                      // at least one layer implements OnTurnEnd
 	inLimit       int                       // MaxInboundBuffered; see inboundFull
 	// writeWatched marks that at least one layer node has a write-progress
 	// watcher; heldPeak is the most output the layers held since the last turn
@@ -395,11 +399,24 @@ const (
 // finishTurn ends a turn: outbound room changes are reported and deferred
 // close or CloseWrite work settles once no layer callback is on the stack.
 func (c *stack) finishTurn() {
+	if c.hasTurnEnd && !c.over() {
+		for i := len(c.layers) - 1; i >= 0; i-- {
+			node := c.layers[i]
+			if node.ops.turnEnd != nil && node.opened.Load() && !c.over() {
+				node.ops.turnEnd(layerCtx{node})
+			}
+		}
+	}
 	c.noteQueueRoom()
 	c.inTurn.Store(false)
 	if c.shutsPending.Load() > 0 || c.over() {
 		c.settle()
 	}
+}
+
+func (c *stack) morePacketsBelow() bool {
+	fdc, ok := c.socket.(*fdConn)
+	return c.packetBottom && ok && fdc.moreInUDPBatch()
 }
 
 func (c *stack) enableWriteWatch() {
@@ -528,6 +545,10 @@ func (c *stack) run() error {
 			return nil // a layer closed the connection: nothing above runs
 		}
 		c.openUpTo() // a ctx.Open() the layer made opens the layers above now
+		if layer.index == 0 && due == 0 && c.morePacketsBelow() && c.topOpen.Load() &&
+			!layer.ended.Load() && layer.held() < c.deliverBound() {
+			return nil
+		}
 	}
 	if !c.topOpen.Load() {
 		return c.endOfStream(false)
