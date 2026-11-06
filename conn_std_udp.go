@@ -194,6 +194,8 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	fc.udp.peers[rAddr] = child
 	fc.mux.Unlock()
 	go func() {
+		blockio.EnterTurn()
+		defer blockio.LeaveTurn()
 		defer events.callbackWG.Done()
 		child.openOnReader()
 	}()

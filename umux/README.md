@@ -211,6 +211,7 @@ complete, so a stream nobody ends is the shutdown context's to cut.
 | `KeepAlive` | 30 s | Ping interval (the sequence rides the frame's length field, as yamux does); a negative value disables it. |
 | `KeepAliveMax` | 60 s | How long a ping may stay unanswered before the session ends with `ErrKeepAlive`. |
 | `Executor` | none | Reserved: per-stream turn scheduling; nil keeps synchronous demultiplexing. |
+| `BlockingWrite` | off | Suspends off-turn `Stream.Write`/`Writev`/`WriteOwned` callers when the peer's stream receive window is exhausted instead of returning `uio.ErrOutboundOverflow` (on-turn writes stay non-blocking). |
 
 ## Rules of the road
 
@@ -223,19 +224,20 @@ complete, so a stream nobody ends is the shutdown context's to cut.
   goroutine, with one reader per stream at a time. `Read` never blocks:
   `(0, nil)` means no bytes yet — the end is `State()&StateReadEnded`, not a
   zero-length read probe.
-- **Writes are non-blocking and safe from any goroutine.** A short write
-  returns `(n, ErrOutboundOverflow)`; retry the remainder when the peer's
-  window update wakes you. `WriteOwned` is whole or refused whole — only an
-  overflow leaves the buffer with the caller.
+- **Writes are non-blocking by default and safe from any goroutine.** Unless
+  `Config.BlockingWrite` (or `uio.NewBlockingConn` / `NewBlockingWriter`) is
+  used off-turn, a short write returns `(n, ErrOutboundOverflow)`; retry the
+  remainder when the peer's window update wakes you. `WriteOwned` is whole or
+  refused whole — only an overflow leaves the buffer with the caller.
 - **Borrowed slices.** `PeekChunk`'s slice is valid for the current handler
   callback (or until a consuming call). `WriteTo` copies out of a borrowed
   transport frame before handing it to the writer, so its bytes stay put.
 - **Deadlines and socket options.** Streams have no dedicated OS socket, so
   `uio.SocketOf(stream)` reports false. The three deadline methods are
   supported as absolute stream deadlines: when one expires, the stream resets
-  with an error wrapping `os.ErrDeadlineExceeded`; a zero time clears it.
-  Reads and writes remain non-blocking, so a deadline closes the stream rather
-  than interrupting a blocked operation.
+  with an error wrapping `os.ErrDeadlineExceeded`; a zero time clears it
+  (`uio.NewBlockingConn(stream)` instead applies non-destructive per-call
+  deadlines to blocked reads and writes).
 
 ## Composing
 

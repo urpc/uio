@@ -18,15 +18,29 @@
 
 package ukcp
 
-import "syscall"
+import (
+	"errors"
+	"syscall"
+)
 
 // setSocketBuffer sizes one kernel socket buffer: SO_RCVBUF when read, else
-// SO_SNDBUF. The kernel may adjust the value — Linux doubles it, and caps it
-// at net.core.rmem_max / wmem_max.
+// SO_SNDBUF. Linux clamps oversized requests automatically, whereas the BSDs
+// return ENOBUFS/EINVAL above kern.ipc.maxsockbuf; halving down to 64 KiB
+// adapts gracefully across BSDs without failing default Serve/Dial calls.
 func setSocketBuffer(fd uintptr, read bool, bytes int) error {
 	option := syscall.SO_SNDBUF
 	if read {
 		option = syscall.SO_RCVBUF
 	}
-	return syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, option, bytes)
+	for cur := bytes; ; {
+		err := syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, option, cur)
+		if err == nil {
+			return nil
+		}
+		if (errors.Is(err, syscall.ENOBUFS) || errors.Is(err, syscall.EINVAL)) && cur > 64<<10 {
+			cur = max(cur/2, 64<<10)
+			continue
+		}
+		return err
+	}
 }

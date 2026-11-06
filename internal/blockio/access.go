@@ -45,7 +45,7 @@ type Source interface {
 
 	MaxInbound() int
 	MaxOutbound() int
-	EnablePullRead(onTurn bool) error
+	EnablePullRead() (onConnTurn bool, err error)
 	Wake() error
 	NewReadPause() *readcontrol.Pause
 	WatchWrite(fn func(int)) bool
@@ -70,7 +70,7 @@ func NewState(src Source) *State {
 
 // Reader returns the connection's single blocking Reader, creating it and
 // switching inbound delivery to pull mode on the first call.
-func (s *State) Reader(window int, onTurn bool) (*Reader, error) {
+func (s *State) Reader(window int) (*Reader, error) {
 	s.mu.Lock()
 	if r := s.reader.Load(); r != nil {
 		s.mu.Unlock()
@@ -82,15 +82,20 @@ func (s *State) Reader(window int, onTurn bool) (*Reader, error) {
 	r := newReader(s.src, window)
 	if s.closed {
 		r.onClose(s.localClose, s.closeErr)
+	} else if s.src.ClosingOrClosed() {
+		r.onClose(false, nil)
 	}
 	s.reader.Store(r)
 	s.mu.Unlock()
 
-	if err := s.src.EnablePullRead(onTurn); err != nil {
+	onConnTurn, err := s.src.EnablePullRead()
+	if err != nil {
 		return nil, err
 	}
-	if onTurn {
+	if onConnTurn {
 		r.Pump()
+	} else if s.src.ClosingOrClosed() {
+		s.OnClose(false, nil)
 	}
 	return r, nil
 }

@@ -915,9 +915,9 @@ func TestServerAndClientSymmetricBlockingConnAndBackpressure(t *testing.T) {
 		}
 	}()
 
-	//Oversized single message (> MaxOutboundBuffered 8 KiB on empty queue) fails fast with ErrBackpressure!
-	if err := cliBC.WriteBinary(ctx, make([]byte, 16<<10)); !errors.Is(err, ErrBackpressure) {
-		t.Fatalf("oversized WriteBinary = %v, want ErrBackpressure", err)
+	// Oversized single message (including near-boundary [limit-13, limit-2] masked frame!) fails fast with ErrBackpressure!
+	if err := cliBC.WriteBinary(ctx, make([]byte, (8<<10)-4)); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("near-boundary WriteBinary = %v, want ErrBackpressure", err)
 	}
 
 	// Stream 48 messages of 1.5 KiB (72 KiB >> 8 KiB outbound/inbound caps) + empty text message!
@@ -1013,6 +1013,9 @@ func TestBlockingConnErrorAndCancellationGuards(t *testing.T) {
 	}
 	if err := unattached.WriteBinary(nil, []byte("x")); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("unattached WriteBinary = %v", err)
+	}
+	if err := unattached.Close(1000, ""); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("unattached Close = %v", err)
 	}
 	if err := unattached.Flush(nil); !errors.Is(err, ErrNotReady) {
 		t.Fatalf("unattached Flush = %v", err)

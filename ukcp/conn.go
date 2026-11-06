@@ -58,6 +58,7 @@ type conn struct {
 
 	needFullFlush bool
 	turnDirty     bool
+	inReadTurn    bool // true only inside this session's active OnRead..OnTurnEnd turn
 
 	finQueued  bool // the end of this stream is queued in the engine
 	peerFin    bool // the peer's end arrived and was delivered up
@@ -196,9 +197,19 @@ func (c *conn) output(buf []byte, size int) {
 	c.outEnds = append(c.outEnds, len(c.out))
 }
 
+func (c *conn) SelfPaced() bool { return true }
+
 func (c *conn) sendBatch() {
 	n := len(c.outEnds)
 	if n == 0 {
+		return
+	}
+	if !c.packet {
+		written, err := c.ctx.Lower().Write(c.out)
+		c.releaseStaging()
+		if err != nil && !(written == 0 && errors.Is(err, uio.ErrOutboundOverflow)) {
+			c.fatal(err)
+		}
 		return
 	}
 	if cap(c.outVec) < n {
@@ -213,7 +224,7 @@ func (c *conn) sendBatch() {
 	}
 	_, err := c.ctx.Lower().Writev(c.outVec)
 	c.releaseStaging()
-	if err != nil && !(c.packet && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe)) {
+	if err != nil && !(!errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe)) {
 		c.fatal(err)
 	}
 }
@@ -288,6 +299,7 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 	}
 	if deferTurnFlush(ctx) {
 		c.turnDirty = true
+		c.inReadTurn = true
 		return nil
 	}
 	c.flushReadTurnLocked()
@@ -301,6 +313,7 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 func (c *conn) OnTurnEnd(uio.LayerContext) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.inReadTurn = false
 	if !c.turnDirty || c.closed || c.ended || c.kcp == nil {
 		return
 	}
@@ -343,9 +356,22 @@ func (c *conn) OnTimer(uio.LayerContext) error {
 		c.fatal(ErrPeerSilent)
 		return nil
 	}
-	c.maintain()
 	c.deliver()
-	c.keepAlive(time.Now())
+	if c.ended {
+		return nil
+	}
+	now := time.Now()
+	if period := c.opts.KeepAlive; period > 0 {
+		if now.Sub(c.lastInbound) >= 3*period {
+			c.fatal(ErrKeepAliveTimeout)
+			return nil
+		}
+		if now.Sub(c.lastInbound) >= period && now.Sub(c.lastProbe) >= period {
+			c.lastProbe = now
+			c.kcp.AskWindow()
+		}
+	}
+	c.maintain()
 	return nil
 }
 
@@ -576,7 +602,7 @@ func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 		}
 		rest = rest[n:]
 	}
-	if deferTurnFlush(c.ctx) && c.kcp.Queued() < 32 {
+	if c.inReadTurn && deferTurnFlush(c.ctx) && c.kcp.Queued() < 32 {
 		c.turnDirty = true
 		c.needFullFlush = true
 		c.noteHeld()
@@ -604,15 +630,21 @@ func (c *conn) CloseWrite(uio.LayerContext) error {
 	return nil
 }
 
-func (c *conn) OnClosing(uio.LayerContext, error) {
+func (c *conn) OnClosing(_ uio.LayerContext, cause error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.ended && !c.closed && !c.finQueued && c.kcp != nil {
-		c.finQueued = true
-		c.debugNote("graceful close")
-		if c.kcp.Send(nil) == 0 {
-			c.kcp.Flush()
-			c.sendBatch()
+	c.inReadTurn = false
+	graceful := cause == nil || errors.Is(cause, io.EOF)
+	if !c.ended && !c.closed && c.kcp != nil && graceful {
+		if !c.finQueued {
+			c.finQueued = true
+			c.debugNote("graceful close")
+			if c.kcp.Send(nil) == 0 {
+				c.kcp.Flush()
+				c.sendBatch()
+			}
+		} else {
+			c.flushReadTurnLocked()
 		}
 	}
 	c.ended = true
@@ -678,6 +710,11 @@ func (c *conn) noteHeld() {
 		held += pushBytes(c.out[start:end])
 		start = end
 	}
+	if held == 0 && c.kcp.WaitSnd() >= c.opts.SendWindow {
+		// Sentinel non-zero hold while the send window is full so writecontrol
+		// and ubridge observe capacity reopening when ACKs drain inflight.
+		held = 1
+	}
 	c.held.Store(held)
 	c.publishState()
 }
@@ -731,27 +768,6 @@ func (c *conn) keepAliveDeadline() time.Time {
 		base = c.lastProbe
 	}
 	return base.Add(c.opts.KeepAlive)
-}
-
-func (c *conn) keepAlive(now time.Time) {
-	period := c.opts.KeepAlive
-	if period <= 0 || c.kcp == nil || c.ended {
-		return
-	}
-	if now.Sub(c.lastInbound) >= 3*period {
-		c.fatal(ErrKeepAliveTimeout)
-		return
-	}
-	if now.Sub(c.lastInbound) >= period && now.Sub(c.lastProbe) >= period {
-		c.lastProbe = now
-		c.probe()
-	}
-}
-
-func (c *conn) probe() {
-	c.kcp.AskWindow()
-	c.kcp.FlushAckOnly()
-	c.sendBatch()
 }
 
 func knownCommand(cmd byte) bool {

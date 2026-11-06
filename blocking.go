@@ -93,7 +93,7 @@ func NewBlockingReader(c Conn, opts ...BlockingOption) (*BlockingReader, error) 
 		return nil, ErrUnsupported
 	}
 	cfg := resolveBlockingOptions(opts)
-	r, err := st.Reader(cfg.bufferSize, blockio.OnTurn())
+	r, err := st.Reader(cfg.bufferSize)
 	if err != nil {
 		return nil, err
 	}

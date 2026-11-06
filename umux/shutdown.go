@@ -18,6 +18,8 @@ package umux
 
 import (
 	"context"
+
+	"github.com/urpc/uio"
 )
 
 // Shutdown drains the session gracefully. It sends a GoAway, refuses new
@@ -35,6 +37,9 @@ import (
 // know when an application's byte stream is complete, so streams the caller
 // (or its peer) never end are the shutdown context's to cut.
 func (s *Session) Shutdown(ctx context.Context) error {
+	if s.onOwnTurn() {
+		return uio.ErrBlockingOnTurn
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}

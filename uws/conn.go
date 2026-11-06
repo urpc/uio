@@ -45,9 +45,10 @@ type Conn struct {
 	assembler   *frame.Assembler // retained only while a fragmented message is open
 	compression *compressionState
 
-	opened  atomic.Bool
-	closed  atomic.Bool
-	closing atomic.Bool
+	opened      atomic.Bool
+	closed      atomic.Bool
+	closing     atomic.Bool
+	hasBlocking bool // turn-owned flag: true once upgraded via NewBlockingConn or DialClient
 
 	readFrames int32 // frames delivered in the current read round
 	// round is non-zero (roundBatching) while a multi-frame read round batches
@@ -65,6 +66,7 @@ type Conn struct {
 	writes       connWriteState
 
 	userData  any
+	turnGoid  atomic.Int64 // goroutine ID of active OnOpen / readAvailable turn
 	metadata  atomic.Pointer[connMetadata]
 	handshake atomic.Pointer[handshakeState]
 }
@@ -211,6 +213,7 @@ type connMetadata struct {
 	// The transport pauses of the application and of the reply watermark,
 	// allocated when a pause is first needed.
 	readPauses  atomic.Pointer[connReadPauses]
+	blocking    atomic.Pointer[BlockingConn]
 	mu          sync.Mutex
 	protocol    string
 	closeErr    error

@@ -1014,3 +1014,115 @@ func TestInvalidOptionsRefused(t *testing.T) {
 		t.Fatalf("Validate of a TLSConfig = %v, want nil", err)
 	}
 }
+
+type windowedLowerLayer struct {
+	limit   atomic.Int32
+	written atomic.Int32
+	failErr atomic.Pointer[error]
+}
+
+func (l *windowedLowerLayer) Attach(uio.LayerContext) uio.LayerHandler {
+	return &windowedLowerHandler{parent: l}
+}
+
+type windowedLowerHandler struct {
+	uio.PassThrough
+	parent *windowedLowerLayer
+}
+
+func (h *windowedLowerHandler) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
+	if pErr := h.parent.failErr.Load(); pErr != nil {
+		return 0, *pErr
+	}
+	lim := int(h.parent.limit.Load())
+	if lim == 0 {
+		return 0, uio.ErrOutboundOverflow
+	}
+	if lim > 0 && len(p) > lim {
+		n, err := ctx.Lower().Write(p[:lim])
+		h.parent.limit.Store(0)
+		return n, func() error {
+			if err != nil {
+				return err
+			}
+			return uio.ErrOutboundOverflow
+		}()
+	}
+	h.parent.written.Add(int32(len(p)))
+	return ctx.Lower().Write(p)
+}
+
+func TestUTLSOutboundOverflowStagingPreservesSession(t *testing.T) {
+	srvCfg, cliCfg := testConfigs(t)
+	wl := &windowedLowerLayer{}
+	wl.limit.Store(-1) // unlimited during handshake
+
+	gotData := make(chan []byte, 4)
+	var acc bytes.Buffer
+	transport := serveTLS(t, uio.FuncHandler{
+		Read: func(c uio.Conn) error {
+			_, _ = c.WriteTo(&acc)
+			return nil
+		},
+		Close: func(uio.Conn, error) {
+			gotData <- append([]byte(nil), acc.Bytes()...)
+		},
+	}, ServerLayer(LayerOptions{TLSConfig: srvCfg}))
+	ln, err := transport.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	addr := "tcp://" + ln.Addr().String()
+
+	cli, _ := dialTLS(t, wl, ClientLayer(LayerOptions{TLSConfig: cliCfg}), addr)
+
+	// Constrain lower layer to accept only 16 bytes before returning ErrOutboundOverflow!
+	wl.limit.Store(16)
+	msg1 := bytes.Repeat([]byte("A"), 256)
+	if n, err := cli.Write(msg1); err != nil || n != len(msg1) {
+		t.Fatalf("first TLS Write over full lower = %d, %v", n, err)
+	}
+	if cli.OutboundBuffered() == 0 {
+		t.Fatal("expected staged outPending bytes to show in OutboundBuffered")
+	}
+	// While lower remains full (limit == 0), subsequent OnWrite returns ErrOutboundOverflow cleanly BEFORE encrypting!
+	if _, err := cli.Write([]byte("second")); !errors.Is(err, uio.ErrOutboundOverflow) {
+		t.Fatalf("second Write while outPending full = %v, want ErrOutboundOverflow", err)
+	}
+
+	// Reopen lower window and trigger a Wake turn so OnTurnEnd drains outPending and subsequent Write + Close succeed!
+	wl.limit.Store(-1)
+	_ = cli.Wake()
+	for deadline := time.Now().Add(time.Second); cli.OutboundBuffered() > 0 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	msg2 := bytes.Repeat([]byte("B"), 128)
+	if n, err := cli.Write(msg2); err != nil || n != len(msg2) {
+		t.Fatalf("post-recovery TLS Write = %d, %v", n, err)
+	}
+	_ = cli.Close()
+
+	select {
+	case received := <-gotData:
+		want := append(append([]byte(nil), msg1...), msg2...)
+		if !bytes.Equal(received, want) {
+			t.Fatalf("received %d bytes, want %d", len(received), len(want))
+		}
+	case <-time.After(testWait):
+		t.Fatal("server did not receive recovered TLS stream")
+	}
+
+	// Also exercise fatal non-overflow error during flushOutPendingLocked!
+	wlFail := &windowedLowerLayer{}
+	wlFail.limit.Store(-1)
+	cli2, _ := dialTLS(t, wlFail, ClientLayer(LayerOptions{TLSConfig: cliCfg}), addr)
+	wlFail.limit.Store(0)
+	_, _ = cli2.Write(bytes.Repeat([]byte("Z"), 70<<10))
+	boom := errors.New("lower broken")
+	wlFail.failErr.Store(&boom)
+	if _, err := cli2.Write([]byte("fail")); !errors.Is(err, boom) {
+		t.Fatalf("fatal lower error = %v, want %v", err, boom)
+	}
+	_ = cli2.Abort(boom)
+}

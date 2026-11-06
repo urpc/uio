@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"unsafe"
 
+	"github.com/petermattis/goid"
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/internal/blockio"
 	_ "github.com/urpc/uio/internal/bytebuf"
@@ -246,17 +247,29 @@ func NewBlockingConn(conn *Conn, opts ...BlockingOption) (*BlockingConn, error) 
 	if conn.closed.Load() {
 		return nil, ErrClosed
 	}
-	if bh, ok := conn.handler.(*blockingHandler); ok {
-		return bh.bc, nil
+	meta := conn.ensureMetadata()
+	if bc := meta.blocking.Load(); bc != nil {
+		return bc, nil
 	}
-	if !blockio.OnTurn() {
-		return nil, fmt.Errorf("%w: NewBlockingConn on an active connection must run in OnOpen or OnMessage", ErrInvalidOptions)
+	onOwn := conn.turnGoid.Load() == goid.Get()
+	if !onOwn {
+		if ot, ok := conn.raw.(interface{ InOwnTurn() bool }); ok {
+			onOwn = ot.InOwnTurn()
+		} else {
+			onOwn = blockio.OnTurn()
+		}
+	}
+	if !onOwn {
+		return nil, fmt.Errorf("%w: NewBlockingConn on an active connection must run in its own OnOpen or OnMessage", ErrInvalidOptions)
 	}
 	cfg := resolveBlockingOpts(conn, opts)
 	bc := newBlockingConn(conn, cfg)
-	conn.handler = &blockingHandler{
-		bc:   bc,
-		prev: conn.handler,
+	if !meta.blocking.CompareAndSwap(nil, bc) {
+		return meta.blocking.Load(), nil
+	}
+	conn.hasBlocking = true
+	if conn.externalReadPaused() {
+		_ = conn.ResumeRead()
 	}
 	return bc, nil
 }
@@ -522,6 +535,12 @@ func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payloa
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
+	if maxOut := c.Conn.maxOutbound(); maxOut > 0 && c.Conn.compression == nil {
+		if fragmentedWireSize(len(payload), c.Conn.maxFramePayload(), c.Conn.isClient()) > maxOut {
+			return ErrBackpressure
+		}
+	}
+
 	c.ensureWriteWatch()
 	limit := c.maxWrite
 	for {
@@ -539,7 +558,9 @@ func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payloa
 			}
 			return ErrClosed
 		}
-		if buffered := c.Conn.OutboundBuffered(); buffered == 0 || buffered < limit {
+		buffered := c.Conn.OutboundBuffered()
+		if buffered == 0 || buffered < limit {
+			wasEmpty := buffered == 0
 			err := c.Conn.send(typ, payload)
 			if err == nil {
 				c.outPark.Store(false)
@@ -549,10 +570,12 @@ func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payloa
 				c.outPark.Store(false)
 				return err
 			}
-			if c.Conn.OutboundBuffered() == 0 && c.Conn.maxOutbound() > 0 && len(payload)+2 > c.Conn.maxOutbound() {
+			if wasEmpty && c.Conn.OutboundBuffered() == 0 && c.outGen.Load() == tok {
 				c.outPark.Store(false)
 				return err
 			}
+		} else {
+			_ = c.Conn.flushAll()
 		}
 		if c.outGen.Load() != tok {
 			c.outPark.Store(false)
@@ -587,7 +610,7 @@ func (c *BlockingConn) Flush(ctx context.Context) error {
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
 
-	if err := c.Conn.flush(); err != nil {
+	if err := c.Conn.flushAll(); err != nil {
 		return err
 	}
 	if c.Conn.OutboundBuffered() == 0 {
@@ -648,6 +671,9 @@ func (c *BlockingConn) CloseEventInfo() CloseEvent {
 // preserving already-queued messages for subsequent ReadMessage calls), and
 // initiates the WebSocket Close handshake.
 func (c *BlockingConn) Close(code uint16, reason string) error {
+	if c.Conn == nil {
+		return ErrNotReady
+	}
 	if _, err := c.Conn.closePayload(code, reason); err != nil {
 		return err
 	}
@@ -673,7 +699,6 @@ func (c *BlockingConn) onConnClose(event CloseEvent) {
 
 type blockingHandler struct {
 	bc    *BlockingConn
-	prev  Handler
 	ready chan error
 	opts  []BlockingOption
 }
@@ -684,6 +709,8 @@ func (h *blockingHandler) OnOpen(conn *Conn) {
 	h.bc.maxReadBytes = cfg.readBytes
 	h.bc.maxReadMsgs = cfg.readMsgs
 	h.bc.maxWrite = cfg.writeBytes
+	conn.ensureMetadata().blocking.Store(h.bc)
+	conn.hasBlocking = true
 	if h.ready != nil {
 		h.ready <- nil
 	}
@@ -693,16 +720,13 @@ func (h *blockingHandler) OnMessage(conn *Conn, message Message) {
 	h.bc.enqueue(conn, message)
 }
 
-func (h *blockingHandler) OnClose(conn *Conn, event CloseEvent) {
+func (h *blockingHandler) OnClose(_ *Conn, event CloseEvent) {
 	h.bc.onConnClose(event)
 	if h.ready != nil {
 		select {
 		case h.ready <- &CloseError{CloseEvent: event}:
 		default:
 		}
-	}
-	if h.prev != nil {
-		h.prev.OnClose(conn, event)
 	}
 }
 

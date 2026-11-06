@@ -266,6 +266,8 @@ func (conn *fdConn) readEnded() bool {
 	return conn.readEOF() && conn.inbound.Empty() && len(conn.inboundTail) == 0
 }
 
+func (conn *fdConn) InOwnTurn() bool { return conn.directOwner() }
+
 // State reports where the connection's streams stand; see ConnState.
 func (conn *fdConn) State() ConnState {
 	var state ConnState

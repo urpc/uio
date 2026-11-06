@@ -79,6 +79,7 @@ type fakeSource struct {
 	writeErr    error
 	flushErr    error
 	enableErr   error
+	onConnTurn  bool
 	wakes       atomic.Int32
 }
 
@@ -245,9 +246,14 @@ func (f *fakeSource) pushIn(data []byte, eof bool) {
 	}
 }
 
-func (f *fakeSource) MaxInbound() int                  { return f.maxIn }
-func (f *fakeSource) MaxOutbound() int                 { return f.maxOut }
-func (f *fakeSource) EnablePullRead(bool) error        { return f.enableErr }
+func (f *fakeSource) MaxInbound() int  { return f.maxIn }
+func (f *fakeSource) MaxOutbound() int { return f.maxOut }
+func (f *fakeSource) EnablePullRead() (bool, error) {
+	if f.enableErr != nil {
+		return false, f.enableErr
+	}
+	return f.onConnTurn, nil
+}
 func (f *fakeSource) Wake() error                      { f.wakes.Add(1); return nil }
 func (f *fakeSource) NewReadPause() *readcontrol.Pause { return readcontrol.NewPause(f) }
 func (f *fakeSource) WatchWrite(fn func(int)) bool     { return writecontrol.Watch(f, fn) }
@@ -263,7 +269,8 @@ func TestTurnDetectionAndNestedRefCount(t *testing.T) {
 		t.Fatal("nested EnterTurn did not register goroutine")
 	}
 	src := newFakeSource(64, 64)
-	r, _ := src.state.Reader(0, true)
+	src.onConnTurn = true
+	r, _ := src.state.Reader(0)
 	w := src.state.Writer(0)
 	if _, err := r.Read(make([]byte, 4)); !errors.Is(err, ErrBlockingOnTurn) {
 		t.Fatalf("Read on turn = %v", err)
@@ -313,11 +320,11 @@ func TestAccessResolutionAndStateIdempotence(t *testing.T) {
 	if !ok || st != src.state {
 		t.Fatal("StateOf failed")
 	}
-	r1, err := st.Reader(128, false)
+	r1, err := st.Reader(128)
 	if err != nil {
 		t.Fatal(err)
 	}
-	r2, err := st.Reader(256, false)
+	r2, err := st.Reader(256)
 	if err != nil || r1 != r2 {
 		t.Fatal("Reader was not singleton")
 	}
@@ -329,7 +336,7 @@ func TestAccessResolutionAndStateIdempotence(t *testing.T) {
 
 	failSrc := newFakeSource(0, 0)
 	failSrc.enableErr = errors.New("enable failed")
-	if _, err := failSrc.state.Reader(0, false); err == nil {
+	if _, err := failSrc.state.Reader(0); err == nil {
 		t.Fatal("expected EnablePullRead error")
 	}
 }
@@ -467,7 +474,7 @@ writeDone:
 
 func TestReaderDirectDeliveryBackpressureDeadlineAndCloseModes(t *testing.T) {
 	src := newFakeSource(64, 64)
-	r, err := src.state.Reader(0, false)
+	r, err := src.state.Reader(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +541,7 @@ func TestReaderDirectDeliveryBackpressureDeadlineAndCloseModes(t *testing.T) {
 
 	// 5. Local Close() drops unread pipe and returns net.ErrClosed immediately!
 	src2 := newFakeSource(64, 64)
-	r2, _ := src2.state.Reader(0, false)
+	r2, _ := src2.state.Reader(0)
 	src2.pushIn([]byte("unread"), false)
 	src2.state.OnClose(true, nil)
 	if _, err := r2.Read(make([]byte, 8)); !errors.Is(err, net.ErrClosed) {
@@ -544,7 +551,7 @@ func TestReaderDirectDeliveryBackpressureDeadlineAndCloseModes(t *testing.T) {
 	// 6. Remote reset error drains buffered bytes first, then returns reset error!
 	resetErr := errors.New("connection reset by peer")
 	src3 := newFakeSource(64, 64)
-	r3, _ := src3.state.Reader(0, false)
+	r3, _ := src3.state.Reader(0)
 	src3.pushIn([]byte("before-rst"), false)
 	src3.state.OnClose(false, resetErr)
 	buf3 := make([]byte, 16)
@@ -562,7 +569,7 @@ func TestZeroCopyWriteToBetweenReaderAndWriter(t *testing.T) {
 	srcOut := newFakeSource(128, 64)
 	srcOut.hardCap = 64
 
-	r, _ := srcIn.state.Reader(0, false)
+	r, _ := srcIn.state.Reader(0)
 	w := srcOut.state.Writer(0)
 
 	payload := bytes.Repeat([]byte("zero-copy-relay-"), 32) // 512 bytes
@@ -589,7 +596,7 @@ func TestZeroCopyWriteToBetweenReaderAndWriter(t *testing.T) {
 
 	// Also test WriteTo plain io.Writer and WriteTo preserving block on dst deadline!
 	srcIn2 := newFakeSource(128, 128)
-	rPlain, _ := srcIn2.state.Reader(0, false)
+	rPlain, _ := srcIn2.state.Reader(0)
 	srcIn2.pushIn([]byte("plain-writer"), true)
 	var plainOut bytes.Buffer
 	if n, err := rPlain.WriteTo(&plainOut); err != nil || n != 12 || plainOut.String() != "plain-writer" {
@@ -600,7 +607,7 @@ func TestZeroCopyWriteToBetweenReaderAndWriter(t *testing.T) {
 	srcIn3 := newFakeSource(128, 128)
 	srcOut3 := newFakeSource(128, 16)
 	srcOut3.hardCap = 16
-	r3, _ := srcIn3.state.Reader(0, false)
+	r3, _ := srcIn3.state.Reader(0)
 	w3 := srcOut3.state.Writer(0)
 	_, _ = w3.Write(make([]byte, 16)) // fill w3
 	_ = w3.SetWriteDeadline(time.Now().Add(-time.Millisecond))
@@ -639,7 +646,8 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 	boom := errors.New("boom")
 	preSrc.state.OnClose(false, boom)
 	preSrc.state.OnClose(true, nil) // idempotent
-	pr, _ := preSrc.state.Reader(512, true)
+	preSrc.onConnTurn = true
+	pr, _ := preSrc.state.Reader(512)
 	pw := preSrc.state.Writer(512)
 	if _, err := pr.Read(make([]byte, 4)); !errors.Is(err, boom) {
 		t.Fatalf("pre-closed Read = %v", err)
@@ -703,7 +711,7 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 	// 3. Reader setWindow resuming paused pipe, zero-len Read after local close,
 	// Pump after local close, and WriteTo wrapper / short writer / wait loop.
 	rSrc := newFakeSource(0, 0) // DefaultWindow path
-	r, _ := rSrc.state.Reader(16, false)
+	r, _ := rSrc.state.Reader(16)
 	rSrc.pushIn(bytes.Repeat([]byte("z"), 20), false)
 	r.setWindow(64) // pipe len 16 <= 32 -> resumes transport!
 	for deadline := time.Now().Add(time.Second); rSrc.InboundBuffered() > 0 && time.Now().Before(deadline); {
@@ -716,7 +724,7 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 	// WriteTo waiting on empty pipe, then receiving data + EOF into InternalWriter wrapper!
 	rSrc2 := newFakeSource(64, 64)
 	dSrc2 := newFakeSource(64, 64)
-	rWait, _ := rSrc2.state.Reader(0, false)
+	rWait, _ := rSrc2.state.Reader(0)
 	wWrap := dSrc2.state.Writer(128) // cw (128) > maxOut (64) -> clamped to 64
 	go func() {
 		time.Sleep(10 * time.Millisecond)
@@ -728,7 +736,7 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 
 	// Local close while parked in Read + Pump discarding after local close.
 	rSrc3 := newFakeSource(64, 64)
-	rClose, _ := rSrc3.state.Reader(0, false)
+	rClose, _ := rSrc3.state.Reader(0)
 	parkedErr := make(chan error, 1)
 	go func() {
 		_, err := rClose.Read(make([]byte, 8))
@@ -755,7 +763,7 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 		t.Fatalf("local-closed WriteTo = %v", err)
 	}
 	rSrc4 := newFakeSource(0, 0)
-	r4, _ := rSrc4.state.Reader(0, false) // DefaultWindow
+	r4, _ := rSrc4.state.Reader(0) // DefaultWindow
 	if r4.window() != DefaultWindow {
 		t.Fatalf("default reader window = %d", r4.window())
 	}
@@ -775,7 +783,7 @@ func TestEdgeBranchesPreClosedReadFromChunkLoopAndShortWrite(t *testing.T) {
 
 	// Pump when already full + onClose(false, io.EOF) while paused + WriteTo errorWriter.
 	rSrc5 := newFakeSource(16, 16)
-	r5, _ := rSrc5.state.Reader(16, false)
+	r5, _ := rSrc5.state.Reader(16)
 	rSrc5.pushIn(bytes.Repeat([]byte("a"), 24), false)
 	r5.Pump() // already at limit -> cur >= limit branch
 	if _, err := r5.WriteTo(errorWriter{err: boom}); !errors.Is(err, boom) {
@@ -912,5 +920,35 @@ vecDone:
 	st.OnClose(true, nil)
 	if _, err := w.Writev([][]byte{[]byte("x")}); !errors.Is(err, net.ErrClosed) {
 		t.Fatalf("closed Writev = %v", err)
+	}
+
+	// Chunk halving when lower hardCap < w.window() on empty queue (both Write & WriteOwned)!
+	capSrc := newFakeSource(64, 128)
+	capSrc.hardCap = 16 // smaller than window 128!
+	capWriter := capSrc.state.Writer(128)
+	go func() {
+		for range 20 {
+			time.Sleep(time.Millisecond)
+			capSrc.drainOut(16)
+		}
+	}()
+	if n, err := capWriter.Write(bytes.Repeat([]byte("h"), 40)); err != nil || n != 40 {
+		t.Fatalf("halved Write = %d, %v", n, err)
+	}
+	ownedBig := bytebuf.AcquireBuffer(40)
+	_, _ = ownedBig.Write(bytes.Repeat([]byte("o"), 40))
+	if n, err := capWriter.WriteOwned(ownedBig); err != nil || n != 40 {
+		t.Fatalf("halved WriteOwned = %d, %v", n, err)
+	}
+
+	// Reader attached to an already-closing source immediately observes close without hanging!
+	deadSrc := newFakeSource(64, 64)
+	deadSrc.closing = true
+	deadR, err := deadSrc.state.Reader(64)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := deadR.Read(make([]byte, 8)); !errors.Is(err, io.EOF) {
+		t.Fatalf("already-closing source Read = %v, want io.EOF", err)
 	}
 }

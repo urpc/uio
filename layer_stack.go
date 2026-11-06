@@ -105,8 +105,8 @@ func (h *stackDriver) OnOpen(socket Conn) {
 			c.hasTurnEnd = true
 		}
 	}
-	c.inTurn.Store(true)
-	defer c.inTurn.Store(false)
+	c.enterTurnOwner()
+	defer c.leaveTurnOwner()
 	c.openUpTo()
 	c.finishTurn()
 }
@@ -155,6 +155,7 @@ type stack struct {
 	writeWatched   atomic.Bool
 	heldPeak       atomic.Int64
 	writeRefused   atomic.Bool
+	reserveRefused atomic.Bool
 	block          atomic.Pointer[blockio.State]
 	pullRead       atomic.Bool
 	localClosed    atomic.Bool
@@ -197,6 +198,7 @@ type stack struct {
 	// asking for another. turnAsked marks a turn requestTurn asked for and no
 	// turn has begun since: one is enough for any number of requests.
 	inTurn    atomic.Bool
+	turnOwner atomic.Int64
 	turnAsked atomic.Bool
 
 	// timers holds the timer of every layer, and in its last slot the one
@@ -250,16 +252,37 @@ func (c *stack) turn() error {
 		c.settle()
 		return nil
 	}
-	c.inTurn.Store(true)
-	defer c.inTurn.Store(false) // a panic an Executor recovers leaves none set
+	c.enterTurnOwner()
+	defer c.leaveTurnOwner() // a panic an Executor recovers leaves none set
 	c.noteHeldPeak()
 	err := c.run()
 	if err != nil {
-		c.inTurn.Store(false) // the failed callback is the last this turn runs
+		if errors.Is(err, io.EOF) {
+			c.runTurnEnds()
+		}
+		c.leaveTurnOwner() // the failed callback is the last this turn runs
 		return c.failTurn(err)
 	}
 	c.finishTurn()
 	return nil
+}
+
+func (c *stack) enterTurnOwner() {
+	c.turnOwner.Store(currentGoroutineID())
+	c.inTurn.Store(true)
+}
+
+func (c *stack) leaveTurnOwner() {
+	c.turnOwner.Store(0)
+	c.inTurn.Store(false)
+}
+
+func (c *stack) inTurnOwner() bool {
+	if !c.inTurn.Load() {
+		return false
+	}
+	owner := c.turnOwner.Load()
+	return owner != 0 && owner == currentGoroutineID()
 }
 
 // failTurn ends a connection whose turn failed — a layer's callback returned
@@ -398,7 +421,8 @@ const (
 
 // finishTurn ends a turn: outbound room changes are reported and deferred
 // close or CloseWrite work settles once no layer callback is on the stack.
-func (c *stack) finishTurn() {
+func (c *stack) runTurnEnds() {
+	c.turnOwner.Store(0)
 	if c.hasTurnEnd && !c.over() {
 		for i := len(c.layers) - 1; i >= 0; i-- {
 			node := c.layers[i]
@@ -407,8 +431,12 @@ func (c *stack) finishTurn() {
 			}
 		}
 	}
+}
+
+func (c *stack) finishTurn() {
+	c.runTurnEnds()
 	c.noteQueueRoom()
-	c.inTurn.Store(false)
+	c.leaveTurnOwner()
 	if c.shutsPending.Load() > 0 || c.over() {
 		c.settle()
 	}
@@ -422,6 +450,7 @@ func (c *stack) morePacketsBelow() bool {
 func (c *stack) enableWriteWatch() {
 	c.writeWatchOnce.Do(func() {
 		c.writeWatched.Store(true)
+		c.noteHeldPeak()
 		writecontrol.Watch(c.socket, c.notifyWrite)
 	})
 }
@@ -545,8 +574,11 @@ func (c *stack) run() error {
 			return nil // a layer closed the connection: nothing above runs
 		}
 		c.openUpTo() // a ctx.Open() the layer made opens the layers above now
+		if c.over() {
+			return nil
+		}
 		if layer.index == 0 && due == 0 && c.morePacketsBelow() && c.topOpen.Load() &&
-			!layer.ended.Load() && layer.held() < c.deliverBound() {
+			!layer.ended.Load() && !layer.stalled.Load() && layer.held() < c.deliverBound() {
 			return nil
 		}
 	}
@@ -595,6 +627,10 @@ func (c *stack) endOfStream(handlerRan bool) error {
 	if handlerRan && heldByConsumer {
 		return nil
 	}
+	if !c.topOpen.Load() {
+		// The underlying stream ended before every layer opened: report truncation!
+		return io.ErrUnexpectedEOF
+	}
 	if c.socket.InboundBuffered() != 0 || c.heldBelowTop() != 0 {
 		// The end came behind a partial unit the layers could not hand up.
 		return io.ErrUnexpectedEOF
@@ -603,9 +639,7 @@ func (c *stack) endOfStream(handlerRan bool) error {
 }
 
 func (c *stack) writeSideEnded(top *layerNode) bool {
-	return top.gate.Load()&gateWriteShut != 0 &&
-		c.shutsPending.Load() == 0 &&
-		c.socket.State()&StateWriteEnded != 0
+	return top.gate.Load()&gateWriteShut != 0 && c.shutsPending.Load() == 0
 }
 
 // heldBelowTop is the input the layers below the Handler's layer hold for
@@ -646,7 +680,7 @@ func (c *stack) ended() bool {
 		return false
 	}
 	for _, layer := range c.layers {
-		if layer.stalled.Load() || layer.readControl.Load().Held() {
+		if layer.stalled.Load() || layer.unpaced.Load() || layer.readControl.Load().Held() {
 			return false
 		}
 	}
@@ -701,10 +735,11 @@ func (c *stack) inbound(layer *layerNode) error {
 		// on this layer — asks for the turn. The layers above it go on
 		// draining what it delivered. A packet bottom is never paced: a
 		// datagram it does not take is gone.
-		if !packetBottom && layer.held() >= c.deliverBound() {
+		if !packetBottom && !layer.ops.selfPaced && layer.held() >= c.deliverBound() {
 			layer.paced.Store(true)
 			return nil
 		}
+		layer.unpaced.Store(false)
 		below, _ := layer.lower.(*layerNode)
 		if below != nil {
 			below.woken.Store(false)
@@ -720,6 +755,9 @@ func (c *stack) inbound(layer *layerNode) error {
 		// A ctx.Open() the layer made takes effect here, before the round
 		// reads on into bytes that arrived behind its handshake.
 		c.openUpTo()
+		if c.over() {
+			return nil
+		}
 		if packetBottom {
 			// The turn carried one datagram. Reading on would hand the layer
 			// whatever it left of it as if it were another packet; the
@@ -765,6 +803,9 @@ func (c *stack) inboundFull() bool {
 // turn once its layers hold less than the limit. It runs on the turn.
 func (c *stack) inboundRoom() {
 	if c.inHeld.Load() && !c.inboundFullNow() && c.inHeld.CompareAndSwap(true, false) {
+		if len(c.layers) > 0 {
+			c.layers[0].unpaced.Store(true)
+		}
 		_ = c.socket.Wake()
 	}
 }
@@ -862,7 +903,13 @@ func (c *stack) closed(err error) {
 		layer.at = 0
 	}
 	if probe := c.probe.Swap(nil); probe != nil {
-		probe.fail(err)
+		cause := err
+		if cause == nil {
+			if held := c.closeCause.Load(); held != nil {
+				cause = *held
+			}
+		}
+		probe.fail(cause)
 	}
 }
 
@@ -939,19 +986,22 @@ func (c *stack) reserve(n int) error {
 	reserved := c.reserved.Add(int64(n))
 	if int64(c.queued())+reserved > int64(c.limit) {
 		c.reserved.Add(-int64(n))
+		if reserved > int64(n) {
+			c.reserveRefused.Store(true)
+		}
 		return ErrOutboundOverflow
 	}
 	return nil
 }
 
 // release returns what reserve took, once the write it admitted is queued
-// below, or failed. If a concurrent writer was refused while this reservation
-// was in flight, releasing it notifies write-control watchers that transient
-// admission capacity is available again even if the socket already drained.
+// below, or failed. If a concurrent writer was refused by stack.reserve while
+// this transient reservation was in flight, releasing it notifies write-control
+// watchers without disturbing writeRefused set by a full lower layer.
 func (c *stack) release(n int) {
 	if c.limit > 0 {
 		c.reserved.Add(-int64(n))
-		if c.writeWatched.Load() && c.writeRefused.Load() && c.writeRefused.Swap(false) {
+		if c.writeWatched.Load() && c.reserveRefused.Load() && c.reserveRefused.Swap(false) {
 			c.notifyWrite(0)
 		}
 	}

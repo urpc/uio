@@ -84,6 +84,7 @@ type fdConn struct {
 	opened         bool
 	wakesAfterOpen int
 	wakesPending   atomic.Int32
+	cbOwner        atomic.Int64
 
 	// readHeld stops the read goroutine once callbacks leave
 	// MaxInboundBuffered bytes unconsumed; it waits on readResume until a Wake
@@ -182,8 +183,25 @@ func (fc *fdConn) retainLifecycle() {
 // still open. A connection closed before this goroutine ran still gets OnOpen
 // and then OnClose, as on the native backend: a Dial that returned it has
 // handed its caller a connection whose end only OnClose reports.
-func (fc *fdConn) openOnReader() bool {
+func (fc *fdConn) directOwner() bool {
+	owner := fc.cbOwner.Load()
+	return owner != 0 && owner == currentGoroutineID()
+}
+
+func (fc *fdConn) InOwnTurn() bool { return fc.directOwner() }
+
+func (fc *fdConn) lockCallback() {
 	fc.callbackMu.Lock()
+	fc.cbOwner.Store(currentGoroutineID())
+}
+
+func (fc *fdConn) unlockCallback() {
+	fc.cbOwner.Store(0)
+	fc.callbackMu.Unlock()
+}
+
+func (fc *fdConn) openOnReader() bool {
+	fc.lockCallback()
 	fc.ensureOpenLocked()
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
 		fc.wakesPending.Add(-1)
@@ -195,7 +213,7 @@ func (fc *fdConn) openOnReader() bool {
 		}
 	}
 	closing := fc.isClosing()
-	fc.callbackMu.Unlock()
+	fc.unlockCallback()
 	if closing {
 		return false
 	}
@@ -510,7 +528,7 @@ func (fc *fdConn) State() ConnState {
 		state |= StateWriteEnded
 	}
 	fc.mux.Unlock()
-	if fc.isClosing() {
+	if fc.isClosing() || fc.draining.Load() {
 		state |= StateClosing
 	}
 	if fc.IsClosed() {
@@ -576,14 +594,16 @@ func (fc *fdConn) runWakeTask() error {
 }
 
 func (fc *fdConn) deliverWake() {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	defer fc.events().callbackWG.Done()
 	if fc.isClosing() {
 		fc.wakesPending.Add(-1)
 		return
 	}
 	// A Wake callback must not race the blocking read goroutine's inbound view.
-	fc.callbackMu.Lock()
-	defer fc.callbackMu.Unlock()
+	fc.lockCallback()
+	defer fc.unlockCallback()
 	if fc.isClosing() {
 		fc.wakesPending.Add(-1)
 		// The connection closed while this callback waited its turn.
@@ -659,14 +679,14 @@ func (fc *fdConn) noteReadEnded() {
 // when both halves of a half-open one ended, or when a non-direct driver closes
 // the connection itself.
 func (fc *fdConn) onReadEOF() {
-	fc.callbackMu.Lock()
+	fc.lockCallback()
 	if fc.isClosing() {
-		fc.callbackMu.Unlock()
+		fc.unlockCallback()
 		return
 	}
 	if fc.autoCloseOnEOF() && !fc.currentReadControl().Held() &&
 		fc.inbound.Empty() && len(fc.inboundTail) == 0 {
-		fc.callbackMu.Unlock()
+		fc.unlockCallback()
 		fc.events().closeConn(fc, io.EOF)
 		return
 	}
@@ -678,7 +698,7 @@ func (fc *fdConn) onReadEOF() {
 		fc.noteReadEnded()
 		fc.closeDeferredReadEOF()
 	}
-	fc.callbackMu.Unlock()
+	fc.unlockCallback()
 	if err != nil {
 		fc.events().closeConn(fc, err)
 	}
@@ -722,11 +742,11 @@ func (fc *fdConn) readLoop() {
 		if n > 0 {
 			// A Reader may return payload and a terminal error together. Deliver the
 			// payload before closing so the final stream segment is not lost.
-			fc.callbackMu.Lock()
+			fc.lockCallback()
 			if fc.isClosing() {
 				// OnClose may already have run: a close requested while this
 				// read was returning ends the stream here.
-				fc.callbackMu.Unlock()
+				fc.unlockCallback()
 				return
 			}
 			fc.inboundTail = buffer[:n]
@@ -734,7 +754,7 @@ func (fc *fdConn) readLoop() {
 			started := fc.beginInboundCallback()
 			if callbackErr := fc.events().onRead(fc); callbackErr != nil {
 				fc.endInboundCallback(started)
-				fc.callbackMu.Unlock()
+				fc.unlockCallback()
 				fc.events().closeConn(fc, callbackErr)
 				return
 			}
@@ -747,7 +767,7 @@ func (fc *fdConn) readLoop() {
 			}
 			wait = fc.readHeld || fc.ReadPaused()
 			fc.endInboundCallback(started)
-			fc.callbackMu.Unlock()
+			fc.unlockCallback()
 		}
 		if readErr != nil {
 			// The end of the stream is the consumer's to see, paused or not;

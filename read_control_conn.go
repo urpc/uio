@@ -45,7 +45,7 @@ func (conn *fdConn) checkReadControl() error {
 	if conn.isDatagram() {
 		return ErrUnsupported
 	}
-	if conn.loop == nil || conn.isClosing() || conn.loop.stopping.Load() ||
+	if conn.loop == nil || conn.closingOrDraining() || conn.loop.stopping.Load() ||
 		conn.entry == nil || conn.events().closing.Load() {
 		return net.ErrClosed
 	}

@@ -185,20 +185,20 @@ type Layer interface {
 }
 
 type LayerHandler interface {
-	OnOpen(ctx LayerContext)                            // start a handshake; Up().Open() when settled
-	OnRead(ctx LayerContext) error                      // a turn: read Down(), write Up()
-	OnWrite(ctx LayerContext, p []byte) (int, error)    // bytes from above → Down().Write(...)
+	OnOpen(ctx LayerContext)                            // start a handshake; ctx.Open() when settled
+	OnRead(ctx LayerContext) error                      // a turn: read Lower(), write Upper()
+	OnWrite(ctx LayerContext, p []byte) (int, error)    // bytes from above → ctx.Lower().Write(...)
 	OnTimer(ctx LayerContext) error                     // this layer's own timer came due
 	OnClose(ctx LayerContext, cause error)
 }
 ```
 
 `Layer` is the protocol, configured once; `LayerHandler` is its instance on
-one connection; `LayerContext` is that instance's place in the stack: `Down()`,
-the connection below it reads from, `Up()`, the layer above's input it writes
-to, and the connection's lifecycle — `ctx.Close(cause)` says this layer's
+one connection; `LayerContext` is that instance's place in the stack: `Lower()`,
+the connection below it reads from, `Upper()`, the layer above's input it writes
+to, and the connection's lifecycle — `ctx.Close()` says this layer's
 goodbye and drains the queue like a close from above, `ctx.Abort(cause)` ends
-it at once. `Down()` carries bytes, options and addressing, never a close: a
+it at once. `Lower()` carries bytes, options and addressing, never a close: a
 layer ends the connection through the context, so every close runs the stack's
 one close algorithm from the layer that began it (`CloseWrite` stays: ending
 one direction is part of a layer's own protocol). An obfuscation layer is all
@@ -425,7 +425,8 @@ Everything is optional; the zero `Events` is ready to use.
 | `Executor` | built-in sharded pool | Your own scheduler for connection and write turns (native backend). |
 | `ReadBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnRead` are batched either way. |
-| `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
+| `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow` (unless `BlockingWrite` suspends off-turn callers). |
+| `BlockingWrite` | off | Suspends off-turn stream `Write`/`Writev`/`WriteOwned` callers when the outbound window is full instead of returning `ErrOutboundOverflow` (defaults an unset `MaxOutboundBuffered` to 64 KiB; on-turn callbacks stay non-blocking). `NewBlockingConn`/`NewBlockingReader`/`NewBlockingWriter` offer explicit pull/blocking wrappers. |
 | `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnRead` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. A packet connection keeps no buffer to hold and is never paced by it: its bottom `PacketLayer` carries whatever backpressure its protocol provides. |
 | `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnRead` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes once both halves are shut and the bytes the peer sent have been consumed. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |

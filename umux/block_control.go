@@ -41,12 +41,13 @@ func (s streamBlockSource) NewReadPause() *readcontrol.Pause { return readcontro
 func (s streamBlockSource) WatchWrite(fn func(int)) bool     { return writecontrol.Watch(s.st, fn) }
 func (s streamBlockSource) IsOverflow(err error) bool        { return errors.Is(err, uio.ErrOutboundOverflow) }
 
-func (s streamBlockSource) EnablePullRead(onTurn bool) error {
+func (s streamBlockSource) EnablePullRead() (bool, error) {
 	s.st.pullRead.Store(true)
-	if !onTurn {
+	onSessTurn := s.st.sess.onOwnTurn()
+	if !onSessTurn {
 		_ = s.st.Wake()
 	}
-	return nil
+	return onSessTurn, nil
 }
 
 func (st *Stream) streamBlockState() (*blockio.State, bool) {
@@ -57,10 +58,18 @@ func (st *Stream) streamBlockState() (*blockio.State, bool) {
 		return b, true
 	}
 	b := blockio.NewState(streamBlockSource{st: st})
-	if st.blockControl.CompareAndSwap(nil, b) {
-		return b, true
+	if !st.blockControl.CompareAndSwap(nil, b) {
+		b = st.blockControl.Load()
 	}
-	return st.blockControl.Load(), true
+	st.mu.Lock()
+	closed := st.closeDelivered || st.closedLocal
+	cause := st.closedErr
+	st.mu.Unlock()
+	local := st.localClosed.Load()
+	if closed || local {
+		b.OnClose(local, cause)
+	}
+	return b, true
 }
 
 func (st *Stream) activeBlockReader() *blockio.Reader {
@@ -77,10 +86,6 @@ func (st *Stream) notifyBlockClose(err error) {
 	if b := st.blockControl.Load(); b != nil {
 		b.OnClose(st.localClosed.Load(), err)
 	}
-}
-
-func (st *Stream) hasWaitingBlockWriter() bool {
-	return st.blockControl.Load().HasWaitingWriter()
 }
 
 func (st *Stream) ensureBlockWriter() *blockio.Writer {

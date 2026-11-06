@@ -211,7 +211,15 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 // A round that carries several frames batches the small replies they send and
 // hands them to the transport together when it ends.
 func (c *Conn) readAvailable() error {
+	defer c.finishReadAvailable()
 	err := c.readRound()
+	if c.heartbeat != nil {
+		c.heartbeatTick(time.Now())
+	}
+	return err
+}
+
+func (c *Conn) finishReadAvailable() {
 	if round := c.round.Load(); round != 0 {
 		if round&roundBatching != 0 {
 			c.endRound(round)
@@ -220,10 +228,6 @@ func (c *Conn) readAvailable() error {
 			c.sendDeferredClose()
 		}
 	}
-	if c.heartbeat != nil {
-		c.heartbeatTick(time.Now())
-	}
-	return err
 }
 
 func (c *Conn) readRound() error {
@@ -368,7 +372,9 @@ func (c *Conn) consumeShortFrame(src []byte, limit int) (int, bool, error) {
 	if c.closing.Load() {
 		return size, true, nil
 	}
-	if handler := c.handler; handler != nil {
+	if c.hasBlocking {
+		c.deliverBlocking(Message{Type: messageType(opcode), Payload: payload})
+	} else if handler := c.handler; handler != nil {
 		handler.OnMessage(c, Message{Type: messageType(opcode), Payload: payload})
 	}
 	return size, true, nil

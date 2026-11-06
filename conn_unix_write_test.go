@@ -1223,5 +1223,18 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 	conn.outbound.Reset()
 	conn.submitMu.Unlock()
 	conn.pending.Store(0)
+
+	// Contended writeOwnerFlag returns (nil, false, nil), and outputClosed returns (nil, true, net.ErrClosed)!
+	conn.scratch = holderFull
+	conn.writeState.Or(writeOwnerFlag)
+	if _, ok, err := conn.ReserveTurnWrite(8); ok || err != nil {
+		t.Fatalf("contended ReserveTurnWrite = %v, %v, want false, nil", ok, err)
+	}
+	conn.writeState.And(^writeOwnerFlag)
+	conn.writeState.Or(writeShutFlag)
+	if _, ok, err := conn.ReserveTurnWrite(8); !ok || !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed ReserveTurnWrite = %v, %v, want true, net.ErrClosed", ok, err)
+	}
+	conn.scratch = nil
 	conn.ioOwner.Store(0)
 }

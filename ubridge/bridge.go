@@ -174,12 +174,16 @@ func (b *Bridge) Pair(a, c uio.Conn) error {
 		}
 		return ErrAlreadyPaired
 	}
+	if bridgeConnGone(a) || bridgeConnGone(c) {
+		b.mu.Unlock()
+		return ErrPeerGone
+	}
 	b.pairs[a], b.pairs[c] = p, p
 	b.mu.Unlock()
 	// A close that completed before the pair was published could not find
-	// it, and its OnClose does not repeat: look again now that it is.
-	if bridgeConnGone(a) || bridgeConnGone(c) || p.closed.Load() {
-		p.closed.Store(true)
+	// it, and its OnClose does not repeat: look again now that it is. If
+	// OnClose already claimed p.closed after publication, let OnClose finish.
+	if (bridgeConnGone(a) || bridgeConnGone(c)) && p.closed.CompareAndSwap(false, true) {
 		b.mu.Lock()
 		delete(b.pairs, a)
 		delete(b.pairs, c)
@@ -256,7 +260,7 @@ func (b *Bridge) OnOpen(c uio.Conn) {
 	}
 	var helper uio.Conn
 	dial := func(ctx context.Context, addr string, opts ...uio.DialOption) (uio.Conn, error) {
-		opts = append(opts, uio.WithUserdata(bridgePeerMark{}))
+		opts = append(opts[:len(opts):len(opts)], uio.WithUserdata(bridgePeerMark{}))
 		up, err := b.Events().DialContext(ctx, addr, opts...)
 		helper = up
 		return up, err
@@ -333,7 +337,7 @@ func (b *Bridge) OnRead(c uio.Conn) error {
 		// StateReadEnded means the peer ended and everything it sent was
 		// read: the end follows the bytes.
 		if c.State()&uio.StateReadEnded != 0 {
-			if err := peer.CloseWrite(); err != nil && !peerGone(peer, err) {
+			if err := peer.CloseWrite(); err != nil && !errors.Is(err, uio.ErrUnsupported) && !peerGone(peer, err) {
 				return err
 			}
 		}
@@ -427,7 +431,9 @@ func (b *Bridge) OnClose(c uio.Conn, err error) {
 	_, other := p.legs(c)
 	peer := other.conn
 	if err == nil || errors.Is(err, io.EOF) {
-		_ = peer.CloseWrite()
+		if cwErr := peer.CloseWrite(); errors.Is(cwErr, uio.ErrUnsupported) {
+			_ = peer.Close()
+		}
 		// Its next callback takes the orphan path; a pause of the bridge's
 		// own would keep that from running.
 		other.waiting.Store(false)

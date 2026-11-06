@@ -13,18 +13,22 @@ func (conn *fdConn) connBlockState() (*blockio.State, bool) {
 		return st, true
 	}
 	st := blockio.NewState(fdBlockSource{conn: conn})
-	if w.block.CompareAndSwap(nil, st) {
-		return st, true
+	if !w.block.CompareAndSwap(nil, st) {
+		st = w.block.Load()
 	}
-	return w.block.Load(), true
+	if conn.close.phase.Load() >= closeDraining {
+		st.OnClose(conn.flags.Load()&localCloseFlag != 0, conn.peekDeferredCloseCause())
+	}
+	return st, true
 }
 
-func (conn *fdConn) enablePullRead(onTurn bool) error {
+func (conn *fdConn) enablePullRead() (bool, error) {
 	conn.wakeState().pullRead.Store(true)
-	if !onTurn && !conn.isClosing() && conn.loop != nil {
+	onConnTurn := conn.directOwner()
+	if !onConnTurn && !conn.isClosing() && conn.loop != nil {
 		conn.scheduleIO(ioEventWake)
 	}
-	return nil
+	return onConnTurn, nil
 }
 
 func (conn *fdConn) hasPullReader() bool {
@@ -36,6 +40,10 @@ func (conn *fdConn) hasPullReader() bool {
 
 func (conn *fdConn) writeSideClosed() bool {
 	return conn.outputClosed()
+}
+
+func (conn *fdConn) closingOrDraining() bool {
+	return conn.close.phase.Load() >= closeDraining
 }
 
 func (conn *fdConn) pumpBlockReader() {
@@ -53,6 +61,14 @@ func (conn *fdConn) notifyBlockClose(err error) {
 		if st := w.block.Load(); st != nil {
 			local := conn.flags.Load()&localCloseFlag != 0
 			st.OnClose(local, err)
+		}
+	}
+}
+
+func (conn *fdConn) notifyBlockWriteSpace() {
+	if w := conn.wake.Load(); w != nil {
+		if ctrl := w.writeControl.Load(); ctrl != nil {
+			ctrl.Notify(0)
 		}
 	}
 }

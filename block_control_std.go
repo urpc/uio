@@ -12,18 +12,28 @@ func (conn *fdConn) connBlockState() (*blockio.State, bool) {
 		return st, true
 	}
 	st := blockio.NewState(fdBlockSource{conn: conn})
-	if conn.blockControl.CompareAndSwap(nil, st) {
-		return st, true
+	if !conn.blockControl.CompareAndSwap(nil, st) {
+		st = conn.blockControl.Load()
 	}
-	return conn.blockControl.Load(), true
+	if conn.isClosing() || conn.draining.Load() {
+		conn.mux.Lock()
+		cause := conn.err
+		if cause == nil {
+			cause = conn.drainCause
+		}
+		conn.mux.Unlock()
+		st.OnClose(conn.localClosed.Load(), cause)
+	}
+	return st, true
 }
 
-func (conn *fdConn) enablePullRead(onTurn bool) error {
+func (conn *fdConn) enablePullRead() (bool, error) {
 	conn.pullRead.Store(true)
-	if !onTurn && !conn.isClosing() {
+	onConnTurn := conn.directOwner()
+	if !onConnTurn && !conn.isClosing() {
 		_ = conn.Wake()
 	}
-	return nil
+	return onConnTurn, nil
 }
 
 func (conn *fdConn) hasPullReader() bool {
@@ -31,10 +41,17 @@ func (conn *fdConn) hasPullReader() bool {
 }
 
 func (conn *fdConn) writeSideClosed() bool {
+	if conn.isClosing() || conn.draining.Load() {
+		return true
+	}
 	conn.mux.Lock()
 	shut := conn.writeShut
 	conn.mux.Unlock()
 	return shut
+}
+
+func (conn *fdConn) closingOrDraining() bool {
+	return conn.isClosing() || conn.draining.Load()
 }
 
 func (conn *fdConn) pumpBlockReader() {
@@ -48,6 +65,12 @@ func (conn *fdConn) pumpBlockReader() {
 func (conn *fdConn) notifyBlockClose(err error) {
 	if st := conn.blockControl.Load(); st != nil {
 		st.OnClose(conn.localClosed.Load(), err)
+	}
+}
+
+func (conn *fdConn) notifyBlockWriteSpace() {
+	if ctrl := conn.writeControl.Load(); ctrl != nil {
+		ctrl.Notify(0)
 	}
 }
 

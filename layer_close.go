@@ -61,6 +61,11 @@ func (l *layerNode) endClose(cause error, graceful, fromAbove bool) error {
 			}
 			return nil
 		}
+		if fromAbove {
+			if st := c.block.Load(); st != nil {
+				st.OnClose(true, cause)
+			}
+		}
 		c.closePlan.Swap(nil)
 		err := c.endAtSocket(cause, false, false)
 		if !fromAbove && errors.Is(err, net.ErrClosed) && !c.closedStack() {
@@ -69,6 +74,11 @@ func (l *layerNode) endClose(cause error, graceful, fromAbove bool) error {
 		return err
 	}
 	c.recordCloseCause(cause)
+	if fromAbove {
+		if st := c.block.Load(); st != nil {
+			st.OnClose(true, cause)
+		}
+	}
 	l.closing.Store(true)
 	from := int32(l.index)
 	if fromAbove {
@@ -136,10 +146,13 @@ func (l *layerNode) CloseWrite() error {
 	if !l.markWriteShut() {
 		return nil
 	}
+	if ctrl := l.writeControl.Load(); ctrl != nil {
+		ctrl.Notify(0)
+	}
 	l.stack.shutsPending.Add(1)
 	l.shutPending.Store(true)
 	done, err := l.shutDown()
-	if done && err == nil && l.isTop() && l.stack.halfOpen && l.stack.ended() {
+	if done && err == nil && l.stack.halfOpen && l.stack.writeSideEnded(l.stack.layers[len(l.stack.layers)-1]) && l.stack.ended() {
 		l.stack.requestTurn()
 	}
 	return err
@@ -166,8 +179,9 @@ func (l *layerNode) shutDown() (bool, error) {
 			}
 			continue
 		}
+		err := l.ops.closeWriter(ctx)
 		l.stack.shutsPending.Add(-1)
-		return true, l.ops.closeWriter(ctx)
+		return true, err
 	}
 	return false, nil
 }
@@ -192,7 +206,7 @@ func (c *stack) finishShuts() {
 			_ = c.failTurn(err)
 			return
 		}
-		if done && err == nil && l.isTop() && c.halfOpen && c.ended() {
+		if done && err == nil && c.halfOpen && c.writeSideEnded(c.layers[len(c.layers)-1]) && c.ended() {
 			c.requestTurn()
 		}
 	}

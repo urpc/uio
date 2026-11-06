@@ -22,6 +22,7 @@ package uio
 
 import (
 	"context"
+	"net"
 	"sync/atomic"
 )
 
@@ -54,6 +55,9 @@ func (p *dialProbe) settle(conn Conn) bool {
 }
 
 func (p *dialProbe) fail(err error) {
+	if err == nil {
+		err = net.ErrClosed
+	}
 	if p.claimed.CompareAndSwap(false, true) {
 		p.err = err
 		close(p.done)

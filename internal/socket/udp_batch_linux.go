@@ -165,8 +165,19 @@ func sockaddrName(remote syscall.Sockaddr, storage *unix.RawSockaddrAny) (*byte,
 		return (*byte)(unsafe.Pointer(storage)), unix.SizeofSockaddrInet6, nil
 	case *syscall.SockaddrUnix:
 		raw := (*unix.RawSockaddrUnix)(unsafe.Pointer(storage))
+		if len(sa.Name) == 0 || len(sa.Name) >= len(raw.Path) {
+			return nil, 0, unix.EINVAL
+		}
 		*raw = unix.RawSockaddrUnix{Family: unix.AF_UNIX}
-		for i := 0; i < len(sa.Name) && i < len(raw.Path)-1; i++ {
+		if sa.Name[0] == '@' {
+			raw.Path[0] = 0
+			for i := 1; i < len(sa.Name); i++ {
+				raw.Path[i] = int8(sa.Name[i])
+			}
+			length := uint32(unsafe.Offsetof(unix.RawSockaddrUnix{}.Path)) + uint32(len(sa.Name))
+			return (*byte)(unsafe.Pointer(storage)), length, nil
+		}
+		for i := 0; i < len(sa.Name); i++ {
 			raw.Path[i] = int8(sa.Name[i])
 		}
 		length := uint32(unsafe.Offsetof(unix.RawSockaddrUnix{}.Path)) + uint32(len(sa.Name)) + 1

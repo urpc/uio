@@ -84,7 +84,8 @@ type Options struct {
 	// disables heartbeats; both servers and dialers may enable them. The
 	// heartbeat runs in the connection's own turns, so a Handler callback
 	// that blocks also pauses its connection's heartbeat until it returns;
-	// a Client waiting on its full queue is bounded so its timeout still runs.
+	// a paused BlockingConn / Client never blocks turns, so its heartbeat
+	// timeout continues to run natively.
 	HeartbeatInterval time.Duration
 	// HeartbeatTimeout bounds both the time a ping may remain queued and the
 	// time to receive its matching pong after it is written. Zero uses twice

@@ -1171,3 +1171,66 @@ func TestWakeIntervalFallsBackAndRepeats(t *testing.T) {
 		t.Fatalf("a stopped fallback interval kept firing: %d then %d", fires, got)
 	}
 }
+
+type recoveringUDPExec struct{ recovered chan struct{} }
+
+func (r recoveringUDPExec) Submit(t IOTask) bool {
+	go func() {
+		defer func() {
+			if recover() != nil {
+				select {
+				case r.recovered <- struct{}{}:
+				default:
+				}
+			}
+		}()
+		t.RunTask()
+	}()
+	return true
+}
+
+func (r recoveringUDPExec) SubmitBatch(ts []IOTask) int {
+	for _, t := range ts {
+		r.Submit(t)
+	}
+	return len(ts)
+}
+
+func TestUDPPanicRecoveryClearsBatchState(t *testing.T) {
+	panicRecovered := make(chan struct{}, 1)
+	panicEv := &Events{
+		Pollers:        1,
+		ReadBufferSize: 2048,
+		Executor:       recoveringUDPExec{recovered: panicRecovered},
+		Handler: FuncHandler{
+			Read: func(Conn) error {
+				panic("udp-callback-panic")
+			},
+		},
+	}
+	pStarted := make(chan struct{})
+	panicEv.Hooks = FuncHandler{Start: func(*Events) { close(pStarted) }}
+	pDone := make(chan error, 1)
+	go func() { pDone <- panicEv.Serve() }()
+	<-pStarted
+	defer func() {
+		_ = panicEv.Close(nil)
+		<-pDone
+	}()
+	pLn, err := panicEv.Listen("udp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pLn.Close()
+	pCli, err := net.Dial("udp", pLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pCli.Close()
+	_, _ = pCli.Write([]byte("boom1"))
+	_, _ = pCli.Write([]byte("boom2"))
+	select {
+	case <-panicRecovered:
+	case <-time.After(2 * time.Second):
+	}
+}

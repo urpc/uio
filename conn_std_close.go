@@ -22,6 +22,7 @@
 package uio
 
 import (
+	"errors"
 	"io"
 	"net"
 	"sync/atomic"
@@ -90,6 +91,7 @@ func (fc *fdConn) closeGracefully(cause error) error {
 		fc.drainTimer = time.AfterFunc(fc.drainWait, fc.finishDrain)
 	}
 	fc.mux.Unlock()
+	fc.notifyBlockClose(cause)
 	if queued > 0 {
 		select {
 		case fc.writeSig <- struct{}{}:
@@ -134,6 +136,7 @@ func (fc *fdConn) Abort(cause error) error {
 		cause = net.ErrClosed
 	}
 	fc.localClosed.Store(true)
+	fc.notifyBlockClose(cause)
 	return fc.enqueueClose(cause)
 }
 
@@ -369,6 +372,7 @@ func (fc *fdConn) CloseWrite() error {
 	}
 	fc.writeShut = true
 	fc.mux.Unlock()
+	fc.notifyBlockWriteSpace()
 	select {
 	case fc.writeSig <- struct{}{}:
 	default:
@@ -384,6 +388,10 @@ func (fc *fdConn) shutWriteIfDrained() error {
 		return nil
 	}
 	fc.mux.Lock()
+	if fc.isClosing() {
+		fc.mux.Unlock()
+		return nil
+	}
 	ready := fc.writeShut && fc.outbound.Len() == 0 && fc.writeBytes == 0
 	fc.mux.Unlock()
 	if !ready {
@@ -398,6 +406,9 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	err := fc.conn.(halfCloser).CloseWrite()
 	fc.writeShutDone.Store(true)
 	if err != nil {
+		if fc.isClosing() || errors.Is(err, net.ErrClosed) {
+			return nil
+		}
 		return err
 	}
 	if fc.entry.directConsumer && fc.readEnded.Load() {

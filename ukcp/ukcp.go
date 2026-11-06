@@ -367,7 +367,10 @@ func (o Options) socketControl() uio.SocketControl {
 	if o.SocketReadBuffer < 0 && o.SocketWriteBuffer < 0 {
 		return nil
 	}
-	return func(_, _ string, fd uintptr) error {
+	return func(network, _ string, fd uintptr) error {
+		if network != "" && !strings.HasPrefix(network, "udp") {
+			return nil
+		}
 		if o.SocketReadBuffer > 0 {
 			if err := setSocketBuffer(fd, true, o.SocketReadBuffer); err != nil {
 				return err

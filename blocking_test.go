@@ -108,12 +108,15 @@ func runBlockingPair(
 		stopEv()
 		t.Fatal(err)
 	}
+	cliOpened := make(chan struct{})
 	cliEv := &Events{
 		Pollers:             1,
 		AllowHalfOpen:       halfOpen,
 		MaxInboundBuffered:  maxIn,
 		MaxOutboundBuffered: maxOut,
-		Handler:             FuncHandler{},
+		Handler: FuncHandler{
+			Open: func(Conn) { close(cliOpened) },
+		},
 	}
 	stopCliEv := startBlockingEvents(t, cliEv)
 	cli, err := cliEv.Adopt(rawNet, adoptOpts...)
@@ -123,6 +126,7 @@ func runBlockingPair(
 		stopEv()
 		t.Fatal(err)
 	}
+	<-cliOpened
 
 	return cli, func() {
 		_ = cli.Close()
@@ -615,4 +619,200 @@ func TestEventsBlockingWriteOptionFairnessTurnGuardAndDeadline(t *testing.T) {
 			}
 		})
 	}
+}
+
+type shortTestWriter struct{ max int }
+
+func (s shortTestWriter) Write(p []byte) (int, error) {
+	if s.max < 0 {
+		return -1, io.ErrShortWrite
+	}
+	if len(p) > s.max {
+		return s.max, nil
+	}
+	return len(p), nil
+}
+
+func TestBlockingAttachToClosingConnAndLayerWriteToContracts(t *testing.T) {
+	readDone := make(chan struct{})
+	srvEv := &Events{
+		Pollers:       1,
+		AllowHalfOpen: true,
+		Handler: FuncHandler{
+			Read: func(c Conn) error {
+				if c.InboundBuffered() == 0 {
+					return nil
+				}
+				if n, err := c.WriteTo(shortTestWriter{max: -1}); n != 0 || err == nil {
+					t.Errorf("negative layerNode.WriteTo = %d, %v", n, err)
+				}
+				if n, err := c.WriteTo(shortTestWriter{max: 2}); err != io.ErrShortWrite || n != 2 {
+					t.Errorf("short layerNode.WriteTo = %d, %v", n, err)
+				}
+				var rest bytes.Buffer
+				if _, err := c.WriteTo(&rest); err != nil {
+					t.Errorf("full layerNode.WriteTo = %v", err)
+				}
+				if n, err := c.WriteTo(io.Discard); n != 0 || err != nil {
+					t.Errorf("empty layerNode.WriteTo = %d, %v", n, err)
+				}
+				close(readDone)
+				return nil
+			},
+		},
+	}
+	stopSrv := startBlockingEvents(t, srvEv)
+	defer stopSrv()
+	ln, err := srvEv.Listen("tcp://127.0.0.1:0", WithLayers(PassThroughLayer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	cliEv := &Events{Pollers: 1, AllowHalfOpen: true}
+	stopCli := startBlockingEvents(t, cliEv)
+	defer stopCli()
+	cli, err := cliEv.Dial("tcp://"+ln.Addr().String(), WithLayers(PassThroughLayer))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bw, _ := NewBlockingWriter(cli)
+	_, _ = bw.WriteOwned(nil)
+	ob := AcquireBuffer(8)
+	_, _ = ob.WriteString("hello")
+	_, _ = bw.WriteOwned(ob)
+	<-readDone
+
+	_ = cli.Close()
+	// Attaching NewBlockingConn after local Close() on both layered & plain conns returns net.ErrClosed immediately!
+	bc, err := NewBlockingConn(cli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bc.Read(make([]byte, 8)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Read on pre-closed layered BlockingConn = %v, want net.ErrClosed", err)
+	}
+	if _, err := bc.Writer().WriteOwned(func() *Buffer { b := AcquireBuffer(4); _, _ = b.WriteString("x"); return b }()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("WriteOwned on pre-closed layered BlockingConn = %v", err)
+	}
+
+	plainCli, cleanupPlain := runBlockingPair(t, false, true, 0, 0, nil, func(c Conn) { _ = c.CloseWrite() })
+	defer cleanupPlain()
+	_ = plainCli.Close()
+	plainBC0, err := NewBlockingConn(plainCli)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = plainBC0.Read(make([]byte, 8))
+
+	plainCli2, cleanupPlain2 := runBlockingPair(t, false, true, 0, 0, nil, func(c Conn) { _ = c.CloseWrite() })
+	defer cleanupPlain2()
+	_ = plainCli2.Abort(errors.New("custom abort"))
+	plainBC, err := NewBlockingConn(plainCli2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := plainBC.Read(make([]byte, 8)); err == nil {
+		t.Fatal("Read on aborted plain BlockingConn succeeded")
+	}
+
+	// Exercise writeOwnedPreservePartial with nil, overflow, and partial-overflow layer!
+	var partialLayer LayerFunc = func(LayerContext) LayerHandler { return partialOverflowLayer{} }
+	pCli, cleanupPartial := runBlockingPair(t, false, true, 0, 0, nil, nil)
+	defer cleanupPartial()
+	_ = pCli
+	partialEv := &Events{Pollers: 1, Handler: FuncHandler{}}
+	_ = partialEv.initConfig()
+	tStack := contractStack(&contractTransport{}, FuncHandler{}, partialLayer.Attach(nil))
+	topNode := tStack.layers[0]
+	if n, err := topNode.writeOwnedPreservePartial(nil); n != 0 || err != nil {
+		t.Fatalf("nil writeOwnedPreservePartial = %d, %v", n, err)
+	}
+	pBuf := AcquireBuffer(16)
+	_, _ = pBuf.WriteString("0123456789")
+	if n, err := topNode.writeOwnedPreservePartial(pBuf); n != 4 || !errors.Is(err, ErrOutboundOverflow) || pBuf.Len() != 6 {
+		t.Fatalf("partial writeOwnedPreservePartial = %d, %v, rem=%d", n, err, pBuf.Len())
+	}
+	// Remaining 3 bytes fit <= 4 and consume pBuf!
+	pBuf.Discard(3)
+	if n, err := topNode.writeOwnedPreservePartial(pBuf); n != 3 || err != nil {
+		t.Fatalf("fit writeOwnedPreservePartial = %d, %v", n, err)
+	}
+	// Closed stack writeOwnedPreservePartial releases buffer and returns ErrClosed!
+	tStack.closed(nil)
+	tStack.closed(nil) // idempotent markClosed false branch
+	pBuf2 := AcquireBuffer(8)
+	_, _ = pBuf2.WriteString("xy")
+	if _, err := topNode.writeOwnedPreservePartial(pBuf2); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("closed writeOwnedPreservePartial = %v", err)
+	}
+
+	// dialProbe.fail(nil) defaults to net.ErrClosed and stack.closed(nil) forwards closeCause!
+	dp := &dialProbe{done: make(chan struct{})}
+	dp.fail(nil)
+	if !errors.Is(dp.err, net.ErrClosed) {
+		t.Fatalf("dialProbe.fail(nil) err = %v", dp.err)
+	}
+	unopenedStack := &stack{
+		socket: &contractTransport{state: StateReadEnded},
+		top:    FuncHandler{},
+		layers: []*layerNode{{conn: passThroughHandler{}}},
+	}
+	unopenedStack.layers[0].stack = unopenedStack
+	dp2 := &dialProbe{done: make(chan struct{})}
+	unopenedStack.probe.Store(dp2)
+	unopenedStack.recordCloseCause(io.ErrUnexpectedEOF)
+	if err := unopenedStack.endOfStream(false); !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("unopened endOfStream = %v, want ErrUnexpectedEOF", err)
+	}
+	unopenedStack.closed(nil)
+	if !errors.Is(dp2.err, io.ErrUnexpectedEOF) {
+		t.Fatalf("closed probe err = %v, want ErrUnexpectedEOF", dp2.err)
+	}
+
+	// Layered Close() followed immediately by Abort() cuts drain and notifies blockio.State!
+	cutStack := contractStack(&contractTransport{}, FuncHandler{}, passThroughHandler{})
+	cutTop := cutStack.layers[0]
+	_, _ = NewBlockingWriter(cutTop)
+	_ = cutTop.CloseWrite()
+	_ = cutTop.Close()
+	_ = cutTop.Abort(errors.New("cut drain"))
+
+	// Attaching blockio.State to a freshly closed stack (c.block == nil && c.over()) + reserveRefused isolation!
+	overStack := contractStack(&contractTransport{}, FuncHandler{}, passThroughHandler{})
+	overStack.limit = 16
+	overStack.enableWriteWatch()
+	_ = overStack.reserve(10)
+	if err := overStack.reserve(10); !errors.Is(err, ErrOutboundOverflow) || !overStack.reserveRefused.Load() {
+		t.Fatalf("concurrent reserve overflow = %v, reserveRefused=%v", err, overStack.reserveRefused.Load())
+	}
+	overStack.release(10)
+	if overStack.reserveRefused.Load() {
+		t.Fatal("release did not clear reserveRefused")
+	}
+	overStack.recordCloseCause(errors.New("already over"))
+	overStack.closed(errors.New("already over"))
+	if _, ok := (*layerNode)(nil).connBlockState(); ok {
+		t.Fatal("nil layerNode returned block state")
+	}
+	if _, ok := (blockControlGetter{}).GetBlockState("invalid"); ok {
+		t.Fatal("non-Conn returned block state")
+	}
+	if _, err := NewBlockingConn(overStack.layers[0]); err != nil {
+		t.Fatal(err)
+	}
+	sbs := stackBlockSource{top: overStack.layers[0]}
+	_ = sbs.MaxInbound()
+	_ = sbs.Wake()
+	_ = sbs.IsOverflow(ErrOutboundOverflow)
+}
+
+type partialOverflowLayer struct{ PassThrough }
+
+func (partialOverflowLayer) OnWrite(_ LayerContext, p []byte) (int, error) {
+	if len(p) > 4 {
+		return 4, ErrOutboundOverflow
+	}
+	return len(p), nil
 }

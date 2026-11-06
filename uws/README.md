@@ -136,15 +136,18 @@ for {
 `uws.Dial` uses `uws.DefaultDialer`, a default-options dialer that lives as
 long as the process. `Dialer.DialClient` is the same with a configured
 dialer, whose `Options.Handler` must be nil because the client owns the
-callbacks. A full message queue pauses the connection's reads — TCP flow
-control then slows the peer — so a client must either keep reading or be
-closed; `Client.Close` works either way. No message is dropped while the
-connection is open; one that arrives once this end has begun closing and finds
-the queue full is dropped rather than holding the close up. With a heartbeat
-configured, a client nobody reads keeps pinging and is closed once a Ping goes
-unanswered, its Pong stuck behind the unread messages. `ReadMessage` reports a
-`*uws.CloseError` after the connection ended and every message received
-before that was returned.
+callbacks (`uws.NewBlockingConn(conn)` upgrades an open server or client
+`*Conn` inside `OnOpen` or `OnMessage` into the same `*BlockingConn` / `*Client`
+synchronous endpoint, offering `ReadMessage`, zero-alloc `ReadMessageInto`, and
+backpressured `WriteText`/`WriteBinary`/`WriteMessage`/`Flush`). A full message
+queue pauses the connection's reads via `Conn.PauseRead` without blocking event
+turns — TCP flow control then slows the peer — so a client must either keep
+reading or be closed; `Client.Close` stops further intake immediately and
+completes the close handshake, while `ReadMessage` drains messages queued before
+the close and then reports `*uws.CloseError`. With a heartbeat configured, a
+paused client keeps pinging on its non-blocking turns and closes if a Ping goes
+unanswered. Calling blocking methods on an event-loop turn returns
+`ErrBlockingOnTurn`.
 
 The callback form, for one handler serving every connection a dialer makes:
 
@@ -362,7 +365,7 @@ peer's Close, and sends one as the connection closes from above; a dial
 returns once the handshake succeeded, and reports a refusal as a
 `*HandshakeError`. The protocol's settings are `Options`' own; the
 transport's — `Handler`, `Pollers`, `ReusePort`, `Executor`, `TLSConfig`,
-`MaxOutboundBuffered` — belong to the Events, and options that name them fail
+`MaxInboundBuffered`, `MaxOutboundBuffered` — belong to the Events, and options that name them fail
 every connection with `ErrInvalidOptions` (`LayerOptions.Validate` reports it
 up front). A client layer takes the URL its upgrade request names as
 `LayerOptions.Target`, one target per layer; a server layer refuses a Target.
@@ -376,9 +379,9 @@ For messages, keep to `Server` and `Dialer`.
   `SendBinary` without copying, for echoes.
 - **Accepted is not delivered.** A nil error from `SendText`, `SendBinary` or
   `Ping` means the message was queued in order, not that the peer has it.
-  Replies to a peer that stops reading pause this connection's reads; sends
-  from elsewhere are bounded only by `MaxOutboundBuffered`, past which they
-  return `ErrBackpressure`.
+  Outbound queues are bounded by `MaxOutboundBuffered`, past which non-blocking
+  sends return `ErrBackpressure` (while `BlockingConn.Write*` suspends off-turn
+  callers until space drains).
 - **State without locks.** The `Handler` callbacks of one connection never
   overlap, so state kept with `SetUserdata` needs no locking from them;
   `TrafficObserver.OnBytesWritten` is the exception, and it must only observe —

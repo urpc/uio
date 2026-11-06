@@ -410,7 +410,7 @@ func (kcp *KCP) Send(buffer []byte) int {
 		if n := kcp.snd_queue.Len(); n > 0 {
 			for ri := kcp.snd_queue.Len() - 1; ri >= 0; ri-- {
 				seg := kcp.snd_queue.At(ri)
-				if len(seg.data) < int(kcp.mss) {
+				if len(seg.data) > 0 && len(seg.data) < int(kcp.mss) {
 					capacity := int(kcp.mss) - len(seg.data)
 					extend := min(len(buffer), capacity)
 
@@ -520,6 +520,9 @@ func (kcp *KCP) parse_ack(sn uint32) {
 // parse_fastack increments the fast-ack counter for segments with sn < the given sn.
 // Returns 1 if any segment's fastack counter has reached the fast retransmit threshold.
 func (kcp *KCP) parse_fastack(sn, ts uint32) int {
+	if kcp.fastresend <= 0 {
+		return 0
+	}
 	diff := _itimediff(sn, kcp.snd_una)
 	if diff <= 0 || _itimediff(sn, kcp.snd_nxt) >= 0 {
 		return 0
@@ -661,7 +664,7 @@ func (kcp *KCP) inputCore(data []byte, pktType PacketType) (flushSegments int, r
 			kcp.debugLog(IKCP_LOG_INPUT, "conv", conv, "cmd", cmd, "frg", frg, "wnd", wnd, "ts", ts, "sn", sn, "una", una, "len", length, "datalen", len(data))
 		}
 
-		if len(data) < int(length) {
+		if len(data) < int(length) || int(length) > mtuLimit {
 			return flushSegments, -2
 		}
 
@@ -932,7 +935,7 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 					segment.rto = kcp.rx_rto
 					segment.resendts = current + segment.rto
 					change++
-				} else if segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 {
+				} else if kcp.fastresend > 0 && segment.fastack > 0 && segment.fastack != 0xFFFFFFFF && newSegsCount == 0 {
 					needsend = true
 					segment.fastack = 0xFFFFFFFF
 					segment.rto = kcp.rx_rto
@@ -1026,7 +1029,9 @@ func (kcp *KCP) transmitSegment(buffer, ptr []byte, segment *segment, current ui
 // and returns where to write next. A method, as TinyGo heap-allocates closures.
 func (kcp *KCP) makeSpace(buffer, ptr []byte, space int) []byte {
 	if size := len(buffer) - len(ptr); size+space > int(kcp.mtu) {
-		kcp.output(buffer, size)
+		if size > 0 {
+			kcp.output(buffer, size)
+		}
 		return buffer
 	}
 	return ptr
@@ -1095,6 +1100,9 @@ func (kcp *KCP) Check() uint32 {
 	for ri := 0; ri < kcp.snd_buf.Len(); ri++ {
 
 		seg := kcp.snd_buf.At(ri)
+		if seg.acked == 1 {
+			continue
+		}
 		diff := _itimediff(seg.resendts, current)
 		if diff <= 0 {
 			return current
@@ -1117,7 +1125,7 @@ func (kcp *KCP) Check() uint32 {
 
 // SetMtu changes MTU size, default is 1400
 func (kcp *KCP) SetMtu(mtu int) int {
-	if mtu <= IKCP_OVERHEAD {
+	if mtu <= IKCP_OVERHEAD || mtu > mtuLimit {
 		return -1
 	}
 

@@ -16,6 +16,8 @@
 
 package pool
 
+import "math/bits"
+
 const (
 	bitsize       = 32 << (^uint(0) >> 63)
 	maxint        = int(1<<(bitsize-1) - 1)
@@ -71,13 +73,10 @@ func FloorToPowerOfTwo(n int) int {
 }
 
 func fillBits(n int) int {
-	n |= n >> 1
-	n |= n >> 2
-	n |= n >> 4
-	n |= n >> 8
-	n |= n >> 16
-	n |= n >> 32
-	return n
+	if n <= 0 {
+		return 0
+	}
+	return int((uint(1) << bits.Len(uint(n))) - 1)
 }
 
 func Max(a, b int) int {

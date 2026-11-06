@@ -277,10 +277,20 @@ func TestUmuxConfigBlockingWriteOption(t *testing.T) {
 		BlockingWrite: true,
 		Handler: uio.FuncHandler{
 			Open: func(c uio.Conn) {
-				// On-turn overflow (> 256 KiB window) MUST return ErrOutboundOverflow without deadlocking!
-				_, err := c.Write(make([]byte, 512<<10))
-				onTurnOverflow <- err
-				srvStreamCh <- c.(*Stream)
+				st := c.(*Stream)
+				if st.ID() == 1 {
+					// Calling Open or Shutdown on this session's own turn returns ErrBlockingOnTurn!
+					if _, oerr := st.sess.Open(context.Background()); !errors.Is(oerr, uio.ErrBlockingOnTurn) {
+						t.Errorf("own-turn Open = %v", oerr)
+					}
+					if serr := st.sess.Shutdown(context.Background()); !errors.Is(serr, uio.ErrBlockingOnTurn) {
+						t.Errorf("own-turn Shutdown = %v", serr)
+					}
+					// On-turn overflow (> 256 KiB window) MUST return ErrOutboundOverflow without deadlocking!
+					_, err := c.Write(make([]byte, 512<<10))
+					onTurnOverflow <- err
+					srvStreamCh <- st
+				}
 			},
 		},
 	})
@@ -359,5 +369,41 @@ func TestUmuxConfigBlockingWriteOption(t *testing.T) {
 	want := bytes.Join([][]byte{p1, p2, p3}, nil)
 	if !bytes.Equal(got, want) {
 		t.Fatalf("umux BlockingWrite received %d bytes, want %d", len(got), len(want))
+	}
+
+	// Verify Stream.Close() wakes parked BlockingConn.Read immediately and Session.Open/Shutdown reject own-turn!
+	st2, err := cliSess.Open(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	bc2, err := uio.NewBlockingConn(st2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	readErrCh := make(chan error, 1)
+	go func() {
+		_, rerr := bc2.Read(make([]byte, 16))
+		readErrCh <- rerr
+	}()
+	time.Sleep(15 * time.Millisecond)
+	if err := bc2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rerr := <-readErrCh:
+		if !errors.Is(rerr, net.ErrClosed) {
+			t.Fatalf("parked Read after Stream.Close = %v, want net.ErrClosed", rerr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Stream.Close did not wake parked BlockingConn.Read")
+	}
+
+	// Attaching NewBlockingConn to an already-closed Stream immediately observes close!
+	bcClosed, err := uio.NewBlockingConn(st2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bcClosed.Read(make([]byte, 8)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("pre-closed Stream BlockingConn.Read = %v, want net.ErrClosed", err)
 	}
 }

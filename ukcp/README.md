@@ -145,7 +145,7 @@ with `ErrInvalidOptions`, since under a layer they would be silently inert.
 | `KeepAlive` | 10 s | An idle session probes the peer's window this often; silence for three periods ends it with `ErrKeepAliveTimeout`. A negative value disables keepalive. |
 | `MaxBuffered` | 4 MiB | Bytes a session holds for the writer; a write past it returns `ErrOutboundOverflow`. |
 | `Handler` | none | The connection callbacks. Required by `Server` and `Dialer`; a layer hands its stream to the layer above instead, and refuses Handler. |
-| `Transport` | zero (`TransportOptions{}`) | Configures the private `uio.Events` of a standalone `Server` or `Dialer` (`ReadBufferSize`, `WriteBufferedThreshold`, `MaxOutboundBuffered`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`). |
+| `Transport` | zero (`TransportOptions{}`) | Configures the private `uio.Events` of a standalone `Server` or `Dialer` (`ReadBufferSize`, `WriteBufferedThreshold`, `MaxOutboundBuffered`, `BlockingWrite`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`). |
 | `SocketReadBuffer` / `SocketWriteBuffer` | 4 MiB | Kernel socket buffers the standalone endpoints size their UDP sockets with. A session bursts a whole window and the kernel default — a few hundred KiB — drops much of it; a negative value leaves the socket alone. A layer endpoint sizes its own sockets with `uio.WithListenControl` and `uio.WithDialControl`. |
 
 Invalid combinations — an MTU past the engine's buffers, a window past 65535, an

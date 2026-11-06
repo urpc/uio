@@ -853,13 +853,20 @@ func (c *Conn) flushLocked() error {
 	return c.flush()
 }
 
+// flushAll hands any batched frames to the transport and flushes the transport.
+func (c *Conn) flushAll() error {
+	c.writes.mu.Lock()
+	err := c.flushLocked()
+	c.unlockWrite()
+	return err
+}
+
 // beginWriteBatch makes the small frames sent from now on join the write
-// batch until the read round ends. Only the connection's own read path calls
-// it, and only the round writes the round word, so a plain load sees whether
-// this round already did and a store keeps the round's mark.
+// batch until the read round ends. Atomic Or preserves concurrent flags such as
+// roundDeferredClose set by Conn.Close.
 func (c *Conn) beginWriteBatch() {
-	if round := c.round.Load(); round&roundBatching == 0 {
-		c.round.Store(round | roundBatching)
+	if c.round.Load()&roundBatching == 0 {
+		c.round.Or(roundBatching)
 	}
 }
 

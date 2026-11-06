@@ -26,6 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/petermattis/goid"
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/internal/writecontrol"
 )
@@ -107,6 +108,7 @@ type Session struct {
 	// they are notified outside the session lock.
 	hasDrained atomic.Bool
 	drained    []*Stream
+	turnGoid   atomic.Int64 // goroutine ID of this session's active transport turn
 	// closeQ carries stream closes waiting for the transport turn; the
 	// handler's callbacks for one stream never run concurrently, so an
 	// Abort from another goroutine is delivered there.
@@ -228,6 +230,9 @@ func (s *Session) OpenWith(ctx context.Context, metadata []byte) (*Stream, error
 }
 
 func (s *Session) open(ctx context.Context, metadata []byte) (*Stream, error) {
+	if s.onOwnTurn() {
+		return nil, uio.ErrBlockingOnTurn
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -296,9 +301,19 @@ func (s *Session) open(ctx context.Context, metadata []byte) (*Stream, error) {
 
 // ------------------------------------------------------------------ inbound
 
+func (s *Session) enterOwnTurn() { s.turnGoid.Store(goid.Get()) }
+func (s *Session) leaveOwnTurn() { s.turnGoid.Store(0) }
+
+func (s *Session) onOwnTurn() bool {
+	owner := s.turnGoid.Load()
+	return owner != 0 && owner == goid.Get()
+}
+
 // onRead parses every complete frame buffered on the transport and dispatches
 // it. It runs on the transport's turn.
 func (s *Session) onRead(c uio.Conn) error {
+	s.enterOwnTurn()
+	defer s.leaveOwnTurn()
 	s.flushReq.Store(false)
 	if s.heldReads() {
 		// The session is over its receive budget: the transport's bytes stay
@@ -822,12 +837,7 @@ func (s *Session) enqueue(st *Stream, frame *uio.Buffer) bool {
 func (s *Session) flush() {
 	s.mu.Lock()
 	err := s.flushLocked()
-	finFlushed := s.finFlushed
-	s.finFlushed = nil
 	s.mu.Unlock()
-	for _, st := range finFlushed {
-		s.tryFinish(st)
-	}
 	s.emitDrained()
 	if err != nil {
 		_ = s.conn.Abort(err)
@@ -886,12 +896,21 @@ func (s *Session) emitDrained() {
 	s.mu.Lock()
 	drained := s.drained
 	s.drained = nil
+	finFlushed := s.finFlushed
+	s.finFlushed = nil
+	moreQueued := !s.closed && (len(s.control) > 0 || len(s.pending) > 0)
 	s.hasDrained.Store(false)
 	s.mu.Unlock()
+	for _, st := range finFlushed {
+		s.tryFinish(st)
+	}
 	for _, st := range drained {
 		if ctrl := st.writeControl.Load(); ctrl != nil {
 			ctrl.Notify(0)
 		}
+	}
+	if moreQueued {
+		s.requestFlush()
 	}
 }
 
@@ -987,6 +1006,7 @@ func (s *Session) flushLocked() error {
 			st.queued = false
 			st.finState = finSent
 			s.finFlushed = append(s.finFlushed, st)
+			s.hasDrained.Store(true)
 			continue
 		}
 		frame := st.out[0]
@@ -1009,6 +1029,9 @@ func (s *Session) flushLocked() error {
 			// Rotate: move this stream to the back of the queue.
 			s.pending = append(s.pending[1:], id)
 		}
+	}
+	if len(s.control) > 0 || len(s.pending) > 0 {
+		s.hasDrained.Store(true)
 	}
 	return nil
 }

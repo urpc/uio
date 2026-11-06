@@ -70,6 +70,8 @@ func (s *Session) queuePending(id uint32) {
 // onTimer fires due stream timers, open and half-close timeouts, and the
 // keepalive. It runs on the transport's turn.
 func (s *Session) onTimer(c uio.Conn) error {
+	s.enterOwnTurn()
+	defer s.leaveOwnTurn()
 	s.timerMu.Lock()
 	s.armedAt = time.Time{} // the armed wake just fired
 	s.timerMu.Unlock()
@@ -142,6 +144,7 @@ func (s *Session) onTimer(c uio.Conn) error {
 	err := s.flushLocked()
 	handler := s.cfg.Handler
 	s.mu.Unlock()
+	s.emitDrained()
 
 	// The timed-out streams and their waiters left the tables above, so the
 	// transport's close path will never find them: release them here, before

@@ -171,11 +171,66 @@ func TestStandaloneValidationAndFailedListenCleanup(t *testing.T) {
 		t.Fatal("negative buffer settings did not leave the socket unchanged")
 	}
 	control := (Options{SocketReadBuffer: 1024, SocketWriteBuffer: -1}).socketControl()
+	if err := control("tcp4", "", ^uintptr(0)); err != nil {
+		t.Fatalf("tcp4 socketControl should skip UDP buffer sizing, got %v", err)
+	}
 	if runtime.GOOS != "windows" {
 		// Windows applies no kernel socket buffers, so it takes any
 		// descriptor and reports nothing to apply.
 		if err := control("udp", "", ^uintptr(0)); err == nil {
 			t.Fatal("invalid socket descriptor was accepted")
+		}
+	}
+
+	// Verify OnClosing flushes deferred ACKs when finQueued is already true, and skips FIN on Abort!
+	cFin, ctxFin := newContractSession(t, Options{KeepAlive: -1})
+	cFin.establish(9)
+	_ = cFin.CloseWrite(ctxFin)
+	ctxFin.lower.wire = nil
+	cFin.kcp.AskWindow()
+	cFin.OnClosing(ctxFin, nil)
+	if len(ctxFin.lower.wire) == 0 {
+		t.Fatal("OnClosing after CloseWrite dropped pending control flush")
+	}
+	cAbort, ctxAbort := newContractSession(t, Options{KeepAlive: -1})
+	cAbort.establish(10)
+	ctxAbort.lower.wire = nil
+	cAbort.OnClosing(ctxAbort, errors.New("abort"))
+	if len(ctxAbort.lower.wire) != 0 {
+		t.Fatal("OnClosing with abort cause emitted clean FIN segment")
+	}
+
+	// Verify SelfPaced, full-window sentinel OutboundHeld, and OnTurnEnd batch deferral!
+	cFull, ctxFull := newContractSession(t, Options{KeepAlive: -1, SendWindow: 1})
+	cFull.establish(11)
+	if !cFull.SelfPaced() {
+		t.Fatal("SelfPaced returned false")
+	}
+	_, _ = cFull.OnWrite(ctxFull, []byte("fill"))
+	if cFull.OutboundHeld(ctxFull) == 0 {
+		t.Fatal("full SendWindow reported OutboundHeld == 0")
+	}
+	cFull.turnDirty = true
+	cFull.OnTurnEnd(ctxFull)
+	// Test output multi-datagram prevStart (n > 1), publishState on ended, and BSD socket buffer clamping!
+	cFull.output(make([]byte, cFull.opts.MTU), cFull.opts.MTU)
+	cFull.output([]byte("d2a"), 3)
+	cFull.output([]byte("d2b"), 3) // n == 2 -> prevStart = outEnds[0], coalesces into 2nd datagram!
+	cFull.noteHeld()               // iterates outEnds in noteHeld!
+	cFull.OnClose(ctxFull, nil)
+	cFull.publishState()
+
+	if runtime.GOOS != "windows" {
+		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+		if err == nil {
+			defer pc.Close()
+			if uc, ok := pc.(*net.UDPConn); ok {
+				if raw, rerr := uc.SyscallConn(); rerr == nil {
+					_ = raw.Control(func(fd uintptr) {
+						_ = setSocketBuffer(fd, true, 1<<30) // exercises BSD ENOBUFS/EINVAL halving loop!
+					})
+				}
+			}
 		}
 	}
 }

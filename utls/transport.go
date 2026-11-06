@@ -17,9 +17,12 @@
 package utls
 
 import (
+	"errors"
 	"io"
 	"net"
 	"time"
+
+	"github.com/urpc/uio"
 )
 
 // transport is what crypto/tls reads and writes the connection through. To
@@ -98,10 +101,29 @@ func (t *transport) serveLocked(p []byte) int {
 // crypto/tls reuses its buffer for the next record. A close this end asked
 // for still sends its goodbye out; only a connection that is gone refuses.
 func (t *transport) Write(p []byte) (int, error) {
-	if t.c.isGone() {
+	c := t.c
+	if c.isGone() {
 		return 0, errClosed
 	}
-	if _, err := t.c.ctx.Lower().Write(p); err != nil {
+	c.outMu.Lock()
+	defer c.outMu.Unlock()
+	if len(c.outPending) > 0 {
+		if err := c.flushOutPendingLocked(); err != nil {
+			return 0, err
+		}
+		if len(c.outPending) > 0 {
+			c.outPending = append(c.outPending, p...)
+			c.outHeld.Store(int64(len(c.outPending)))
+			return len(p), nil
+		}
+	}
+	n, err := c.ctx.Lower().Write(p)
+	if err != nil {
+		if errors.Is(err, uio.ErrOutboundOverflow) {
+			c.outPending = append(c.outPending, p[n:]...)
+			c.outHeld.Store(int64(len(c.outPending)))
+			return len(p), nil
+		}
 		return 0, err
 	}
 	return len(p), nil

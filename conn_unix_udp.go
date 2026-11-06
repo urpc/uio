@@ -212,12 +212,17 @@ func (conn *fdConn) handleUDPPacketCached(packet []byte, source socket.UDPAddres
 	packetConn.udp.moreInBatch = more
 	packetConn.inboundTail = packet
 	packetConn.events().onSocketBytesRead(packetConn, len(packet))
-	err := packetConn.fireOnRead()
-	started := packetConn.beginInboundCallback()
-	_, _ = packetConn.Discard(-1)
-	packetConn.endInboundCallback(started)
-	packetConn.inboundTail = nil
-	packetConn.udp.moreInBatch = false
+	var err error
+	func() {
+		defer func() {
+			started := packetConn.beginInboundCallback()
+			_, _ = packetConn.Discard(-1)
+			packetConn.endInboundCallback(started)
+			packetConn.inboundTail = nil
+			packetConn.udp.moreInBatch = false
+		}()
+		err = packetConn.fireOnRead()
+	}()
 	if err != nil {
 		packetConn.requestClose(err)
 		return nil, socket.UDPAddress{}

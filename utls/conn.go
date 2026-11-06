@@ -18,10 +18,12 @@ package utls
 
 import (
 	stdtls "crypto/tls"
+	"errors"
 	"io"
 	"iter"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio"
@@ -65,12 +67,20 @@ type conn struct {
 	transportClosed bool // crypto/tls closed the transport
 	readEnded       bool // the peer's close_notify or a read failure
 	lowerEnded      bool // the stream below ended; read below it reports io.EOF
+
+	// outMu and outPending stage encrypted TLS records when a windowed lower
+	// layer (such as ukcp) transiently returns uio.ErrOutboundOverflow, keeping
+	// crypto/tls AEAD sequence numbers intact instead of poisoning c.tls.out.
+	outMu      sync.Mutex
+	outPending []byte
+	outHeld    atomic.Int64
 }
 
 var (
 	_ uio.LayerHandler                     = (*conn)(nil)
 	_ uio.CloseWriter                      = (*conn)(nil)
 	_ uio.LayerCloser                      = (*conn)(nil)
+	_ uio.OutboundHolder                   = (*conn)(nil)
 	_ interface{ State() ConnectionState } = (*conn)(nil)
 )
 
@@ -157,6 +167,9 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 		// apply. Taking less than all of it, the turn calls again once the
 		// handshake read this.
 		chunk := lower.PeekChunk()
+		if len(chunk) == 0 {
+			c.noteLowerEndLocked(lower)
+		}
 		bound := max(c.stagingBound(), handshakeTakeFloor)
 		if room := bound - (len(c.pending) - c.readAt); len(chunk) > room {
 			chunk = chunk[:max(room, 0)]
@@ -172,7 +185,9 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 			// The chunk held the stream's end: read it out now, on the turn
 			// that saw it, not on one that may never come.
 			if waiting {
-				_ = ctx.Wake() // the coroutine suspended: resume it on the end
+				if _, waiting = resume(); !waiting {
+					c.settle(ctx)
+				}
 			} else if err := c.pump(ctx); err != nil {
 				_ = ctx.Abort(err)
 			}
@@ -311,13 +326,64 @@ func (c *conn) OnClose(uio.LayerContext, error) {
 	stop := c.stop
 	c.resume, c.stop, c.yield = nil, nil, nil
 	c.mu.Unlock()
+	c.outMu.Lock()
+	c.outPending = nil
+	c.outHeld.Store(0)
+	c.outMu.Unlock()
 	if stop != nil {
 		stop() // a handshake waiting for data ends with the connection
 	}
 }
 
+func (c *conn) OutboundHeld(uio.LayerContext) int {
+	return int(c.outHeld.Load())
+}
+
+func (c *conn) OnTurnEnd(uio.LayerContext) {
+	if c.outHeld.Load() > 0 {
+		_ = c.flushOutPending()
+	}
+}
+
+func (c *conn) flushOutPending() error {
+	c.outMu.Lock()
+	defer c.outMu.Unlock()
+	return c.flushOutPendingLocked()
+}
+
+func (c *conn) flushOutPendingLocked() error {
+	for len(c.outPending) > 0 {
+		n, err := c.ctx.Lower().Write(c.outPending)
+		if n > 0 {
+			n = copy(c.outPending, c.outPending[n:])
+			c.outPending = c.outPending[:n]
+			c.outHeld.Store(int64(len(c.outPending)))
+		}
+		if err != nil {
+			if errors.Is(err, uio.ErrOutboundOverflow) {
+				return nil
+			}
+			c.outPending = nil
+			c.outHeld.Store(0)
+			return err
+		}
+	}
+	if cap(c.outPending) > 64<<10 {
+		c.outPending = nil
+	}
+	return nil
+}
+
 // OnWrite encrypts what the layer above writes, from any goroutine.
 func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
+	if c.outHeld.Load() > 0 {
+		if err := c.flushOutPending(); err != nil {
+			return 0, err
+		}
+		if c.outHeld.Load() > 0 {
+			return 0, uio.ErrOutboundOverflow
+		}
+	}
 	engine, err := c.engine()
 	if err != nil {
 		return 0, err
@@ -327,20 +393,30 @@ func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 
 // OnClosing sends the peer close_notify, once what was accepted has left, as
 // the layer above closes the connection.
-func (c *conn) OnClosing(uio.LayerContext, error) {
-	if engine, err := c.engine(); err == nil {
-		_ = engine.Close()
+func (c *conn) OnClosing(_ uio.LayerContext, cause error) {
+	if cause == nil || errors.Is(cause, io.EOF) {
+		_ = c.flushOutPending()
+		if engine, err := c.engine(); err == nil {
+			_ = engine.Close()
+		}
+		_ = c.flushOutPending()
 	}
 }
 
 // CloseWrite sends close_notify one way, then shuts the socket's writing
 // half behind it: the peer's reads end, this end's go on.
 func (c *conn) CloseWrite(ctx uio.LayerContext) error {
+	if err := c.flushOutPending(); err != nil {
+		return err
+	}
 	engine, err := c.engine()
 	if err != nil {
 		return err
 	}
 	if err := engine.CloseWrite(); err != nil {
+		return err
+	}
+	if err := c.flushOutPending(); err != nil {
 		return err
 	}
 	return ctx.Lower().CloseWrite()

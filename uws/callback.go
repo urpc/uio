@@ -16,12 +16,16 @@
 
 package uws
 
+import "github.com/petermattis/goid"
+
 // UIO connection tasks serialize the complete protocol and application
 // callback path for one connection. UWS therefore invokes handlers directly:
 // no second mailbox, payload copy, or runner state is required here.
 func (c *Conn) notifyOpen() {
 	state := c.handshake.Load()
 	defer c.releaseHandshakeState(state)
+	c.turnGoid.Store(goid.Get())
+	defer c.turnGoid.Store(0)
 	if handler := c.handler; handler != nil {
 		handler.OnOpen(c)
 	}
@@ -36,6 +40,10 @@ func (c *Conn) notifyMessage(message Message) error {
 		// round keeps consuming so the peer's Close completes the handshake.
 		return nil
 	}
+	if c.hasBlocking {
+		c.deliverBlocking(message)
+		return nil
+	}
 	if handler := c.handler; handler != nil {
 		handler.OnMessage(c, message)
 	}
@@ -43,7 +51,20 @@ func (c *Conn) notifyMessage(message Message) error {
 }
 
 func (c *Conn) notifyClose(info CloseEvent) {
+	if m := c.metadata.Load(); m != nil {
+		if bc := m.blocking.Load(); bc != nil {
+			bc.onConnClose(info)
+		}
+	}
 	if handler := c.handler; handler != nil {
 		handler.OnClose(c, info)
+	}
+}
+
+func (c *Conn) deliverBlocking(message Message) {
+	if m := c.metadata.Load(); m != nil {
+		if bc := m.blocking.Load(); bc != nil {
+			bc.enqueue(c, message)
+		}
 	}
 }

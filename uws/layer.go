@@ -291,6 +291,9 @@ func (w *wsLayerHandler) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 			part = part[:most]
 		}
 		if err := conn.SendBinary(part); err != nil {
+			if errors.Is(err, ErrBackpressure) {
+				err = uio.ErrOutboundOverflow
+			}
 			return sent, err
 		}
 		sent += len(part)

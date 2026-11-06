@@ -556,16 +556,8 @@ func (st *Stream) WriteTo(w io.Writer) (int64, error) {
 // window is exhausted it returns ErrOutboundOverflow; writers retry once the
 // peer's WindowUpdate wakes the stream.
 func (st *Stream) Write(p []byte) (int, error) {
-	if st.sess.cfg.BlockingWrite {
-		if st.hasWaitingBlockWriter() && !blockio.OnTurn() {
-			return st.ensureBlockWriter().Write(p)
-		}
-		n, err := st.writeNonBlocking(p)
-		if errors.Is(err, uio.ErrOutboundOverflow) && !blockio.OnTurn() {
-			n2, err2 := st.ensureBlockWriter().Write(p[n:])
-			return n + n2, err2
-		}
-		return n, err
+	if st.sess.cfg.BlockingWrite && !blockio.OnTurn() {
+		return st.ensureBlockWriter().Write(p)
 	}
 	return st.writeNonBlocking(p)
 }
@@ -678,15 +670,8 @@ func (st *Stream) writevNonBlocking(vec [][]byte) (int, error) {
 }
 
 func (st *Stream) WriteOwned(buffer *uio.Buffer) (int, error) {
-	if buffer != nil && st.sess.cfg.BlockingWrite {
-		if st.hasWaitingBlockWriter() && !blockio.OnTurn() {
-			return st.ensureBlockWriter().WriteOwned(buffer)
-		}
-		n, err := st.writeOwnedNonBlocking(buffer)
-		if errors.Is(err, uio.ErrOutboundOverflow) && !blockio.OnTurn() {
-			return st.ensureBlockWriter().WriteOwned(buffer)
-		}
-		return n, err
+	if buffer != nil && st.sess.cfg.BlockingWrite && !blockio.OnTurn() {
+		return st.ensureBlockWriter().WriteOwned(buffer)
 	}
 	return st.writeOwnedNonBlocking(buffer)
 }
@@ -783,6 +768,9 @@ func (st *Stream) CloseWrite() error {
 	st.mu.Unlock()
 	st.sess.enqueueFin(st)
 	st.wmu.Unlock()
+	if ctrl := st.writeControl.Load(); ctrl != nil {
+		ctrl.Notify(0)
+	}
 	st.sess.requestFlush()
 	st.sess.tryFinish(st)
 	st.sess.rearmTimer()
@@ -791,14 +779,15 @@ func (st *Stream) CloseWrite() error {
 
 // Close closes the stream gracefully, draining queued data first.
 func (st *Stream) Close() error {
-	st.localClosed.Store(true)
+	already := st.localClosed.Swap(true)
 	st.mu.Lock()
-	if st.closedLocal {
+	if already || st.closedLocal {
 		st.mu.Unlock()
 		return net.ErrClosed
 	}
 	st.closedErr = nil
 	st.mu.Unlock()
+	st.notifyBlockClose(net.ErrClosed)
 	return st.CloseWrite()
 }
 

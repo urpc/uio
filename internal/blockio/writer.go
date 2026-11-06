@@ -126,8 +126,8 @@ func (w *Writer) Flush() error {
 	if OnTurn() {
 		return ErrBlockingOnTurn
 	}
-	w.wmu.Lock()
-	defer w.wmu.Unlock()
+	w.enterWrite()
+	defer w.leaveWrite()
 
 	if err := w.src.Flush(); err != nil {
 		return w.resolveWriteErr(err)
@@ -266,18 +266,28 @@ func (w *Writer) writeLocked(p []byte) (int, error) {
 		if buffered := w.src.OutboundBuffered(); buffered < limit {
 			room := limit - buffered
 			chunk := p[written : written+min(len(p)-written, room)]
-			n, err := w.src.Write(chunk)
-			written += n
-			if n > 0 && (err == nil || w.src.IsOverflow(err)) {
-				w.waiter.cancelPrepare()
-				continue
-			}
-			if err != nil && !w.src.IsOverflow(err) {
-				w.waiter.cancelPrepare()
-				return written, w.resolveWriteErr(err)
+			for {
+				n, err := w.src.Write(chunk)
+				written += n
+				if n > 0 && (err == nil || w.src.IsOverflow(err)) {
+					w.waiter.cancelPrepare()
+					goto nextWrite
+				}
+				if err != nil && !w.src.IsOverflow(err) {
+					w.waiter.cancelPrepare()
+					return written, w.resolveWriteErr(err)
+				}
+				// If a lower layer enforces a smaller per-write cap than w.window()
+				// on an empty queue, halve chunk until it fits!
+				if buffered == 0 && len(chunk) > 1 {
+					chunk = chunk[:len(chunk)/2]
+					continue
+				}
+				break
 			}
 		}
 		w.waiter.wait(tok)
+	nextWrite:
 	}
 	return written, nil
 }
@@ -295,20 +305,20 @@ func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 	}
 	w.enterWrite()
 	defer w.leaveWrite()
-	n, err := w.writeOwnedPreserveLocked(buf)
-	if err != nil && buf.Len() > 0 {
+	n, retained, err := w.writeOwnedPreserveLocked(buf)
+	if retained {
 		bytebuf.ReleaseBuffer(buf)
 	}
 	return n, err
 }
 
-func (w *Writer) writeOwnedPreserveOnAbort(buf *bytebuf.Buffer) (int, error) {
+func (w *Writer) writeOwnedPreserveOnAbort(buf *bytebuf.Buffer) (int, bool, error) {
 	w.enterWrite()
 	defer w.leaveWrite()
 	return w.writeOwnedPreserveLocked(buf)
 }
 
-func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, error) {
+func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, bool, error) {
 	size := buf.Len()
 	if size > w.window() {
 		n, err := w.writeLocked(buf.Bytes())
@@ -317,30 +327,45 @@ func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, error) {
 		}
 		if buf.Len() == 0 {
 			bytebuf.ReleaseBuffer(buf)
+			return n, false, err
 		}
-		return n, err
+		return n, true, err
 	}
 	for {
 		tok := w.waiter.prepare()
 		if err := w.terminalErr(); err != nil {
 			w.waiter.cancelPrepare()
-			return 0, err
+			return 0, true, err
 		}
 		if err := w.waiter.checkDeadline(); err != nil {
 			w.waiter.cancelPrepare()
-			return 0, err
+			return 0, true, err
 		}
 		limit := w.window()
 		if buffered := w.src.OutboundBuffered(); buffered == 0 || buffered+size <= limit {
 			n, err := w.src.WriteOwned(buf)
 			if err == nil {
 				w.waiter.cancelPrepare()
-				return n, nil
+				return n, false, nil
 			}
 			if !w.src.IsOverflow(err) {
 				w.waiter.cancelPrepare()
-				buf.Reset()
-				return n, w.resolveWriteErr(err)
+				// w.src.WriteOwned already released buf on non-overflow errors!
+				return n, false, w.resolveWriteErr(err)
+			}
+			// If even an empty queue refused buf (lower layer MaxBuffered < buf.Len()),
+			// fall back to chunked writeLocked so it never hangs!
+			if buffered == 0 && buf.Len() > 1 {
+				w.waiter.cancelPrepare()
+				nw, werr := w.writeLocked(buf.Bytes())
+				if nw > 0 {
+					buf.Discard(nw)
+				}
+				if buf.Len() == 0 {
+					bytebuf.ReleaseBuffer(buf)
+					return n + nw, false, werr
+				}
+				return n + nw, true, werr
 			}
 		}
 		w.waiter.wait(tok)
@@ -373,8 +398,8 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 		nr, rerr := r.Read(buf.AvailableBuffer()[:chunkCap])
 		if nr > 0 {
 			buf.CommitWrite(nr)
-			nw, werr := w.writeOwnedPreserveLocked(buf)
-			if werr != nil && buf.Len() > 0 {
+			nw, retained, werr := w.writeOwnedPreserveLocked(buf)
+			if retained {
 				bytebuf.ReleaseBuffer(buf)
 			}
 			total += int64(nw)

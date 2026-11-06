@@ -707,3 +707,36 @@ func writeUntilStalled(t *testing.T, conn net.Conn, total int) int {
 	_ = conn.SetWriteDeadline(time.Time{})
 	return sent
 }
+
+func TestBridgeUnsupportedCloseWriteKeepsReverseAndClosesOnEnd(t *testing.T) {
+	a := newBridgeOwnedConn(nil)
+	a.inbound = []byte("req")
+	a.state.Store(uint32(uio.StateReadEnded))
+	b := newBridgeOwnedConn(nil)
+	b.writeCloseError = uio.ErrUnsupported
+
+	br := &Bridge{}
+	if err := br.Pair(a, b); err != nil {
+		t.Fatal(err)
+	}
+	// OnRead forwarding EOF to a non-CloseWriter leg must NOT abort with ErrUnsupported!
+	if err := br.OnRead(a); err != nil {
+		t.Fatalf("OnRead with ErrUnsupported CloseWrite = %v, want nil", err)
+	}
+	if b.gracefulCloses.Load() != 0 {
+		t.Fatal("non-CloseWriter leg closed prematurely during half-open OnRead")
+	}
+	// OnClose(nil) falls back to peer.Close() when CloseWrite returns ErrUnsupported!
+	br.OnClose(a, io.EOF)
+	if b.gracefulCloses.Load() != 1 {
+		t.Fatal("OnClose did not call Close() when CloseWrite returned ErrUnsupported")
+	}
+
+	// Pairing with an already-closed peer returns ErrPeerGone cleanly!
+	dead := newBridgeOwnedConn(nil)
+	dead.state.Store(uint32(uio.StateClosed))
+	live := newBridgeOwnedConn(nil)
+	if err := br.Pair(live, dead); !errors.Is(err, ErrPeerGone) {
+		t.Fatalf("Pair with closed conn = %v, want ErrPeerGone", err)
+	}
+}

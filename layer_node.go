@@ -42,6 +42,7 @@ type layerOps struct {
 	closeWriter func(LayerContext) error  // CloseWriter
 	held        func(LayerContext) int    // OutboundHolder
 	turnEnd     func(LayerContext)        // post-turn piggyback/batch flush
+	selfPaced   bool                      // ARQ layer (e.g. ukcp) manages its own receive window
 }
 
 // opsOf resolves a LayerHandler's optional interfaces.
@@ -58,6 +59,9 @@ func opsOf(h LayerHandler) layerOps {
 	}
 	if finisher, ok := h.(interface{ OnTurnEnd(LayerContext) }); ok {
 		ops.turnEnd = finisher.OnTurnEnd
+	}
+	if sp, ok := h.(interface{ SelfPaced() bool }); ok && sp.SelfPaced() {
+		ops.selfPaced = true
 	}
 	return ops
 }
@@ -92,6 +96,7 @@ type layerNode struct {
 	writers     atomic.Int32
 	stalled     atomic.Bool // the layer stopped short; see Upper.Yield
 	paced       atomic.Bool // a full delivery kept the layer from running; the read above wakes it
+	unpaced     atomic.Bool // roomMade released paced; holds EOF until the layer runs once more
 	woken       atomic.Bool // the consumer above scheduled a Wake; holds EOF while delivered > 0
 
 	// delivered is what the layer handed up that the layer above has not
@@ -160,7 +165,10 @@ func (lc layerCtx) Abort(cause error) error { return lc.l.endClose(cause, false,
 
 func (lc layerCtx) Wake() error { return lc.l.stack.socket.Wake() }
 
-func (lc layerCtx) DeferTurnFlush() bool { return lc.l.stack.inTurn.Load() }
+func (lc layerCtx) DeferTurnFlush() bool { return lc.l.stack.inTurnOwner() }
+
+func (l *layerNode) InOwnTurn() bool  { return l.stack.inTurnOwner() }
+func (s socketLower) InOwnTurn() bool { return s.stack.inTurnOwner() }
 
 // layerUpper is the layer above's inbound delivery buffer.
 type layerUpper struct{ l *layerNode }
@@ -411,10 +419,20 @@ func (l *layerNode) Flush() error {
 }
 
 func (l *layerNode) WriteTo(w io.Writer) (int64, error) {
+	held := l.held()
+	if held == 0 {
+		return 0, nil
+	}
 	n, err := w.Write(l.delivered[l.at:])
+	if n < 0 || n > held {
+		n = max(min(n, held), 0)
+	}
 	l.at += n
 	l.reclaim()
 	l.roomMade()
+	if err == nil && n < held {
+		err = io.ErrShortWrite
+	}
 	return int64(n), err
 }
 
@@ -428,6 +446,7 @@ func (l *layerNode) roomMade() {
 		_ = l.stack.socket.Wake()
 	}
 	if l.paced.Load() && l.paced.Swap(false) {
+		l.unpaced.Store(true)
 		// The layer feeding this one was paused on a full delivery; the read
 		// that just ran makes room, so a turn calls it again.
 		_ = l.stack.socket.Wake()
@@ -596,6 +615,26 @@ func (l *layerNode) writeOwnedNonBlocking(buffer *Buffer) (int, error) {
 			return 0, err
 		}
 		err = io.ErrShortWrite
+	}
+	ReleaseBuffer(buffer)
+	return n, err
+}
+
+func (l *layerNode) writeOwnedPreservePartial(buffer *Buffer) (int, error) {
+	if buffer == nil {
+		return 0, nil
+	}
+	n, err := l.writeNonBlocking(buffer.Bytes())
+	if err == nil {
+		n = buffer.Len()
+		ReleaseBuffer(buffer)
+		return n, nil
+	}
+	if errors.Is(err, ErrOutboundOverflow) {
+		if n > 0 {
+			buffer.Discard(n)
+		}
+		return n, err
 	}
 	ReleaseBuffer(buffer)
 	return n, err

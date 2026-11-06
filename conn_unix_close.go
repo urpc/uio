@@ -139,6 +139,7 @@ func (conn *fdConn) CloseWrite() error {
 	}
 	conn.writeState.Or(writeShutFlag)
 	conn.submitMu.Unlock()
+	conn.notifyBlockWriteSpace()
 	conn.scheduleIO(ioEventShutWrite)
 	return nil
 }
@@ -179,6 +180,15 @@ func (conn *fdConn) shutWrite() {
 		return
 	}
 	conn.closeIfEnded()
+}
+
+func (conn *fdConn) peekDeferredCloseCause() error {
+	conn.submitMu.Lock()
+	defer conn.submitMu.Unlock()
+	if conn.close.deferred == nil {
+		return nil
+	}
+	return conn.close.deferred.cause
 }
 
 func (conn *fdConn) takeDeferredCloseCause() error {
@@ -260,6 +270,7 @@ func (conn *fdConn) closeGracefully(cause error) error {
 	conn.setDeferredCloseLocked(cause)
 	pending := conn.pending.Load()
 	conn.submitMu.Unlock()
+	conn.notifyBlockClose(cause)
 	if pending == 0 {
 		conn.escalateDrain()
 		return nil
@@ -337,6 +348,7 @@ func (conn *fdConn) closeWithCause(err error) error {
 	}
 	conn.setDeferredCloseLocked(err)
 	conn.submitMu.Unlock()
+	conn.notifyBlockClose(err)
 	conn.stopDrainTimer()
 	conn.routeClose()
 	return nil

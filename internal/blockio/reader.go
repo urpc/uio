@@ -85,7 +85,7 @@ func (r *Reader) window() int {
 	return DefaultWindow
 }
 
-func (r *Reader) syncPause(wakeIfUnpaused bool) {
+func (r *Reader) syncPause(wakeIfUnpaused bool) bool {
 	r.pauseMu.Lock()
 	defer r.pauseMu.Unlock()
 	r.mu.Lock()
@@ -95,19 +95,20 @@ func (r *Reader) syncPause(wakeIfUnpaused bool) {
 		if !wantPaused && wakeIfUnpaused {
 			_ = r.src.Wake()
 		}
-		return
+		return false
 	}
 	if wantPaused {
 		if !r.pause.Paused() {
 			_ = r.pause.Pause()
 		}
-		return
+		return r.pause.Paused()
 	}
 	if r.pause.Paused() {
 		_ = r.pause.Resume()
 	} else if wakeIfUnpaused {
 		_ = r.src.Wake()
 	}
+	return false
 }
 
 func (r *Reader) resumeTransport() {
@@ -157,11 +158,9 @@ func (r *Reader) Pump() {
 		r.mu.Unlock()
 
 		_, _ = r.src.Discard(take)
-		if nowFull {
-			r.syncPause(false)
-		}
+		paused := nowFull && r.syncPause(false)
 		r.waiter.notify()
-		if nowFull {
+		if paused {
 			return
 		}
 	}
@@ -252,18 +251,19 @@ func (r *Reader) Read(p []byte) (int, error) {
 			r.waiter.cancelPrepare()
 			return 0, err
 		}
+		if r.directReady {
+			n := r.directN
+			r.directReady = false
+			r.directN = 0
+			r.mu.Unlock()
+			r.waiter.cancelPrepare()
+			return n, nil
+		}
 		if err := r.waiter.checkDeadline(); err != nil {
 			r.directDst = nil
 			r.mu.Unlock()
 			r.waiter.cancelPrepare()
 			return 0, err
-		}
-		if r.directReady {
-			n := r.directN
-			r.directReady = false
-			r.mu.Unlock()
-			r.waiter.cancelPrepare()
-			return n, nil
 		}
 		if !r.pipe.Empty() {
 			r.directDst = nil
@@ -342,10 +342,10 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 					r.resumeTransport()
 				}
 				if block != nil {
-					nw, werr := dstWriter.writeOwnedPreserveOnAbort(block)
+					nw, retained, werr := dstWriter.writeOwnedPreserveOnAbort(block)
 					total += int64(nw)
 					if werr != nil {
-						if block.Len() > 0 {
+						if retained {
 							r.mu.Lock()
 							if !r.closed || !r.localAbort {
 								r.pipe.PrependOwned(block)
