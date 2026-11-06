@@ -768,7 +768,7 @@ func (kcp *KCP) wnd_unused() uint16 {
 //	Phase 3: Send window probe commands (WASK/WINS)
 //	Phase 4: Move segments from snd_queue to snd_buf (sliding window)
 //	Phase 5: Retransmit segments (initial, fast, early, RTO)
-//	Phase 6: Update SNMP counters and congestion window
+//	Phase 6: Update congestion window
 //
 // Returns the suggested interval (ms) until the next flush call.
 func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {

@@ -9,8 +9,7 @@ upstream module keeps in `sess.go`, `fec.go` and friends.
 |---|---|
 | `kcp.go` | upstream, patched (see below) |
 | `ringbuffer.go` | upstream, verbatim |
-| `bufferpool.go` | upstream, verbatim |
-| `snmp.go` | upstream, verbatim |
+| `bufferpool.go` | per-P fixed-array packet buffer pool |
 | `kcp_trace_off.go`, `kcp_trace_on.go` | upstream, verbatim (`-tags debug`) |
 | `ukcp_shim.go` | ours: the small additions listed below |
 
@@ -41,7 +40,7 @@ Accessors upstream keeps on `UDPSession` or does not expose: `SetStreamMode`,
 
 ## Updating
 
-Fetch the new release, copy the same six files, re-apply the three patches
+Fetch the new release, copy the engine files, re-apply the patches
 above and keep `ukcp_shim.go`; check that the fields the shim reads still
 exist. The third is structural: an upstream `flush` without the flush type
 must be reworked, not just re-copied.

@@ -2,9 +2,7 @@ package kcp
 
 import (
 	"math/rand"
-	"reflect"
 	"slices"
-	"strconv"
 	"testing"
 )
 
@@ -152,39 +150,5 @@ func TestRingBufferWrappedIterationDiscardAndGrowth(t *testing.T) {
 	r.Clear()
 	if !r.IsEmpty() {
 		t.Fatal("wrapped clear retained elements")
-	}
-}
-
-func TestSNMPSerializationSnapshotAndReset(t *testing.T) {
-	s := newSnmp()
-	v := reflect.ValueOf(s).Elem()
-	values := make(map[string]string)
-	for i := 0; i < v.NumField(); i++ {
-		n := uint64(i+1) * 1009
-		v.Field(i).SetUint(n)
-		name := v.Type().Field(i).Name
-		if name == "FECFullShardSet" {
-			name = "FECFullShards" // the published metrics column name
-		}
-		values[name] = strconv.FormatUint(n, 10)
-	}
-	header, row := s.Header(), s.ToSlice()
-	if len(header) != len(values) || len(row) != len(header) {
-		t.Fatalf("metric schema: fields=%d headers=%d values=%d", len(values), len(header), len(row))
-	}
-	for i, name := range header {
-		if row[i] != values[name] {
-			t.Fatalf("metric %s=%q, want %q", name, row[i], values[name])
-		}
-	}
-	copy := s.Copy()
-	s.Reset()
-	if !slices.Equal(copy.ToSlice(), row) {
-		t.Fatal("reset modified an existing statistics snapshot")
-	}
-	for _, value := range s.ToSlice() {
-		if value != "0" {
-			t.Fatal("Reset left a nonzero metric")
-		}
 	}
 }
