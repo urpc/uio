@@ -1,4 +1,4 @@
-//go:build (darwin || netbsd || freebsd || openbsd || dragonfly) && !stdio
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly
 
 /*
  * Copyright 2024 the urpc project
@@ -169,14 +169,10 @@ func (poller *Poller) modify(fd int, previous, want Interest, edge bool) error {
 // of independent kqueue filter changes.
 func (poller *Poller) modifyLocked(fd int, previous, want Interest, edge bool) error {
 	if previous&Readable != 0 && want&Readable == 0 {
-		if err := poller.deleteFilter(fd, readEvents); err != nil {
-			return err
-		}
+		_ = poller.deleteFilter(fd, readEvents)
 	}
 	if previous&Writable != 0 && want&Writable == 0 {
-		if err := poller.deleteFilter(fd, writeEvents); err != nil {
-			return err
-		}
+		_ = poller.deleteFilter(fd, writeEvents)
 	}
 	if previous&Readable == 0 && want&Readable != 0 {
 		if err := poller.change(fd, readEvents, unix.EV_ADD, edge); err != nil {

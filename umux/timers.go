@@ -166,12 +166,12 @@ func (s *Session) onTimer(c uio.Conn) error {
 	}
 	if keepaliveDead {
 		s.drainCloses()
-		_ = c.CloseWith(ErrKeepAlive)
+		_ = c.Abort(ErrKeepAlive)
 		return ErrKeepAlive
 	}
 	if err != nil {
 		s.drainCloses()
-		_ = c.CloseWith(err)
+		_ = c.Abort(err)
 		return err
 	}
 	for _, st := range due {
@@ -261,6 +261,7 @@ func (s *Session) onTransportClose(err error) {
 	// when the final timer/flush pass failed after submitting earlier frames.
 	s.finFlushed = nil
 	s.drained = nil
+	s.hasDrained.Store(false)
 	s.wakeQ = nil
 	s.control = nil
 	s.pending = nil

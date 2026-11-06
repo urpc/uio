@@ -20,17 +20,17 @@ func TestIdleResumeKeepsForeignPauseOwners(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range 10 {
-		if err := control.ResumeReads(); err != nil {
+		if err := control.ResumeRead(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if !foreign.Paused() || !control.ReadsPaused() || resumes != 0 {
+	if !foreign.Paused() || !control.ReadPaused() || resumes != 0 {
 		t.Fatal("an idle application resume bypassed a foreign owner")
 	}
 	if err := foreign.Resume(); err != nil {
 		t.Fatal(err)
 	}
-	if control.ReadsPaused() || resumes != 1 {
+	if control.ReadPaused() || resumes != 1 {
 		t.Fatal("the foreign owner's final release did not schedule a turn")
 	}
 }
@@ -57,23 +57,23 @@ func TestAccessResolvesTheSameBoundaryThroughWrappers(t *testing.T) {
 		t.Fatal("capability did not preserve the underlying boundary")
 	}
 	first, second := NewPause(boundary), NewPause(wrapped)
-	for _, pause := range []func() error{control.PauseReads, first.Pause, second.Pause} {
+	for _, pause := range []func() error{control.PauseRead, first.Pause, second.Pause} {
 		if err := pause(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, resume := range []func() error{control.ResumeReads, first.Resume} {
+	for _, resume := range []func() error{control.ResumeRead, first.Resume} {
 		if err := resume(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if !control.ReadsPaused() || !second.Paused() || resumes != 0 {
+	if !control.ReadPaused() || !second.Paused() || resumes != 0 {
 		t.Fatal("one owner released another owner's pause")
 	}
 	if err := second.Resume(); err != nil {
 		t.Fatal(err)
 	}
-	if control.ReadsPaused() || resumes != 1 {
+	if control.ReadPaused() || resumes != 1 {
 		t.Fatal("last owner did not release and schedule a resume")
 	}
 }
@@ -94,21 +94,21 @@ func TestCheckPreservesLifecycleErrorAndPauseState(t *testing.T) {
 	closed := errors.New("boundary closed")
 	var lifecycleErr error
 	control := New(func() error { return lifecycleErr }, nil)
-	if err := control.PauseReads(); err != nil {
+	if err := control.PauseRead(); err != nil {
 		t.Fatal(err)
 	}
 	lifecycleErr = closed
 	if err := control.Check(); !errors.Is(err, closed) {
 		t.Fatalf("Check = %v, want lifecycle error", err)
 	}
-	if !control.ReadsPaused() {
+	if !control.ReadPaused() {
 		t.Fatal("lifecycle check changed pause state")
 	}
 	lifecycleErr = nil
 	if err := control.Check(); err != nil {
 		t.Fatal(err)
 	}
-	if !control.ReadsPaused() {
+	if !control.ReadPaused() {
 		t.Fatal("successful check released a pause")
 	}
 	var missing *Control

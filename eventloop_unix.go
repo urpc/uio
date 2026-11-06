@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/fdmap"
 	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/socket"
@@ -38,7 +39,21 @@ import (
 // unscheduled against ~30 running); several pollers keep a connection's events
 // within one cluster of cores, and measurements on that host put the knee at
 // eight.
-const maxLoops = 8
+const (
+	maxLoops   = 8
+	eventBatch = 1024
+	ioStopBit  = uint64(1 << 63)
+)
+
+var (
+	unixFdMap     *fdmap.Map[fdConn]
+	unixFdMapOnce sync.Once
+)
+
+func newFdMap() *fdmap.Map[fdConn] {
+	unixFdMapOnce.Do(func() { unixFdMap = fdmap.NewMap[fdConn]() })
+	return unixFdMap
+}
 
 // defaultPollers scales the loop count with the machine: one loop per four
 // Ps, at least one and at most maxLoops. A small host keeps a single loop, so
@@ -391,6 +406,8 @@ func (loop *eventLoop) start(count int, mode waitMode, lockOSThread bool) {
 		waiter.adaptive = mode == waitAdaptive
 		loop.waiters.Add(1)
 		go func() {
+			blockio.EnterTurn()
+			defer blockio.LeaveTurn()
 			defer loop.waiters.Done()
 			if lockOSThread {
 				runtime.LockOSThread()

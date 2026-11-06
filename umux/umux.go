@@ -48,13 +48,6 @@ var (
 	ErrMetadataTooLarge = errors.New("umux: stream metadata exceeds MaxMetadata")
 )
 
-// QueueDrainedObserver receives a stream whose outbound frames have all been
-// accepted by the transport. It supplements TrafficObserver's byte counts and
-// window-credit notifications. Relays use it to resume a source paused on a
-// stream's queue. The callback must not block. It is uio's capability of the
-// same name.
-type QueueDrainedObserver = uio.QueueDrainedObserver
-
 // MetadataHandler is an optional capability of Config.Handler. When the
 // handler implements it, the session calls OnMetadata just before OnOpen with
 // the opaque bytes the opener attached to the stream's SYN through
@@ -73,13 +66,7 @@ type Config struct {
 	Handler uio.Handler
 	// Observer, when set, is told every stream's read and written bytes on
 	// top of the transport's own observation. OnBytesWritten also reports a
-	// window update that reopened blocked writers, with n == 0, so a relay can
-	// wake the connection paused on this stream's queue. An Observer that also
-	// implements OnQueueDrained(Conn) hears, additionally, each flush that
-	// emptied a stream's outbound queue — the stream's equivalent of a socket
-	// leg reporting its write progress; a relay wakes a reader paused on the
-	// stream's queue from it. Without such an Observer, a Handler that
-	// implements it hears them instead.
+	// window update that reopened blocked writers, with n == 0.
 	Observer uio.TrafficObserver
 	// Accept, when set, vets an inbound stream before it is accepted; a
 	// non-nil error rejects it with RST. It sees no metadata: the frame is

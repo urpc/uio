@@ -36,7 +36,7 @@ func main() {
 
 	var events uio.Events
 	events.Pollers = *pollers
-	events.MaxBufferSize = *buffer
+	events.ReadBufferSize = *buffer
 	events.LockOSThread = *lockOS
 	events.ReusePort = *reusePort
 

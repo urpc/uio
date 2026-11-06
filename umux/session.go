@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
 // maxFlushFrames bounds one flush pass, so a busy sender cannot hold the
@@ -102,17 +103,13 @@ type Session struct {
 	// finFlushed collects streams whose FIN left the wire in a flush; they
 	// settle outside the session lock.
 	finFlushed []*Stream
-	// drainObs, when the observer asks for it, receives one event per flush
-	// that emptied a stream's outbound queue — the stream's version of a
-	// socket leg reporting its write progress. It is resolved once: an
-	// observer not implementing the optional method pays nothing.
-	drainObs QueueDrainedObserver
-	// drained collects streams whose outbound queue a flush emptied; they are
-	// reported outside the session lock.
-	drained []*Stream
+	// drained collects watched streams whose outbound queue a flush emptied;
+	// they are notified outside the session lock.
+	hasDrained atomic.Bool
+	drained    []*Stream
 	// closeQ carries stream closes waiting for the transport turn; the
-	// handler's callbacks for one stream never run concurrently, so a
-	// CloseWith from another goroutine is delivered there.
+	// handler's callbacks for one stream never run concurrently, so an
+	// Abort from another goroutine is delivered there.
 	closeQ []closeItem
 	// wakeQ holds streams that asked for an empty read turn, so a turn does
 	// not scan the whole table.
@@ -136,14 +133,11 @@ func newSession(conn uio.Conn, cfg Config, client bool) *Session {
 	} else {
 		s.nextID = 2 // server streams are even
 	}
-	// A Handler that hears drains — a uio.Bridge — needs no Observer set too.
-	if obs, ok := cfg.Observer.(QueueDrainedObserver); ok {
-		s.drainObs = obs
-	} else {
-		s.drainObs, _ = cfg.Handler.(QueueDrainedObserver)
-	}
 	if cfg.KeepAlive > 0 {
 		s.lastPing = time.Now()
+	}
+	if conn != nil {
+		writecontrol.Watch(conn, func(int) { s.onTransportWritable() })
 	}
 	s.rearmTimer()
 	return s
@@ -202,10 +196,13 @@ func (s *Session) Close(cause error) error {
 	s.mu.Unlock()
 	s.emitDrained()
 	if err != nil {
-		_ = s.conn.CloseWith(err)
+		_ = s.conn.Abort(err)
 		return nil
 	}
-	return s.conn.CloseWith(cause)
+	if cause == nil {
+		return s.conn.Close()
+	}
+	return s.conn.Abort(cause)
 }
 
 // Open starts a stream and waits for the peer's ACK. The ACK names the peer's
@@ -280,7 +277,7 @@ func (s *Session) open(ctx context.Context, metadata []byte) (*Stream, error) {
 	if err != nil {
 		s.removeStream(st)
 		st.resetLocal(err)
-		_ = s.conn.CloseWith(err)
+		_ = s.conn.Abort(err)
 		return nil, err
 	}
 	select {
@@ -316,7 +313,7 @@ func (s *Session) onRead(c uio.Conn) error {
 	for {
 		fr, ok, err := readFrame(c, s.cfg.WindowSize, s.cfg.MaxMetadata)
 		if err != nil {
-			_ = c.CloseWith(err)
+			_ = c.Abort(err)
 			return err
 		}
 		if !ok {
@@ -325,12 +322,12 @@ func (s *Session) onRead(c uio.Conn) error {
 		herr := s.handleFrame(fr.hdr, fr.payload, fr.borrowed)
 		if !fr.consumed {
 			if _, err := c.Discard(fr.total); err != nil {
-				_ = c.CloseWith(err)
+				_ = c.Abort(err)
 				return err
 			}
 		}
 		if herr != nil {
-			_ = c.CloseWith(herr)
+			_ = c.Abort(herr)
 			return herr
 		}
 		if s.exhaustedBudget() {
@@ -348,15 +345,21 @@ func (s *Session) runWakes() {
 	handler := s.cfg.Handler
 	s.mu.Lock()
 	if handler == nil {
-		// Pull mode runs no read turns; drop what asked for one rather than
-		// keep closed streams queued.
+		var blockWakes []*Stream
 		for _, st := range s.wakeQ {
 			st.mu.Lock()
 			st.wakePending = false
+			closed := st.closedLocal
 			st.mu.Unlock()
+			if !closed && st.activeBlockReader() != nil {
+				blockWakes = append(blockWakes, st)
+			}
 		}
 		s.wakeQ = nil
 		s.mu.Unlock()
+		for _, st := range blockWakes {
+			s.dispatchRead(st)
+		}
 		return
 	}
 	wakes := s.wakeQ
@@ -553,20 +556,13 @@ func (s *Session) handleWindowUpdate(h frameHeader) error {
 		return nil
 	}
 	if granted := st.grantWindow(int64(h.length)); granted {
-		// The peer's credit unblocks writers: report the reopened window
-		// (a zero-byte write) and run an empty read turn, as a Wake would on
-		// a socket connection.
+		// The peer's credit unblocks writers: notify outbound watchers, report
+		// the reopened window (a zero-byte write), and run an empty read turn.
+		if ctrl := st.writeControl.Load(); ctrl != nil {
+			ctrl.Notify(0)
+		}
 		if obs := s.cfg.Observer; obs != nil {
 			obs.OnBytesWritten(st, 0)
-			if _, carries := obs.(QueueDrainedObserver); !carries && s.drainObs != nil {
-				// An Observer without drain reports cannot reach one
-				// waiting on the Handler; the reopened window is room.
-				s.drainObs.OnQueueDrained(st)
-			}
-		} else if s.drainObs != nil {
-			// A Handler hearing drains in the Observer's place hears the
-			// reopened window as one.
-			s.drainObs.OnQueueDrained(st)
 		}
 		s.dispatchRead(st)
 	}
@@ -834,7 +830,7 @@ func (s *Session) flush() {
 	}
 	s.emitDrained()
 	if err != nil {
-		_ = s.conn.CloseWith(err)
+		_ = s.conn.Abort(err)
 	}
 	s.maybeFinishDrain()
 }
@@ -884,15 +880,18 @@ func (s *Session) drainCloses() {
 // exactly that signal; streams must report it too, or a leg paused on this
 // stream's queue waits for a window grant that a flushed queue never needs.
 func (s *Session) emitDrained() {
-	if s.drainObs == nil {
+	if !s.hasDrained.Load() {
 		return
 	}
 	s.mu.Lock()
 	drained := s.drained
 	s.drained = nil
+	s.hasDrained.Store(false)
 	s.mu.Unlock()
 	for _, st := range drained {
-		s.drainObs.OnQueueDrained(st)
+		if ctrl := st.writeControl.Load(); ctrl != nil {
+			ctrl.Notify(0)
+		}
 	}
 }
 
@@ -907,10 +906,9 @@ func (s *Session) tryFinish(st *Stream) {
 	}
 	st.mu.Lock()
 	// FIN completion waits for the consumer: unread input, a callback
-	// running, a pause or the resume turn its release owes, or a
-	// continuation it asked for with YieldRead — its final callback sees the
+	// running, or a pause / owed resume turn — its final callback sees the
 	// end first. Pull readers have no callback to wait for.
-	owed := s.cfg.Handler != nil && (st.yieldOwed || st.readControl.Load().Held())
+	owed := (s.cfg.Handler != nil || st.pullRead.Load()) && st.readControl.Load().Held()
 	if st.closedLocal || st.callbackActive || !st.peerFIN || !st.localFIN || st.finState != finSent || len(st.out) != 0 || st.in.len() != 0 || owed {
 		st.mu.Unlock()
 		s.mu.Unlock()
@@ -1003,8 +1001,9 @@ func (s *Session) flushLocked() error {
 		if len(st.out) == 0 && st.finState != finQueued {
 			s.pending = s.pending[1:]
 			st.queued = false
-			if s.drainObs != nil {
+			if st.writeControl.Load() != nil {
 				s.drained = append(s.drained, st)
+				s.hasDrained.Store(true)
 			}
 		} else {
 			// Rotate: move this stream to the back of the queue.
@@ -1036,7 +1035,7 @@ func (s *Session) sendWindowUpdate(id uint32, delta int64) {
 	s.mu.Unlock()
 	s.emitDrained()
 	if err != nil {
-		_ = s.conn.CloseWith(err)
+		_ = s.conn.Abort(err)
 	}
 }
 
@@ -1158,7 +1157,7 @@ func (s *Session) abortStream(st *Stream, cause error) {
 	}
 	st.resetLocal(cause)
 	if err != nil {
-		_ = s.conn.CloseWith(err)
+		_ = s.conn.Abort(err)
 	}
 	s.maybeFinishDrain()
 }
@@ -1186,14 +1185,26 @@ func (s *Session) abortRemote(st *Stream, cause error) {
 // dispatchRead runs the stream's read callback: data arrived, the peer ended
 // its direction, or a window update woke writers.
 func (s *Session) dispatchRead(st *Stream) {
+	if st.ReadPaused() {
+		s.tryFinish(st)
+		return
+	}
+	if r := st.activeBlockReader(); r != nil {
+		st.mu.Lock()
+		if !st.closedLocal {
+			st.readControl.Load().ConsumerRuns()
+		}
+		st.mu.Unlock()
+		r.Pump()
+		s.tryFinish(st)
+		return
+	}
 	handler := s.cfg.Handler
-	if handler == nil || st.ReadsPaused() {
-		// Pull mode reads directly; a paused callback retains its receive credit.
+	if handler == nil {
 		s.tryFinish(st)
 		return
 	}
 	s.invokeCallback(st, func() error {
-		st.readControl.Load().ConsumerRuns()
 		return handler.OnRead(st)
 	}, true)
 	s.tryFinish(st)
@@ -1202,9 +1213,8 @@ func (s *Session) dispatchRead(st *Stream) {
 // invokeCallback holds the consumer's lifetime through its callback. Read and
 // Discard can drain the last bytes inline, while a concurrent FIN flush can
 // also attempt completion, so the callback is published as active before it
-// runs — it is also the continuation an earlier YieldRead asked for. Abort
-// errors before releasing it, so EOF cannot win the race with a callback
-// failure. The deferred release covers a panic too.
+// runs. Abort errors before releasing it, so EOF cannot win the race with a
+// callback failure. The deferred release covers a panic too.
 func (s *Session) invokeCallback(st *Stream, callback func() error, read bool) {
 	st.mu.Lock()
 	if st.closedLocal {
@@ -1213,7 +1223,7 @@ func (s *Session) invokeCallback(st *Stream, callback func() error, read bool) {
 	}
 	st.callbackActive = true
 	if read {
-		st.yieldOwed = false
+		st.readControl.Load().ConsumerRuns()
 	}
 	st.mu.Unlock()
 	defer func() {

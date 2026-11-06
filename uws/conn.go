@@ -25,8 +25,8 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/petermattis/goid"
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/writecontrol"
 	"github.com/urpc/uio/uws/internal/compress"
 	"github.com/urpc/uio/uws/internal/frame"
 	"github.com/urpc/uio/uws/internal/handshake"
@@ -38,7 +38,7 @@ import (
 // fields every message touches come first, so they share as few cache lines
 // as the struct's size class allows.
 type Conn struct {
-	raw         uio.LayerDown
+	raw         uio.Lower
 	config      *connConfig
 	handler     Handler
 	parser      *frame.Parser    // retained only while a frame spans input reads
@@ -50,61 +50,66 @@ type Conn struct {
 	closing atomic.Bool
 
 	readFrames int32 // frames delivered in the current read round
-	// round is the read round's word, written only by the round and read by
-	// senders: the mark of the goroutine running it (roundToken) while it
-	// tells its replies apart (watchReplies), and roundBatching while it
-	// batches the small frames it sends.
+	// round is non-zero (roundBatching) while a multi-frame read round batches
+	// the small frames sent during it.
 	round atomic.Uint32
-	// readPaused mirrors which of this connection's pauses of the transport
-	// are held — the application's and the automatic reply watermark's —
-	// so a read round checks them between frames with one load. The
-	// transport's own controller holds the pauses; see backpressure.go.
+	// readPaused mirrors whether the application's pause is held so a read
+	// round checks it between frames with one load.
 	readPaused atomic.Uint32
 
 	batch *uio.Buffer // small frames accepted but not yet handed over; guarded by writes.mu
-	// batchBuffered publishes the write batch's size for lock-free public
-	// observations, including synchronous transport completion callbacks.
-	// A negative value marks a batch being handed to the transport.
-	batchBuffered atomic.Int64
-	// replies follows the read rounds' replies while they are queued; nil
-	// while none is followed. See replyLedger. A tracked transport — a layer
-	// stack, TLS under the protocol — reports bytes on the wire, which are
-	// not the frame bytes replies are counted in, so it tracks none.
-	replies   atomic.Pointer[replyLedger]
-	heartbeat *heartbeatState
-	writes    connWriteState
+	// batchHandoff holds the byte size of a batch while flushBatchLocked hands
+	// it to the transport when TrafficObserver is enabled.
+	batchHandoff atomic.Int64
+	heartbeat    *heartbeatState
+	writes       connWriteState
 
 	userData  any
 	metadata  atomic.Pointer[connMetadata]
 	handshake atomic.Pointer[handshakeState]
 }
 
-// setRaw installs the transport the connection runs on and records whether
-// it hands out wire receipts (uio.TrackedWriter): with layers, the connection
-// follows the Close frame and the heartbeat Ping by their receipts instead of
-// counting bytes; a plain socket has no wire position to hand out and keeps
-// the byte accounting. The bit rides the close flags so the connection keeps
-// its size class.
-func (c *Conn) setRaw(raw uio.LayerDown) {
+// setRaw installs the transport the connection runs on and subscribes to
+// writecontrol progress notifications on layered transports.
+func (c *Conn) setRaw(raw uio.Lower) {
 	c.raw = raw
-	if _, ok := raw.(uio.TrackedWriter); ok {
-		c.writes.close.flags.Or(wireTrackedFlag)
+	_, asLayer := c.handler.(layerSink)
+	if !asLayer && uio.LayerOf(raw) == nil {
+		return
+	}
+	ctrl := writecontrol.ControlOf(raw)
+	if ctrl.Inexact() {
+		c.writes.close.flags.Or(inexactWireFlag)
+	}
+	if ctrl != nil {
+		c.writes.close.flags.Or(closeWatchArmed)
+		ctrl.Watch(func(sent int) {
+			if asLayer || sent == 0 {
+				c.onTransportProgress(sent)
+			}
+		})
 	}
 }
 
-// wireTracked reports a transport that hands out wire receipts; see setRaw.
-func (c *Conn) wireTracked() bool { return c.writes.close.flags.Load()&wireTrackedFlag != 0 }
-
-// receiptSent is a tracked write's proof that the wire passed r. The Close
-// frame and the heartbeat Ping are the tracked writes, and each takes its
-// proof here: the Close frame lets the transport close be claimed, the Ping
-// starts the Pong timeout.
-func (c *Conn) receiptSent(r uio.SendReceipt) {
-	if c.writes.close.claimReceipt(r) && c.writes.close.closePending() {
-		_, _ = c.tryCloseTransport()
+func (c *Conn) ensureCloseWatch() {
+	if c == nil || c.raw == nil {
+		return
 	}
-	if heartbeat := c.heartbeat; heartbeat != nil && heartbeat.claimPingReceipt(r) {
-		heartbeat.markPingReceiptSent(time.Now())
+	if c.writes.close.flags.Or(closeWatchArmed)&closeWatchArmed == 0 {
+		writecontrol.Watch(c.raw, func(sent int) {
+			c.onTransportProgress(sent)
+		})
+	}
+}
+
+func (c *Conn) inexactWire() bool {
+	return c.writes.close.flags.Load()&inexactWireFlag != 0
+}
+
+func (c *Conn) onTransportProgress(sent int) {
+	c.transportSent(sent)
+	if c.writes.close.closePending() {
+		_, _ = c.tryCloseTransport()
 	}
 }
 
@@ -122,29 +127,17 @@ type connWriteState struct {
 // retiring. transitionMu only protects short state transitions; it never
 // covers socket I/O or application work.
 type connCloseProgress struct {
-	pendingBytes atomic.Int64
 	transitionMu sync.Mutex
-	// aux carries the rare per-close state: the deferred Close frame's
-	// payload until it is written, then the tracked frame's receipt. It
-	// lives behind one pointer so the connection keeps its size class; only
-	// the atomic done is read outside transitionMu.
+	// aux carries the rare per-close state: a deferred Close frame's payload
+	// until it is written. It lives behind one pointer so the connection keeps
+	// its compact size class.
 	aux   *closeAux // guarded by transitionMu
 	flags atomic.Uint32
 }
 
-// closeAux is one close's rare state: a Close frame waiting for outbound
-// room, and later — once that frame is written — the tracked frame's place on
-// the wire and whether the wire passed it. A deferred frame clears its
-// payload as it is written, so the two never both hold data.
+// closeAux is one close's rare state: a Close frame waiting for outbound room.
 type closeAux struct {
-	payload []byte          // a deferred Close frame; guarded by transitionMu
-	receipt uio.SendReceipt // the tracked Close frame's position; guarded by transitionMu
-	// earlySend keeps a receipt OnSent delivered before the writer registered
-	// it: an external Close's tracked write returns from WriteTracked only
-	// after a turn may have reported its receipt, and that report must not be
-	// dropped; setReceipt consumes it. Guarded by transitionMu.
-	earlySend uio.SendReceipt
-	done      atomic.Bool // the wire passed the receipt
+	payload []byte // a deferred Close frame; guarded by transitionMu
 }
 
 const (
@@ -160,220 +153,23 @@ const (
 	closeFrameDeferred
 )
 
-// wireTrackedFlag marks a transport that hands out wire receipts; see setRaw.
-// It sits above the transport phase bits (transportPhaseShift-Mask), which
-// share this word.
-const wireTrackedFlag uint32 = 1 << 4
+// inexactWireFlag marks a transport with an OutboundHolder below it. It sits
+// above the transport phase bits (transportPhaseShift-Mask), which share this
+// word.
+const (
+	inexactWireFlag uint32 = 1 << 4
+	closeWatchArmed uint32 = 1 << 5
+)
 
 const (
 	transportPhaseShift = 2
 	transportPhaseMask  = uint32(3 << transportPhaseShift)
 )
 
-// roundBatching marks a read round that batches the small frames it sends;
-// the bits above it hold the round's goroutine mark.
-const roundBatching uint32 = 1
-
-// roundToken is the calling goroutine's mark in the round word: its id,
-// shifted past roundBatching. The id is truncated, as UIO's write claims
-// truncate it: two live goroutines would have to be two billion apart to
-// share a mark. A goroutine whose mark is zero is never told apart, and its
-// rounds count no replies.
-func roundToken() uint32 { return uint32(goid.Get()) << 1 }
-
-// countReply records a frame of wireSize bytes the read round's goroutine
-// queued as one of the round's replies: the Handler answering what the round
-// delivered, or the protocol answering a Ping. round is the round word its
-// sender loaded, with the round's mark in it. A batched frame takes its place
-// in the queue when the batch is handed over. Sends from anywhere else —
-// another goroutine, another connection's round — are not replies, whatever
-// they queue. It requires writes.mu.
-func (c *Conn) countReply(round uint32, wireSize int, batched bool) {
-	if !c.wireTracked() && round&^roundBatching == roundToken() {
-		c.noteReply(wireSize, batched)
-	}
-}
-
-// noteReply records a reply frame of wireSize bytes; see countReply. A
-// batched reply is already appended, so its batch offset is available here.
-// It requires writes.mu.
-func (c *Conn) noteReply(wireSize int, batched bool) {
-	if wireSize <= 0 || c.wireTracked() {
-		return
-	}
-	replies := c.replies.Load()
-	if replies == nil {
-		if !batched && c.raw.OutboundBuffered() <= c.config.outboundLow {
-			// A reply into a drained queue: the next round's check starts
-			// the count over anyway.
-			return
-		}
-		replies = newReplyLedger()
-		c.replies.Store(replies)
-	}
-	if batched {
-		replies.addBatched(int64(wireSize), int64(c.batch.Len()))
-		return
-	}
-	replies.add(int64(wireSize), c.queueEnd(replies))
-}
-
-// placeReplyBatch counts the batched replies of a write batch just handed
-// over. Each run keeps its offset within the batch, including gaps written
-// by external senders. A refused batch queued nothing. Requires writes.mu.
-func (c *Conn) placeReplyBatch(size int, accepted bool) {
-	replies := c.replies.Load()
-	if replies != nil && replies.batched != 0 {
-		replies.placeBatch(int64(size), c.queueEnd(replies), accepted)
-	}
-}
-
-// queueEnd is the position the transport's queue ends at, in the terms of
-// replies: what it reported sent and what it still holds. The sent is read
-// first: a send report retires the queue's bytes before it raises the sent
-// count, so a report that lands between the two readings leaves the sum no
-// higher than the truth — a reply placed short retires early, while one
-// placed past its bytes would keep counting after it left. It requires
-// writes.mu.
-func (c *Conn) queueEnd(replies *replyLedger) int64 {
-	sent := replies.sent.Load()
-	return sent + int64(c.raw.OutboundBuffered())
-}
-
-// holdsReplies reports whether a read round stops consuming because its
-// connection's replies back up: the queue reached the high watermark, and the
-// replies still in it make up at least the band between the two watermarks.
-// A connection that only answers pauses where its queue reaches the high
-// watermark. Output queued from anywhere else — a broadcast, a pull Client's
-// sends, a relay's forwards — never pauses reads: stopping them would not slow
-// it, and would only keep the peer from being read.
-func (c *Conn) holdsReplies(high int) bool {
-	if c.closing.Load() {
-		return false
-	}
-	if c.wireTracked() {
-		// A tracked transport reports wire bytes, not the frame bytes the
-		// replies are counted in; see Conn.replies.
-		return false
-	}
-	if c.internalReadsPaused() {
-		return c.holdReads()
-	}
-	low := c.config.outboundLow
-	queued := c.raw.OutboundBuffered()
-	if queued <= low {
-		c.watchReplies(false)
-		if c.replies.Load() != nil {
-			c.releaseReplies()
-		}
-		return false
-	}
-	c.watchReplies(true)
-	replies := c.replies.Load()
-	if queued < high || replies == nil {
-		return false
-	}
-	c.writes.mu.Lock()
-	own := replies.queued()
-	c.writes.mu.Unlock()
-	if own < int64(high-low) {
-		return false
-	}
-	return c.holdReads()
-}
-
-// releaseReplies drops the ledger once every reply it followed has left, so
-// a connection whose queue is drained keeps none. The drain's report asks
-// for a round to run it: see resumeReadsAfterDrain.
-func (c *Conn) releaseReplies() {
-	c.writes.mu.Lock()
-	if replies := c.replies.Load(); replies != nil && replies.batched == 0 && replies.queued() == 0 {
-		c.replies.Store(nil)
-	}
-	c.writes.mu.Unlock()
-}
-
-// watchReplies publishes the round's mark in the round word, or withdraws
-// it. Telling a send apart costs it a goroutine-id lookup, so a round tells
-// its sends apart only while the queue holds more than the low watermark: the
-// replies to a chunk read with the queue drained are not counted, and the
-// count starts with the next chunk, once a check finds the queue above the low
-// watermark — a connection that only answers pauses at most one chunk later
-// than counting every reply would. A mark whose queue drains stays until the
-// round's next check or its end.
-func (c *Conn) watchReplies(on bool) {
-	round := c.round.Load()
-	if watched := round > roundBatching; watched == on {
-		return
-	}
-	if on {
-		c.round.Store(round | roundToken())
-	} else {
-		c.round.Store(round & roundBatching)
-	}
-}
-
-// holdReads reports whether a read round stops consuming, so UIO's inbound
-// hold stops the socket reads. A connection pauses once holdsReplies finds
-// its replies backed up and stays paused until the queue drains to the low
-// watermark, whatever runs its next round: input that arrives in between is
-// left for later. It counts both transitions.
-//
-// The pause is published before the queue is looked at again, and
-// resumeReadsAfterDrain reads the pause after the transport has retired the
-// bytes it reports, so whichever of the two runs second sees the other: a
-// queue that drained between the round's check and the pause is caught here,
-// and the round goes on reading.
-func (c *Conn) holdReads() bool {
-	low := c.config.outboundLow
-	if c.internalReadsPaused() {
-		if c.raw.OutboundBuffered() > low {
-			return true
-		}
-		// Drained: resume here. Losing the race to resumeReadsAfterDrain
-		// means it resumed, and woke the connection, already.
-		if c.setInternalReadPause(false) && c.config.stats != nil {
-			c.config.stats.resumed.Add(1)
-		}
-		return false
-	}
-	if !c.setInternalReadPause(true) {
-		return true
-	}
-	if c.raw.OutboundBuffered() <= low && c.setInternalReadPause(false) {
-		return false
-	}
-	if c.config.stats != nil {
-		c.config.stats.paused.Add(1)
-	}
-	return true
-}
-
-// resumeReadsAfterDrain wakes a paused connection once its queued output has
-// fallen to the low watermark. The transport's outbound callback calls it.
-// A connection that was never paused, or already resumed, gets a round only
-// when it still follows replies: the round drops the ledger once the queue
-// has drained (releaseReplies), which no other callback can run.
-func (c *Conn) resumeReadsAfterDrain() {
-	config := c.config
-	if config == nil || config.outboundHigh <= 0 {
-		return
-	}
-	if c.internalReadsPaused() {
-		if c.raw.OutboundBuffered() > config.outboundLow {
-			return
-		}
-		if c.setInternalReadPause(false) {
-			if config.stats != nil {
-				config.stats.resumed.Add(1)
-			}
-		}
-		return
-	}
-	if c.replies.Load() != nil && c.raw.OutboundBuffered() <= config.outboundLow {
-		_ = c.raw.Wake()
-	}
-}
+const (
+	roundBatching      uint32 = 1
+	roundDeferredClose uint32 = 2
+)
 
 // compressionState holds negotiated direction-specific RFC 7692 contexts.
 type compressionState struct {
@@ -382,40 +178,21 @@ type compressionState struct {
 }
 
 // heartbeatState distinguishes a Ping waiting to be accepted, queued for
-// transport, and actually sent. The first failed enqueue keeps its deadline
-// across retries; byte positions mark when the Ping leaves the transport queue.
-// Every submission holds the connection's write lock, so accepted positions
-// follow the transport's order.
+// transport, and actually sent.
 type heartbeatState struct {
-	mu sync.Mutex
-	// sendStalledAt remains set across backpressure retries.
+	mu            sync.Mutex
 	sendStalledAt int64
 	pingQueuedAt  int64
 	pingSentAt    int64
 	pingNonce     uint64
-	pingTarget    uint64
-	// nextPingAt is when the next Ping may be sent — zero until the heartbeat
-	// begins — and armedAt the wake deadline the transport currently holds.
-	// Both change only in the connection's turn, under this mutex with the
-	// rest.
-	nextPingAt int64
-	armedAt    int64
-	// Accepted and retired are monotonic FIFO byte positions, a plain
-	// transport's: the ping target marks when its complete frame has left the
-	// transport queue without requiring the connection's later writes to
-	// drain first. A tracked transport follows the Ping by its wire receipt
-	// instead — pingReceipt, zero while that Ping is not tracked — and the
-	// counters stay still.
-	outboundAccepted atomic.Uint64
-	outboundRetired  atomic.Uint64
-	pingOutstanding  atomic.Bool
-	pingReceipt      uio.SendReceipt // guarded by mu
-	// parsed counts frames delivered to the handler, any Ping's deferrals
-	// apart; deferredAt is the count at the last deferral, set to the
-	// count at the Ping's start. Guarded by mu, parsed excluded: it moves
-	// on turns.
-	parsed     atomic.Int64
-	deferredAt int64
+	nextPingAt    int64
+	armedAt       int64
+
+	pingOutstanding atomic.Bool
+	pingWireWait    int64 // remaining queued bytes ahead of an armed Ping; guarded by mu
+	pingWaitEmpty   bool  // Ping waits for OutboundBuffered == 0; guarded by mu
+	parsed          atomic.Int64
+	deferredAt      int64
 }
 
 // closeTimerState protects lazy creation, replacement, and cancellation of the
@@ -444,9 +221,6 @@ type connMetadata struct {
 	// Deferred reports may be delivered by the submitting goroutine rather
 	// than the transport callback. Preserve serialization with other reports.
 	outboundMu sync.Mutex
-	// staged is a handshake's unconsumed frame tail. Only protocol read
-	// turns access it, as they do the parser and assembler.
-	staged []byte
 }
 
 // handshakeState contains every resource whose lifetime ends at handshake
@@ -576,7 +350,10 @@ func (c *Conn) SetNoDelay(noDelay bool) error {
 	if c == nil || c.raw == nil {
 		return ErrNotReady
 	}
-	return c.raw.SetNoDelay(noDelay)
+	if sc, ok := uio.SocketOf(c.raw); ok {
+		return sc.SetNoDelay(noDelay)
+	}
+	return uio.ErrUnsupported
 }
 
 // Request returns the HTTP upgrade request during OnOpen for server

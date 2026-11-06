@@ -6,8 +6,8 @@ import (
 	"github.com/urpc/uio/internal/readcontrol"
 )
 
-// Embed the shared private capability without adding a public field or a
-// controller accessor to Stream's API.
+// streamReadAccess embeds the shared private read-control capability without
+// adding public fields or controller accessors to Stream's API.
 type streamReadAccess = readcontrol.Access[streamReadControlGetter]
 
 type streamReadControlGetter struct{}
@@ -47,23 +47,23 @@ func (st *Stream) ensureReadControl() *readcontrol.Control {
 	return st.readControl.Load()
 }
 
-// PauseReads suppresses subsequent OnRead callbacks for this stream only.
+// PauseRead suppresses subsequent OnRead callbacks for this stream only.
 // Timers, session control frames, writes, and other streams continue normally.
-func (st *Stream) PauseReads() error {
-	return st.ensureReadControl().PauseReads()
+func (st *Stream) PauseRead() error {
+	return st.ensureReadControl().PauseRead()
 }
 
-// ResumeReads releases the application's pause; once no pause remains, a read
+// ResumeRead releases the application's pause; once no pause remains, a read
 // turn hands the stream's buffered input to OnRead. Other owners' pauses stay.
 // Without a pause to release it does nothing.
-func (st *Stream) ResumeReads() error {
+func (st *Stream) ResumeRead() error {
 	if err := st.checkReadControl(); err != nil {
 		return err
 	}
 	if control := st.readControl.Load(); control != nil {
-		return control.ResumeReads()
+		return control.ResumeRead()
 	}
 	return nil
 }
 
-func (st *Stream) ReadsPaused() bool { return st.readControl.Load().ReadsPaused() }
+func (st *Stream) ReadPaused() bool { return st.readControl.Load().ReadPaused() }

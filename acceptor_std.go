@@ -30,8 +30,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/urpc/uio/internal/poller"
 )
 
 // listener holds the blocking Go listener used by stdio and Windows builds.
@@ -56,14 +54,6 @@ type acceptor struct {
 	next      int  // the key of the next listener
 	accepting bool // startAccepting has run: a new listener starts at once
 	closed    bool // close has run: Listen adds nothing more
-}
-
-// OnEvent is unused because listener goroutines perform blocking accepts.
-func (ld *acceptor) OnEvent(ep *poller.Poller, fd int, events poller.Events) {}
-
-// OnClose releases every blocking listener and stops its accept goroutine.
-func (ld *acceptor) OnClose(ep *poller.Poller, err error) {
-	ld.close()
 }
 
 // startMultiAcceptors exists for the shared Serve path. This backend has no
@@ -237,7 +227,7 @@ func (ld *acceptor) startLocked(l *listener) {
 			fdc.entry = l.entry
 			fdc.conn = conn
 
-			fdc.loop = ld.events.selectWorker(fdc.Fd())
+			fdc.loop = ld.events.selectWorker()
 			fdc.SetUserdata(l.userdata)
 			fdc.setLocalAddr(conn.LocalAddr())
 			fdc.setRemoteAddr(conn.RemoteAddr())
@@ -246,7 +236,7 @@ func (ld *acceptor) startLocked(l *listener) {
 
 			// Registration runs on the worker loop; waiting for it here would
 			// hold every later accept behind that loop's queue.
-			ld.events.submitAccepted(fdc, true)
+			ld.events.submitAccepted(fdc)
 		}
 	}()
 }

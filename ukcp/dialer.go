@@ -45,12 +45,10 @@ func Dial(addr string) (uio.Conn, error) {
 // KCP, use the layer form — ClientLayer above utls.ClientLayer in a WithLayers
 // chain — as with any other protocol.
 //
-// The Events-level settings — Handler, MaxBufferSize, Pollers, Executor,
-// SocketReadBuffer, SocketWriteBuffer, WriteBufferedThreshold,
-// MaxOutboundBuffered, AllowHalfOpen — are read when the transport starts at
-// the first dial and frozen with it; the session settings — MTU, the
-// windows, KeepAlive and the rest — are read on every dial. Set them before
-// dialing.
+// The transport settings — Handler, SocketReadBuffer, SocketWriteBuffer, and
+// Transport — are read when the transport starts at the first dial and frozen
+// with it; the session settings — MTU, the windows, KeepAlive and the rest —
+// are read on every dial. Set them before dialing.
 type Dialer struct {
 	Options
 
@@ -125,16 +123,9 @@ func (d *Dialer) transport(opts Options) (*uio.Events, error) {
 		return d.events, nil
 	}
 	started := make(chan struct{})
-	events := &uio.Events{
-		Pollers:                opts.Pollers,
-		Executor:               opts.Executor,
-		MaxBufferSize:          opts.MaxBufferSize,
-		WriteBufferedThreshold: opts.WriteBufferedThreshold,
-		MaxOutboundBuffered:    opts.MaxOutboundBuffered,
-		AllowHalfOpen:          opts.AllowHalfOpen,
-		Handler:                opts.Handler,
-		Hooks:                  uio.FuncHandler{Start: func(*uio.Events) { close(started) }},
-	}
+	events := opts.Transport.events(opts.Handler)
+	events.ReusePort = false
+	events.Hooks = uio.FuncHandler{Start: func(*uio.Events) { close(started) }}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
 	select {

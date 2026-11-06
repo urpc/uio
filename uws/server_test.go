@@ -3,25 +3,485 @@ package uws
 import (
 	"bufio"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"errors"
-	"io"
-	"net"
-	"strings"
-	"testing"
-	"time"
-
-	"github.com/petermattis/goid"
+	"fmt"
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
+	"io"
+	"math/big"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"runtime"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
 )
+
+func TestServerHTTPHandlerEcho(t *testing.T) {
+	baseHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1), conn: make(chan *Conn, 1)}
+	serverHandler := &httpEchoHandler{echoHandler: baseHandler, request: make(chan *http.Request, 1)}
+	server := NewServer(Options{Handler: serverHandler})
+	server.Options.Pollers = 1
+	server.Subprotocols = []string{"chat"}
+	server.EnableCompression = true
+	serveWithoutListener(t, server)
+	httpServer := httptest.NewServer(server)
+	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
+	dialer := NewDialer(Options{Handler: clientHandler})
+	dialer.Options.Pollers = 1
+	dialer.Subprotocols = []string{"chat"}
+	dialer.EnableCompression = true
+	err := dialer.Dial(context.Background(), "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+		httpServer.Close()
+	})
+	waitForSignal(t, serverHandler.open, "server OnOpen")
+	waitForSignal(t, clientHandler.open, "client OnOpen")
+	client := clientHandler.conn
+	serverConn := <-serverHandler.conn
+	if serverConn.raw.Userdata() != serverConn {
+		t.Fatal("transport userdata changed meaning during HTTP adoption")
+	}
+	if request := <-serverHandler.request; request == nil || request.RequestURI != "/" {
+		t.Fatalf("HTTP upgrade request = %#v, want request URI /", request)
+	}
+	deadline := time.Now().Add(testIOTimeout())
+	for serverConn.Request() != nil && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if request := serverConn.Request(); request != nil {
+		t.Fatalf("HTTP upgrade request retained after OnOpen: %#v", request)
+	}
+	if serverConn.handshake.Load() != nil {
+		t.Fatal("HTTP adoption retained handshake state after OnOpen")
+	}
+	serverConn.SetUserdata("business")
+	if serverConn.Userdata() != "business" {
+		t.Fatalf("business userdata = %v", serverConn.Userdata())
+	}
+	if protocol := client.Subprotocol(); protocol != "chat" {
+		t.Fatalf("client subprotocol = %q, want chat", protocol)
+	}
+	payload := strings.Repeat("compressible-message-", 64)
+	if err = client.SendText(payload); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case message := <-serverHandler.message:
+		if string(message.Payload) != payload {
+			t.Fatalf("server message length = %d, want %d", len(message.Payload), len(payload))
+		}
+	case <-time.After(testIOTimeout()):
+		t.Fatal("server did not receive message")
+	}
+	select {
+	case message := <-clientHandler.message:
+		if string(message.Payload) != "world" {
+			t.Fatalf("client message = %q", message.Payload)
+		}
+	case <-time.After(testIOTimeout()):
+		t.Fatal("client did not receive echo")
+	}
+}
+
+type httpEchoHandler struct {
+	*echoHandler
+	request chan *http.Request
+}
+
+func (h *httpEchoHandler) OnOpen(conn *Conn) {
+	h.request <- conn.Request()
+	h.echoHandler.OnOpen(conn)
+}
+
+func TestServerHTTPRejectsBufferedDataBeforeSwitchingProtocols(t *testing.T) {
+	opened := make(chan struct{}, 1)
+	server := NewServer(Options{Handler: handlerFuncs{onOpen: func(*Conn) {
+		signal(opened, struct{}{})
+	}}})
+	server.Options.Pollers = 1
+	serveWithoutListener(t, server)
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+	target, err := url.Parse(httpServer.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := net.Dial("tcp", target.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	request := websocketUpgradeRequest(target.Host)
+	earlyFrame := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Text, Masked: true, Payload: []byte("early")}, [4]byte{1, 2, 3, 4})
+	if _, err = client.Write(append([]byte(request), earlyFrame...)); err != nil {
+		t.Fatal(err)
+	}
+	if err = client.SetReadDeadline(time.Now().Add(testIOTimeout())); err != nil {
+		t.Fatal(err)
+	}
+	response, err := http.ReadResponse(bufio.NewReader(client), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("response status = %q", response.Status)
+	}
+	if got := strings.TrimSpace(string(body)); got != httpErrorEarlyData {
+		t.Fatalf("response body = %q, want %q", got, httpErrorEarlyData)
+	}
+	select {
+	case <-opened:
+		t.Fatal("buffered early frame reached OnOpen")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestServerHTTPRequiresServe(t *testing.T) {
+	server := NewServer(Options{})
+	server.Options.Pollers = 1
+	request := newHTTPUpgradeRequest()
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	assertHTTPError(t, recorder, http.StatusInternalServerError, httpErrorServerNotServing)
+	if server.started.Load() || server.ready.Load() {
+		t.Fatal("ServeHTTP started the UIO transport")
+	}
+}
+
+func TestServerHTTPRequiresHijacker(t *testing.T) {
+	server := NewServer(Options{})
+	server.Options.Pollers = 1
+	serveWithoutListener(t, server)
+	request := newHTTPUpgradeRequest()
+	recorder := httptest.NewRecorder()
+	server.ServeHTTP(recorder, request)
+	assertHTTPError(t, recorder, http.StatusInternalServerError, httpErrorCannotHijack)
+}
+
+func assertHTTPError(t *testing.T, recorder *httptest.ResponseRecorder, status int, message string) {
+	t.Helper()
+	if recorder.Code != status {
+		t.Fatalf("status = %d, want %d", recorder.Code, status)
+	}
+	if got := strings.TrimSpace(recorder.Body.String()); got != message {
+		t.Fatalf("response body = %q, want %q", got, message)
+	}
+}
+
+func serveWithoutListener(t *testing.T, server *Server) {
+	t.Helper()
+	started := make(chan struct{})
+	oldHook := server.startHook
+	server.startHook = func() {
+		if oldHook != nil {
+			oldHook()
+		}
+		close(started)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- server.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = server.Close(nil)
+		select {
+		case <-done:
+		case <-time.After(testIOTimeout()):
+			t.Error("Server.Serve did not stop")
+		}
+	})
+	select {
+	case <-started:
+	case err := <-done:
+		t.Fatalf("Server.Serve exited before OnStart: %v", err)
+	case <-time.After(testIOTimeout()):
+		t.Fatal("Server.Serve did not start")
+	}
+}
+
+func newHTTPUpgradeRequest() *http.Request {
+	request := httptest.NewRequest(http.MethodGet, "http://example.test/ws", nil)
+	request.Header.Set("Connection", "Upgrade")
+	request.Header.Set("Upgrade", "websocket")
+	request.Header.Set("Sec-WebSocket-Version", "13")
+	request.Header.Set("Sec-WebSocket-Key", testKey)
+	return request
+}
+
+func websocketUpgradeRequest(host string) string {
+	return "GET /ws HTTP/1.1\r\n" + "Host: " + host + "\r\n" + "Connection: Upgrade\r\nUpgrade: websocket\r\n" + "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
+}
+
+func waitForSignal(t *testing.T, signal <-chan struct{}, name string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(testIOTimeout()):
+		t.Fatalf("%s was not called", name)
+	}
+}
+
+type handlerFuncs struct {
+	onOpen    func(*Conn)
+	onMessage func(*Conn, Message)
+	onClose   func(*Conn, CloseEvent)
+}
+
+func (handler handlerFuncs) OnOpen(conn *Conn) {
+	if handler.onOpen != nil {
+		handler.onOpen(conn)
+	}
+}
+
+func (handler handlerFuncs) OnMessage(conn *Conn, message Message) {
+	if handler.onMessage != nil {
+		handler.onMessage(conn, message)
+	}
+}
+
+func (handler handlerFuncs) OnClose(conn *Conn, event CloseEvent) {
+	if handler.onClose != nil {
+		handler.onClose(conn, event)
+	}
+}
+
+func startNativeTestServer(t *testing.T, handler Handler, configure func(*Server)) string {
+	t.Helper()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		s := NewServer(Options{Handler: handler})
+		if configure != nil {
+			configure(s)
+		}
+		s.Options.Pollers = 1
+		s.Options.ReadBufferSize = 4 << 10
+		return s
+	})
+	t.Cleanup(func() {
+		stopTestServer(t, server, serveDone)
+	})
+	return addr
+}
+
+func dialNativeTestServer(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+	t.Helper()
+	var client net.Conn
+	var err error
+	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
+		client, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
+		if err != nil {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if client == nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+	return client, bufio.NewReader(client)
+}
+
+func readStatusLine(t *testing.T, reader *bufio.Reader) string {
+	t.Helper()
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	return line
+}
+
+type reuseRequestHandler struct {
+	request chan *http.Request
+	conn    chan *Conn
+}
+
+func (h *reuseRequestHandler) OnOpen(conn *Conn) {
+	h.request <- conn.Request()
+	h.conn <- conn
+}
+
+func (h *reuseRequestHandler) OnMessage(*Conn, Message) {
+}
+
+func (h *reuseRequestHandler) OnClose(*Conn, CloseEvent) {
+}
+
+func TestServerNativeRequestSurvivesHandshakeReuse(t *testing.T) {
+	handler := &reuseRequestHandler{request: make(chan *http.Request, 16), conn: make(chan *Conn, 16)}
+	addr := startNativeTestServer(t, handler, nil)
+	var kept []*http.Request
+	for i := range 8 {
+		client, reader := dialNativeTestServer(t, addr)
+		token := fmt.Sprintf("token-%d", i)
+		request := "GET /n/" + token + " HTTP/1.1\r\nHost: " + addr + "\r\n" + "X-Business-Token: " + token + "\r\n" + "Connection: Upgrade\r\nUpgrade: websocket\r\n" + "Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
+		if _, err := client.Write([]byte(request)); err != nil {
+			t.Fatal(err)
+		}
+		if line := readStatusLine(t, reader); !strings.HasPrefix(line, "HTTP/1.1 101 ") {
+			t.Fatalf("handshake response = %q", line)
+		}
+		seen := <-handler.request
+		if seen == nil || seen.Header.Get("X-Business-Token") != token || seen.RequestURI != "/n/"+token {
+			t.Fatalf("connection %d saw request %+v", i, seen)
+		}
+		kept = append(kept, seen)
+		conn := <-handler.conn
+		deadline := time.Now().Add(testIOTimeout())
+		for conn.Request() != nil {
+			if time.Now().After(deadline) {
+				t.Fatal("request retained after OnOpen")
+			}
+			time.Sleep(time.Millisecond)
+		}
+		_ = client.Close()
+	}
+	for i, request := range kept {
+		if token := fmt.Sprintf("token-%d", i); request.Header.Get("X-Business-Token") != token {
+			t.Fatalf("kept request %d now carries %q", i, request.Header.Get("X-Business-Token"))
+		}
+	}
+}
+
+func TestHandshakeResourcesDetachExactlyOnce(t *testing.T) {
+	for _, action := range []string{"open", "stop", "expire"} {
+		t.Run(action, func(t *testing.T) {
+			var contextStops, cleanups atomic.Int32
+			state := &handshakeState{epoch: 1, contextStop: func() bool {
+				contextStops.Add(1)
+				return true
+			}, cleanup: func() {
+				cleanups.Add(1)
+			}}
+			conn := &Conn{raw: newScriptedConn()}
+			state.shard = deadlineShardIndex()
+			deadlineShardAt(state.shard).arm(conn, deadlineKindHandshake, time.Now().Add(time.Hour).UnixNano(), 1, true)
+			conn.handshake.Store(state)
+			switch action {
+			case "open":
+				if !conn.markOpened() {
+					t.Fatal("markOpened rejected live handshake")
+				}
+				if conn.handshake.Load() != state {
+					t.Fatal("OnOpen lost handshake state before callback")
+				}
+				conn.notifyOpen()
+			case "stop":
+				conn.stopHandshakeTimer()
+			case "expire":
+				conn.expireHandshake(state, 1, context.DeadlineExceeded)
+			}
+			conn.stopHandshakeTimer()
+			conn.expireHandshake(state, 1, context.DeadlineExceeded)
+			if got := contextStops.Load(); got != 1 {
+				t.Fatalf("context stops = %d, want 1", got)
+			}
+			if got := cleanups.Load(); got != 1 {
+				t.Fatalf("cleanups = %d, want 1", got)
+			}
+			if conn.handshake.Load() != nil {
+				t.Fatal("handshake state retained after completion")
+			}
+			state.mu.Lock()
+			defer state.mu.Unlock()
+			if deadlineShardAt(state.shard).has(conn, deadlineKindHandshake) {
+				t.Fatal("handshake deadline retained after completion")
+			}
+			if state.contextStop != nil || state.cleanup != nil {
+				t.Fatal("handshake resources retained after completion")
+			}
+		})
+	}
+}
+
+func TestHandshakeOpenStopAndExpiryRace(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		var cleanups atomic.Int32
+		state := &handshakeState{epoch: 1, cleanup: func() {
+			cleanups.Add(1)
+		}}
+		raw := newScriptedConn()
+		conn := &Conn{raw: raw}
+		conn.handshake.Store(state)
+		var wg sync.WaitGroup
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			conn.markOpened()
+		}()
+		go func() {
+			defer wg.Done()
+			conn.stopHandshakeTimer()
+		}()
+		go func() {
+			defer wg.Done()
+			conn.expireHandshake(state, 1, context.DeadlineExceeded)
+		}()
+		wg.Wait()
+		if got := cleanups.Load(); got != 1 {
+			t.Fatalf("iteration %d: cleanups = %d, want 1", i, got)
+		}
+		if conn.handshake.Load() != nil {
+			t.Fatalf("iteration %d: handshake state retained", i)
+		}
+		if conn.opened.Load() && raw.closes != 0 {
+			t.Fatalf("iteration %d: opened connection expired", i)
+		}
+	}
+}
+
+func TestOptionsValidation(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		opts Options
+	}{{"negative header limit", Options{MaxHeaderBytes: -1}}, {"negative timeout", Options{HandshakeTimeout: -time.Second}}, {"negative close timeout", Options{CloseTimeout: -time.Second}}, {"negative heartbeat", Options{HeartbeatInterval: -time.Second}}, {"negative pollers", Options{Pollers: -1}}, {"negative read buffer", Options{ReadBufferSize: -1}}, {"negative outbound limit", Options{MaxOutboundBuffered: -1}}, {"compression level range", Options{EnableCompression: true, CompressionLevel: 10}}, {"level without compression", Options{CompressionLevel: 1}}} {
+		if _, err := test.opts.resolve(); !errors.Is(err, ErrInvalidOptions) {
+			t.Fatalf("%s: error = %v, want %v", test.name, err, ErrInvalidOptions)
+		}
+	}
+}
+
+func TestDialerConnectionsShareFrozenConfig(t *testing.T) {
+	dialer := &Dialer{Options: Options{Subprotocols: []string{"v1"}, MaxHeaderBytes: 101, MaxFramePayload: 102, MaxMessageSize: 103, CloseTimeout: 105 * time.Millisecond, HandshakeTimeout: 106 * time.Millisecond, EnableCompression: true, CompressionLevel: 1}}
+	dialer.config = testDialerConfig(dialer)
+	dialer.Subprotocols[0] = "mutated"
+	dialer.MaxFramePayload = 1
+	dialer.MaxMessageSize = 1
+	first := dialer.newClientConn(nil, &dialSetup{})
+	second := dialer.newClientConn(nil, &dialSetup{})
+	if first.config != dialer.config || second.config != dialer.config || first.config != second.config {
+		t.Fatal("dialer connections did not share the startup config")
+	}
+	if first.config.subprotocols[0] != "v1" || !first.isClient() {
+		t.Fatal("dialer connection observed configuration mutated after startup")
+	}
+	if first.maxFramePayload() != 102 || first.maxMessageSize() != 103 {
+		t.Fatal("dialer connection limits changed after startup")
+	}
+}
 
 type heartbeatWriteProbe struct {
 	*scriptedConn
 	written chan struct{}
-}
-
-func newHeartbeatWriteProbe() *heartbeatWriteProbe {
-	return &heartbeatWriteProbe{scriptedConn: newScriptedConn(), written: make(chan struct{}, 1)}
 }
 
 func (c *heartbeatWriteProbe) signalWrite() {
@@ -41,109 +501,6 @@ func (c *heartbeatWriteProbe) WriteOwned(buffer *uio.Buffer) (int, error) {
 	n, err := c.scriptedConn.WriteOwned(buffer)
 	c.signalWrite()
 	return n, err
-}
-
-func TestResolveWriteCoalesce(t *testing.T) {
-	opts, err := (Options{}).resolve()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := opts.WriteCoalesce; got != defaultWriteBufferedThreshold {
-		t.Fatalf("default WriteCoalesce = %d, want %d", got, defaultWriteBufferedThreshold)
-	}
-
-	const configured = 32 << 10
-	opts, err = Options{WriteCoalesce: configured}.resolve()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := opts.WriteCoalesce; got != configured {
-		t.Fatalf("configured WriteCoalesce = %d, want %d", got, configured)
-	}
-
-	opts, err = Options{WriteCoalesce: -1}.resolve()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := opts.WriteCoalesce; got != -1 {
-		t.Fatalf("disabled WriteCoalesce = %d, want -1", got)
-	}
-}
-
-func TestServerServeAcceptsMultipleAddresses(t *testing.T) {
-	server := NewServer(Options{})
-	server.Options.Pollers = 1
-	server.startHook = func() { _ = server.Close(nil) }
-	if err := server.Serve("127.0.0.1:0", "127.0.0.1:0"); err != nil {
-		t.Fatalf("Serve with multiple addresses: %v", err)
-	}
-	if !server.started.Load() || server.ready.Load() {
-		t.Fatal("Serve did not start and stop the Server")
-	}
-}
-
-func TestHeartbeatTimeoutClosesAndPingsOthers(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatInterval = time.Millisecond
-	server.HeartbeatTimeout = 5 * time.Millisecond
-	server.CloseTimeout = 5 * time.Millisecond
-	config := testServerConfig(server)
-	expiredRaw := &writeProbeConn{closed: make(chan struct{})}
-	expired := &Conn{raw: expiredRaw, config: config, heartbeat: &heartbeatState{}}
-	expired.opened.Store(true)
-	timedOutAt := time.Now().Add(-time.Second)
-	expired.heartbeat.beginPing(timedOutAt, 1)
-	expired.heartbeat.mu.Lock()
-	expired.heartbeat.pingSentAt = timedOutAt.UnixNano()
-	expired.heartbeat.mu.Unlock()
-	responsiveRaw := newHeartbeatWriteProbe()
-	responsive := &Conn{raw: responsiveRaw, config: config, heartbeat: &heartbeatState{}}
-	responsive.opened.Store(true)
-	responsive.beginHeartbeat()
-	now := time.Now().Add(time.Millisecond) // one interval in: the first ping is due
-	expired.heartbeatTick(now)
-	responsive.heartbeatTick(now)
-	select {
-	case <-responsiveRaw.written:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat timeout prevented later connections from being processed")
-	}
-	select {
-	case <-expiredRaw.closed:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("timed-out connection did not close within CloseTimeout")
-	}
-	if info := expired.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
-		t.Fatalf("heartbeat close info = %+v", info)
-	}
-}
-
-func TestHeartbeatQueuedPingHasFiniteTimeout(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatInterval = time.Millisecond
-	server.HeartbeatTimeout = 20 * time.Millisecond
-	server.CloseTimeout = 5 * time.Millisecond
-	config := testServerConfig(server)
-	raw := newHeartbeatWriteProbe()
-	raw.closed = make(chan struct{})
-	conn := &Conn{raw: raw, config: config, heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	queuedAt := time.Now()
-	if err := conn.sendHeartbeatPing(queuedAt); err != nil || !conn.heartbeat.pingOutstanding.Load() {
-		t.Fatalf("queue heartbeat ping: outstanding=%v err=%v", conn.heartbeat.pingOutstanding.Load(), err)
-	}
-	conn.heartbeat.mu.Lock()
-	pingTarget := conn.heartbeat.pingTarget
-	conn.heartbeat.mu.Unlock()
-	if conn.writes.close.pendingBytes.Load() == 0 || pingTarget == 0 {
-		t.Fatal("heartbeat ping was not tracked in the outbound queue")
-	}
-	conn.heartbeatTick(queuedAt.Add(2 * server.HeartbeatTimeout))
-	select {
-	case <-raw.closed:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("connection with a permanently queued ping did not close")
-	}
 }
 
 func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
@@ -168,9 +525,6 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 		if stalledAt != first.UnixNano() {
 			t.Fatalf("attempt %d: stalled at %d, want %d", i, stalledAt, first.UnixNano())
 		}
-		if accepted, retired := conn.heartbeat.outboundAccepted.Load(), conn.heartbeat.outboundRetired.Load(); accepted != 0 || retired != 0 {
-			t.Fatalf("attempt %d: rejected Ping counted as sent: accepted=%d retired=%d", i, accepted, retired)
-		}
 	}
 	if raw.writes != 4 {
 		t.Fatalf("failed Ping writes = %d, want 4", raw.writes)
@@ -181,37 +535,6 @@ func TestHeartbeatRepeatedBackpressureHasFiniteTimeout(t *testing.T) {
 	}
 	if info := conn.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
 		t.Fatalf("heartbeat close info = %+v", info)
-	}
-}
-
-func TestHeartbeatRetryKeepsOriginalSendDeadline(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatTimeout = 20 * time.Millisecond
-	raw := newScriptedConn()
-	raw.writeErr = uio.ErrOutboundOverflow
-	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	conn.beginHeartbeat()
-	first := time.Now()
-	conn.heartbeatTick(first)
-	raw.writeErr = nil
-	conn.heartbeatTick(first.Add(server.HeartbeatTimeout / 2))
-	conn.heartbeat.mu.Lock()
-	queuedAt := conn.heartbeat.pingQueuedAt
-	conn.heartbeat.mu.Unlock()
-	if queuedAt != first.UnixNano() || !conn.heartbeat.pingOutstanding.Load() {
-		t.Fatalf("successful retry queued at %d, want first stalled time %d", queuedAt, first.UnixNano())
-	}
-	pending := conn.writes.close.pendingBytes.Load()
-	if pending == 0 {
-		t.Fatal("successful retry did not queue a Ping")
-	}
-	conn.releaseOutbound(int(pending))
-	conn.heartbeat.mu.Lock()
-	sentAt, stalledAt := conn.heartbeat.pingSentAt, conn.heartbeat.sendStalledAt
-	conn.heartbeat.mu.Unlock()
-	if sentAt == 0 || stalledAt != 0 {
-		t.Fatalf("sent Ping did not switch deadlines: sent=%d stalled=%d", sentAt, stalledAt)
 	}
 }
 
@@ -232,80 +555,12 @@ func TestHeartbeatFatalSendErrorAbortsImmediately(t *testing.T) {
 	}
 }
 
-func TestHeartbeatPongTimeoutStartsWhenPingIsWritten(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatInterval = time.Millisecond
-	server.HeartbeatTimeout = 20 * time.Millisecond
-	server.CloseTimeout = 5 * time.Millisecond
-	config := testServerConfig(server)
-	raw := newHeartbeatWriteProbe()
-	raw.closed = make(chan struct{})
-	conn := &Conn{raw: raw, config: config, heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	queuedAt := time.Now()
-	if err := conn.sendHeartbeatPing(queuedAt); err != nil || !conn.heartbeat.pingOutstanding.Load() {
-		t.Fatalf("queue heartbeat ping: outstanding=%v err=%v", conn.heartbeat.pingOutstanding.Load(), err)
-	}
-	pending := conn.writes.close.pendingBytes.Load()
-	conn.releaseOutbound(int(pending))
-	conn.heartbeat.mu.Lock()
-	sentAt := conn.heartbeat.pingSentAt
-	conn.heartbeat.mu.Unlock()
-	if sentAt == 0 {
-		t.Fatal("heartbeat ping was not marked written when its queue position retired")
-	}
-	// Later business writes must not move the fixed Pong deadline.
-	if err := conn.SendBinary([]byte("later")); err != nil {
-		t.Fatal(err)
-	}
-	if conn.writes.close.pendingBytes.Load() == 0 {
-		t.Fatal("later business write did not remain queued")
-	}
-	sent := time.Unix(0, sentAt)
-	conn.heartbeatTick(sent.Add(server.HeartbeatTimeout / 2))
-	if conn.closing.Load() {
-		t.Fatal("connection timed out before the Pong deadline")
-	}
-	conn.heartbeatTick(sent.Add(2 * server.HeartbeatTimeout))
-	select {
-	case <-raw.closed:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("later outbound traffic postponed the Pong timeout")
-	}
-}
-
-func TestHeartbeatCancelRequiresMatchingNonce(t *testing.T) {
-	heartbeat := &heartbeatState{}
-	const nonce = uint64(42)
-	if !heartbeat.beginPing(time.Now(), nonce) {
-		t.Fatal("heartbeat ping did not start")
-	}
-	heartbeat.cancelPing(nonce + 1)
-	if !heartbeat.pingOutstanding.Load() {
-		t.Fatal("mismatched nonce canceled the heartbeat ping")
-	}
-	heartbeat.cancelPing(nonce)
-	if heartbeat.pingOutstanding.Load() {
-		t.Fatal("matching nonce did not cancel the heartbeat ping")
-	}
-	heartbeat.mu.Lock()
-	defer heartbeat.mu.Unlock()
-	if heartbeat.pingQueuedAt != 0 || heartbeat.pingSentAt != 0 || heartbeat.pingNonce != 0 || heartbeat.pingTarget != 0 {
-		t.Fatal("canceled heartbeat retained ping state")
-	}
-}
-
 func TestHeartbeatSendPaths(t *testing.T) {
 	if err := (&Conn{}).sendHeartbeatPing(time.Now()); !errors.Is(err, ErrClosed) {
 		t.Fatalf("unavailable heartbeat ping = %v", err)
 	}
-
 	raw := newScriptedConn()
-	conn := &Conn{
-		raw:       raw,
-		config:    testServerConfig(NewServer(Options{})),
-		heartbeat: &heartbeatState{},
-	}
+	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{})), heartbeat: &heartbeatState{}}
 	conn.opened.Store(true)
 	if !conn.heartbeat.beginPing(time.Now(), 1) {
 		t.Fatal("heartbeat ping did not start")
@@ -313,7 +568,6 @@ func TestHeartbeatSendPaths(t *testing.T) {
 	if err := conn.sendHeartbeatPing(time.Now()); err != nil || raw.writes != 0 {
 		t.Fatalf("outstanding heartbeat ping = %v, writes = %d", err, raw.writes)
 	}
-
 	writeErr := errors.New("heartbeat close write failed")
 	failedRaw := newScriptedConn()
 	failedRaw.writeErr = writeErr
@@ -340,24 +594,9 @@ func TestHandshakeTimeoutClosesUnresponsiveConnection(t *testing.T) {
 	if conn.opened.Load() {
 		t.Fatal("timed out handshake was marked open")
 	}
-	if err := conn.consumeHandshake([]byte("late")); !errors.Is(err, ErrClosed) {
+	if _, err := conn.consumeHandshake([]byte("late")); !errors.Is(err, ErrClosed) {
 		t.Fatalf("timed-out handshake accepted more data: %v", err)
 	}
-}
-
-func TestCompletedHandshakeCancelsTimeout(t *testing.T) {
-	raw := &writeProbeConn{closed: make(chan struct{})}
-	conn := &Conn{raw: raw, config: testServerConfig(&Server{Options: Options{HandshakeTimeout: 5 * time.Millisecond}})}
-	conn.startHandshakeTimer(conn.config.handshakeTimeout)
-	if !conn.markOpened() {
-		t.Fatal("markOpened returned false")
-	}
-	select {
-	case <-raw.closed:
-		t.Fatal("completed handshake was closed by stale timeout")
-	case <-time.After(30 * time.Millisecond):
-	}
-	conn.stopHandshakeTimer()
 }
 
 func TestServerServeAfterCloseReportsClosed(t *testing.T) {
@@ -370,165 +609,17 @@ func TestServerServeAfterCloseReportsClosed(t *testing.T) {
 	}
 }
 
-func TestServerServeRunsEventsOnCallerGoroutine(t *testing.T) {
-	server := NewServer(Options{})
-	server.Options.Pollers = 1
-	caller := make(chan int64, 1)
-	onStart := make(chan int64, 1)
-	server.startHook = func() {
-		onStart <- goid.Get()
-		_ = server.Close(nil)
-	}
-	done := make(chan error, 1)
-	go func() {
-		caller <- goid.Get()
-		done <- server.Serve()
-	}()
-	var callerID, startID int64
-	select {
-	case callerID = <-caller:
-	case <-time.After(time.Second):
-		t.Fatal("Serve caller did not start")
-	}
-	select {
-	case startID = <-onStart:
-	case <-time.After(time.Second):
-		t.Fatal("Events.OnStart was not called")
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Serve did not return")
-	}
-	if startID != callerID {
-		t.Fatalf("OnStart goroutine = %d, Serve caller = %d", startID, callerID)
-	}
-}
-
-func TestServerHeartbeatClosesSilentPeer(t *testing.T) {
-	handler := &heartbeatHandler{closed: make(chan CloseEvent, 1)}
-	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{Handler: handler})
-		s.HeartbeatInterval = 10 * time.Millisecond
-		s.HeartbeatTimeout = 25 * time.Millisecond
-		s.Options.Pollers = 1
-		s.Options.ReadBufferSize = 4 << 10
-		return s
-	})
-	t.Cleanup(func() { stopTestServer(t, server, serveDone) })
-
-	var client net.Conn
-	var err error
-	for deadline := time.Now().Add(testIOTimeout()); client == nil && time.Now().Before(deadline); {
-		client, err = net.DialTimeout("tcp", addr, 100*time.Millisecond)
-		if err != nil {
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if client == nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	request := "GET / HTTP/1.1\r\nHost: " + addr + "\r\n" +
-		"Connection: Upgrade\r\nUpgrade: websocket\r\n" +
-		"Sec-WebSocket-Version: 13\r\nSec-WebSocket-Key: " + testKey + "\r\n\r\n"
-	if _, err = client.Write([]byte(request)); err != nil {
-		t.Fatal(err)
-	}
-	reader := bufio.NewReader(client)
-	if line, err := reader.ReadString('\n'); err != nil || !strings.HasPrefix(line, "HTTP/1.1 101 ") {
-		t.Fatalf("handshake response = %q, %v", line, err)
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		if line == "\r\n" {
-			break
-		}
-	}
-	select {
-	case info := <-handler.closed:
-		if info.Code != 1001 {
-			t.Fatalf("heartbeat close code = %d, want 1001", info.Code)
-		}
-	case <-time.After(testIOTimeout()):
-		t.Fatal("heartbeat did not close silent peer")
-	}
-}
-
-func TestServerHeartbeatKeepsResponsiveClient(t *testing.T) {
-	serverHandler := &echoHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	server, addr, serveDone := startTestServer(t, func() *Server {
-		s := NewServer(Options{Handler: serverHandler})
-		s.HeartbeatInterval = 10 * time.Millisecond
-		// The timeout must survive a starved CI runner: with 250ms a pong delayed
-		// by scheduling could close a client that responded promptly in program
-		// order, which is exactly what this test asserts cannot happen.
-		s.HeartbeatTimeout = 2 * time.Second
-		s.Options.Pollers = 1
-		s.Options.ReadBufferSize = 4 << 10
-		return s
-	})
-
-	clientHandler := &clientHandler{open: make(chan struct{}), closed: make(chan struct{}), message: make(chan Message, 1)}
-	dialer := NewDialer(Options{Handler: clientHandler})
-	dialer.Options.Pollers = 1
-	dialer.Options.ReadBufferSize = 4 << 10
-	err := dialer.Dial(context.Background(), "ws://"+addr+"/", nil)
-	if err != nil {
-		_ = server.Close(nil)
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		_ = dialer.Close(nil)
-		stopTestServer(t, server, serveDone)
-	})
-	select {
-	case <-clientHandler.open:
-	case <-time.After(testIOTimeout()):
-		t.Fatal("client OnOpen was not called")
-	}
-	client := clientHandler.conn
-
-	time.Sleep(600 * time.Millisecond)
-	select {
-	case <-serverHandler.closed:
-		t.Fatal("responsive heartbeat client was closed")
-	default:
-	}
-	if err = client.SendText("alive"); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case message := <-clientHandler.message:
-		if string(message.Payload) != "world" {
-			t.Fatalf("heartbeat echo = %q", message.Payload)
-		}
-	case <-clientHandler.closed:
-		t.Fatal("responsive client was closed while waiting for its echo")
-	case <-time.After(testIOTimeout()):
-		t.Fatal("responsive client stopped receiving messages")
-	}
-}
-
 func TestServerLifecycleEdges(t *testing.T) {
 	server := &Server{}
 	if err := server.Close(nil); err != nil {
 		t.Fatalf("Server.Close with nil Events = %v", err)
 	}
-
 	invalid := newScriptedConn()
 	invalid.userdata = "invalid"
 	if err := server.onData(invalid); !errors.Is(err, ErrClosed) {
 		t.Fatalf("invalid onData error = %v", err)
 	}
 	server.onClose(invalid, io.EOF)
-
 	unopenedRaw := newScriptedConn()
 	unopened := &Conn{raw: unopenedRaw, config: testServerConfig(server)}
 	unopenedRaw.userdata = unopened
@@ -537,12 +628,10 @@ func TestServerLifecycleEdges(t *testing.T) {
 	if !unopened.closed.Load() {
 		t.Fatal("unopened server connection was not marked closed")
 	}
-
 	openedRaw := newScriptedConn()
 	handler := &recordingHandler{}
 	opened := &Conn{raw: openedRaw, config: testServerConfig(server), handler: handler}
 	opened.opened.Store(true)
-	opened.writes.close.pendingBytes.Store(8)
 	openedRaw.userdata = opened
 	server.onOutbound(openedRaw, 8)
 	server.onClose(openedRaw, io.EOF)
@@ -554,153 +643,6 @@ func TestServerLifecycleEdges(t *testing.T) {
 	}
 }
 
-// A Pong accepted before a heartbeat Ping keeps its place ahead of it: only
-// the Ping's own retirement starts the Pong timeout.
-func TestHeartbeatPingPositionFollowsEarlierPong(t *testing.T) {
-	raw := newScriptedConn()
-	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{})), heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	if err := conn.acceptControl(frame.Frame{Fin: true, Opcode: frame.Ping, Payload: []byte{1}}); err != nil {
-		t.Fatal(err)
-	}
-	beforePing := conn.writes.close.pendingBytes.Load()
-	if beforePing == 0 {
-		t.Fatal("Pong was not queued")
-	}
-	if err := conn.sendHeartbeatPing(time.Now()); err != nil {
-		t.Fatal(err)
-	}
-	pending := conn.writes.close.pendingBytes.Load()
-	conn.heartbeat.mu.Lock()
-	target, sentAt := conn.heartbeat.pingTarget, conn.heartbeat.pingSentAt
-	conn.heartbeat.mu.Unlock()
-	if pending <= beforePing || target != uint64(pending) || sentAt != 0 {
-		t.Fatalf("queued Ping = pending:%d prior:%d target:%d sent:%d", pending, beforePing, target, sentAt)
-	}
-	conn.releaseOutbound(int(beforePing))
-	conn.heartbeat.mu.Lock()
-	sentAt = conn.heartbeat.pingSentAt
-	conn.heartbeat.mu.Unlock()
-	if sentAt != 0 {
-		t.Fatal("Pong retirement marked Ping as sent")
-	}
-	conn.releaseOutbound(int(pending - beforePing))
-	conn.heartbeat.mu.Lock()
-	sentAt = conn.heartbeat.pingSentAt
-	conn.heartbeat.mu.Unlock()
-	if sentAt == 0 {
-		t.Fatal("Ping retirement did not start Pong timeout")
-	}
-}
-
-// A Ping the outbound limit refuses must leave a timer aimed at the stall
-// deadline: the one-shot that brought the turn has fired, so re-arming the
-// deadline it carried would never come again and the connection would never
-// time out. This is the heartbeat's "peer silent and our own outbound full"
-// case.
-func TestHeartbeatRearmsAfterBackpressure(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatInterval = 10 * time.Millisecond
-	server.HeartbeatTimeout = 50 * time.Millisecond
-	raw := newScriptedConn()
-	raw.writeErr = uio.ErrOutboundOverflow
-	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	conn.beginHeartbeat()
-	first, ok := raw.lastWakeArm()
-	if !ok {
-		t.Fatal("beginHeartbeat armed no wake deadline")
-	}
-
-	// At the interval the Ping is refused for lack of outbound room.
-	conn.heartbeatTick(first)
-	if conn.heartbeat.pingOutstanding.Load() {
-		t.Fatal("a refused Ping stayed outstanding")
-	}
-	heartbeat := conn.heartbeat
-	heartbeat.mu.Lock()
-	stalledAt := heartbeat.sendStalledAt
-	heartbeat.mu.Unlock()
-	if stalledAt != first.UnixNano() {
-		t.Fatalf("stall noted at %d, want the refused attempt's %d", stalledAt, first.UnixNano())
-	}
-	// The wake is re-aimed at the earlier of the next interval and the
-	// stall deadline — never left on the deadline that just fired.
-	next, ok := raw.lastWakeArm()
-	if !ok || next.Equal(first) {
-		t.Fatalf("re-armed at %v; the fired deadline %v left no timer for the stall", next, first)
-	}
-	stallDeadline := first.Add(server.HeartbeatTimeout)
-	if want := first.Add(server.HeartbeatInterval); !next.Equal(want) {
-		t.Fatalf("re-armed at %v, want the next interval %v (before the stall deadline %v)", next, want, stallDeadline)
-	}
-
-	// Each retry is refused again; the stall keeps its first moment, so the
-	// chain of wakes ends at the stall deadline, where the connection times
-	// out.
-	for at := next; at.Before(stallDeadline); {
-		conn.heartbeatTick(at)
-		if conn.closing.Load() {
-			t.Fatalf("closed at %v, before the stall deadline %v", at, stallDeadline)
-		}
-		armed, ok := raw.lastWakeArm()
-		if !ok || !armed.After(at) {
-			t.Fatalf("retry at %v left the timer at %v", at, armed)
-		}
-		at = armed
-	}
-	conn.heartbeatTick(stallDeadline)
-	if !conn.closing.Load() || raw.closes != 1 {
-		t.Fatalf("closing=%v closes=%d, want the stall timeout to close", conn.closing.Load(), raw.closes)
-	}
-	if info := conn.closeInfo(); info.Code != 1001 || info.Reason != "heartbeat timeout" {
-		t.Fatalf("heartbeat close info = %+v", info)
-	}
-}
-
-// A wake deadline the transport refuses is not recorded as armed: the steady
-// fast path would otherwise trust a timer that does not exist, and the
-// connection's heartbeat would stop. The next turn retries the arm.
-func TestHeartbeatRefusedArmIsRetried(t *testing.T) {
-	server := NewServer(Options{})
-	server.HeartbeatInterval = time.Hour
-	raw := newScriptedConn()
-	raw.wakeArmErr = errors.New("transport refused the timer")
-	conn := &Conn{raw: raw, config: testServerConfig(server), heartbeat: &heartbeatState{}}
-	conn.opened.Store(true)
-	conn.beginHeartbeat()
-	conn.heartbeat.mu.Lock()
-	armed := conn.heartbeat.armedAt
-	conn.heartbeat.mu.Unlock()
-	if armed != 0 {
-		t.Fatal("a refused arm was recorded as armed")
-	}
-
-	// A data turn long before the interval: with no timer, it must re-arm
-	// rather than take the steady fast path.
-	raw.wakeMu.Lock()
-	raw.wakeArmErr = nil
-	raw.wakeMu.Unlock()
-	before := len(raw.wakeArms())
-	conn.heartbeatTick(time.Now())
-	if len(raw.wakeArms()) != before+1 {
-		t.Fatal("a turn after a refused arm took the fast path and left no timer")
-	}
-	conn.heartbeat.mu.Lock()
-	armed, next := conn.heartbeat.armedAt, conn.heartbeat.nextPingAt
-	conn.heartbeat.mu.Unlock()
-	if armed != next {
-		t.Fatalf("armedAt %d, want the next ping %d once the transport took it", armed, next)
-	}
-	// Now the steady path holds: another turn arms nothing.
-	conn.heartbeatTick(time.Now())
-	if len(raw.wakeArms()) != before+1 {
-		t.Fatal("a steady turn re-armed an already armed timer")
-	}
-}
-
-// Ready closes once Serve has brought the transport up, and not before: it is
-// what a ServeHTTP mount waits on so an early upgrade is not answered 500.
 func TestServerReadySignalsServeStart(t *testing.T) {
 	server := NewServer(Options{})
 	select {
@@ -708,9 +650,10 @@ func TestServerReadySignalsServeStart(t *testing.T) {
 		t.Fatal("Ready closed before Serve")
 	case <-time.After(20 * time.Millisecond):
 	}
-
 	done := make(chan error, 1)
-	go func() { done <- server.Serve("tcp://127.0.0.1:0") }()
+	go func() {
+		done <- server.Serve("tcp://127.0.0.1:0")
+	}()
 	select {
 	case <-server.Ready():
 	case <-time.After(5 * time.Second):
@@ -726,5 +669,247 @@ func TestServerReadySignalsServeStart(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve did not return")
+	}
+}
+
+func wssConfigs(t testing.TB) (serverTLS *tls.Config, clientTLS *tls.Config) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "uws wss test"}, NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour), DNSNames: []string{"localhost"}, IPAddresses: []net.IP{net.ParseIP("127.0.0.1")}, KeyUsage: x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}}
+	der, err := x509.CreateCertificate(crand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	leaf, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	pool.AddCert(leaf)
+	serverTLS = &tls.Config{Certificates: []tls.Certificate{{Certificate: [][]byte{der}, PrivateKey: key, Leaf: leaf}}}
+	clientTLS = &tls.Config{ServerName: "localhost", RootCAs: pool}
+	return serverTLS, clientTLS
+}
+
+type wssRecorder struct {
+	opened chan *Conn
+	got    chan string
+	closed chan error
+}
+
+func newWSSRecorder() *wssRecorder {
+	return &wssRecorder{opened: make(chan *Conn, 4), got: make(chan string, 16), closed: make(chan error, 4)}
+}
+
+func (h *wssRecorder) OnOpen(c *Conn) {
+	h.opened <- c
+}
+
+func (h *wssRecorder) OnMessage(c *Conn, m Message) {
+	h.got <- string(m.Payload)
+	_ = c.SendText(m.Text())
+}
+
+func (h *wssRecorder) OnClose(_ *Conn, event CloseEvent) {
+	h.closed <- event.Err
+}
+
+func startWSS(t *testing.T, serverTLS *tls.Config) string {
+	t.Helper()
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{Handler: newWSSRecorder(), TLSConfig: serverTLS})
+	})
+	t.Cleanup(func() {
+		_ = server.Close(nil)
+		<-serveDone
+	})
+	return addr
+}
+
+func wssWait[T any](t *testing.T, c chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-c:
+		return v
+	case <-time.After(testIOTimeout()):
+		t.Fatalf("no %s within %v", what, testIOTimeout())
+		return *new(T)
+	}
+}
+
+func TestWSSNeedsATLSConfig(t *testing.T) {
+	dialer := &Dialer{}
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
+	err := dialer.Dial(context.Background(), "wss://127.0.0.1:1/", nil)
+	if !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("Dial wss without a TLSConfig = %v, want ErrInvalidOptions", err)
+	}
+}
+
+func TestWSSHeartbeatClosesBackpressuredPeer(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	listener, err := tls.Listen("tcp", "127.0.0.1:0", serverTLS)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	hold := make(chan struct{})
+	defer close(hold)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		reader := bufio.NewReader(conn)
+		key := ""
+		for {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			trimmed := strings.TrimSpace(line)
+			if len(trimmed) > len("sec-websocket-key:") && strings.EqualFold(trimmed[:len("sec-websocket-key:")], "sec-websocket-key:") {
+				key = strings.TrimSpace(trimmed[len("sec-websocket-key:"):])
+			}
+			if line == "\r\n" {
+				break
+			}
+		}
+		_, _ = fmt.Fprintf(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", testAcceptKey(key))
+		<-hold
+		_, _ = io.Copy(io.Discard, reader)
+	}()
+	watcher := &connCloseWatcher{closeWatcher: newCloseWatcher(), conns: make(chan *Conn, 1)}
+	dialer := NewDialer(Options{Handler: watcher, Pollers: 1, HeartbeatInterval: 10 * time.Millisecond, HeartbeatTimeout: 60 * time.Millisecond, CloseTimeout: 100 * time.Millisecond, MaxOutboundBuffered: 64 << 10, TLSConfig: clientTLS})
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
+	if err := dialer.Dial(context.Background(), "wss://"+listener.Addr().String()+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, watcher.conns, "OnOpen")
+	big := make([]byte, 16<<10)
+	for i := 0; i < 64; i++ {
+		if err := conn.SendBinary(big); err != nil {
+			break
+		}
+	}
+	if event := wssWait(t, watcher.closed, "the heartbeat close"); event.Code != 1001 || event.Reason != "heartbeat timeout" {
+		t.Fatalf("closed with %d %q, want the heartbeat timeout", event.Code, event.Reason)
+	}
+}
+
+type connCloseWatcher struct {
+	*closeWatcher
+	conns chan *Conn
+}
+
+func (w *connCloseWatcher) OnOpen(c *Conn) {
+	w.closeWatcher.OnOpen(c)
+	w.conns <- c
+}
+
+func TestWSSDialVerifiesTheURLHost(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	addr := startWSS(t, serverTLS)
+	clientTLS.ServerName = ""
+	client := newWSSRecorder()
+	dialer := &Dialer{Options: Options{Handler: client, TLSConfig: clientTLS}}
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, client.opened, "client open over wss")
+	state, ok := uio.LayerOf(conn.raw).(interface{ State() tls.ConnectionState })
+	if !ok {
+		t.Fatal("the connection runs no TLS layer")
+	}
+	if chains := state.State().VerifiedChains; len(chains) == 0 {
+		t.Fatal("the server's certificate was not verified")
+	}
+}
+
+func TestWSSServerAdoptsHTTPUpgradesWithoutTLS(t *testing.T) {
+	serverTLS, _ := wssConfigs(t)
+	server := NewServer(Options{Handler: newWSSRecorder(), TLSConfig: serverTLS, Pollers: 1})
+	serveWithoutListener(t, server)
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+	client := quietRecorder{newWSSRecorder()}
+	dialer := &Dialer{Options: Options{Handler: client}}
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "ws"+strings.TrimPrefix(httpServer.URL, "http"), nil); err != nil {
+		t.Fatal(err)
+	}
+	conn := wssWait(t, client.opened, "client open through net/http")
+	if err := conn.SendText("adopted"); err != nil {
+		t.Fatal(err)
+	}
+	if got := wssWait(t, client.got, "the adopted connection's echo"); got != "adopted" {
+		t.Fatalf("echo = %q", got)
+	}
+}
+
+type quietRecorder struct{ *wssRecorder }
+
+func (h quietRecorder) OnMessage(_ *Conn, m Message) {
+	h.got <- string(m.Payload)
+}
+
+func TestWSSAuthorizeSeesTLS(t *testing.T) {
+	serverTLS, clientTLS := wssConfigs(t)
+	seen := make(chan string, 1)
+	server := newWSSRecorder()
+	srv, addr, done := startTestServer(t, func() *Server {
+		s := NewServer(Options{Handler: server, TLSConfig: serverTLS})
+		s.Authorize = func(r *http.Request) (any, error) {
+			if r.TLS == nil {
+				seen <- "no TLS"
+			} else {
+				seen <- r.TLS.ServerName
+			}
+			return nil, nil
+		}
+		return s
+	})
+	t.Cleanup(func() {
+		stopTestServer(t, srv, done)
+	})
+	dialer := &Dialer{Options: Options{Handler: quietRecorder{newWSSRecorder()}, TLSConfig: clientTLS}}
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+	if err := dialer.Dial(ctx, "wss://"+addr+"/", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := wssWait(t, seen, "Authorize"); got != "localhost" {
+		t.Fatalf("Authorize saw server name %q, want localhost", got)
+	}
+	conn := wssWait(t, server.opened, "the server's open")
+	if state, ok := conn.TLSState(); !ok || !state.HandshakeComplete {
+		t.Fatalf("TLSState = %v, %v", state.HandshakeComplete, ok)
+	}
+}
+
+func signal[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
 	}
 }

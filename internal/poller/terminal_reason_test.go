@@ -1,3 +1,5 @@
+//go:build !windows
+
 package poller
 
 import (
@@ -45,7 +47,7 @@ func TestQueuedWakeCannotHidePublishedTerminalReason(t *testing.T) {
 }
 
 func TestWakeRacingClosePreservesServeCause(t *testing.T) {
-	for range 64 {
+	for i := range 64 {
 		p, err := New()
 		if err != nil {
 			t.Fatal(err)
@@ -53,7 +55,7 @@ func TestWakeRacingClosePreservesServeCause(t *testing.T) {
 		cause := errors.New("concurrent close")
 		h := terminalReasonHandler{closed: make(chan error, 1)}
 		done := make(chan error, 1)
-		go func() { done <- p.Serve(false, h) }()
+		go func() { done <- p.Serve(i%2 == 0, h) }()
 		if err := p.Wake(); err != nil {
 			t.Fatal(err)
 		}
@@ -71,5 +73,19 @@ func TestWakeRacingClosePreservesServeCause(t *testing.T) {
 		if err := <-h.closed; !errors.Is(err, cause) {
 			t.Fatalf("callback lost close cause: %v", err)
 		}
+	}
+
+	p, err := New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cause := errors.New("parked serve close")
+	h := terminalReasonHandler{closed: make(chan error, 1)}
+	done := make(chan error, 1)
+	go func() { done <- p.Serve(true, h) }()
+	time.Sleep(10 * time.Millisecond)
+	_ = p.Close(cause)
+	if err := <-done; !errors.Is(err, cause) {
+		t.Fatalf("parked Serve = %v, want %v", err, cause)
 	}
 }

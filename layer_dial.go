@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-// Dialing through a chain: the probe that marks the connection's userdata
+// Dialing through a chain: the probe attached to the connection's driver slot
 // until the whole stack opened, so DialContext can return the wrapped
 // connection — and refuse it with zero callbacks.
 
@@ -25,22 +25,18 @@ import (
 	"sync/atomic"
 )
 
-// dialMarker replaces the dial's userdata with a probe when the connection's
-// entry carries a chain, so the stack can report the dial once it opened. The
-// second return is the userdata the dialed connection starts with.
-func (ev *Events) dialMarker(userdata any, layered bool) (*dialProbe, any) {
-	if !layered {
-		return nil, userdata
+func prepareLayeredDial(fdc *fdConn) func(context.Context) (Conn, error) {
+	probe := &dialProbe{done: make(chan struct{})}
+	fdc.setDriverData(probe)
+	return func(ctx context.Context) (Conn, error) {
+		return awaitDial(ctx, fdc, probe)
 	}
-	probe := &dialProbe{user: userdata, done: make(chan struct{})}
-	return probe, probe
 }
 
 // dialProbe is the marker a dial carries until its stack opens: the stack
-// takes the dial's userdata from it, and settles or fails it — or the dial
-// gives up on it first. Whichever claims it first decides.
+// settles or fails it — or the dial gives up on it first. Whichever claims it
+// first decides.
 type dialProbe struct {
-	user    any
 	claimed atomic.Bool
 	done    chan struct{} // closed once, with conn or err in place
 	conn    Conn
@@ -66,7 +62,7 @@ func (p *dialProbe) fail(err error) {
 
 // awaitDial waits for a dial's stack to open and reports what it became.
 // raw is the socket, for a cancellation to close.
-func (ev *Events) awaitDial(ctx context.Context, raw Conn, probe *dialProbe) (Conn, error) {
+func awaitDial(ctx context.Context, raw Conn, probe *dialProbe) (Conn, error) {
 	select {
 	case <-probe.done:
 		if probe.err != nil {
@@ -85,7 +81,7 @@ func (ev *Events) awaitDial(ctx context.Context, raw Conn, probe *dialProbe) (Co
 			}
 			return probe.conn, nil
 		}
-		_ = raw.CloseWith(cause)
+		_ = raw.Abort(cause)
 		return nil, cause
 	}
 }

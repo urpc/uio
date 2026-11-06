@@ -2,7 +2,7 @@ package uws
 
 import (
 	"bufio"
-	"bytes"
+	"github.com/urpc/uio"
 	"io"
 	"math/rand/v2"
 	"net"
@@ -10,8 +10,6 @@ import (
 	"sync"
 	"testing"
 	"time"
-
-	"github.com/urpc/uio"
 )
 
 const testKey = "dGhlIHNhbXBsZSBub25jZQ=="
@@ -24,7 +22,7 @@ func testServerConfig(server *Server) *connConfig {
 	if err != nil {
 		panic(err)
 	}
-	return newServerConnConfig(opts, server.CheckOrigin, server.Authorize, &server.stats)
+	return newServerConnConfig(opts, server.CheckOrigin, server.Authorize)
 }
 
 func testDialerConfig(dialer *Dialer) *connConfig {
@@ -35,7 +33,7 @@ func testDialerConfig(dialer *Dialer) *connConfig {
 	if err != nil {
 		panic(err)
 	}
-	return newDialerConnConfig(opts, &dialer.stats)
+	return newDialerConnConfig(opts)
 }
 
 func testIOTimeout() time.Duration {
@@ -55,42 +53,23 @@ type echoHandler struct {
 
 type clientHandler struct {
 	name    string
-	conn    *Conn // set by OnOpen before open closes
+	conn    *Conn
 	open    chan struct{}
 	closed  chan struct{}
 	message chan Message
-}
-
-type fragmentedMessageHandler struct {
-	ready chan error
-}
-
-type compressedMessageHandler struct {
-	ready chan error
-}
-
-type heartbeatHandler struct {
-	closed chan CloseEvent
-}
-
-type reentrantCloseHandler struct {
-	open    chan struct{}
-	closed  chan struct{}
-	closeMu sync.RWMutex
-	closeFn func()
-	once    sync.Once
-}
+} // set by OnOpen before open closes
 
 type writeProbeConn struct {
 	probeReadAccess
 	uio.Conn
+	uio.SocketConn
 	probeReadControl
 	writes        int
 	writevs       int
 	flushes       int
 	wakes         int
 	wakeErr       error
-	outbound      int // reported by OutboundBuffered
+	outbound      int
 	closes        int
 	closed        chan struct{}
 	closeCause    chan error
@@ -101,31 +80,35 @@ type writeProbeConn struct {
 	deadlineErr   error
 	noDelay       bool
 	noDelayErr    error
-	// wakeMu guards wakesAt, the deadlines the heartbeat armed. A test reads
-	// it from its own goroutine; the fake itself records no other way.
-	wakeMu     sync.Mutex
-	wakesAt    []time.Time
-	wakeArmErr error // SetWakeDeadline's result, recorded or not
-}
+	wakeMu        sync.Mutex
+	wakesAt       []time. // reported by OutboundBuffered
+		// wakeMu guards wakesAt, the deadlines the heartbeat armed. A test reads
+		// it from its own goroutine; the fake itself records no other way.
+		Time
+	wakeArmErr error
+} // SetWakeDeadline's result, recorded or not
 
 type bufferedProbeConn struct {
 	writeProbeConn
 	inbound []byte
 }
 
-// OutboundBuffered reports the queued output tests simulate.
-func (c *writeProbeConn) OutboundBuffered() int { return c.outbound }
+func (c *writeProbeConn) OutboundBuffered() int {
+	return c.outbound
+}
 
-func (c *bufferedProbeConn) YieldRead() error { return c.Wake() }
-
-func (c *bufferedProbeConn) InboundBuffered() int { return len(c.inbound) }
+func (c *bufferedProbeConn) InboundBuffered() int {
+	return len(c.inbound)
+}
 
 func (c *bufferedProbeConn) Peek(dst []byte) []byte {
 	n := copy(dst, c.inbound)
 	return dst[:n]
 }
 
-func (c *bufferedProbeConn) PeekChunk() []byte { return c.inbound }
+func (c *bufferedProbeConn) PeekChunk() []byte {
+	return c.inbound
+}
 
 func (c *bufferedProbeConn) Discard(n int) (int, error) {
 	if n < 0 || n > len(c.inbound) {
@@ -141,8 +124,6 @@ type segmentedProbeConn struct {
 	buffered int
 }
 
-func (c *segmentedProbeConn) YieldRead() error { return c.Wake() }
-
 func newSegmentedProbeConn(segments ...[]byte) *segmentedProbeConn {
 	c := &segmentedProbeConn{segments: segments}
 	for _, segment := range segments {
@@ -151,7 +132,9 @@ func newSegmentedProbeConn(segments ...[]byte) *segmentedProbeConn {
 	return c
 }
 
-func (c *segmentedProbeConn) InboundBuffered() int { return c.buffered }
+func (c *segmentedProbeConn) InboundBuffered() int {
+	return c.buffered
+}
 
 func (c *segmentedProbeConn) Peek(dst []byte) []byte {
 	written := 0
@@ -192,20 +175,6 @@ func (c *segmentedProbeConn) Discard(n int) (int, error) {
 	}
 	return discarded, nil
 }
-
-type assemblerStateHandler struct {
-	assemblerVisible bool
-	messages         []string
-}
-
-func (*assemblerStateHandler) OnOpen(*Conn) {}
-
-func (h *assemblerStateHandler) OnMessage(conn *Conn, message Message) {
-	h.assemblerVisible = conn.assembler != nil
-	h.messages = append(h.messages, string(message.Payload))
-}
-
-func (*assemblerStateHandler) OnClose(*Conn, CloseEvent) {}
 
 type recordingHandler struct {
 	mu       sync.Mutex
@@ -254,18 +223,11 @@ func (c *writeProbeConn) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return n, nil
 }
 
-// ReserveOutbound sends probes down the owned-write path, which they count.
-func (c *writeProbeConn) ReserveOutbound(int) ([]byte, error) {
-	return nil, uio.ErrReserveUnsupported
-}
-
 func (c *writeProbeConn) Flush() error {
 	c.flushes++
 	return nil
 }
 
-// SetWakeDeadline records the deadline the heartbeat arms; the fakes run no
-// timers, so a test drives the ticks itself.
 func (c *writeProbeConn) SetWakeDeadline(when time.Time) error {
 	c.wakeMu.Lock()
 	defer c.wakeMu.Unlock()
@@ -273,16 +235,16 @@ func (c *writeProbeConn) SetWakeDeadline(when time.Time) error {
 	return c.wakeArmErr
 }
 
-func (c *writeProbeConn) SetWakeInterval(time.Duration) error { return nil }
+func (c *writeProbeConn) SetWakeInterval(time.Duration) error {
+	return nil
+}
 
-// wakeArms is every deadline SetWakeDeadline recorded, in order.
 func (c *writeProbeConn) wakeArms() []time.Time {
 	c.wakeMu.Lock()
 	defer c.wakeMu.Unlock()
 	return append([]time.Time(nil), c.wakesAt...)
 }
 
-// lastWakeArm is the deadline one-shot timer the transport now holds.
 func (c *writeProbeConn) lastWakeArm() (time.Time, bool) {
 	c.wakeMu.Lock()
 	defer c.wakeMu.Unlock()
@@ -317,7 +279,11 @@ func (c *writeProbeConn) SetNoDelay(noDelay bool) error {
 	return c.noDelayErr
 }
 
-func (c *writeProbeConn) CloseWith(err error) error {
+func (c *writeProbeConn) Close() error {
+	return c.Abort(io.EOF)
+}
+
+func (c *writeProbeConn) Abort(err error) error {
 	c.closes++
 	if c.closeCause != nil {
 		select {
@@ -326,70 +292,39 @@ func (c *writeProbeConn) CloseWith(err error) error {
 		}
 	}
 	if c.closed != nil {
-		c.closeOnce.Do(func() { close(c.closed) })
+		c.closeOnce.Do(func() {
+			close(c.closed)
+		})
 	}
 	return nil
 }
 
 func completeTestOutbound(conn *Conn) {
-	pending := conn.writes.close.pendingBytes.Load()
-	if pending > 0 {
-		conn.releaseOutbound(int(pending))
+	drained := 0
+	switch raw := conn.raw.(type) {
+	case *scriptedConn:
+		drained, raw.outbound = raw.outbound, 0
+	case *heartbeatWriteProbe:
+		drained, raw.outbound = raw.outbound, 0
+	case *writeProbeConn:
+		drained, raw.outbound = raw.outbound, 0
 	}
+	conn.onTransportProgress(drained)
 	_, _ = conn.tryCloseTransport()
 }
 
-func (*heartbeatHandler) OnOpen(*Conn)                       {}
-func (*heartbeatHandler) OnMessage(*Conn, Message)           {}
-func (h *heartbeatHandler) OnClose(_ *Conn, info CloseEvent) { h.closed <- info }
-
-func (h *reentrantCloseHandler) OnOpen(*Conn) {
-	if h.open != nil {
-		close(h.open)
-	}
+func (h *clientHandler) OnOpen(c *Conn) {
+	h.conn = c
+	close(h.open)
 }
 
-func (*reentrantCloseHandler) OnMessage(*Conn, Message) {}
-
-func (h *reentrantCloseHandler) OnClose(*Conn, CloseEvent) {
-	h.closeMu.RLock()
-	closeFn := h.closeFn
-	h.closeMu.RUnlock()
-	if closeFn != nil {
-		closeFn()
-	}
-	h.once.Do(func() {
-		if h.closed != nil {
-			close(h.closed)
-		}
-	})
+func (h *clientHandler) OnMessage(_ *Conn, message Message) {
+	h.message <- message.Clone()
 }
 
-func (h *reentrantCloseHandler) setCloseFunc(closeFn func()) {
-	h.closeMu.Lock()
-	h.closeFn = closeFn
-	h.closeMu.Unlock()
+func (h *clientHandler) OnClose(*Conn, CloseEvent) {
+	close(h.closed)
 }
-
-func (h *fragmentedMessageHandler) OnOpen(conn *Conn) {
-	h.ready <- conn.SendBinary([]byte("abcdef"))
-}
-
-func (*fragmentedMessageHandler) OnMessage(*Conn, Message)  {}
-func (*fragmentedMessageHandler) OnClose(*Conn, CloseEvent) {}
-
-func (h *compressedMessageHandler) OnOpen(conn *Conn) {
-	h.ready <- conn.SendBinary(bytes.Repeat([]byte("compressed-message-"), 32))
-}
-
-func (*compressedMessageHandler) OnMessage(*Conn, Message)  {}
-func (*compressedMessageHandler) OnClose(*Conn, CloseEvent) {}
-
-func (h *clientHandler) OnOpen(c *Conn) { h.conn = c; close(h.open) }
-
-func (h *clientHandler) OnMessage(_ *Conn, message Message) { h.message <- message.Clone() }
-
-func (h *clientHandler) OnClose(*Conn, CloseEvent) { close(h.closed) }
 
 func (h *echoHandler) OnOpen(conn *Conn) {
 	if h.conn != nil {
@@ -403,7 +338,11 @@ func (h *echoHandler) OnMessage(conn *Conn, message Message) {
 	_ = conn.SendText("world")
 }
 
-func (h *echoHandler) OnClose(*Conn, CloseEvent) { h.once.Do(func() { close(h.closed) }) }
+func (h *echoHandler) OnClose(*Conn, CloseEvent) {
+	h.once.Do(func() {
+		close(h.closed)
+	})
+}
 
 func readServerFrame(reader *bufio.Reader) (first byte, payload []byte, fin bool, err error) {
 	var header [2]byte
@@ -439,16 +378,6 @@ func readServerFrame(reader *bufio.Reader) (first byte, payload []byte, fin bool
 	return first, payload, fin, err
 }
 
-// startTestServer binds and starts the server built by newServer on a fresh
-// loopback port and returns it with its address and Serve's result. The
-// listeners are bound before it returns: ready is set at the start of OnStart,
-// after the bind. The caller owns shutdown and must drain serveDone.
-//
-// The port is picked below the ephemeral ranges (32768 up on Linux, 49152 up
-// on macOS and Windows). A port probed from those ranges and released is
-// handed to the next outgoing connection of any process on the host, and
-// processes running tests side by side dial thousands. Below them only an
-// explicit bind can take a port, and a taken one is retried.
 func startTestServer(t *testing.T, newServer func() *Server) (*Server, string, <-chan error) {
 	t.Helper()
 	var lastErr error
@@ -457,12 +386,13 @@ attempt:
 		addr := net.JoinHostPort("127.0.0.1", strconv.Itoa(20000+rand.IntN(12000)))
 		server := newServer()
 		serveDone := make(chan error, 1)
-		go func() { serveDone <- server.Serve(addr) }()
+		go func() {
+			serveDone <- server.Serve(addr)
+		}()
 		deadline := time.Now().Add(testIOTimeout())
 		for {
 			select {
 			case lastErr = <-serveDone:
-				// Serve gave up before binding: the port is in use.
 				continue attempt
 			default:
 			}
@@ -479,7 +409,6 @@ attempt:
 	return nil, "", nil
 }
 
-// stopTestServer closes server and waits for Serve to return.
 func stopTestServer(t *testing.T, server *Server, serveDone <-chan error) {
 	t.Helper()
 	_ = server.Close(nil)

@@ -11,9 +11,6 @@ import (
 	"time"
 )
 
-// exhaustDescriptors lowers the process's descriptor limit to what is open
-// now and fills any gaps below it, so the next descriptor anything allocates
-// fails with EMFILE. The returned function frees them and restores the limit.
 func exhaustDescriptors(t *testing.T) (restore func()) {
 	t.Helper()
 	var saved syscall.Rlimit
@@ -48,10 +45,6 @@ func exhaustDescriptors(t *testing.T) (restore func()) {
 	}
 }
 
-// Running out of descriptors while connections wait to be accepted neither
-// stops the Events nor spins the loop that accepts: the listener pauses, and
-// once descriptors are free again it accepts the connections still waiting
-// and new ones.
 func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 	const waiting = 4
 	type startState struct {
@@ -60,28 +53,29 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 	}
 	opened := make(chan Conn, waiting+1)
 	started := make(chan startState, 1)
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{
-		Open: func(c Conn) { signal(opened, c) },
-		Start: func(ev *Events) {
-			// Nothing is accepted until OnStart returns: the clients wait in
-			// the backlog, and the first accept finds no descriptor left.
-			var state startState
-			defer func() { started <- state }()
-			addr := ""
-			for _, l := range ev.acceptor.listeners {
-				addr = l.ln.Addr().String()
+	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Open: func(c Conn) {
+		signal(opened, c)
+	}, Start: func(ev *Events) {
+		var state startState
+		defer func() {
+			started <- state
+		}()
+		addr := ""
+		for _, l := range // Nothing is accepted until OnStart returns: the clients wait in
+		// the backlog, and the first accept finds no descriptor left.
+		ev.acceptor.listeners {
+			addr = l.ln.Addr().String()
+		}
+		for range waiting {
+			c, err := net.Dial("tcp4", addr)
+			if err != nil {
+				t.Error(err)
+				return
 			}
-			for range waiting {
-				c, err := net.Dial("tcp4", addr)
-				if err != nil {
-					t.Error(err)
-					return
-				}
-				state.clients = append(state.clients, c)
-			}
-			state.restore = exhaustDescriptors(t)
-		},
-	})
+			state.clients = append(state.clients, c)
+		}
+		state.restore = exhaustDescriptors(t)
+	}})
 	var serveErr error
 	served := make(chan struct{})
 	go func() {
@@ -113,8 +107,7 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 			state.restore()
 		}
 	}()
-
-	time.Sleep(50 * time.Millisecond) // the shortage has begun
+	time.Sleep(50 * time.Millisecond)
 	cpuBefore, wallBefore := processCPUTime(), time.Now()
 	time.Sleep(300 * time.Millisecond)
 	cpu, wall := processCPUTime()-cpuBefore, time.Since(wallBefore)
@@ -131,9 +124,6 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 	if cpu > wall/2 {
 		t.Errorf("the process used %v of CPU in %v while accepting could not proceed", cpu, wall)
 	}
-
-	// Linux keeps a connection whose accept ran out of descriptors in the
-	// backlog, where the paused listener finds it again; the BSDs drop it.
 	if runtime.GOOS == "linux" {
 		for i := range waiting {
 			select {

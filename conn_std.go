@@ -27,9 +27,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/bytebuf"
-	"github.com/urpc/uio/internal/poller"
 	"github.com/urpc/uio/internal/readcontrol"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
 // Keep tiny writes coalesced while bounding payload work done under mux.
@@ -38,11 +39,15 @@ const stdOwnedWriteThreshold = 4 << 10
 const stdWriteVecLimit = 16
 
 type fdConn struct {
-	inputReadControlAccess
-	readControl atomic.Pointer[readcontrol.Control] // optional consumer pauses, independent of readHeld
-	// yieldPending marks a YieldRead whose continuation callback has not run
-	// yet: the end of the stream waits for it.
-	yieldPending atomic.Bool
+	readControlAccess
+	writeControlAccess
+	blockControlAccess
+	readControl  atomic.Pointer[readcontrol.Control]  // optional read control, independent of readHeld
+	writeControl atomic.Pointer[writecontrol.Control] // optional write control
+	blockControl atomic.Pointer[blockio.State]        // optional blocking I/O state
+	pullRead     atomic.Bool
+	localClosed  atomic.Bool
+	driver       atomic.Pointer[any] // optional endpoint driver state
 	commonConn
 	conn           net.Conn
 	udp            *stdUDPState
@@ -78,6 +83,7 @@ type fdConn struct {
 	// deliver right after it, one OnRead each. Both are guarded by callbackMu.
 	opened         bool
 	wakesAfterOpen int
+	wakesPending   atomic.Int32
 
 	// readHeld stops the read goroutine once callbacks leave
 	// MaxInboundBuffered bytes unconsumed; it waits on readResume until a Wake
@@ -147,15 +153,7 @@ func (fc *fdConn) OutboundBuffered() int {
 	return fc.outbound.Len() + fc.writeBytes
 }
 
-func (fc *fdConn) initialInterest() poller.Interest { return poller.Readable }
-
-func (fc *fdConn) setInterest(poller.Interest) {}
-
-func (fc *fdConn) currentInterest() poller.Interest { return poller.Readable }
-
 func (fc *fdConn) isClosing() bool { return fc.closing.Load() || fc.IsClosed() }
-
-func (fc *fdConn) beginShutdown() {}
 
 func (fc *fdConn) isDatagram() bool { return fc.udp != nil }
 
@@ -188,6 +186,7 @@ func (fc *fdConn) openOnReader() bool {
 	fc.callbackMu.Lock()
 	fc.ensureOpenLocked()
 	for ; fc.wakesAfterOpen > 0 && !fc.isClosing(); fc.wakesAfterOpen-- {
+		fc.wakesPending.Add(-1)
 		started := fc.beginInboundCallback()
 		err := fc.events().onRead(fc)
 		fc.endInboundCallback(started)
@@ -415,28 +414,6 @@ func (fc *fdConn) RemoteAddr() net.Addr {
 	return nil
 }
 
-func (fc *fdConn) Fd() int {
-	var rc syscall.Conn
-
-	if fc.udp != nil {
-		rc = net.PacketConn(fc.udp.sock).(syscall.Conn)
-	} else {
-		rc = fc.conn.(syscall.Conn)
-	}
-
-	sc, err := rc.SyscallConn()
-	if err != nil {
-		return -1
-	}
-
-	var fd int
-	err = sc.Control(func(h uintptr) { fd = int(h) })
-	if nil != err {
-		return -1
-	}
-	return fd
-}
-
 func (fc *fdConn) SetLinger(secs int) error {
 	if fc.isClosing() {
 		return net.ErrClosed
@@ -513,8 +490,6 @@ var readDeadlineNotedForTest func()
 // found its read deadline passed and before it acts on that.
 var heldDeadlineExpiredForTest func()
 
-func (fc *fdConn) applySocketOption(socketOptionKind, int) error { return ErrUnsupported }
-
 func releaseStdBuffers(buffers []*bytebuf.Buffer) {
 	for _, buffer := range buffers {
 		bytebuf.ReleaseBuffer(buffer)
@@ -528,11 +503,11 @@ func (fc *fdConn) State() ConnState {
 	var state ConnState
 	// The same condition Read reports io.EOF by.
 	if fc.readEOF.Load() && fc.inbound.Empty() && len(fc.inboundTail) == 0 {
-		state |= StatePeerEnded
+		state |= StateReadEnded
 	}
 	fc.mux.Lock()
 	if fc.writeShut {
-		state |= StateWriteShut
+		state |= StateWriteEnded
 	}
 	fc.mux.Unlock()
 	if fc.isClosing() {
@@ -562,22 +537,29 @@ func (fc *fdConn) Wake() error {
 	// previously submitted tasks and one callback is scheduled per call. The
 	// loop only dequeues it; see runWakeTask for why the callback itself runs
 	// elsewhere.
+	fc.wakesPending.Add(1)
 	t := acquireTask(wakeTask, fc)
 	if !fc.loop.submitTask(t) {
+		fc.wakesPending.Add(-1)
 		releaseTask(t)
 		return net.ErrClosed
 	}
 	return nil
 }
 
-// YieldRead asks for a continuation callback through the loop's queue. The
-// reader goes on reading meanwhile, so a callback that waits for more bytes
-// gets them; the end of the stream waits for the continuation.
-func (fc *fdConn) YieldRead() error {
-	if !fc.isDatagram() {
-		fc.yieldPending.Store(true)
+func (fc *fdConn) driverData() any {
+	if d := fc.driver.Load(); d != nil {
+		return *d
 	}
-	return fc.Wake()
+	return nil
+}
+
+func (fc *fdConn) setDriverData(value any) {
+	if value == nil {
+		fc.driver.Store(nil)
+		return
+	}
+	fc.driver.Store(&value)
 }
 
 // runWakeTask runs on the event loop, in submission order, and hands the
@@ -596,12 +578,14 @@ func (fc *fdConn) runWakeTask() error {
 func (fc *fdConn) deliverWake() {
 	defer fc.events().callbackWG.Done()
 	if fc.isClosing() {
+		fc.wakesPending.Add(-1)
 		return
 	}
 	// A Wake callback must not race the blocking read goroutine's inbound view.
 	fc.callbackMu.Lock()
 	defer fc.callbackMu.Unlock()
 	if fc.isClosing() {
+		fc.wakesPending.Add(-1)
 		// The connection closed while this callback waited its turn.
 		return
 	}
@@ -610,18 +594,11 @@ func (fc *fdConn) deliverWake() {
 		fc.wakesAfterOpen++
 		return
 	}
+	fc.wakesPending.Add(-1)
 	started := fc.beginInboundCallback()
 	defer fc.endInboundCallback(started)
-	before := fc.inputMark()
 	if err := fc.events().onRead(fc); err != nil {
 		fc.requestClose(err)
-		return
-	}
-	if fc.readEOF.Load() && fc.yieldPending.Load() && fc.inputMark() == before {
-		// The stream ended and this continuation moved nothing: no byte can
-		// arrive to complete the unit its consumer waits for. It had its
-		// chance; its unconsumed input goes as a close's does.
-		fc.requestClose(io.EOF)
 		return
 	}
 	fc.noteReadEnded()
@@ -642,6 +619,8 @@ func (fc *fdConn) flushOnLoop() (int, error) { return 0, nil }
 // connection closes: a close wakes it through the same notification channel,
 // and the drain then reports the closed transport.
 func (fc *fdConn) writeLoop() {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	defer fc.events().callbackWG.Done()
 	for range fc.writeSig {
 		written, err := fc.drainOutbound()
@@ -666,7 +645,7 @@ func (fc *fdConn) noteReadEnded() {
 		return
 	}
 	fc.readEnded.Store(true)
-	if fc.writeShutDone.Load() {
+	if fc.entry.directConsumer && fc.writeShutDone.Load() {
 		fc.requestClose(io.EOF)
 	}
 }
@@ -677,15 +656,15 @@ func (fc *fdConn) noteReadEnded() {
 // the end is recorded and OnRead runs once more, so a consumer sees what it
 // retained and a half-open one sees Read report io.EOF. The connection then
 // closes when the consumer no longer holds the end back (closeDeferredReadEOF),
-// when both halves of a half-open one ended, or — layered — when the stack
-// handed the end up (stack.ended).
+// when both halves of a half-open one ended, or when a non-direct driver closes
+// the connection itself.
 func (fc *fdConn) onReadEOF() {
 	fc.callbackMu.Lock()
 	if fc.isClosing() {
 		fc.callbackMu.Unlock()
 		return
 	}
-	if !fc.events().AllowHalfOpen && !fc.entry.layered && !fc.yieldPending.Load() && !fc.currentReadControl().Held() &&
+	if fc.autoCloseOnEOF() && !fc.currentReadControl().Held() &&
 		fc.inbound.Empty() && len(fc.inboundTail) == 0 {
 		fc.callbackMu.Unlock()
 		fc.events().closeConn(fc, io.EOF)
@@ -766,13 +745,13 @@ func (fc *fdConn) readLoop() {
 					fc.readHeld = true
 				}
 			}
-			wait = fc.readHeld || fc.ReadsPaused()
+			wait = fc.readHeld || fc.ReadPaused()
 			fc.endInboundCallback(started)
 			fc.callbackMu.Unlock()
 		}
 		if readErr != nil {
 			// The end of the stream is the consumer's to see, paused or not;
-			// a fatal error ends the connection at once, as CloseWith can
+			// a fatal error ends the connection at once, as Abort can
 			// discard input not yet consumed.
 			if readErr == io.EOF {
 				fc.onReadEOF()
@@ -799,7 +778,7 @@ func (fc *fdConn) waitReadResume() bool {
 	}()
 	for {
 		fc.callbackMu.Lock()
-		held := fc.readHeld || fc.ReadsPaused()
+		held := fc.readHeld || fc.ReadPaused()
 		fc.callbackMu.Unlock()
 		if fc.isClosing() {
 			return false
@@ -858,6 +837,8 @@ func (fc *fdConn) fireWriteEvent() error {
 func (fc *fdConn) fireReadEvent() error {
 	fc.events().callbackWG.Add(1)
 	go func() {
+		blockio.EnterTurn()
+		defer blockio.LeaveTurn()
 		if !fc.openOnReader() {
 			fc.events().callbackWG.Done()
 			return

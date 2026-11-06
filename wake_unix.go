@@ -24,8 +24,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/readcontrol"
 	"github.com/urpc/uio/internal/timewheel"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
 // wakeState is a connection's wake timer: one entry on its loop's wheel. The
@@ -33,12 +35,16 @@ import (
 // re-arms, so a due entry the wheel reports is the deadline that was armed —
 // and the wake turn's existing guards (isClosing, the held-read pause) carry
 // the rest. The wheel's mutex serializes its lists; an atomic publication
-// shares the cold allocation with optional input-control state. A setter that
+// shares the cold allocation with optional flow-control state. A setter that
 // loses the race with the close path — armed after the close's cancel ran —
 // undoes itself by re-checking isClosing after the arm.
 type wakeState struct {
-	readControl atomic.Pointer[readcontrol.Control] // optional input control; shares cold allocation
-	entry       *timewheel.Entry[*fdConn]
+	readControl  atomic.Pointer[readcontrol.Control]  // optional read control; shares cold allocation
+	writeControl atomic.Pointer[writecontrol.Control] // optional write control; shares cold allocation
+	block        atomic.Pointer[blockio.State]        // optional blocking I/O state; shares cold allocation
+	pullRead     atomic.Bool                          // true when switched to BlockingReader pull mode
+	driver       atomic.Pointer[any]                  // optional endpoint driver state
+	entry        *timewheel.Entry[*fdConn]
 	// mu holds the wheel's arm and the mirror — armed, due and period — as
 	// one step, so a setter and a consuming turn can never see the pair
 	// split: a due published with a stale period would consume the timer as
@@ -109,6 +115,25 @@ func (conn *fdConn) wakeState() *wakeState {
 		return w
 	}
 	return conn.wake.Load()
+}
+
+func (conn *fdConn) driverData() any {
+	if w := conn.wake.Load(); w != nil {
+		if d := w.driver.Load(); d != nil {
+			return *d
+		}
+	}
+	return nil
+}
+
+func (conn *fdConn) setDriverData(value any) {
+	if value == nil {
+		if w := conn.wake.Load(); w != nil {
+			w.driver.Store(nil)
+		}
+		return
+	}
+	conn.wakeState().driver.Store(&value)
 }
 
 // fireWakeTimer runs the connection's own timer callback when its deadline

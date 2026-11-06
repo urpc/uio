@@ -16,11 +16,11 @@
 
 // Tunnel forwards every connection it accepts to an upstream TCP server: a
 // relay with end-to-end backpressure, half-close passthrough and aborts that
-// stay aborts. uio.Bridge is exactly that shape, so the example is the bridge
-// and its configuration.
+// stay aborts. ubridge.Bridge is exactly that shape, so the example is the
+// bridge and its configuration.
 //
 //	  client                        tunnel                      upstream
-//	  │                            (uio.Bridge)                  │
+//	  │                           (ubridge.Bridge)                 │
 //	  │  accept  ┌──────────────────────┐                        │
 //	  └─────────►│ client leg   upstream│────────────────────────►│
 //	   reply ◄───┤    leg         leg   │◄───────────────────────│
@@ -58,7 +58,7 @@ import (
 	"flag"
 	"fmt"
 
-	"github.com/urpc/uio"
+	"github.com/urpc/uio/ubridge"
 )
 
 func main() {
@@ -69,7 +69,7 @@ func main() {
 	// The bridge dials one upstream per client leg and relays both ways; its
 	// defaults (a 256 KiB InboundLimit and the Events they configure) are all
 	// this relay needs.
-	br := &uio.Bridge{Upstream: *upstream}
+	br := &ubridge.Bridge{Upstream: *upstream}
 	fmt.Println("tunnel", *listen, "->", *upstream)
 	// Serve blocks on the user listener; every accepted connection is
 	// relayed by the bridge until the process stops.

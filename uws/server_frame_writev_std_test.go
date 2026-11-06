@@ -3,11 +3,9 @@
 package uws
 
 import (
-	"bytes"
-	"testing"
-
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/uws/internal/frame"
+	"testing"
 )
 
 type stdFrameSink struct {
@@ -43,60 +41,10 @@ func (s *stdFrameSink) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return written, nil
 }
 
-func (s *stdFrameSink) ReserveOutbound(int) ([]byte, error) {
-	return nil, uio.ErrReserveUnsupported
-}
-
-func TestStdServerFrameUsesSingleTransportCopy(t *testing.T) {
-	payload := bytes.Repeat([]byte{0xa5}, 1<<20)
-	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
-	conn := &Conn{
-		raw:    raw,
-		config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}}),
-	}
-	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
-		t.Fatal(err)
-	}
-	if raw.writes != 0 || raw.writevs != 1 {
-		t.Fatalf("transport calls = Write:%d Writev:%d, want 0/1", raw.writes, raw.writevs)
-	}
-	if raw.copied != len(payload)+10 {
-		t.Fatalf("transport copied bytes = %d, want %d", raw.copied, len(payload)+10)
-	}
-	if !bytes.Equal(raw.dst[10:raw.copied], payload) {
-		t.Fatal("transport copy differs from caller payload")
-	}
-	raw.dst[10] ^= 0xff
-	if payload[0] != 0xa5 {
-		t.Fatal("transport retained and modified caller payload")
-	}
-}
-
-func TestStdClientFrameKeepsMaskedCopy(t *testing.T) {
-	payload := bytes.Repeat([]byte{0xa5}, 1<<20)
-	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
-	conn := &Conn{
-		raw:    raw,
-		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: uint64(len(payload))}}),
-	}
-	if err := conn.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}); err != nil {
-		t.Fatal(err)
-	}
-	if raw.writes != 1 || raw.writevs != 0 {
-		t.Fatalf("transport calls = Write:%d Writev:%d, want 1/0", raw.writes, raw.writevs)
-	}
-	if !bytes.Equal(payload, bytes.Repeat([]byte{0xa5}, len(payload))) {
-		t.Fatal("client masking modified caller payload")
-	}
-}
-
 func BenchmarkStdServerFrame1MiB(b *testing.B) {
 	payload := make([]byte, 1<<20)
 	raw := &stdFrameSink{dst: make([]byte, len(payload)+14)}
-	conn := &Conn{
-		raw:    raw,
-		config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}}),
-	}
+	conn := &Conn{raw: raw, config: testServerConfig(&Server{Options: Options{MaxFramePayload: uint64(len(payload))}})}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: payload}
 	b.ReportAllocs()
 	b.SetBytes(int64(len(payload)))

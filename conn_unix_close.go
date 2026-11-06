@@ -114,7 +114,7 @@ func (state *connCloseState) release() bool {
 // closeIfEnded closes a half-open connection whose two halves have both
 // ended, once a callback consumed the last bytes its peer sent.
 func (conn *fdConn) closeIfEnded() {
-	if conn.writeState.Load()&writeShutDoneFlag != 0 && conn.readEnded() && conn.readCloseReady() {
+	if conn.entry.directConsumer && conn.writeState.Load()&writeShutDoneFlag != 0 && conn.readEnded() && conn.readCloseReady() {
 		conn.requestClose(io.EOF)
 	}
 }
@@ -231,21 +231,26 @@ func (conn *fdConn) closesOffTurn() bool {
 	return conn.flags.Load()&(controlAliasFlag|offTurnCloseFlag) == offTurnCloseFlag
 }
 
-func (conn *fdConn) Close() error { return conn.CloseWith(io.ErrUnexpectedEOF) }
+// Close requests a graceful close that lets what was accepted leave first, and
+// returns.
+func (conn *fdConn) Close() error {
+	conn.flags.Or(localCloseFlag)
+	return conn.closeGracefully(nil)
+}
 
-// CloseGracefully requests a close that lets what was accepted leave first,
+// closeGracefully requests a close that lets what was accepted leave first,
 // and returns. Writes are refused from the call; the connection's turn
-// releases it once its queue is empty — or once LingerTimeout passes, a
-// CloseWith at any time, or the Events closing ends the wait — and leftover
+// releases it once its queue is empty — or once LingerTimeout passes, an
+// Abort at any time, or the Events closing ends the wait — and leftover
 // output reaches OnClose as UnflushedError appended to cause. Reads go on
 // until the release, so the peer's acknowledgements are seen. A datagram
-// connection has no queue to wait for: it closes as CloseWith does.
-func (conn *fdConn) CloseGracefully(cause error) error {
+// connection has no queue to wait for: it closes immediately.
+func (conn *fdConn) closeGracefully(cause error) error {
 	if conn.loop == nil {
 		return net.ErrClosed
 	}
 	if conn.isDatagram() {
-		return conn.CloseWith(cause)
+		return conn.closeWithCause(cause)
 	}
 	conn.submitMu.Lock()
 	if conn.isClosing() || conn.events().closing.Load() || conn.loop.stopping.Load() || !conn.close.drain() {
@@ -259,25 +264,40 @@ func (conn *fdConn) CloseGracefully(cause error) error {
 		conn.escalateDrain()
 		return nil
 	}
-	// Bound the wait, on the lazily-allocated timer state so a connection
-	// that never closes gracefully carries nothing for it. The bound is
-	// captured once: progress resets it by the same span without reading the
-	// package variable again. A queue that drains in the instant between the
-	// check and the arm leaves a stray timer whose callback finds the phase
-	// moved on and does nothing.
-	if conn.close.isDraining() {
-		conn.wakeState().drain.Store(&drainBound{
-			timer: time.AfterFunc(lingerTimeout, conn.escalateDrain),
-			wait:  lingerTimeout,
-		})
+	// When called inside the connection's own turn, the turn's epilogue
+	// flushes corked output first and arms the timer only if bytes still wait.
+	if conn.directOwner() {
+		return nil
 	}
+	conn.ensureDrainTimer()
 	// Output that already waits may have no sender of its own.
 	conn.kickWriterOutside()
 	return nil
 }
 
+func (conn *fdConn) ensureDrainTimer() {
+	if !conn.close.isDraining() {
+		return
+	}
+	w := conn.wakeState()
+	if w.drain.Load() != nil {
+		return
+	}
+	bound := &drainBound{
+		timer: time.AfterFunc(lingerTimeout, conn.escalateDrain),
+		wait:  lingerTimeout,
+	}
+	if !w.drain.CompareAndSwap(nil, bound) {
+		bound.timer.Stop()
+		return
+	}
+	if !conn.close.isDraining() {
+		conn.stopDrainTimer()
+	}
+}
+
 // escalateDrain ends a drain — its queue left, or its bound arrived — so the
-// close proceeds as CloseWith's does. Any goroutine may call it.
+// close proceeds as Abort's does. Any goroutine may call it.
 func (conn *fdConn) escalateDrain() {
 	if !conn.close.escalate() {
 		return
@@ -296,11 +316,17 @@ func (conn *fdConn) stopDrainTimer() {
 	}
 }
 
-// CloseWith requests the close and returns: the connection is released, and
-// OnClose delivered, by its own turn once the callback that closed it has
-// returned. Requesting it under submitMu puts Close after external writes
-// that have already reached their submission point.
-func (conn *fdConn) CloseWith(err error) error {
+// Abort requests an immediate close with cause, cutting any graceful Close
+// drain short at once.
+func (conn *fdConn) Abort(cause error) error {
+	if cause == nil {
+		cause = net.ErrClosed
+	}
+	conn.flags.Or(localCloseFlag)
+	return conn.closeWithCause(cause)
+}
+
+func (conn *fdConn) closeWithCause(err error) error {
 	if conn.loop == nil {
 		return net.ErrClosed
 	}
@@ -311,6 +337,7 @@ func (conn *fdConn) CloseWith(err error) error {
 	}
 	conn.setDeferredCloseLocked(err)
 	conn.submitMu.Unlock()
+	conn.stopDrainTimer()
 	conn.routeClose()
 	return nil
 }
@@ -486,6 +513,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	conn.inbound.Reset()
 	conn.inboundTail = nil
 	conn.pending.Store(0)
+	conn.notifyBlockClose(finalErr)
 	return finalErr
 }
 

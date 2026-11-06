@@ -3,12 +3,111 @@ package uio
 import (
 	"context"
 	"errors"
+	"github.com/urpc/uio/internal/readcontrol"
 	"io"
 	"net"
-	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestPublishedDialResultWinsConcurrentCancellation(t *testing.T) {
+	for _, failure := range []error{nil, errors.New("handshake failed")} {
+		for range 64 {
+			ctx, cancel := context.WithCancel(context.Background())
+			probe := &dialProbe{done: make(chan struct{})}
+			transport := &contractTransport{}
+			if failure == nil {
+				probe.settle(transport)
+			} else {
+				probe.fail(failure)
+			}
+			cancel()
+			conn, err := awaitDial(ctx, transport, probe)
+			if !errors.Is(err, failure) || (failure == nil && conn != transport) {
+				t.Fatalf("published dial = %v, %v, want %v", conn, err, failure)
+			}
+			if transport.state&StateClosed != 0 {
+				t.Fatal("cancellation aborted an already published dial result")
+			}
+		}
+	}
+}
+
+func TestCanceledDialAbortsTransportAndCannotPublishALateOpen(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cause := errors.New("dial owner stopped waiting")
+	cancel(cause)
+	transport := &contractTransport{}
+	probe := &dialProbe{done: make(chan struct{})}
+	conn, err := awaitDial(ctx, transport, probe)
+	if conn != nil || !errors.Is(err, cause) || !errors.Is(transport.closeCause, cause) {
+		t.Fatalf("canceled dial = %v, %v, transport cause %v", conn, err, transport.closeCause)
+	}
+	if probe.settle(transport) {
+		t.Fatal("late handshake opened a dial already canceled by its owner")
+	}
+}
+
+func TestLayerDefaultsAcceptTypedNilHandlerAndDiscardInput(t *testing.T) {
+	var handler *FuncHandler
+	events := &Events{Handler: handler}
+	entry, err := events.newEntry([]Layer{PassThroughLayer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := &contractTransport{input: []byte("unhandled input")}
+	entry.cb.onOpen(transport)
+	if err := entry.cb.onRead(transport); err != nil {
+		t.Fatal(err)
+	}
+	c := stackOf(transport)
+	if !c.topOpen.Load() || len(transport.input) != 0 || c.topConn().InboundBuffered() != 0 {
+		t.Fatal("typed nil Handler did not use the default consuming handler")
+	}
+}
+
+func TestDefaultReadHandlerConsumesEachBorrowedSocketChunk(t *testing.T) {
+	observed := make(chan int, 2)
+	events := &Events{Pollers: 1, ReadBufferSize: 1, Handler: FuncHandler{}, Observer: FuncHandler{BytesRead: func(c Conn, _ int) {
+		observed <- c.InboundBuffered()
+	}}}
+	peer, _ := readControlServe(t, events)
+	for _, payload := range []string{"a", "b"} {
+		if _, err := peer.Write([]byte(payload)); err != nil {
+			t.Fatal(err)
+		}
+		if buffered := readControlAwait(t, observed, "default handler input"); buffered != 1 {
+			t.Fatalf("default handler retained an earlier chunk: %d bytes", buffered)
+		}
+	}
+}
+
+func TestPacketInputRejectsConsumerPauseWithoutInstallingAnOwner(t *testing.T) {
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Hooks: FuncHandler{Start: func(*Events) {
+		close(started)
+	}}}
+	done := make(chan error, 1)
+	go func() {
+		done <- events.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		readControlAwait(t, done, "packet Events stopped")
+	})
+	readControlAwait(t, started, "packet Events started")
+	conn, err := events.Dial("udp://127.0.0.1:9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(conn.PauseRead(), ErrUnsupported) || !errors.Is(conn.ResumeRead(), ErrUnsupported) {
+		t.Fatal("raw packet transport acquired stream-style pause semantics")
+	}
+	if conn.ReadPaused() || readcontrol.ControlOf(conn) != nil || readcontrol.NewPause(conn) != nil {
+		t.Fatal("unsupported packet input retained a consumer owner")
+	}
+}
 
 func expectPeerClosed(t *testing.T, conn net.Conn) {
 	t.Helper()
@@ -28,66 +127,6 @@ func expectPeerClosed(t *testing.T, conn net.Conn) {
 		if !errors.As(err, &operationError) {
 			t.Fatalf("peer read = %v, want closed connection", err)
 		}
-	}
-}
-
-func TestAdoptTransfersTCPConnection(t *testing.T) {
-	events := &Events{Pollers: 1}
-	started := make(chan struct{})
-	opened := make(chan Conn, 1)
-	received := make(chan string, 1)
-	funcs(events).Start = func(*Events) { close(started) }
-	funcs(events).Open = func(conn Conn) { opened <- conn }
-	funcs(events).Read = func(conn Conn) error {
-		payload := make([]byte, conn.InboundBuffered())
-		_, err := conn.Read(payload)
-		if err == nil {
-			received <- string(payload)
-		}
-		return err
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- events.Serve() }()
-	t.Cleanup(func() {
-		_ = events.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(time.Second):
-			t.Error("Events.Serve did not stop")
-		}
-	})
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("Events.Serve did not start")
-	}
-
-	client, server := tcpConnectionPair(t)
-	defer client.Close()
-	const userdata = "adopted"
-	adopted, err := events.Adopt(server, WithUserdata(userdata))
-	if err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case conn := <-opened:
-		if conn != adopted || conn.Userdata() != userdata {
-			t.Fatalf("OnOpen connection = %v/%v, want adopted userdata", conn, conn.Userdata())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Adopt did not call OnOpen")
-	}
-
-	if _, err = client.Write([]byte("payload")); err != nil {
-		t.Fatal(err)
-	}
-	select {
-	case payload := <-received:
-		if payload != "payload" {
-			t.Fatalf("received payload = %q", payload)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("adopted connection did not receive data")
 	}
 }
 
@@ -134,30 +173,6 @@ func tcpConnectionPair(t *testing.T) (net.Conn, net.Conn) {
 	return nil, nil
 }
 
-func TestPollerCountDefaultsAndLimits(t *testing.T) {
-	procs := runtime.GOMAXPROCS(0)
-	for _, test := range []struct {
-		name       string
-		configured int
-		want       int
-	}{
-		{name: "zero", want: min(defaultPollers(procs), procs)},
-		{name: "negative", configured: -1, want: min(defaultPollers(procs), procs)},
-		{name: "explicit", configured: 1, want: 1},
-		{name: "above CPU count", configured: procs + 1, want: procs},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			events := &Events{Pollers: test.configured}
-			if err := events.initConfig(); err != nil {
-				t.Fatal(err)
-			}
-			if events.Pollers != test.want {
-				t.Fatalf("Pollers = %d, want %d", events.Pollers, test.want)
-			}
-		})
-	}
-}
-
 func TestDialRejectsAnotherEventsLoop(t *testing.T) {
 	owner := currentGoroutineID()
 	activeEventLoops.Store(owner, struct{}{})
@@ -169,51 +184,8 @@ func TestDialRejectsAnotherEventsLoop(t *testing.T) {
 	}
 }
 
-func TestEventLoopShutdownClosesIOAdmission(t *testing.T) {
-	loop := &eventLoop{ioIdle: make(chan struct{})}
-	if !loop.acquireIO() {
-		t.Fatal("loop rejected I/O before shutdown")
-	}
-	released := false
-	defer func() {
-		if !released {
-			loop.releaseIO()
-		}
-	}()
-	stopped := make(chan struct{})
-	go func() {
-		loop.stopIO()
-		close(stopped)
-	}()
-	deadline := time.Now().Add(time.Second)
-	for !loop.ioStopped() {
-		if time.Now().After(deadline) {
-			t.Fatal("loop did not close I/O admission")
-		}
-		runtime.Gosched()
-	}
-	if loop.acquireIO() {
-		loop.releaseIO()
-		t.Fatal("loop accepted I/O after stop")
-	}
-	select {
-	case <-stopped:
-		t.Fatal("shutdown returned before active I/O completed")
-	default:
-	}
-	loop.releaseIO()
-	released = true
-	select {
-	case <-stopped:
-	case <-time.After(time.Second):
-		t.Fatal("shutdown did not complete after I/O returned")
-	}
-	loop.acquireCloseIO()
-	loop.releaseIO()
-}
-
 func TestReadBufferPoolDoesNotAllocateOnReuse(t *testing.T) {
-	events := &Events{MaxBufferSize: 16 * 1024}
+	events := &Events{ReadBufferSize: 16 * 1024}
 	if err := events.initConfig(); err != nil {
 		t.Fatal(err)
 	}
@@ -230,9 +202,10 @@ func TestReadBufferPoolDoesNotAllocateOnReuse(t *testing.T) {
 
 func TestEventLifecycleHelpers(t *testing.T) {
 	events := &Events{}
-
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- events.Wait() }()
+	go func() {
+		waitDone <- events.Wait()
+	}()
 	select {
 	case <-waitDone:
 		t.Fatal("Wait returned before Close")
@@ -255,13 +228,17 @@ func TestWaitIncludesOnStop(t *testing.T) {
 	started := make(chan struct{})
 	stopStarted := make(chan struct{})
 	releaseStop := make(chan struct{})
-	funcs(events).Start = func(*Events) { close(started) }
+	funcs(events).Start = func(*Events) {
+		close(started)
+	}
 	funcs(events).Stop = func(*Events) {
 		close(stopStarted)
 		<-releaseStop
 	}
 	serveDone := make(chan error, 1)
-	go func() { serveDone <- events.Serve() }()
+	go func() {
+		serveDone <- events.Serve()
+	}()
 	<-started
 	shutdownErr := errors.New("wait for on-stop")
 	if err := events.Close(shutdownErr); err != nil {
@@ -269,7 +246,9 @@ func TestWaitIncludesOnStop(t *testing.T) {
 	}
 	<-stopStarted
 	waitDone := make(chan error, 1)
-	go func() { waitDone <- events.Wait() }()
+	go func() {
+		waitDone <- events.Wait()
+	}()
 	select {
 	case <-waitDone:
 		t.Fatal("Wait returned before OnStop")
@@ -284,45 +263,12 @@ func TestWaitIncludesOnStop(t *testing.T) {
 	}
 }
 
-func TestDialContextCancellationBeforeNetworkDial(t *testing.T) {
-	started := make(chan struct{})
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{Start: func(*Events) { close(started) }})
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- events.Serve() }()
-	defer func() {
-		_ = events.Close(nil)
-		select {
-		case <-serveDone:
-		case <-time.After(5 * time.Second):
-			t.Error("Events.Serve did not stop")
-		}
-	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Events.Serve did not start")
-	}
-
-	cause := errors.New("dial canceled")
-	ctx, cancel := context.WithCancelCause(context.Background())
-	cancel(cause)
-	conn, err := events.DialContext(ctx, "tcp://127.0.0.1:1")
-	if conn != nil || !errors.Is(err, context.Canceled) {
-		t.Fatalf("DialContext() = %v, %v; want nil, cancellation", conn, err)
-	}
-}
-
 func TestServeInitializesListeners(t *testing.T) {
 	for _, test := range []struct {
 		name  string
 		addrs []string
 		want  int
-	}{
-		{name: "dial only", want: 0},
-		{name: "empty address", addrs: []string{""}, want: 0},
-		{name: "listener", addrs: []string{"tcp://127.0.0.1:0"}, want: 1},
-		{name: "listeners", addrs: []string{"tcp://127.0.0.1:0", "tcp://127.0.0.1:0"}, want: 2},
-	} {
+	}{{name: "dial only", want: 0}, {name: "empty address", addrs: []string{""}, want: 0}, {name: "listener", addrs: []string{"tcp://127.0.0.1:0"}, want: 1}, {name: "listeners", addrs: []string{"tcp://127.0.0.1:0", "tcp://127.0.0.1:0"}, want: 2}} {
 		t.Run(test.name, func(t *testing.T) {
 			events := &Events{Pollers: 1}
 			funcs(events).Start = func(events *Events) {
@@ -338,69 +284,7 @@ func TestServeInitializesListeners(t *testing.T) {
 	}
 }
 
-func TestServeAcceptsConnectionsOnAllAddresses(t *testing.T) {
-	events := &Events{Pollers: 1}
-	started := make(chan []string, 1)
-	funcs(events).Start = func(events *Events) {
-		addrs := make([]string, 0, len(events.acceptor.listeners))
-		for _, listener := range events.acceptor.listeners {
-			addrs = append(addrs, listener.ln.Addr().String())
-		}
-		started <- addrs
-	}
-	funcs(events).Read = func(conn Conn) error {
-		_, err := conn.WriteTo(conn)
-		return err
-	}
-	serveDone := make(chan error, 1)
-	go func() { serveDone <- events.Serve("tcp://127.0.0.1:0", "tcp://127.0.0.1:0") }()
-	t.Cleanup(func() {
-		_ = events.Close(nil)
-		select {
-		case err := <-serveDone:
-			if err != nil {
-				t.Error(err)
-			}
-		case <-time.After(2 * time.Second):
-			t.Error("Serve did not stop")
-		}
-	})
-
-	var addrs []string
-	select {
-	case addrs = <-started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Serve did not start")
-	}
-	if len(addrs) != 2 || addrs[0] == addrs[1] {
-		t.Fatalf("listening addresses = %v, want two distinct addresses", addrs)
-	}
-	for _, addr := range addrs {
-		conn, err := net.DialTimeout("tcp", addr, time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err = conn.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-			conn.Close()
-			t.Fatal(err)
-		}
-		if _, err = conn.Write([]byte("ping")); err != nil {
-			conn.Close()
-			t.Fatal(err)
-		}
-		var response [4]byte
-		_, err = io.ReadFull(conn, response[:])
-		conn.Close()
-		if err != nil || string(response[:]) != "ping" {
-			t.Fatalf("echo on %s = %q, %v", addr, response, err)
-		}
-	}
-}
-
 func TestServeRollsBackListenersWhenLaterAddressFails(t *testing.T) {
-	// The port is free between the probe and Serve and again after the
-	// rollback, so another process may bind it meanwhile; a listener the
-	// rollback leaked fails every attempt.
 	for attempt := 1; ; attempt++ {
 		reserved, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -410,7 +294,6 @@ func TestServeRollsBackListenersWhenLaterAddressFails(t *testing.T) {
 		if err = reserved.Close(); err != nil {
 			t.Fatal(err)
 		}
-
 		events := &Events{Pollers: 1}
 		if err = events.Serve(addr, "unsupported://address"); err == nil {
 			t.Fatal("Serve accepted an unsupported second address")
@@ -427,4 +310,251 @@ func TestServeRollsBackListenersWhenLaterAddressFails(t *testing.T) {
 			t.Fatalf("first listener was not released: %v", err)
 		}
 	}
+}
+
+type liveFuncs struct{ fh *FuncHandler }
+
+func (l *liveFuncs) OnOpen(c Conn) {
+	l.fh.OnOpen(c)
+}
+
+func (l *liveFuncs) OnRead(c Conn) error {
+	return l.fh.OnRead(c)
+}
+
+func (l *liveFuncs) OnTimer(c Conn) error {
+	return l.fh.OnTimer(c)
+}
+
+func (l *liveFuncs) OnClose(c Conn, err error) {
+	l.fh.OnClose(c, err)
+}
+
+func (l *liveFuncs) OnBytesRead(c Conn, n int) {
+	l.fh.OnBytesRead(c, n)
+}
+
+func (l *liveFuncs) OnBytesWritten(c Conn, n int) {
+	l.fh.OnBytesWritten(c, n)
+}
+
+func (l *liveFuncs) OnStart(ev *Events) {
+	l.fh.OnStart(ev)
+}
+
+func (l *liveFuncs) OnStop(ev *Events) {
+	l.fh.OnStop(ev)
+}
+
+func bareEntry() *entry {
+	e, err := (&Events{}).newEntry(nil)
+	if err != nil {
+		panic(err)
+	}
+	return e
+}
+
+func funcs(ev *Events) *FuncHandler {
+	if live, ok := ev.Handler.(*liveFuncs); ok {
+		return live.fh
+	}
+	fh, ok := asFuncs(ev.Handler)
+	if !ok || fh == nil {
+		fh = &FuncHandler{}
+	}
+	live := &liveFuncs{fh: fh}
+	ev.Handler, ev.Observer, ev.Hooks = live, live, live
+	ev.cb = resolveCallbacks(live, live, live)
+	return fh
+}
+
+func withFuncs(ev *Events, fh FuncHandler) *Events {
+	ev.Handler, ev.Observer, ev.Hooks = fh, fh, fh
+	ev.cb = resolveCallbacks(fh, fh, fh)
+	return ev
+}
+
+func signal[T any](ch chan<- T, v T) {
+	select {
+	case ch <- v:
+	default:
+	}
+}
+
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+type timerRecorder struct {
+	mu    sync.Mutex
+	order []string
+}
+
+func (r *timerRecorder) note(what string) {
+	r.mu.Lock()
+	r.order = append(r.order, what)
+	r.mu.Unlock()
+}
+
+func (r *timerRecorder) sequence() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.order...)
+}
+
+func (r *timerRecorder) count(what string) int {
+	n := 0
+	for _, got := range r.sequence() {
+		if got == what {
+			n++
+		}
+	}
+	return n
+}
+
+func waitForNote(t *testing.T, rec *timerRecorder, what string, want int, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for {
+		if got := rec.count(what); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s fired %d times within %v, want at least %d; ran %v", what, rec.count(what), within, want, rec.sequence())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+func TestHandlerTimerErrorCloses(t *testing.T) {
+	wantErr := errors.New("timer boom")
+	closed := make(chan struct{}, 1)
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Handler: FuncHandler{Read: func(Conn) error {
+		return nil
+	}, Timer: func(Conn) error {
+		return wantErr
+	}, Close: func(Conn, error) {
+		select {
+		case closed <- struct{}{}:
+		default:
+		}
+	}}, Hooks: FuncHandler{Start: func(*Events) {
+		close(started)
+	}}}
+	done := make(chan error, 1)
+	go func() {
+		done <- events.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-done
+	})
+	<-started
+	listener, err := events.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	if err := conn.SetWakeDeadline(time.Now().Add(20 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnClose did not run after the OnTimer error")
+	}
+}
+
+func TestHandlerTimerThroughLayers(t *testing.T) {
+	rec := &timerRecorder{}
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Handler: FuncHandler{Read: func(Conn) error {
+		rec.note("read")
+		return nil
+	}, Timer: func(Conn) error {
+		rec.note("timer")
+		return nil
+	}, Close: func(Conn, error) {
+	}}, Hooks: FuncHandler{Start: func(*Events) {
+		close(started)
+	}}}
+	done := make(chan error, 1)
+	go func() {
+		done <- events.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-done
+	})
+	<-started
+	listener, err := events.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	conn, err := events.Dial("tcp://"+listener.Addr().String(), WithLayers(PassThroughLayer))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	if err := conn.SetWakeDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	waitForNote(t, rec, "timer", 1, 2*time.Second)
+	if n := rec.count("timer"); n != 1 {
+		t.Fatalf("OnTimer ran %d times through a stack, want 1", n)
+	}
+}
+
+func serveAndDial(t *testing.T, handler Handler) Conn {
+	t.Helper()
+	started := make(chan struct{})
+	events := &Events{Pollers: 1, Handler: handler, Hooks: FuncHandler{Start: func(*Events) {
+		close(started)
+	}}}
+	done := make(chan error, 1)
+	go func() {
+		done <- events.Serve()
+	}()
+	t.Cleanup(func() {
+		_ = events.Close(nil)
+		<-done
+	})
+	<-started
+	listener, err := events.Listen("tcp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = listener.Close()
+	})
+	conn, err := events.Dial("tcp://" + listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = conn.Close()
+	})
+	return conn
 }

@@ -47,7 +47,7 @@ func (fc *fdConn) WriteString(s string) (n int, err error) {
 // coalesceBlockSize is the block size queued writes pack into while the peer
 // is slow to drain: two read buffers' worth, capped at 64 KiB.
 func (fc *fdConn) coalesceBlockSize() int {
-	return min(64<<10, fc.events().readBufferSize*2)
+	return min(64<<10, fc.events().readBufSize*2)
 }
 
 func (fc *fdConn) Write(p []byte) (n int, err error) {
@@ -114,7 +114,7 @@ func (fc *fdConn) Write(p []byte) (n int, err error) {
 // reported once that call returns. Nobody waits for the claim, so OnBytesWritten
 // callbacks that write to each other cannot deadlock.
 func (fc *fdConn) reportOutbound(n int) {
-	if fc.callbacks().onBytesWritten == nil {
+	if fc.callbacks().onBytesWritten == nil && !fc.hasWriteControl() {
 		return
 	}
 	udp := fc.udp
@@ -139,7 +139,7 @@ func (fc *fdConn) drainOutboundReports() {
 		if pending == 0 {
 			return
 		}
-		fc.callbacks().onBytesWritten(fc.events().observed(fc), int(pending))
+		fc.events().reportBytesWritten(fc, int(pending))
 	}
 }
 
@@ -237,15 +237,6 @@ func (fc *fdConn) Writev(vec [][]byte) (n int, err error) {
 	}
 
 	return
-}
-
-// ReserveOutbound is unsupported: the dedicated writer goroutine may detach
-// outbound at any moment, so bytes cannot be left in it to be filled later.
-func (fc *fdConn) ReserveOutbound(int) ([]byte, error) {
-	if fc.isClosing() {
-		return nil, net.ErrClosed
-	}
-	return nil, ErrReserveUnsupported
 }
 
 func (fc *fdConn) WriteOwned(owned *Buffer) (n int, err error) {
@@ -359,7 +350,7 @@ func (fc *fdConn) drainOutbound() (int, error) {
 			fc.writeBytes -= n
 			if fc.draining.Load() && fc.drainTimer != nil {
 				// A drain's queue is moving: its bound starts over, as the
-				// native backend's does on a send report.
+				// native backend's does when bytes leave the socket.
 				fc.drainTimer.Reset(fc.drainWait)
 			}
 			fc.mux.Unlock()

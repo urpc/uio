@@ -57,11 +57,11 @@
 // the writing half with CloseWrite first. A peer that goes silent is found
 // out by KeepAlive (WASK probes) and by the engine's dead-link bound.
 //
-// MTU must not exceed the Events' MaxBufferSize (4 KiB by default), or the
+// MTU must not exceed the Events' ReadBufferSize (4 KiB by default), or the
 // socket truncates datagrams and segments never reassemble; the defaults
 // (1400) fit. Both ends' MTU matter: a segment arrives into this end's read
 // buffer, so a peer's larger MTU must fit here too — run both ends with the
-// same MTU, or keep MaxBufferSize at least the largest one in play.
+// same MTU, or keep ReadBufferSize at least the largest one in play.
 package ukcp
 
 import (
@@ -159,7 +159,7 @@ type Options struct {
 
 	// MTU is the largest segment, header included. The engine's buffers hold
 	// 1500, so 24..1500; the default is 1400. It must not exceed the Events'
-	// MaxBufferSize (4 KiB by default) — on both ends: a segment from the
+	// ReadBufferSize (4 KiB by default) — on both ends: a segment from the
 	// peer must fit this end's read buffer too.
 	MTU int
 
@@ -215,26 +215,13 @@ type Options struct {
 	// ErrOutboundOverflow. Zero takes the default of 4 MiB.
 	MaxBuffered int
 
-	// ---- The transport, for the standalone server and dialer ----
-	// A layer takes these from the Events it runs on instead, and refuses
-	// them with ErrInvalidOptions rather than leaving them silently inert.
-	// MaxBufferSize excepted: it must still hold a segment.
+	// ---- Standalone server and dialer settings ----
+	// A layer runs inside an Events it does not own and refuses Handler,
+	// Transport, SocketReadBuffer, and SocketWriteBuffer with ErrInvalidOptions.
 
-	// MaxBufferSize is the Events' MaxBufferSize, the socket read size. It
-	// must be at least MTU; zero leaves the Events default (4 KiB).
-	MaxBufferSize int
-	// WriteBufferedThreshold is the Events' WriteBufferedThreshold.
-	WriteBufferedThreshold int
-	// MaxOutboundBuffered is the Events' MaxOutboundBuffered.
-	MaxOutboundBuffered int
-	// AllowHalfOpen keeps a session open after its peer ended its stream.
-	AllowHalfOpen bool
-	// Pollers is the Events' event-loop count.
-	Pollers int
-	// ReusePort shares the bound address.
-	ReusePort bool
-	// Executor schedules the Events' connection turns.
-	Executor uio.Executor
+	// Transport configures the private uio.Events owned by a standalone Server
+	// or Dialer.
+	Transport TransportOptions
 
 	// SocketReadBuffer and SocketWriteBuffer size the UDP socket's kernel
 	// buffers: a KCP session bursts a whole window — about 1.4 MiB at the
@@ -244,6 +231,43 @@ type Options struct {
 	// uio.WithListenControl and uio.WithDialControl, and refuses these two.
 	SocketReadBuffer  int
 	SocketWriteBuffer int
+}
+
+// TransportOptions configures the private [uio.Events] transport of a
+// standalone [Server] or [Dialer].
+type TransportOptions struct {
+	// ReadBufferSize is the Events' socket read size; it must be at least MTU
+	// (zero uses UIO's 4 KiB default).
+	ReadBufferSize         int
+	WriteBufferedThreshold int
+	MaxOutboundBuffered    int
+	AllowHalfOpen          bool
+	Pollers                int
+	ReusePort              bool
+	Executor               uio.Executor
+}
+
+func (t TransportOptions) isZero() bool {
+	return t.ReadBufferSize == 0 &&
+		t.WriteBufferedThreshold == 0 &&
+		t.MaxOutboundBuffered == 0 &&
+		!t.AllowHalfOpen &&
+		t.Pollers == 0 &&
+		!t.ReusePort &&
+		t.Executor == nil
+}
+
+func (t TransportOptions) events(handler uio.Handler) *uio.Events {
+	return &uio.Events{
+		Pollers:                t.Pollers,
+		ReusePort:              t.ReusePort,
+		Executor:               t.Executor,
+		ReadBufferSize:         t.ReadBufferSize,
+		WriteBufferedThreshold: t.WriteBufferedThreshold,
+		MaxOutboundBuffered:    t.MaxOutboundBuffered,
+		AllowHalfOpen:          t.AllowHalfOpen,
+		Handler:                handler,
+	}
 }
 
 // LayerOptions names the options a ServerLayer or ClientLayer runs with: the
@@ -364,20 +388,13 @@ func withKCPScheme(addr string) string {
 
 // checkLayerOptions refuses what a standalone endpoint owns: a layer runs
 // inside an Events it does not own and hands its stream to the layer above,
-// so these settings would be silently inert under it. MaxBufferSize is not
-// among them: it still has to hold a segment (see checkTransport).
+// so standalone settings would be silently inert under it.
 func (o Options) checkLayerOptions() error {
 	switch {
 	case o.Handler != nil:
 		return fmt.Errorf("%w: a layer hands its stream to the layer above, not to a Handler", ErrInvalidOptions)
-	case o.WriteBufferedThreshold != 0:
-		return fmt.Errorf("%w: WriteBufferedThreshold belongs to the layer's Events", ErrInvalidOptions)
-	case o.MaxOutboundBuffered != 0:
-		return fmt.Errorf("%w: a stack's outbound limit is its Events' MaxOutboundBuffered", ErrInvalidOptions)
-	case o.AllowHalfOpen:
-		return fmt.Errorf("%w: AllowHalfOpen belongs to the layer's Events", ErrInvalidOptions)
-	case o.Pollers != 0, o.ReusePort, o.Executor != nil:
-		return fmt.Errorf("%w: Pollers, ReusePort and Executor belong to the layer's Events", ErrInvalidOptions)
+	case !o.Transport.isZero():
+		return fmt.Errorf("%w: Transport belongs to a standalone Server or Dialer, not to a layer", ErrInvalidOptions)
 	case o.SocketReadBuffer != 0, o.SocketWriteBuffer != 0:
 		return fmt.Errorf("%w: a layer sizes its sockets through uio.WithListenControl and uio.WithDialControl", ErrInvalidOptions)
 	}
@@ -386,9 +403,9 @@ func (o Options) checkLayerOptions() error {
 
 // checkTransport refuses transport settings no session can run with.
 func (o Options) checkTransport() error {
-	if o.MaxBufferSize > 0 && o.MaxBufferSize < o.MTU {
-		return fmt.Errorf("%w: MaxBufferSize %d below the %d MTU: datagrams would truncate",
-			ErrInvalidOptions, o.MaxBufferSize, o.MTU)
+	if o.Transport.ReadBufferSize > 0 && o.Transport.ReadBufferSize < o.MTU {
+		return fmt.Errorf("%w: ReadBufferSize %d below the %d MTU: datagrams would truncate",
+			ErrInvalidOptions, o.Transport.ReadBufferSize, o.MTU)
 	}
 	return nil
 }

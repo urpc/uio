@@ -230,5 +230,3 @@ func (fc *fdConn) stopWriteDeadline() {
 	}
 	fc.deadlineMu.Unlock()
 }
-
-func (fc *fdConn) handleTimeout(deadlineKind, uint64) {}

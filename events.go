@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"context"
 	"errors"
 	"net"
 	"runtime"
@@ -67,42 +68,39 @@ type Executor interface {
 // interface copy of the slice header on every native read round.
 type readBuffer struct {
 	bytes []byte
-	// out is the reply space of the read round that borrowed this buffer:
-	// a native stream turn's reservations are laid out in it while it reads
-	// (see fdConn.scratch). Unset until a round reserves.
-	out *bytebuf.Buffer
+	out   *bytebuf.Buffer
 }
 
 // entry is what one endpoint — a Listen, a Dial, an Adopt — hands each of
-// its connections: the callbacks resolved for its chain, and whether that
-// chain has layers. Every connection carries its own, read-only for its life.
+// its connections: the callbacks resolved for it and its consumer/dial policy.
+// Every connection carries its own, read-only for its life.
 type entry struct {
-	ev      *Events // the Events the endpoint dials or listens through
-	cb      callbacks
-	layered bool // the chain has layers: the socket takes no payload limit
+	ev             *Events // the Events the endpoint dials or listens through
+	cb             callbacks
+	directConsumer bool                                              // true when cb.onRead directly consumes socket input
+	dial           func(*fdConn) func(context.Context) (Conn, error) // optional post-registration settlement hook
 }
 
 // Events owns listeners, event loops, the native connection-task scheduler,
 // shared read buffers, and application callbacks for one server/dialer
 // lifecycle. Configure it before Serve; an Events value is not restartable.
 type Events struct {
-	loopState                  // the backend's event loops
-	acceptor       *acceptor   // connection acceptor
-	mux            sync.Mutex  // serializes initialization and shutdown publication
-	started        atomic.Bool // Serve was called: an Events starts once
-	closing        atomic.Bool
-	ready          atomic.Bool    // Dial is allowed only after full initialization
-	callbackWG     sync.WaitGroup // std connections, I/O goroutines, and callbacks
-	socketCloses   closeCounter   // native UDP sockets closing; Serve waits for them
-	done           chan struct{}  // closed after OnStop and all owned work exits
-	doneOnce       sync.Once
-	closeReason    atomic.Pointer[error]
-	ioPool         *ioTaskPool
-	readPool       plocal.Cache[*readBuffer] // read buffers, one kept per P
-	readBufferSize int
-	cb             callbacks // Handler, resolved when Serve starts
-	plain          *entry    // the entry of a connection that brings no chain
-	plainOnce      sync.Once
+	loopState                // the backend's event loops
+	acceptor     *acceptor   // connection acceptor
+	mux          sync.Mutex  // serializes initialization and shutdown publication
+	started      atomic.Bool // Serve was called: an Events starts once
+	closing      atomic.Bool
+	ready        atomic.Bool    // Dial is allowed only after full initialization
+	callbackWG   sync.WaitGroup // std connections, I/O goroutines, and callbacks
+	socketCloses closeCounter   // native UDP sockets closing; Serve waits for them
+	done         chan struct{}  // closed after OnStop and all owned work exits
+	doneOnce     sync.Once
+	closeReason  atomic.Pointer[error]
+	readPool     plocal.Cache[*readBuffer] // read buffers, one kept per P
+	readBufSize  int
+	cb           callbacks // Handler, resolved when Serve starts
+	plain        *entry    // default direct-consumer entry
+	plainOnce    sync.Once
 
 	// Pollers is the number of event loops. On Unix each loop is one
 	// epoll or kqueue instance that a few goroutines wait on: they collect
@@ -132,9 +130,9 @@ type Events struct {
 	// The default value is false.
 	LockOSThread bool
 
-	// MaxBufferSize is the buffer size of each socket read. Native connection
+	// ReadBufferSize is the buffer size of each socket read. Native connection
 	// tasks may perform multiple reads per readiness event. The default is 4 KiB.
-	MaxBufferSize int
+	ReadBufferSize int
 
 	// WriteBufferedThreshold makes native callback writes smaller than this value
 	// join the connection's current outbound batch instead of attempting an
@@ -357,46 +355,22 @@ func (ev *Events) initConfig() error {
 	}
 	ev.Pollers = min(ev.Pollers, runtime.GOMAXPROCS(0))
 
-	if ev.MaxBufferSize <= 0 {
-		ev.MaxBufferSize = 1024 * 4
+	if ev.ReadBufferSize <= 0 {
+		ev.ReadBufferSize = 1024 * 4
 	}
-	if ev.readBufferSize == 0 {
-		ev.readBufferSize = ev.MaxBufferSize
-		size := ev.readBufferSize
+	if ev.readBufSize == 0 {
+		ev.readBufSize = ev.ReadBufferSize
+		size := ev.readBufSize
 		ev.readPool.Init(func() *readBuffer { return &readBuffer{bytes: make([]byte, size)} })
 	}
 
 	return nil
 }
 
-func (ev *Events) onRead(fdc *fdConn) error {
-	skipRead, err := fdc.fireWakeTimer()
-	if err != nil {
-		return err
-	}
-	if skipRead {
-		return nil // the timer callback closed: no read callback follows
-	}
-	if !fdc.entry.layered && fdc.ReadsPaused() {
-		return nil
-	}
-	// The Handler runs now, or the stack that runs it: the continuation a
-	// YieldRead asked for, and the turn a released pause owed.
-	fdc.consumerStarts()
-	if onRead := fdc.callbacks().onRead; onRead != nil {
-		return onRead(fdc)
-	}
-	// Without a data callback the received bytes are discarded.
-	started := fdc.beginInboundCallback()
-	_, _ = fdc.Discard(-1)
-	fdc.endInboundCallback(started)
-	return nil
-}
-
 func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 	if onInbound := fdc.callbacks().onBytesRead; readBytes > 0 && onInbound != nil {
 		started := fdc.beginInboundCallback()
-		onInbound(ev.observed(fdc), readBytes)
+		onInbound(fdc, readBytes)
 		fdc.endInboundCallback(started)
 	}
 }
@@ -404,13 +378,18 @@ func (ev *Events) onSocketBytesRead(fdc *fdConn, readBytes int) {
 // onSocketBytesWrite stays small enough to inline into every send path, so a
 // connection nobody observes pays a nil check and no call.
 func (ev *Events) onSocketBytesWrite(fdc *fdConn, writeBytes int) {
-	if writeBytes > 0 && fdc.callbacks().onBytesWritten != nil {
+	if writeBytes > 0 && (fdc.callbacks().onBytesWritten != nil || fdc.hasWriteControl()) {
 		ev.reportBytesWritten(fdc, writeBytes)
 	}
 }
 
 func (ev *Events) reportBytesWritten(fdc *fdConn, writeBytes int) {
-	fdc.callbacks().onBytesWritten(ev.observed(fdc), writeBytes)
+	if out := fdc.currentWriteControl(); out != nil {
+		out.Notify(writeBytes)
+	}
+	if onBytesWritten := fdc.callbacks().onBytesWritten; onBytesWritten != nil {
+		onBytesWritten(fdc, writeBytes)
+	}
 }
 
 // closeCounter counts closes Serve waits for. Unlike a sync.WaitGroup, a close

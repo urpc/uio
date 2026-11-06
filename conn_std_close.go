@@ -26,6 +26,8 @@ import (
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/urpc/uio/internal/blockio"
 )
 
 func (fc *fdConn) closeUnregistered() {
@@ -65,16 +67,16 @@ func (fc *fdConn) closeListenerSocket(err error) {
 	fc.closeOnLoop(err)
 }
 
+// Close refuses new writes and lets the writer drain what was accepted,
+// bounded by LingerTimeout without progress, before releasing the connection.
 func (fc *fdConn) Close() error {
-	return fc.CloseWith(io.ErrUnexpectedEOF)
+	fc.localClosed.Store(true)
+	return fc.closeGracefully(nil)
 }
 
-// CloseGracefully refuses new writes and lets the writer drain what was
-// accepted, bounded by LingerTimeout without progress, before the close it
-// asked for; this backend reports no UnflushedError.
-func (fc *fdConn) CloseGracefully(cause error) error {
+func (fc *fdConn) closeGracefully(cause error) error {
 	if fc.udp != nil || fc.loop == nil {
-		return fc.CloseWith(cause)
+		return fc.enqueueClose(cause)
 	}
 	fc.mux.Lock()
 	if fc.isClosing() || !fc.draining.CompareAndSwap(false, true) {
@@ -125,8 +127,14 @@ func (fc *fdConn) finishDrain() {
 	_ = fc.enqueueClose(cause)
 }
 
-func (fc *fdConn) CloseWith(err error) error {
-	return fc.enqueueClose(err)
+// Abort immediately closes the connection with cause, cutting any graceful
+// Close drain short at once.
+func (fc *fdConn) Abort(cause error) error {
+	if cause == nil {
+		cause = net.ErrClosed
+	}
+	fc.localClosed.Store(true)
+	return fc.enqueueClose(cause)
 }
 
 func (fc *fdConn) enqueueClose(err error) error {
@@ -134,6 +142,10 @@ func (fc *fdConn) enqueueClose(err error) error {
 	if fc.isClosing() || (fc.udp != nil && fc.udp.svr != nil && fc.udp.svr.isClosing()) {
 		fc.mux.Unlock()
 		return net.ErrClosed
+	}
+	if fc.drainTimer != nil {
+		fc.drainTimer.Stop()
+		fc.drainTimer = nil
 	}
 	// Publish the first request's cause together with closing. A listener's
 	// release may overtake the task, but must retain that requested cause.
@@ -237,6 +249,7 @@ func (fc *fdConn) finishClose(err error) {
 	if hook := testHookStdCloseReleased.Load(); hook != nil {
 		(*hook)(fc)
 	}
+	fc.notifyBlockClose(err)
 	fc.scheduleCloseCallback(err)
 }
 
@@ -306,6 +319,8 @@ func (fc *fdConn) scheduleCloseCallback(err error) {
 // deliverCloseCallback runs one connection's OnClose under its callback
 // mutex, exactly once per connection.
 func (fc *fdConn) deliverCloseCallback(err error) {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	fc.callbackMu.Lock()
 	defer fc.callbackMu.Unlock()
 	if !fc.internal && !fc.opened {
@@ -374,7 +389,7 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	if !ready {
 		return nil
 	}
-	if fc.readEnded.Load() {
+	if fc.entry.directConsumer && fc.readEnded.Load() {
 		// Both halves end: closing sends the FIN behind what was sent.
 		fc.writeShutDone.Store(true)
 		fc.requestClose(io.EOF)
@@ -385,7 +400,7 @@ func (fc *fdConn) shutWriteIfDrained() error {
 	if err != nil {
 		return err
 	}
-	if fc.readEnded.Load() {
+	if fc.entry.directConsumer && fc.readEnded.Load() {
 		fc.requestClose(io.EOF)
 	}
 	return nil

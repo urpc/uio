@@ -4,13 +4,12 @@ package uio
 
 import (
 	"fmt"
+	"golang.org/x/sys/unix"
 	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 func BenchmarkCallbackWrite(b *testing.B) {
@@ -49,7 +48,6 @@ func BenchmarkCallbackWrite(b *testing.B) {
 					}
 				}
 			}()
-
 			b.ReportAllocs()
 			b.SetBytes(int64(size))
 			b.ResetTimer()
@@ -75,30 +73,18 @@ func BenchmarkCallbackWrite(b *testing.B) {
 	}
 }
 
-// Run with:
-//
-//	go test -run '^$' -bench '^BenchmarkIOTaskSchedulers$' -benchmem -count=5
-//
-// Every scheduler executes the same runIOTask path through batch submission.
-// The executor case puts a plain channel-fed worker set behind the Executor
-// interface, for the cost of the injected path next to the owned scheduler.
 func BenchmarkIOTaskSchedulers(b *testing.B) {
 	workers := runtime.GOMAXPROCS(0)
 	for _, workload := range []struct {
 		name  string
 		batch int
-	}{
-		{name: "EventBatch", batch: eventBatch},
-		{name: "Burst", batch: workers},
-		{name: "OverflowStress", batch: 16 << 10},
-	} {
+	}{{name: "EventBatch", batch: eventBatch}, {name: "Burst", batch: workers}, {name: "OverflowStress", batch: 16 << 10}} {
 		b.Run(workload.name, func(b *testing.B) {
 			for _, factory := range ioSchedulerFactories(workers) {
 				b.Run(factory.name, func(b *testing.B) {
 					scheduler := factory.new()
 					runner := newIOTaskBenchmarkRunner(workload.batch, scheduler)
-					runner.runBatch() // warm workers and pooled callback state
-
+					runner.runBatch()
 					b.ReportAllocs()
 					b.ResetTimer()
 					started := time.Now()
@@ -130,25 +116,14 @@ type ioBenchmarkFactory struct {
 }
 
 func ioSchedulerFactories(workers int) []ioBenchmarkFactory {
-	return []ioBenchmarkFactory{
-		{
-			name: "UIODefault",
-			new: func() ioBenchmarkScheduler {
-				return &internalIOScheduler{pool: newIOTaskPool(nil)}
-			},
-		},
-		{
-			name: "UIOChannelExecutor",
-			new: func() ioBenchmarkScheduler {
-				executor := newChannelExecutor(workers)
-				return &executorIOScheduler{pool: newIOTaskPool(executor), executor: executor}
-			},
-		},
-	}
+	return []ioBenchmarkFactory{{name: "UIODefault", new: func() ioBenchmarkScheduler {
+		return &internalIOScheduler{pool: newIOTaskPool(nil)}
+	}}, {name: "UIOChannelExecutor", new: func() ioBenchmarkScheduler {
+		executor := newChannelExecutor(workers)
+		return &executorIOScheduler{pool: newIOTaskPool(executor), executor: executor}
+	}}}
 }
 
-// channelExecutor is a minimal Executor: a fixed set of workers fed by one
-// channel.
 type channelExecutor struct {
 	tasks   chan IOTask
 	workers sync.WaitGroup
@@ -190,14 +165,21 @@ type internalIOScheduler struct{ pool *ioTaskPool }
 func (scheduler *internalIOScheduler) bind(conn *fdConn) {
 	conn.loop = &eventLoop{ioPool: scheduler.pool, count: 1}
 }
-func (scheduler *internalIOScheduler) openKey() { scheduler.pool.connOpened() }
+
+func (scheduler *internalIOScheduler) openKey() {
+	scheduler.pool.connOpened()
+}
+
 func (scheduler *internalIOScheduler) submitBatch(conns []*fdConn, _ []IOTask) int {
 	if scheduler.pool.submitConnBatch(conns, nil) {
 		return len(conns)
 	}
 	return 0
 }
-func (scheduler *internalIOScheduler) stop() { scheduler.pool.stop() }
+
+func (scheduler *internalIOScheduler) stop() {
+	scheduler.pool.stop()
+}
 
 type executorIOScheduler struct {
 	pool     *ioTaskPool
@@ -207,13 +189,17 @@ type executorIOScheduler struct {
 func (scheduler *executorIOScheduler) bind(conn *fdConn) {
 	conn.loop = &eventLoop{ioPool: scheduler.pool, count: 1}
 }
-func (scheduler *executorIOScheduler) openKey() {}
+
+func (scheduler *executorIOScheduler) openKey() {
+}
+
 func (scheduler *executorIOScheduler) submitBatch(_ []*fdConn, tasks []IOTask) int {
 	if scheduler.pool.submitBatch(tasks) {
 		return len(tasks)
 	}
 	return 0
 }
+
 func (scheduler *executorIOScheduler) stop() {
 	scheduler.pool.stop()
 	scheduler.executor.stop()
@@ -229,18 +215,17 @@ type ioTaskBenchmarkRunner struct {
 func newIOTaskBenchmarkRunner(batch int, scheduler ioBenchmarkScheduler) *ioTaskBenchmarkRunner {
 	runner := &ioTaskBenchmarkRunner{scheduler: scheduler}
 	events := &Events{}
-	funcs(events).Read = func(Conn) error { runner.active.Load().Done(); return nil }
+	funcs(events).Read = func(Conn) error {
+		runner.active.Load().Done()
+		return nil
+	}
 	entry := events.plainEntry()
 	runner.connections = make([]*fdConn, batch)
 	runner.tasks = make([]IOTask, batch)
 	for index := range runner.connections {
-		// Distinct descriptors spread the turns over the scheduler's shards,
-		// as real connections' do; no socket is touched.
 		runner.connections[index] = &fdConn{commonConn: commonConn{entry: entry}, fd: int32(index)}
 		runner.tasks[index] = runner.connections[index]
 		scheduler.bind(runner.connections[index])
-		// Keep the owned scheduler's shard count in sync with production: each
-		// registered connection calls connOpened before its first turn.
 		scheduler.openKey()
 	}
 	return runner
@@ -251,8 +236,6 @@ func (runner *ioTaskBenchmarkRunner) runBatch() {
 	wait.Add(len(runner.connections))
 	runner.active.Store(&wait)
 	for _, conn := range runner.connections {
-		// A wake turn runs a callback without touching a socket, which these
-		// connections do not have.
 		conn.taskState.Store(ioEventWake)
 		conn.taskState.Or(taskScheduledBit)
 		if !conn.loop.acquireIO() {

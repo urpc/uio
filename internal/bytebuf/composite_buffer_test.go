@@ -1041,3 +1041,34 @@ func TestCompositeBufferWriteCoalesced(t *testing.T) {
 		t.Fatalf("length = %d, want %d", got, want)
 	}
 }
+
+func TestCompositeBufferPopAndPrependOwned(t *testing.T) {
+	var b CompositeBuffer
+	if b.PopBlock() != nil {
+		t.Fatal("empty PopBlock returned non-nil")
+	}
+	b.PrependOwned(nil)
+	b.PrependOwned(AcquireBuffer(16)) // empty owned buffer released
+
+	empty := AcquireBuffer(16)
+	b.bufList = append(b.bufList, empty)
+	if b.PopBlock() != nil {
+		t.Fatal("zero-len head block was not skipped")
+	}
+
+	_, _ = b.Write([]byte("second"))
+	first := AcquireBuffer(8)
+	_, _ = first.WriteString("first-")
+	b.PrependOwned(first)
+
+	popped := b.PopBlock()
+	if popped == nil || string(popped.Bytes()) != "first-" {
+		t.Fatalf("popped = %v", popped)
+	}
+	ReleaseBuffer(popped)
+	rest := b.PopBlock()
+	if rest == nil || string(rest.Bytes()) != "second" || !b.Empty() {
+		t.Fatalf("rest = %v, len = %d", rest, b.Len())
+	}
+	ReleaseBuffer(rest)
+}

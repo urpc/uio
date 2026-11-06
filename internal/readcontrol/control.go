@@ -60,20 +60,22 @@ func (c *Control) application() *Pause {
 	return c.manual.Load()
 }
 
-// PauseReads and ResumeReads operate the application's own owner. It is one
+// PauseRead and ResumeRead operate the application's own owner. It is one
 // switch, idempotent rather than reference counted.
-func (c *Control) PauseReads() error  { return c.application().Pause() }
-func (c *Control) ResumeReads() error { return c.application().Resume() }
+func (c *Control) PauseRead() error  { return c.application().Pause() }
+func (c *Control) ResumeRead() error { return c.application().Resume() }
 
-// ReadsPaused reports whether any owner holds a pause.
-func (c *Control) ReadsPaused() bool { return c != nil && c.owners.Load() != 0 }
+// ReadPaused reports whether any owner holds a pause.
+func (c *Control) ReadPaused() bool { return c != nil && c.owners.Load() != 0 }
 
 // Held reports whether the end of the stream must wait for the consumer: a
-// pause holds it, or a resume turn is owed.
-func (c *Control) Held() bool { return c != nil && (c.owners.Load() != 0 || c.owed.Load()) }
+// pause holds it, or a released pause's resume turn has not run yet.
+func (c *Control) Held() bool {
+	return c != nil && (c.owners.Load() != 0 || c.owed.Load())
+}
 
-// ConsumerRuns records the consumer's callback starting unpaused: any resume
-// turn owed is this one.
+// ConsumerRuns records the consumer's callback starting unpaused, clearing any
+// owed resume turn.
 func (c *Control) ConsumerRuns() {
 	if c != nil && c.owed.Load() {
 		c.owed.Store(false)

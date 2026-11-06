@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/ubridge"
 )
 
 // A KCP session's held output drains as its peer acknowledges it, with no
@@ -41,7 +42,7 @@ func TestBridgeUploadIntoKCPHearsAcknowledgedDrains(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = ln.Close() })
 	up := ln.Addr().String()
-	br := &uio.Bridge{Dial: func(ctx context.Context, _ uio.Conn, dial uio.DialFunc) (uio.Conn, error) {
+	br := &ubridge.Bridge{Dial: func(ctx context.Context, _ uio.Conn, dial ubridge.DialFunc) (uio.Conn, error) {
 		return dial(ctx, "udp://"+up, uio.WithLayers(ClientLayer(opts)))
 	}}
 	ev := br.Events()

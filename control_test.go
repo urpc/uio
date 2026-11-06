@@ -4,26 +4,37 @@ package uio
 
 import (
 	"errors"
+	"golang.org/x/sys/unix"
 	"net"
 	"os"
 	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
-// setTTL and ttlOf read and write a stream or datagram socket's IP_TTL, the
-// option no dedicated setter carries.
+func isPeerGoneWrite(err error) bool {
+	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE)
+}
+
 func setTTL(fd uintptr) error {
 	return unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL, 3)
+}
+
+func mustSocket(t *testing.T, conn Conn) SocketConn {
+	t.Helper()
+	sc, ok := SocketOf(conn)
+	if !ok {
+		t.Fatal("SocketOf reported false for a socket connection")
+	}
+	return sc
 }
 
 func ttlOf(t *testing.T, conn Conn) int {
 	t.Helper()
 	var ttl int
-	if err := conn.Control(func(fd uintptr) {
+	if err := mustSocket(t, conn).Control(func(fd uintptr) {
 		value, err := unix.GetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TTL)
 		if err != nil {
 			t.Error(err)
@@ -36,54 +47,6 @@ func ttlOf(t *testing.T, conn Conn) int {
 	return ttl
 }
 
-// Control reaches a live connection's descriptor, and a closed one refuses.
-func TestConnControlSetsSocketOptions(t *testing.T) {
-	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
-	addr, _ := serveLoopback(t, events)
-	conn, err := events.Dial("tcp://" + addr)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := conn.Control(func(fd uintptr) {
-		if err := setTTL(fd); err != nil {
-			t.Error(err)
-		}
-	}); err != nil {
-		t.Fatalf("Control: %v", err)
-	}
-	if ttl := ttlOf(t, conn); ttl != 3 {
-		t.Fatalf("IP_TTL = %d, want 3", ttl)
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := conn.Control(func(uintptr) {}); !errors.Is(err, net.ErrClosed) {
-		t.Fatalf("Control after Close = %v, want %v", err, net.ErrClosed)
-	}
-}
-
-// A datagram child's Control lands on the socket it shares with its listener.
-func TestConnControlOnDialedPeer(t *testing.T) {
-	f := startPacketFixture(t)
-	conn, err := f.packet.DialPeer(f.peerAddr, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	if err := conn.Control(func(fd uintptr) {
-		if err := setTTL(fd); err != nil {
-			t.Error(err)
-		}
-	}); err != nil {
-		t.Fatalf("Control: %v", err)
-	}
-	if ttl := ttlOf(t, conn); ttl != 3 {
-		t.Fatalf("IP_TTL = %d, want 3", ttl)
-	}
-}
-
-// WithLocalAddr binds the dial's socket, and the connection reports it.
 func TestDialWithLocalAddr(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
@@ -98,9 +61,6 @@ func TestDialWithLocalAddr(t *testing.T) {
 	}
 }
 
-// WithDialControl runs on the dialing socket before it connects — the option
-// it sets survives onto the established connection — and sees what the socket
-// is for.
 func TestDialWithControl(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
@@ -113,7 +73,7 @@ func TestDialWithControl(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-	if gotNetwork != "tcp4" || gotAddr != addr { // net reports the address family it dialed
+	if gotNetwork != "tcp4" || gotAddr != addr {
 		t.Fatalf("control saw %s %s, want tcp4 %s", gotNetwork, gotAddr, addr)
 	}
 	if ttl := ttlOf(t, conn); ttl != 3 {
@@ -121,7 +81,6 @@ func TestDialWithControl(t *testing.T) {
 	}
 }
 
-// A control on a bad address fails the dial, not the option silently.
 func TestDialWithControlErrorFails(t *testing.T) {
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	addr, _ := serveLoopback(t, events)
@@ -133,8 +92,6 @@ func TestDialWithControlErrorFails(t *testing.T) {
 	}
 }
 
-// WithListenControl runs on the listening socket before it binds: what it
-// sets is on the socket that accepts, once per listener of the group.
 func TestListenWithControl(t *testing.T) {
 	for _, reusePort := range []bool{false, true} {
 		t.Run(map[bool]string{false: "plain", true: "reuseport"}[reusePort], func(t *testing.T) {
@@ -162,7 +119,6 @@ func TestListenWithControl(t *testing.T) {
 			if runs.Load() == 0 {
 				t.Fatal("the control never ran")
 			}
-			// The listener works with the option set.
 			client, err := net.DialTimeout("tcp", ln.Addr().String(), time.Second)
 			if err != nil {
 				t.Fatal(err)
@@ -172,11 +128,7 @@ func TestListenWithControl(t *testing.T) {
 	}
 }
 
-// The unix LocalAddr accepts the scheme-prefixed form, as the dial target
-// does; the bound path is the one after the scheme.
 func TestDialWithLocalAddrUnixSchemeStripped(t *testing.T) {
-	// Short paths: a unix socket address is capped at 104 bytes, which a
-	// TempDir path holding this test's name would exceed.
 	dir, err := os.MkdirTemp("/tmp", "u")
 	if err != nil {
 		t.Fatal(err)
@@ -186,7 +138,9 @@ func TestDialWithLocalAddrUnixSchemeStripped(t *testing.T) {
 	local := filepath.Join(dir, "s.sock")
 	events := withFuncs(&Events{Pollers: 1}, FuncHandler{})
 	done := make(chan error, 1)
-	go func() { done <- events.Serve("unix://" + remote) }()
+	go func() {
+		done <- events.Serve("unix://" + remote)
+	}()
 	t.Cleanup(func() {
 		_ = events.Close(nil)
 		select {

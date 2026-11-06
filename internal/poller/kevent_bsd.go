@@ -1,4 +1,4 @@
-//go:build (darwin || freebsd || openbsd || dragonfly) && !stdio
+//go:build darwin || freebsd || openbsd || dragonfly
 
 /*
  * Copyright 2024 the urpc project

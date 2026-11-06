@@ -20,7 +20,7 @@
 // its local service. Half-closes travel through the streams, and an abort on
 // one side stays an abort on the other.
 //
-// Both ends are plain uio.Bridge values whose legs are uio.Conns — user
+// Both ends are plain ubridge.Bridge values whose legs are uio.Conns — user
 // sockets on one end, umux streams in the middle — so the two bridges chain
 // without a socket between them:
 //
@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/ubridge"
 	"github.com/urpc/uio/umux"
 )
 
@@ -75,7 +76,7 @@ func runRelay() {
 	// Dial opens each one's upstream leg — a stream on the agent's transport —
 	// instead of dialing a socket.
 	var sess atomic.Value // *umux.Session: the latest agent transport
-	br := &uio.Bridge{Dial: func(ctx context.Context, _ uio.Conn, _ uio.DialFunc) (uio.Conn, error) {
+	br := &ubridge.Bridge{Dial: func(ctx context.Context, _ uio.Conn, _ ubridge.DialFunc) (uio.Conn, error) {
 		s, _ := sess.Load().(*umux.Session)
 		if s == nil {
 			return nil, errors.New("umux-tunnel: no agent connected")
@@ -119,7 +120,7 @@ func runAgent() {
 	// Every stream the relay opens arrives here as a client leg; the bridge
 	// dials the local target for it and relays both ways, so each stream is
 	// one TCP connection to the service.
-	br := &uio.Bridge{Upstream: *target}
+	br := &ubridge.Bridge{Upstream: *target}
 	targets := br.Events()
 	// The dial-only Events must already be serving when the first stream
 	// asks it to dial the target: wait for its start hook before dialing the

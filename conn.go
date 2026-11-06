@@ -22,23 +22,23 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/readcontrol"
-	"sync/atomic"
 )
 
-// Conn is a connection managed by Events. On native Unix, socket I/O and
-// callbacks run in the connection's turn, one serialized task outside the
-// event loops, which only collect readiness. The stdio/Windows backend uses
-// dedicated blocking I/O goroutines and serializes lifecycle callbacks per
-// connection. Writes from other goroutines are safe and retain no
-// caller-owned data after returning. Close and CloseWith return after the
-// close request is accepted; OnClose is final. Native UDP writes send the
-// datagram before returning, from any goroutine.
-type Conn interface {
+// Lower is the connection below a protocol [Layer]: [Conn] without
+// whole-connection close verbs, because a layer closes the stack through
+// [LayerContext.Close] or [LayerContext.Abort]. CloseWrite remains available
+// to end one direction.
+type Lower interface {
 	ReadController
+	io.Reader
+	io.Writer
+	io.ByteWriter
+	io.StringWriter
 
 	// LocalAddr is the connection's local socket address.
 	LocalAddr() net.Addr
@@ -53,6 +53,186 @@ type Conn interface {
 	// SetUserdata replaces user-defined connection data, from any goroutine.
 	SetUserdata(value any)
 
+	// SetDeadline sets deadline for both read and write.
+	// If it is time.Zero, SetDeadline will clear the deadlines.
+	SetDeadline(t time.Time) error
+
+	// SetReadDeadline sets the deadline for future Read calls.
+	// When the user doesn't update the deadline and the deadline exceeds,
+	// the connection will be closed.
+	// If it is time.Zero, SetReadDeadline will clear the deadline.
+	SetReadDeadline(t time.Time) error
+
+	// SetWriteDeadline sets the deadline for future data writing; a deadline
+	// that passes closes the connection, as SetReadDeadline's does, whether
+	// or not a write is in flight: a callback cannot be interrupted, so the
+	// bound is the connection's on every backend.
+	// If it is time.Zero, SetWriteDeadline will clear the deadline.
+	SetWriteDeadline(t time.Time) error
+
+	// Peek returns the next len(b) bytes without advancing the inbound buffer.
+	//
+	// Peek, PeekChunk, Discard, InboundBuffered, Read, WriteTo and the slices
+	// they return read the connection's inbound buffer: call them only from
+	// inside the current invocation of this connection's OnOpen, OnRead,
+	// OnTimer, OnBytesRead or OnClose callback — never from OnBytesWritten, never from
+	// another goroutine, and never after the callback returned. The slices are
+	// borrowed from the buffer, and any call that consumes inbound data —
+	// Read, WriteTo, Discard — or the callback's return may invalidate them
+	// as the consumed blocks go back to the pool: copy anything that must
+	// outlive that.
+	Peek(b []byte) []byte
+
+	// PeekChunk returns the first contiguous inbound chunk without advancing it.
+	// The returned slice is borrowed: Read, WriteTo, Discard or the callback's
+	// return may invalidate it. See Peek for the calling scope.
+	PeekChunk() []byte
+
+	// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
+	// See Peek for the calling scope.
+	Discard(n int) (int, error)
+
+	// InboundBuffered returns inbound buffer data length.
+	// See Peek for the calling scope.
+	InboundBuffered() int
+
+	// ReserveInbound makes the next n inbound bytes, such as a
+	// length-prefixed packet whose header has arrived, readable as one chunk:
+	// the bytes buffered so far, up to n, move into one block with room for
+	// n, and PeekChunk returns them. Bytes read later are borrowed again until
+	// the next call moves them in too, so a codec calls it in each callback
+	// while the unit is incomplete and once more when it is complete, and then
+	// decodes PeekChunk in place instead of copying the unit out with Peek;
+	// each call copies only what arrived since the last. It does nothing when
+	// the first chunk already holds n bytes. The block is allocated by the
+	// first call, so a caller should reserve only a length it has checked,
+	// and may wait until part of the unit has arrived; with a
+	// MaxInboundBuffered limit, an n above it returns ErrInboundOverflow. It
+	// invalidates slices returned by Peek and PeekChunk, and is a no-op for
+	// datagram connections. See Peek for the calling scope.
+	ReserveInbound(n int) error
+
+	// OutboundBuffered returns payload bytes accepted by this connection but not
+	// yet written to the socket.
+	OutboundBuffered() int
+
+	// Writev "writev"-like batch write. On a stream connection the buffers
+	// form one byte stream, written together. On a packet connection each
+	// buffer is one datagram of its own, sent in one sendmmsg where the
+	// system has it; the count reports the bytes of the datagrams the socket
+	// took, and a datagram it refused is lost — a datagram transport leaves
+	// the retransmission to its protocol above, or has none. Empty buffers
+	// carry no datagram.
+	// Notice: non-blocking interface, should not be used as you use std.
+	Writev(vec [][]byte) (int, error)
+
+	// WriteOwned submits buffer without copying and consumes its ownership on
+	// every return path except ErrOutboundOverflow, which accepts nothing and
+	// returns the buffer to the caller to resubmit or release. A direct write
+	// that partially reached the socket and then could not queue its suffix
+	// reports io.ErrShortWrite instead: that buffer is consumed and the stream
+	// is being closed, so the partial frame is never resubmitted. For UDP, one
+	// buffer is sent as one datagram.
+	WriteOwned(buffer *Buffer) (int, error)
+
+	// Flush schedules buffered data for writing without waiting for socket I/O.
+	// Writes accepted before Flush remain ordered before later writes. When
+	// another sender is sending the connection's output, Flush leaves the
+	// bytes to it and returns.
+	Flush() error
+
+	// Wake schedules one OnRead callback after previously submitted tasks: a
+	// callback that left input unconsumed — its destination was full, say —
+	// gets the next one from it once it can go on. While read is paused
+	// the turn runs no OnRead, only timers and layer work; Wake never clears
+	// a pause.
+	Wake() error
+
+	// SetWakeDeadline schedules one OnTimer callback for the connection at
+	// when, within one scheduler tick of it: the timed form of Wake. The
+	// timer turn runs OnTimer and then OnRead, which may find bytes already
+	// buffered. Due is computed against the clock, so a wake or a read that
+	// arrives first runs the timer just the same, once. A connection whose
+	// reads are held (see MaxInboundBuffered) runs the turn anyway —
+	// consuming what it holds is what a held connection's wake is for — and
+	// its socket reads resume once the callback consumes below the limit. A
+	// zero time cancels the pending timer, and arming again replaces
+	// whatever was armed. Safe from any goroutine.
+	SetWakeDeadline(when time.Time) error
+
+	// SetWakeInterval schedules OnTimer callbacks for the connection every
+	// interval, the repeating form of SetWakeDeadline, until cancelled by a
+	// zero or negative interval or replaced by either setter. The native
+	// scheduler coarsens time into slots of a few milliseconds; an interval
+	// below a slot still fires — at the retry granularity, about a
+	// millisecond — and one above a slot fires within a slot of its period.
+	// A connection needing several timers arms this one at the earliest
+	// deadline and decides in the callback, by its own clocks, which of them
+	// came due.
+	SetWakeInterval(interval time.Duration) error
+
+	// CloseWrite shuts the connection's writing half: the peer reads the end
+	// of the stream once everything accepted before the call has been sent,
+	// and writes after it return net.ErrClosed. The connection keeps reading
+	// until the peer shuts its own writing half; with Events.AllowHalfOpen it
+	// then closes, without it the end of the stream closes it as before. It
+	// may be called from any goroutine, and calling it again does nothing. On
+	// a layered connection the top layer's own CloseWrite runs once what was
+	// written before it has gone below and the layer holds nothing — before
+	// this returns when that already holds — and for TLS writing a
+	// close_notify, so it may wait on I/O; otherwise the end is passed on a
+	// turn. A stack whose layers do not implement CloseWriter returns
+	// ErrUnsupported. Datagram connections, and stdio-backend connections
+	// whose net.Conn cannot shut one half, return an unsupported error too.
+	CloseWrite() error
+
+	// State reports where the connection's streams stand: the peer's end
+	// once everything it sent was read, this end's writing half, and a close.
+	// It reads state the turns keep, so call it on the connection's turn.
+	State() ConnState
+}
+
+// Conn is a connection managed by Events. On native Unix, socket I/O and
+// callbacks run in the connection's turn, one serialized task outside the
+// event loops, which only collect readiness. The stdio/Windows backend uses
+// dedicated blocking I/O goroutines and serializes lifecycle callbacks per
+// connection. Writes from other goroutines are safe and retain no
+// caller-owned data after returning. Close and Abort return after the close
+// request is accepted; OnClose is final. Native UDP writes send the datagram
+// before returning, from any goroutine.
+//
+// OS-level socket options and raw descriptor access live on [SocketConn],
+// obtained via [SocketOf].
+type Conn interface {
+	Lower
+
+	// WriteTo drains inbound data; see Peek for the calling scope.
+	// Notice: non-blocking interface, should not be used as you use std.
+	io.WriterTo
+
+	// Close requests a graceful close and returns: everything accepted before
+	// the call leaves first, so the peer reads it whole. Writes are refused
+	// from the call (net.ErrClosed) while reads go on, and the connection's
+	// turn releases it once its queue is empty or LingerTimeout has passed
+	// without progress; on native Unix leftover output reaches OnClose as
+	// UnflushedError. On a layered connection each layer's OnClosing hook runs
+	// first. Calling Abort at any time cuts the drain short at once. Datagram
+	// connections have no stream queue to drain and release immediately.
+	io.Closer
+
+	// Abort requests an immediate close with cause and returns, cutting any
+	// graceful Close drain short at once. If cause is nil, net.ErrClosed is
+	// used. On native Unix the connection's turn releases it once any active
+	// callback has returned and reports unsent accepted payload as
+	// UnflushedError.
+	Abort(cause error) error
+}
+
+// SocketConn exposes OS-level socket options and raw descriptor control for
+// connections backed by a physical socket. Use [SocketOf] to reach it through
+// protocol layers or connection wrappers; virtual streams such as multiplexed
+// streams report false.
+type SocketConn interface {
 	// SetLinger sets the behavior of Close on a connection which still
 	// has data waiting to be sent or to be acknowledged.
 	//
@@ -101,219 +281,69 @@ type Conn interface {
 	// SetWriteBuffer sets the size of the operating system's
 	// transmit buffer associated with the connection.
 	SetWriteBuffer(size int) error
+}
 
-	// SetDeadline sets deadline for both read and write.
-	// If it is time.Zero, SetDeadline will clear the deadlines.
-	SetDeadline(t time.Time) error
+// Unwrapper is implemented by connection decorators and protocol-layer nodes
+// so [SocketOf], [FindLayer], [LayerOf], and flow-control helpers can reach the
+// underlying connection.
+type Unwrapper interface {
+	Unwrap() Conn
+}
 
-	// SetReadDeadline sets the deadline for future Read calls.
-	// When the user doesn't update the deadline and the deadline exceeds,
-	// the connection will be closed.
-	// If it is time.Zero, SetReadDeadline will clear the deadline.
-	SetReadDeadline(t time.Time) error
+// Unwrap returns the inner connection wrapped by c if c implements
+// Unwrap() Conn or Unwrap() Lower, or nil otherwise.
+func Unwrap(c Lower) Lower {
+	switch u := c.(type) {
+	case interface{ Unwrap() Conn }:
+		next := u.Unwrap()
+		if next != nil && next != c {
+			return next
+		}
+	case interface{ Unwrap() Lower }:
+		next := u.Unwrap()
+		if next != nil && next != c {
+			return next
+		}
+	}
+	return nil
+}
 
-	// SetWriteDeadline sets the deadline for future data writing; a deadline
-	// that passes closes the connection, as SetReadDeadline's does, whether
-	// or not a write is in flight: a callback cannot be interrupted, so the
-	// bound is the connection's on every backend.
-	// If it is time.Zero, SetWriteDeadline will clear the deadline.
-	SetWriteDeadline(t time.Time) error
+// unwrapBase peels non-layer decorators to reach a built-in layer node or base
+// transport connection.
+func unwrapBase(c Lower) Lower {
+	for c != nil {
+		if _, isLayer := c.(*layerNode); isLayer {
+			return c
+		}
+		if _, isSocketLower := c.(socketLower); isSocketLower {
+			return c
+		}
+		next := Unwrap(c)
+		if next == nil {
+			return c
+		}
+		c = next
+	}
+	return nil
+}
 
-	// Peek returns the next len(b) bytes without advancing the inbound buffer.
-	//
-	// Peek, PeekChunk, Discard, InboundBuffered, Read, WriteTo and the slices
-	// they return read the connection's inbound buffer: call them only from
-	// inside the current invocation of this connection's OnOpen, OnRead,
-	// OnTimer, OnBytesRead or OnClose callback — never from OnBytesWritten, never from
-	// another
-	// goroutine, and never after the callback returned. The slices are
-	// borrowed from the buffer, and any call that consumes inbound data —
-	// Read, WriteTo, Discard — or the callback's return may invalidate them
-	// as the consumed blocks go back to the pool: copy anything that must
-	// outlive that.
-	Peek(b []byte) []byte
-
-	// PeekChunk returns the first contiguous inbound chunk without advancing it.
-	// The returned slice is borrowed: Read, WriteTo, Discard or the callback's
-	// return may invalidate it. See Peek for the calling scope.
-	PeekChunk() []byte
-
-	// Discard advances the inbound buffer with next n bytes, returning the number of bytes discarded.
-	// See Peek for the calling scope.
-	Discard(n int) (int, error)
-
-	// InboundBuffered returns a inbound buffer data length.
-	// See Peek for the calling scope.
-	InboundBuffered() int
-
-	// ReserveInbound makes the next n inbound bytes, such as a
-	// length-prefixed packet whose header has arrived, readable as one chunk:
-	// the bytes buffered so far, up to n, move into one block with room for
-	// n, and PeekChunk returns them. Bytes read later are borrowed again until
-	// the next call moves them in too, so a codec calls it in each callback
-	// while the unit is incomplete and once more when it is complete, and then
-	// decodes PeekChunk in place instead of copying the unit out with Peek;
-	// each call copies only what arrived since the last. It does nothing when
-	// the first chunk already holds n bytes. The block is allocated by the
-	// first call, so a caller should reserve only a length it has checked,
-	// and may wait until part of the unit has arrived; with a
-	// MaxInboundBuffered limit, an n above it returns ErrInboundOverflow. It
-	// invalidates slices returned by Peek and PeekChunk, and is a no-op for
-	// datagram connections. See Peek for the calling scope.
-	ReserveInbound(n int) error
-
-	// OutboundBuffered returns payload bytes accepted by this connection but not
-	// yet written to the socket.
-	OutboundBuffered() int
-
-	// WriterTo
-	// WriteTo drains inbound data; see Peek for the calling scope.
-	// Notice: non-blocking interface, should not be used as you use std.
-	io.WriterTo
-
-	// ReadWriteCloser
-	// Read is inbound access; see Peek for the calling scope. Write and Close
-	// are safe from other goroutines.
-	// Stream writes are non-blocking; a native UDP write makes one
-	// non-blocking send and returns its result.
-	io.ReadWriteCloser
-
-	// ByteWriter
-	// Notice: non-blocking interface, should not be used as you use std.
-	io.ByteWriter
-
-	// StringWriter
-	// Notice: non-blocking interface, should not be used as you use std.
-	io.StringWriter
-
-	// Writev "writev"-like batch write. On a stream connection the buffers
-	// form one byte stream, written together. On a packet connection each
-	// buffer is one datagram of its own, sent in one sendmmsg where the
-	// system has it; the count reports the bytes of the datagrams the socket
-	// took, and a datagram it refused is lost — a datagram transport leaves
-	// the retransmission to its protocol above, or has none. Empty buffers
-	// carry no datagram.
-	// Notice: non-blocking interface, should not be used as you use std.
-	Writev(vec [][]byte) (int, error)
-
-	// WriteOwned submits buffer without copying and consumes its ownership on
-	// every return path except ErrOutboundOverflow, which accepts nothing and
-	// returns the buffer to the caller to resubmit or release. A direct write
-	// that partially reached the socket and then could not queue its suffix
-	// reports io.ErrShortWrite instead: that buffer is consumed and the stream
-	// is being closed, so the partial frame is never resubmitted. For UDP, one
-	// buffer is sent as one datagram.
-	WriteOwned(buffer *Buffer) (int, error)
-
-	// ReserveOutbound appends n bytes to the connection's outbound queue and
-	// returns them for the caller to fill in place, so an encoder writes
-	// straight into the queue instead of into a buffer that is copied again.
-	// It works only in a native stream connection's own callback, where the
-	// queue is sent after the callback returns; elsewhere, or while output
-	// written from another goroutine is queued for or being sent by a write
-	// turn, it reserves nothing and returns ErrReserveUnsupported, and the
-	// caller writes another way. A layered connection's Conn does not serve
-	// it at all: the layers between would have to be bypassed to fill the
-	// queue in place. Once a reservation succeeds, output from other
-	// goroutines waits for the end of the connection's turn.
-	// Every reserved byte must be written before the callback returns and
-	// before the next Flush.
-	ReserveOutbound(n int) ([]byte, error)
-
-	// Flush schedules buffered data for writing without waiting for socket I/O.
-	// Writes accepted before Flush remain ordered before later writes. When
-	// another sender is sending the connection's output, Flush leaves the
-	// bytes to it and returns.
-	Flush() error
-
-	// Wake schedules one OnRead callback after previously submitted tasks: a
-	// callback that left input unconsumed — its destination was full, say —
-	// gets the next one from it once it can go on. While reads are paused
-	// the turn runs no OnRead, only timers and layer work; Wake never clears
-	// a pause.
-	Wake() error
-
-	// SetWakeDeadline schedules one OnTimer callback for the connection at
-	// when, within one scheduler tick of it: the timed form of Wake. The
-	// timer turn runs OnTimer and then OnRead, which may find bytes already
-	// buffered. Due is computed against the clock, so a wake or a read that
-	// arrives first runs the timer just the same, once. A connection whose
-	// reads are held (see MaxInboundBuffered) runs the turn anyway —
-	// consuming what it holds is what a held connection's wake is for — and
-	// its socket reads resume once the callback consumes below the limit. A
-	// zero time cancels the pending timer, and arming again replaces
-	// whatever was armed. Safe from any goroutine.
-	SetWakeDeadline(when time.Time) error
-
-	// SetWakeInterval schedules OnTimer callbacks for the connection every
-	// interval, the repeating form of SetWakeDeadline, until cancelled by a
-	// zero or negative interval or replaced by either setter. The native
-	// scheduler coarsens time into slots of a few milliseconds; an interval
-	// below a slot still fires — at the retry granularity, about a
-	// millisecond — and one above a slot fires within a slot of its period.
-	// A connection needing several timers arms this one at the earliest
-	// deadline and decides in the callback, by its own clocks, which of them
-	// came due.
-	SetWakeInterval(interval time.Duration) error
-
-	// YieldRead ends the current read round once the callback returns, and a
-	// later turn calls OnRead again with what it left — a continuation, even
-	// with nothing left to read, since a protocol may hold work of its own.
-	// The end of the stream waits for that continuation. A continuation that
-	// consumed nothing reads the socket for more before the next one, so a
-	// callback waiting for a whole message gets it; once the stream has
-	// ended, such a continuation closes the connection, its unconsumed input
-	// going as a close's does. Before that end, yielding without progress
-	// spins. It never clears a pause. Call only from a connection callback,
-	// then return.
-	YieldRead() error
-
-	// CloseWith requests the close and returns. On native Unix the
-	// connection's turn releases it once the callback that closed it has
-	// returned, and reports unsent accepted payload as UnflushedError.
-	CloseWith(err error) error
-
-	// CloseGracefully requests the close and returns; everything accepted
-	// before the call leaves first, so the peer reads it whole. Writes are
-	// refused from the call — net.ErrClosed — while reads go on, and the
-	// connection's turn releases it once its queue is empty or LingerTimeout
-	// has passed without progress; on native Unix leftover output reaches
-	// OnClose as UnflushedError appended to cause. On a layered connection the
-	// layers' goodbyes are said first, and the mode is this call's whatever
-	// the cause. A CloseWith at any time ends the wait at once: a drain this
-	// call, or a layer's LayerContext.Close, began ends there and then, while
-	// a CloseWith that finds a close another CloseWith began joins it.
-	// Datagram connections close as CloseWith does: their sends wait for
-	// nothing.
-	CloseGracefully(cause error) error
-
-	// CloseWrite shuts the connection's writing half: the peer reads the end
-	// of the stream once everything accepted before the call has been sent,
-	// and writes after it return net.ErrClosed. The connection keeps reading
-	// until the peer shuts its own writing half; with Events.AllowHalfOpen it
-	// then closes, without it the end of the stream closes it as before. It
-	// may be called from any goroutine, and calling it again does nothing. On
-	// a layered connection the top layer's own CloseWrite runs once what was
-	// written before it has gone below and the layer holds nothing — before
-	// this returns when that already holds — flushing the layer, and for TLS
-	// writing a close_notify, so it may wait on I/O; otherwise the end is
-	// passed on a turn. A stack whose layers do not implement CloseWriter
-	// returns ErrUnsupported. Datagram connections, and stdio-backend
-	// connections whose net.Conn cannot shut one half, return an unsupported
-	// error too.
-	CloseWrite() error
-
-	// State reports where the connection's streams stand: the peer's end
-	// once everything it sent was read, this end's writing half, and a close.
-	// It reads state the turns keep, so call it on the connection's turn.
-	State() ConnState
+// SocketOf returns the underlying [SocketConn] of c, unwrapping protocol layers
+// and [Unwrapper] decorators. It returns (nil, false) for virtual connections
+// that have no dedicated OS socket, such as multiplexed streams.
+func SocketOf(c Lower) (SocketConn, bool) {
+	for c != nil {
+		if sc, ok := c.(SocketConn); ok {
+			return sc, true
+		}
+		c = Unwrap(c)
+	}
+	return nil, false
 }
 
 // ErrUnsupported reports a method this connection cannot carry: CloseWrite on
 // a datagram or stdio connection, or on a layered one whose layers do not
 // implement CloseWriter; a deadline or an option the backend has no way to
-// honor. A reserve the connection cannot serve reports ErrReserveUnsupported
-// instead.
+// honor.
 var ErrUnsupported = readcontrol.ErrUnsupported
 
 var (
@@ -324,15 +354,10 @@ var (
 	// ErrFirstTurnRefused reports an Executor that declined to run a dialed
 	// or adopted connection's first turn, so the connection closed without
 	// ever calling back.
-	ErrFirstTurnRefused   = errors.New("uio: the executor refused the connection's first turn")
-	ErrReserveUnsupported = errors.New("uio: outbound reservation needs the connection's own callback")
+	ErrFirstTurnRefused = errors.New("uio: the executor refused the connection's first turn")
 	// ErrPeerExists reports DialPeer finding the peer already connected.
 	ErrPeerExists = errors.New("uio: peer already connected")
 )
-
-// Deprecated: nothing returns ErrUDPWriteOnEventLoop any more; a UDP write
-// sends its datagram from any goroutine.
-var ErrUDPWriteOnEventLoop = errors.New("uio: UDP write cannot wait on another event loop")
 
 // UnflushedError reports payload accepted by the framework but not sent before
 // the connection was closed.
@@ -346,18 +371,18 @@ func (err UnflushedError) Error() string {
 
 func (err UnflushedError) Unwrap() error { return ErrUnflushedData }
 
-// ConnState reports where a connection's streams stand, as Conn.State and
-// LayerDown.State report it. The bits are independent: a peer-ended
-// connection still writes, a write-shut one still reads.
+// ConnState reports where a connection's streams stand, as [Conn.State] and
+// [Lower.State] report it. The bits are independent: a read-ended connection
+// still writes, and a write-ended one still reads.
 type ConnState uint32
 
 const (
-	// StatePeerEnded reports a peer that ended its stream with everything it
-	// sent read — what Read(nil) reporting io.EOF says. A layer above still
-	// writing holds it open.
-	StatePeerEnded ConnState = 1 << iota
-	// StateWriteShut reports this end's writing half ended by CloseWrite.
-	StateWriteShut
+	// StateReadEnded reports that the peer ended its writing half and every
+	// byte it sent was consumed — what Read(nil) reporting io.EOF says.
+	StateReadEnded ConnState = 1 << iota
+	// StateWriteEnded reports that this end's writing half was ended by
+	// CloseWrite.
+	StateWriteEnded
 	// StateClosing reports a close begun — by either side — after which
 	// writes are refused. A graceful close still reads until it releases.
 	StateClosing
@@ -365,8 +390,8 @@ const (
 	StateClosed
 )
 
-// LingerTimeout bounds how long a graceful close — [Conn.CloseGracefully] —
-// waits for its output without progress before it closes with what remains.
+// LingerTimeout bounds how long a graceful close — [Conn.Close] — waits for
+// its output without progress before it closes with what remains.
 const LingerTimeout = 5 * time.Second
 
 // lingerTimeout is LingerTimeout, which tests shorten.
@@ -380,7 +405,7 @@ var lingerTimeout = LingerTimeout
 // turns write. The remote address is read only on request.
 type commonConn struct {
 	loop     *eventLoop          // event loop
-	entry    *entry              // this connection's endpoint: its Events, callbacks and chain
+	entry    *entry              // this connection's endpoint: its Events, callbacks and policy
 	userdata atomic.Pointer[any] // user-defined data; see Conn.SetUserdata
 	// addr carries the address objects LocalAddr and RemoteAddr hand back.
 	// Accepted connections share the listener's single pair, and a connection
@@ -408,13 +433,17 @@ func (fc *commonConn) events() *Events { return fc.entry.ev }
 func (fc *commonConn) callbacks() *callbacks { return &fc.entry.cb }
 
 // payloadLimit is the accepted payload the socket refuses past:
-// MaxOutboundBuffered on a bare connection, none under layers (the stack's
-// top enforces it instead).
+// MaxOutboundBuffered when the endpoint's consumer reads directly from the
+// socket, zero when an upper driver enforces its own admission budget.
 func (fc *commonConn) payloadLimit() int {
-	if fc.entry != nil && fc.entry.layered {
+	if fc.entry == nil || !fc.entry.directConsumer {
 		return 0
 	}
 	return fc.events().MaxOutboundBuffered
+}
+
+func (fc *commonConn) autoCloseOnEOF() bool {
+	return fc.entry != nil && fc.entry.directConsumer && !fc.events().AllowHalfOpen
 }
 
 func (fc *commonConn) LocalAddr() net.Addr {

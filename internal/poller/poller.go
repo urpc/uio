@@ -1,3 +1,5 @@
+//go:build !windows
+
 /*
  * Copyright 2024 the urpc project
  *
@@ -14,7 +16,7 @@
  * limitations under the License.
  */
 
-// Package poller normalizes epoll, kqueue, and blocking-backend wake semantics.
+// Package poller normalizes epoll and kqueue readiness semantics on Unix.
 package poller
 
 import "errors"

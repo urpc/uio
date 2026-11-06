@@ -21,270 +21,60 @@ package uio
 import (
 	"context"
 	"net"
-	"net/url"
 	"runtime"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"syscall"
 
 	"github.com/urpc/uio/internal/socket"
 )
 
-// Dial connects to the address on the named network.
-//
-// Known networks are "tcp", "tcp4" (IPv4-only), "tcp6" (IPv6-only),
-// "udp", "udp4" (IPv4-only), "udp6" (IPv6-only), "ip", "ip4"
-// (IPv4-only), "ip6" (IPv6-only), "unix", "unixgram" and
-// "unixpacket".
-//
-// Examples:
-//
-//	Dial("tcp://golang.org:http")
-//	Dial("tcp://192.0.2.1:http")
-//	Dial("tcp://198.51.100.1:80")
-//	Dial("udp://[2001:db8::1]:domain")
-//	Dial("udp://[fe80::1%lo0]:53")
-//	Dial("tcp://:80")
-//	Dial("unix:///path/your/unix.sock")
-func (ev *Events) Dial(addr string, opts ...DialOption) (Conn, error) {
-	return ev.defaultDialer().Dial(addr, opts...)
-}
-
-// Adopt transfers ownership of an established stream connection to ev. The
-// caller must not use conn after calling Adopt, including when Adopt returns an
-// error. ev must already be serving. With layers installed it returns as
-// DialContext does: once the whole stack opened, with the top layer's
-// connection — the one the Handler holds — and a stack that fails before
-// that reports its error; see AdoptContext to bound the wait.
-func (ev *Events) Adopt(conn net.Conn, opts ...AdoptOption) (Conn, error) {
-	return ev.AdoptContext(context.Background(), conn, opts...)
-}
-
-// AdoptContext is Adopt with ctx bounding the wait for the layers to open; a
-// stack still opening when ctx ends is closed, and AdoptContext reports the
-// cause. Without layers there is nothing to wait for. With them, like
-// DialContext, it cannot be called on an event loop goroutine.
-func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, opts ...AdoptOption) (Conn, error) {
-	if conn == nil {
-		return nil, ErrUnsupported
-	}
-	if !ev.ready.Load() || ev.closing.Load() {
-		_ = conn.Close()
-		return nil, net.ErrClosed
-	}
-	cfg := adoptConfigFor(opts)
-	userdata := cfg.userdata
-	layered := cfg.hasLayers
-	if layered && isEventLoopGoroutine() {
-		_ = conn.Close()
-		return nil, ErrDialOnEventLoop
-	}
-	if err := refuseLayerPacket(conn.LocalAddr().Network(), cfg.layers, cfg.hasLayers); err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	entry, err := ev.entryFor(cfg.layers, cfg.hasLayers)
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	localAddr := conn.LocalAddr()
-	remoteAddr := conn.RemoteAddr()
-
-	// Detach the socket from net.Conn before giving its duplicate to the native
-	// poller. DupNetConn marks the new descriptor close-on-exec.
-	fd, err := socket.DupNetConn(conn)
+func detachNetConn(conn net.Conn) (fd int, local, remote net.Addr, err error) {
+	local, remote = conn.LocalAddr(), conn.RemoteAddr()
+	fd, err = socket.DupNetConn(conn)
 	_ = conn.Close()
 	if err != nil {
-		return nil, err
+		return 0, nil, nil, err
 	}
 	if err = socket.SetNonblock(fd, true); err != nil {
 		_ = syscall.Close(fd)
+		return 0, nil, nil, err
+	}
+	return fd, local, remote, nil
+}
+
+func (ev *Events) newAdoptedConn(conn net.Conn) (*fdConn, error) {
+	fd, local, remote, err := detachNetConn(conn)
+	if err != nil {
 		return nil, err
 	}
-
 	fdc := &fdConn{
-		commonConn: commonConn{
-			addr: &addrPair{local: localAddr},
-		},
-		fd: int32(fd),
+		commonConn: commonConn{addr: &addrPair{local: local}},
+		fd:         int32(fd),
 	}
-	fdc.setRemoteAddr(remoteAddr)
-	fdc.entry = entry
-	probe, marked := ev.dialMarker(userdata, entry.layered)
-	fdc.SetUserdata(marked)
-	fdc.loop = ev.selectLoop()
-	if err = ev.addConnContext(ctx, fdc); err != nil {
-		return nil, err
-	}
-	if probe == nil {
-		return fdc, nil
-	}
-	return ev.awaitDial(ctx, fdc, probe)
+	fdc.setRemoteAddr(remote)
+	return fdc, nil
 }
 
-// DialContext connects synchronously and allows cancellation while resolving
-// or establishing the connection. The connection is registered on the calling
-// goroutine; with layers installed it returns once the whole stack opened,
-// which waits for that connection's turns, so a call from a connection
-// callback waits for the dial and its open stage — never call it from an
-// event loop goroutine.
-// A connection it returns gets OnOpen and, at its end, OnClose, even if it is
-// closed first; after an error no callback runs for it.
-func (ev *Events) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
-	return ev.defaultDialer().DialContext(dialCtx, addr, opts...)
-}
-
-// Dialer dials through one Events with private defaults — the options it was
-// built with, a chain among them — which each Dial's own options override: a
-// Dial naming its chain (WithLayers) runs that chain for its connection alone,
-// so one Dialer serves ws:// and wss:// dials alike. A Listener, by contrast,
-// carries its one chain for its life. Events.Dial is the Events' default
-// Dialer's.
-type Dialer struct {
-	ev  *Events
-	cfg dialConfig
-
-	entryOnce sync.Once
-	entry     *entry
-	entryErr  error
-}
-
-// Dialer returns a Dialer of ev with opts as its defaults: WithLayers names
-// the chain every dial of it runs unless the dial names its own, and
-// WithUserdata the Userdata its connections start with unless the dial sets
-// its own. It fails on a chain a connection cannot carry; a chain's layers
-// are attached when a dial runs.
-func (ev *Events) Dialer(opts ...DialOption) (*Dialer, error) {
-	cfg := dialConfigFor(opts)
-	if err := validateChain(cfg.layers, cfg.hasLayers); err != nil {
-		return nil, err
-	}
-	return &Dialer{ev: ev, cfg: cfg}, nil
-}
-
-// defaultDialer is the Dialer the Events' own Dial and DialContext dial
-// through: no defaults, every dial naming its own options.
-func (ev *Events) defaultDialer() *Dialer { return &Dialer{ev: ev} }
-
-// dialerEntry resolves the defaults' entry once: the Events' plain one, or
-// the one the default chain builds. A dial that names its own chain builds
-// its own.
-func (d *Dialer) dialerEntry() (*entry, error) {
-	if !d.cfg.hasLayers {
-		return d.ev.plainEntry(), nil
-	}
-	d.entryOnce.Do(func() { d.entry, d.entryErr = d.ev.newEntry(d.cfg.layers) })
-	return d.entry, d.entryErr
-}
-
-// Dial dials addr with this Dialer; see DialContext.
-func (d *Dialer) Dial(addr string, opts ...DialOption) (Conn, error) {
-	return d.DialContext(context.Background(), addr, opts...)
-}
-
-// DialContext connects synchronously through this Dialer's Events; see
-// Events.DialContext.
-func (d *Dialer) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
-	ev := d.ev
-	config := d.cfg
-	callLayers := false
-	for _, opt := range opts {
-		if opt == nil {
-			continue
-		}
-		if _, ok := opt.(layersOption); ok {
-			callLayers = true
-		}
-		opt.applyDial(&config)
-	}
-	userdata := config.userdata
-	if !ev.ready.Load() || ev.closing.Load() {
-		return nil, net.ErrClosed
-	}
-	if isEventLoopGoroutine() {
-		return nil, ErrDialOnEventLoop
-	}
-
-	if !strings.Contains(addr, "://") {
-		addr = "tcp://" + addr
-	}
-
-	u, err := url.Parse(addr)
-	if nil != err {
-		return nil, err
-	}
-	if err := refuseLayerPacket(u.Scheme, config.layers, config.hasLayers); err != nil {
-		return nil, err
-	}
-	var entry *entry
-	if callLayers {
-		entry, err = ev.newEntry(config.layers)
-	} else {
-		entry, err = d.dialerEntry()
-	}
+func (ev *Events) newDialedConn(scheme string, conn net.Conn) (*fdConn, error) {
+	fd, local, remote, err := detachNetConn(conn)
 	if err != nil {
 		return nil, err
 	}
-
-	var address = u.Host
-	if strings.HasPrefix(u.Scheme, "unix") {
-		address = u.Path
-	}
-
-	dialer, err := netDialerFor(u.Scheme, config)
-	if err != nil {
-		return nil, err
-	}
-	conn, err := dialer.DialContext(dialCtx, u.Scheme, address)
-	if nil != err {
-		return nil, err
-	}
-
-	lAddr := conn.LocalAddr()
-	rAddr := conn.RemoteAddr()
-
-	// Dup detaches the descriptor from net.Conn so the poller becomes its sole
-	// I/O owner after the original connection is closed.
-	nfd, err := socket.DupNetConn(conn)
-
-	_ = conn.Close()
-
-	if nil != err {
-		return nil, err // dup failed
-	}
-
-	if err = syscall.SetNonblock(nfd, true); nil != err {
-		_ = syscall.Close(nfd)
-		return nil, err
-	}
-
-	probe, marked := ev.dialMarker(userdata, entry.layered)
-	fdc := &fdConn{}
-	fdc.entry = entry
-	fdc.fd = int32(nfd)
-	fdc.SetUserdata(marked)
-	fdc.setLocalAddr(lAddr)
-	fdc.setRemoteAddr(rAddr)
-	fdc.loop = ev.selectLoop()
-	if strings.HasPrefix(u.Scheme, "udp") {
+	fdc := &fdConn{fd: int32(fd)}
+	fdc.setLocalAddr(local)
+	fdc.setRemoteAddr(remote)
+	if strings.HasPrefix(scheme, "udp") {
 		fdc.udp = &unixUDPState{}
 	}
-
-	if err = ev.addConnContext(dialCtx, fdc); nil != err {
-		return nil, err
-	}
-	if probe == nil {
-		return fdc, nil
-	}
-	return ev.awaitDial(dialCtx, fdc, probe)
+	return fdc, nil
 }
 
 // loopState is this backend's share of Events: the event loops, each one
 // poller and the goroutines that wait on it, and the signal that ends Serve.
 type loopState struct {
 	loops    []*eventLoop
+	ioPool   *ioTaskPool
 	stopped  chan struct{} // closed once Close has been requested
 	nextLoop atomic.Uint32 // picks the loops of connections not accepted by a waiter
 }

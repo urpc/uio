@@ -22,7 +22,7 @@
 // cut in crypto/tls's buffer until it is whole.
 //
 // A record carries up to 16 KiB, so a transport whose reads are smaller
-// carries every record through several rounds: set Events.MaxBufferSize to
+// carries every record through several rounds: set Events.ReadBufferSize to
 // at least a record. 16 KiB reads — the cadence crypto/tls runs at — move a
 // bulk transfer about 1.4× the 4 KiB default's, ahead of crypto/tls on the
 // same wire; 64 KiB reads measured 1.4–1.8× the default and fastest on both
@@ -38,8 +38,8 @@
 // one way, then shuts the connection below's writing half — a stack below
 // that cannot end one direction reports ErrUnsupported after close_notify
 // went. A peer's close_notify delivers what arrived with it and then the
-// close. The connection below's deadlines and fd-shaped options reach
-// through to it.
+// close. The connection below's deadlines pass through directly, and its
+// socket options are reached through [uio.SocketOf].
 //
 // One crypto/tls behavior this relies on is not a written contract: that a
 // temporary net.Error from the transport Read makes it keep the partial
@@ -55,7 +55,7 @@
 //
 // Size the transport's reads to the record: a TLS record carries up to 16 KiB,
 // and a socket read smaller than that splits one record across several rounds,
-// each costing a syscall. On UIO that is [uio.Events.MaxBufferSize], whose
+// each costing a syscall. On UIO that is [uio.Events.ReadBufferSize], whose
 // default of 4 KiB turns one 16 KiB record into four reads; a transfer reads
 // about twice as fast with 16 KiB and about half again as fast with 64 KiB.
 package utls

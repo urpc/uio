@@ -29,6 +29,8 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/urpc/uio/internal/blockio"
 )
 
 // fdConn uses one blocking reader and one blocking writer per stream. mux
@@ -145,7 +147,7 @@ func peerKey(addr netip.AddrPort) netip.AddrPort {
 // goroutine of its own serialized with the reader by the child's callback
 // mutex; a datagram from the peer that arrives first runs it there instead.
 func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
-	if fc.entry != nil && fc.entry.layered {
+	if fc.entry != nil && !fc.entry.directConsumer {
 		// A chain's peer connection is the stack's: the socket-level Conn
 		// returned here would bypass every layer. Dial is the way in.
 		return nil, ErrUnsupported
@@ -271,6 +273,8 @@ func (fc *fdConn) readUDPLoop() {
 // listenUDP owns the shared packet socket and logical peer map. Each packet is
 // borrowed for one callback and discarded before the receive buffer is reused.
 func (fc *fdConn) listenUDP() error {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	// UDP peer callbacks all run on this listener goroutine.
 	defer fc.events().callbackWG.Done()
 
@@ -281,7 +285,7 @@ func (fc *fdConn) listenUDP() error {
 	for {
 		n, addr, err := fc.udp.sock.ReadFrom(buffer)
 		if nil != err {
-			_ = fc.CloseWith(err)
+			_ = fc.Abort(err)
 			return err
 		}
 
@@ -340,7 +344,7 @@ func (fc *fdConn) listenUDP() error {
 
 		if nil != err {
 			// close udp connection
-			_ = udpConn.CloseWith(err)
+			_ = udpConn.Abort(err)
 		}
 	}
 }

@@ -28,7 +28,9 @@ import (
 	"unsafe"
 
 	"github.com/urpc/uio"
+	_ "github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/plocal"
+	"github.com/urpc/uio/internal/writecontrol"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
@@ -173,72 +175,19 @@ func (state *connCloseProgress) closePending() bool {
 	return state.flags.Load()&transportPhaseMask == transportClosePending<<transportPhaseShift
 }
 
-// claimPendingTransportClose claims shutdown once it is certain the Close
-// frame left: on a tracked transport when its receipt fired, on a plain one
-// when every accepted byte retired. A waiting or deferred Close frame holds
-// it either way.
-func (state *connCloseProgress) claimPendingTransportClose(wireTracked bool) bool {
-	if state.closeIsDeferred() || (!wireTracked && state.pendingBytes.Load() != 0) {
+// claimPendingTransportClose claims shutdown once any deferred Close frame went
+// out and the outbound queue is empty.
+func (state *connCloseProgress) claimPendingTransportClose(queued int) bool {
+	if state.closeIsDeferred() || queued != 0 {
 		return false
 	}
 	state.transitionMu.Lock()
 	defer state.transitionMu.Unlock()
-	if state.phase() != transportClosePending || state.closeIsDeferred() {
-		return false
-	}
-	if wireTracked {
-		if state.aux == nil || !state.aux.done.Load() {
-			return false
-		}
-	} else if state.pendingBytes.Load() != 0 {
+	if state.phase() != transportClosePending || state.closeIsDeferred() || queued != 0 {
 		return false
 	}
 	state.setPhaseLocked(transportCloseClaimed)
 	return true
-}
-
-// setReceipt records the Close frame's wire receipt. A zero receipt — one
-// that marks no bytes — is already done.
-func (state *connCloseProgress) setReceipt(r uio.SendReceipt) {
-	state.transitionMu.Lock()
-	aux := state.auxLocked()
-	if r != (uio.SendReceipt{}) && aux.earlySend == r {
-		// OnSent beat this registration: a turn reported the receipt before
-		// WriteTracked returned, as an external Close's write lets it. The
-		// notification stands; nothing more is waited for.
-		aux.earlySend = uio.SendReceipt{}
-		state.transitionMu.Unlock()
-		aux.done.Store(true)
-		return
-	}
-	aux.receipt = r
-	state.transitionMu.Unlock()
-	if r == (uio.SendReceipt{}) {
-		aux.done.Store(true)
-	}
-}
-
-// claimReceipt reports the wire passing the Close frame's receipt, if r is
-// it, and marks the claim armed.
-func (state *connCloseProgress) claimReceipt(r uio.SendReceipt) bool {
-	state.transitionMu.Lock()
-	aux := state.aux
-	if aux != nil && r != (uio.SendReceipt{}) && aux.receipt == r {
-		aux.receipt = uio.SendReceipt{}
-		state.transitionMu.Unlock()
-		aux.done.Store(true)
-		return true
-	}
-	if r != (uio.SendReceipt{}) {
-		// Not registered yet: keep it for setReceipt, which may still be on
-		// its way back from WriteTracked. One slot is enough — a connection
-		// tracks one Close frame and one Ping at a time, and the Ping's
-		// registration happens on the turn that wrote it, before any later
-		// turn can report it.
-		state.auxLocked().earlySend = r
-	}
-	state.transitionMu.Unlock()
-	return false
 }
 
 // SendText queues payload as one text message. The transport flushes accepted
@@ -289,8 +238,8 @@ func (c *Conn) Ping(payload []byte) error {
 }
 
 // sendHeartbeatPing queues a heartbeat Ping unless one is outstanding. It
-// records queue time now, while markPingSent starts the Pong timeout only after
-// OnOutbound proves that the complete Ping frame left UIO's queue.
+// records queue time now, while markPingSent / noteLayeredProgress starts the
+// Pong timeout only after transport progress proves the Ping frame left UIO's queue.
 func (c *Conn) sendHeartbeatPing(now time.Time) error {
 	heartbeat := c.heartbeat
 	if heartbeat == nil || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
@@ -314,19 +263,9 @@ func (c *Conn) sendHeartbeatPing(now time.Time) error {
 		return nil
 	}
 	ping := frame.Frame{Fin: true, Opcode: frame.Ping, Payload: payload[:]}
-	var err error
-	if c.wireTracked() {
-		// A tracked transport proves the Ping left by its receipt; OnSent
-		// starts the Pong timeout then.
-		var r uio.SendReceipt
-		if r, err = c.writeTrackedFrame(ping); err == nil {
-			heartbeat.setPingReceipt(r)
-		}
-	} else {
-		// The heartbeat speaks first: its Ping is no reply, even when a pull
-		// Client runs it from inside a read round.
-		_, _, err = c.queueFrameLocked(ping)
-	}
+	// The heartbeat speaks first: its Ping is no reply, even when a pull
+	// Client runs it from inside a read round.
+	_, _, err := c.queueFrameLocked(ping)
 	if err == nil {
 		err = c.flushLocked()
 	}
@@ -334,6 +273,7 @@ func (c *Conn) sendHeartbeatPing(now time.Time) error {
 		heartbeat.cancelPing(nonce)
 		return err
 	}
+	heartbeat.armPing(now, c.raw.OutboundBuffered(), c.inexactWire())
 	return nil
 }
 
@@ -447,6 +387,12 @@ func (c *Conn) sendCloseFrameLocked(payload []byte) (deferred bool, err error) {
 	err = c.sendFrameLocked(frame.Frame{Fin: true, Opcode: frame.Close, Payload: payload})
 	if errors.Is(err, ErrBackpressure) {
 		deferred, err = c.writes.close.deferClose(payload), nil
+		if deferred {
+			c.round.Or(roundDeferredClose)
+			if c.config != nil && c.config.heartbeatInterval <= 0 && !c.config.observeTraffic {
+				c.ensureCloseWatch()
+			}
+		}
 	}
 	c.markClosing()
 	if err == nil {
@@ -475,18 +421,9 @@ func (c *Conn) sendDeferredClose() {
 			f.Masked = true
 		}
 		wireSize := frameWireSize(len(payload), f.Masked)
-		var err error
-		if c.wireTracked() {
-			var r uio.SendReceipt
-			if r, err = c.writeTrackedFrame(f); err == nil {
-				c.writes.close.setReceipt(r)
-				c.writes.close.markCloseFrameSent()
-			}
-		} else {
-			c.trackOutbound(wireSize)
-			err = c.writeFrameOwned(f, maskKey, wireSize)
-		}
+		err := c.writeFrameOwned(f, maskKey, wireSize)
 		if err == nil {
+			c.round.And(^roundDeferredClose)
 			_ = c.flush()
 			// A writer may have retired these bytes while the deferred flag
 			// was still set, leaving the transport close unclaimed; see
@@ -522,21 +459,12 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 		return frame.ErrProtocol
 	}
 	c.writes.mu.Lock()
-	// Each path counts the round's replies itself (countReply), so nothing
-	// here lives across their calls.
-	round := c.round.Load()
-	if round&roundBatching != 0 {
-		if batched, err := c.batchMessageLocked(opcode, payload, round); batched {
-			// A message the batch takes proves no close is in progress: the
-			// close checks above reject one. A Close begun concurrently runs
-			// its own unlockWrite under this lock, and the round's hand-over
-			// (endRound) checks close progress again, so the check
-			// unlockWrite would repeat here cannot fire; skipping it measured
-			// 3% of a 256-byte pipeline.
+	if c.round.Load()&roundBatching != 0 {
+		if batched, err := c.batchMessageLocked(opcode, payload); batched {
 			c.writes.mu.Unlock()
 			return err
 		}
-	} else if sent, err := c.sendShortLocked(opcode, payload, round); sent {
+	} else if sent, err := c.sendShortLocked(opcode, payload); sent {
 		c.unlockWrite()
 		return err
 	}
@@ -619,41 +547,22 @@ func (c *Conn) sendFrame(f frame.Frame) error {
 	return c.flushLocked()
 }
 
-// sendPong answers a Ping with a Pong carrying its payload. The Pong is a
-// reply wherever the queue stands, counted without asking which goroutine
-// sends it (noteReply): a peer that floods Pings and never reads the answers
-// is paused like any other, and one whose first Pings arrive in one chunk
-// with the queue drained is paused all the same.
+// sendPong answers a Ping with a Pong carrying its payload.
 func (c *Conn) sendPong(payload []byte) error {
 	if !c.opened.Load() {
 		return ErrNotReady
 	}
 	c.writes.mu.Lock()
 	defer c.unlockWrite()
-	wireSize, _, err := c.queueFrameLocked(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: payload})
-	if err != nil {
+	if _, _, err := c.queueFrameLocked(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: payload}); err != nil {
 		return err
 	}
-	// This call flushes its Pong before returning. Count it at that position,
-	// rather than allocating a batch ledger for an isolated keepalive.
-	if err := c.flushLocked(); err != nil {
-		return err
-	}
-	if c.config != nil && c.config.outboundHigh > 0 {
-		c.noteReply(wireSize, false)
-	}
-	return nil
+	return c.flushLocked()
 }
 
-// sendFrameLocked queues one frame; see queueFrameLocked. A frame the read
-// round's goroutine sends is the round's reply, and is counted as one; see
-// countReply. It requires writes.mu.
+// sendFrameLocked queues one frame; see queueFrameLocked. It requires writes.mu.
 func (c *Conn) sendFrameLocked(f frame.Frame) error {
-	round := c.round.Load()
-	wireSize, batched, err := c.queueFrameLocked(f)
-	if err == nil && round > roundBatching {
-		c.countReply(round, wireSize, batched)
-	}
+	_, _, err := c.queueFrameLocked(f)
 	return err
 }
 
@@ -673,18 +582,6 @@ func (c *Conn) queueFrameLocked(f frame.Frame) (wireSize int, batched bool, err 
 	if f.Opcode == frame.Close && c.writes.close.closeFrameQueued() {
 		return 0, false, nil
 	}
-	if f.Opcode == frame.Close && c.wireTracked() {
-		// Over a tracked transport the Close frame's place on the wire is
-		// what the transport close waits for: take its receipt now, and let
-		// OnSent prove it left.
-		r, err := c.writeTrackedFrame(f)
-		if err != nil {
-			return 0, false, err
-		}
-		c.writes.close.setReceipt(r)
-		c.writes.close.markCloseFrameSent()
-		return frameWireSize(len(f.Payload), c.isClient()), false, nil
-	}
 	var maskKey [4]byte
 	if c.isClient() {
 		if _, err := rand.Read(maskKey[:]); err != nil {
@@ -699,38 +596,13 @@ func (c *Conn) queueFrameLocked(f frame.Frame) (wireSize int, batched bool, err 
 		if err := c.batchFrame(f, maskKey, wireSize); err != nil {
 			return 0, false, err
 		}
-		// Pending once the batch is handed over, as batchMessageLocked's
-		// frames are: until then the bytes sit above the transport, and a
-		// transport report — "its queue is empty" over layers — must not
-		// retire them. A tracked transport has no pending count.
-		if !c.wireTracked() {
-			if heartbeat := c.heartbeat; heartbeat != nil {
-				heartbeat.outboundAccepted.Add(uint64(wireSize))
-			}
-		}
-		c.markHeartbeatPingTarget(f)
 		return wireSize, true, c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
 	}
 	// Frames batched earlier go first, so this one cannot overtake them.
 	if err := c.flushBatchLocked(); err != nil {
 		return 0, false, err
 	}
-	c.trackOutbound(wireSize)
-	c.markHeartbeatPingTarget(f)
 	if f.Masked || small {
-		if small {
-			// Inside the connection's own task the frame is encoded straight
-			// into the outbound queue: one copy of the payload, no buffer of
-			// its own to acquire and release.
-			dst, err := c.raw.ReserveOutbound(wireSize)
-			if err == nil {
-				frame.Append(dst[:0], f, maskKey)
-				return wireSize, false, c.finishFrameWrite(f.Opcode, wireSize, wireSize, nil)
-			}
-			if err != uio.ErrReserveUnsupported {
-				return wireSize, false, c.finishFrameWrite(f.Opcode, 0, wireSize, err)
-			}
-		}
 		return wireSize, false, c.writeFrameOwned(f, maskKey, wireSize)
 	}
 	scratch := acquireServerFrameScratch()
@@ -760,46 +632,6 @@ func (c *Conn) writeFrameOwned(f frame.Frame, maskKey [4]byte, wireSize int) err
 		uio.ReleaseBuffer(owned)
 	}
 	return c.finishFrameWrite(f.Opcode, n, wireSize, err)
-}
-
-// trackedFrameScratch fits the control frames a tracked write carries: a
-// Close or Ping payload is 125 bytes at most, with a 14-byte header and a
-// client's 4-byte mask.
-const trackedFrameScratch = 144
-
-// writeTrackedFrame hands one control frame to a tracked transport and takes
-// its wire receipt; see uio.TrackedWriter. Only Close and Ping frames are
-// tracked, so the frame is built on the stack. It requires writes.mu and
-// returns ErrBackpressure for a write the outbound limit refused, as the
-// other send paths report it.
-func (c *Conn) writeTrackedFrame(f frame.Frame) (uio.SendReceipt, error) {
-	tracked, ok := c.raw.(uio.TrackedWriter)
-	if !ok {
-		return uio.SendReceipt{}, uio.ErrUnsupported
-	}
-	var maskKey [4]byte
-	if c.isClient() {
-		if _, err := rand.Read(maskKey[:]); err != nil {
-			return uio.SendReceipt{}, err
-		}
-		f.Masked = true
-	}
-	var scratch [trackedFrameScratch]byte
-	wire := frame.Append(scratch[:0], f, maskKey)
-	n, r, err := tracked.WriteTracked(wire)
-	if err != nil {
-		if errors.Is(err, uio.ErrOutboundOverflow) {
-			return uio.SendReceipt{}, ErrBackpressure
-		}
-		if errors.Is(err, net.ErrClosed) {
-			return uio.SendReceipt{}, ErrClosed
-		}
-		return uio.SendReceipt{}, err
-	}
-	if n != len(wire) {
-		return uio.SendReceipt{}, io.ErrShortWrite
-	}
-	return r, nil
 }
 
 // refuseBeforeBuild is the frame size from which outboundRefuses looks
@@ -837,7 +669,7 @@ func (c *Conn) outboundRefuses(wireSize int) bool {
 // one addition for the whole batch. Until then they cannot retire, and no
 // graceful close can claim the transport: its Close frame is counted, and it
 // either follows them in the batch or hands the batch over first.
-func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte, round uint32) (bool, error) {
+func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte) (bool, error) {
 	config := c.config
 	if config == nil || c.heartbeat != nil || c.compression != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
@@ -879,55 +711,57 @@ func (c *Conn) batchMessageLocked(opcode frame.OpCode, payload []byte, round uin
 		copy(dst[len(header):], payload)
 	}
 	batch.CommitWrite(wireSize)
-	c.batchBuffered.Store(int64(batch.Len()))
-	if round > roundBatching {
-		c.countReply(round, wireSize, true)
-	}
 	return true, nil
 }
 
 // sendShortLocked is send for a server's common single reply: an
 // uncompressed message of up to shortSendDirect bytes, a 16-bit length at
 // most, with no batch to hand over first, no heartbeat and no close in
-// progress. It encodes the frame straight into the transport's outbound
-// queue, which the connection's own task can reserve. It reports false,
-// having done nothing, for any message it does not cover, including one sent
-// from outside that task and every message of a client, whose limit is -1.
-// round is the round word send loaded; see countReply.
-func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte, round uint32) (bool, error) {
+// progress. It encodes the frame header directly into a pooled buffer handed
+// to WriteOwned. It reports false, having done nothing, for any message it
+// does not cover, including every message of a client, whose limit is -1.
+func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error) {
 	size := len(payload)
 	if c.config == nil || size > c.config.shortSendDirect || c.heartbeat != nil || c.compression != nil || c.batch != nil ||
 		c.writes.close.flags.Load() != 0 || !c.opened.Load() || c.closed.Load() || c.closing.Load() {
 		return false, nil
 	}
-	// A 16-bit length replies through the same one reservation: its header
-	// is four bytes instead of two, the payload copy identical.
 	wireSize, head := size+2, 2
 	if size > 125 {
 		wireSize, head = size+4, 4
 	}
-	// The transport refuses a reservation past its outbound limit, after
-	// flushing what it can, which is the check send's other paths make too.
-	c.trackOutbound(wireSize)
-	dst, err := c.raw.ReserveOutbound(wireSize)
-	if err == uio.ErrReserveUnsupported {
-		c.rollbackOutbound(wireSize)
-		return false, nil
+	if c.outboundRefuses(wireSize) {
+		return true, ErrBackpressure
 	}
-	if err != nil {
-		return true, c.finishFrameWrite(opcode, 0, wireSize, err)
+	if reserver, ok := c.raw.(writecontrol.TurnReserver); ok {
+		if dst, reserved, err := reserver.ReserveTurnWrite(wireSize); reserved {
+			if err != nil {
+				return true, c.finishFrameWrite(opcode, 0, wireSize, err)
+			}
+			encodeServerShortHeader(dst, opcode, size, head)
+			copy(dst[head:], payload)
+			return true, nil
+		}
 	}
-	if round > roundBatching {
-		c.countReply(round, wireSize, false)
+	owned := uio.AcquireBuffer(wireSize)
+	dst := owned.AvailableBuffer()[:wireSize]
+	encodeServerShortHeader(dst, opcode, size, head)
+	copy(dst[head:], payload)
+	owned.CommitWrite(wireSize)
+	n, err := c.raw.WriteOwned(owned)
+	if errors.Is(err, uio.ErrOutboundOverflow) {
+		uio.ReleaseBuffer(owned)
 	}
+	return true, c.finishFrameWrite(opcode, n, wireSize, err)
+}
+
+func encodeServerShortHeader(dst []byte, opcode frame.OpCode, size, head int) {
 	if head == 4 {
 		dst[0], dst[1] = 0x80|byte(opcode), 126
 		binary.BigEndian.PutUint16(dst[2:4], uint16(size))
 	} else {
 		dst[0], dst[1] = 0x80|byte(opcode), byte(size)
 	}
-	copy(dst[head:], payload)
-	return true, nil
 }
 
 func (c *Conn) batchBlockSize() int {
@@ -965,7 +799,6 @@ func (c *Conn) batchFrame(f frame.Frame, maskKey [4]byte, wireSize int) error {
 	}
 	frame.Append(batch.AvailableBuffer()[:0], f, maskKey)
 	batch.CommitWrite(wireSize)
-	c.batchBuffered.Store(int64(batch.Len()))
 	return nil
 }
 
@@ -990,16 +823,17 @@ func (c *Conn) flushBatchLocked() error {
 	}
 	c.batch = nil
 	want := batch.Len()
-	if !c.wireTracked() {
-		// Every batched frame joins the pending count here, at once.
-		c.writes.close.pendingBytes.Add(int64(want))
+	observe := c.config != nil && c.config.observeTraffic
+	if observe {
+		// Completion may run inside WriteOwned. Defer user observer delivery
+		// until the handoff settles so OutboundBuffered reflects the post-handoff queue.
+		c.batchHandoff.Store(-1)
 	}
-	// Completion may run inside WriteOwned. Its observer must see retired
-	// transport bytes, rather than also counting the batch being submitted.
-	c.batchBuffered.Store(^int64(want))
 	n, err := c.raw.WriteOwned(batch)
-	c.batchBuffered.Store(0)
-	c.flushOutboundObservation()
+	if observe {
+		c.batchHandoff.Store(0)
+		c.flushOutboundObservation()
+	}
 	if errors.Is(err, uio.ErrOutboundOverflow) {
 		uio.ReleaseBuffer(batch)
 		err = errBatchRefused
@@ -1007,8 +841,6 @@ func (c *Conn) flushBatchLocked() error {
 	if err = c.finishFrameWrite(frame.Continuation, n, want, err); err != nil && !errors.Is(err, ErrClosed) {
 		c.failStream(err)
 	}
-	// The round's replies in the batch take their place in the queue.
-	c.placeReplyBatch(want, err == nil)
 	return err
 }
 
@@ -1031,12 +863,10 @@ func (c *Conn) beginWriteBatch() {
 	}
 }
 
-// endRound clears the round word as the read round ends — later sends are no
-// longer its replies — and, when the round batched, hands its batch over. A
-// lock holder that released during the round left the batch in place, so this
-// waits for the lock, which is only ever held for one message or frame.
+// endRound clears roundBatching as the read round ends — later sends are no
+// longer its replies — and, when the round batched, hands its batch over.
 func (c *Conn) endRound(round uint32) {
-	c.round.Store(0)
+	c.round.And(^roundBatching)
 	if round&roundBatching != 0 {
 		c.writes.mu.Lock()
 		c.unlockWrite()
@@ -1067,7 +897,6 @@ func (c *Conn) failStream(err error) {
 // transport write and translates UIO's connection-level limit to the UWS API.
 func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) error {
 	if err != nil {
-		c.rollbackOutbound(want - n)
 		if errors.Is(err, uio.ErrOutboundOverflow) {
 			return ErrBackpressure
 		}
@@ -1079,7 +908,6 @@ func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) err
 		return err
 	}
 	if n != want {
-		c.rollbackOutbound(want - n)
 		return io.ErrShortWrite
 	}
 	if opcode == frame.Close {
@@ -1090,18 +918,14 @@ func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) err
 
 func (c *Conn) writeTransportOwned(buffer *uio.Buffer) error {
 	want := buffer.Len()
-	// Handshake bytes participate in graceful-close ordering just like frames.
-	c.trackOutbound(want)
 	n, err := c.raw.WriteOwned(buffer)
 	if errors.Is(err, uio.ErrOutboundOverflow) {
 		uio.ReleaseBuffer(buffer)
 	}
 	if err != nil {
-		c.rollbackOutbound(want - n)
 		return err
 	}
 	if n != want {
-		c.rollbackOutbound(want - n)
 		return io.ErrShortWrite
 	}
 	return nil
@@ -1134,131 +958,53 @@ func fragmentedWireSize(payload int, maxFrame uint64, masked bool) int {
 	return size
 }
 
-// trackOutbound records accepted wire positions used by graceful close and
-// heartbeat send detection on a plain transport. A tracked one needs none:
-// its Close frame and Ping are followed by their receipts. It intentionally
-// performs no limit check.
-func (c *Conn) trackOutbound(n int) {
-	if c.wireTracked() {
-		return
-	}
-	c.writes.close.pendingBytes.Add(int64(n))
-	if heartbeat := c.heartbeat; heartbeat != nil {
-		heartbeat.outboundAccepted.Add(uint64(n))
-	}
-}
-
-// reducePendingOutbound reconciles either transport retirement or a rejected
-// write against the same pending count without allowing a concurrent callback
-// to make that count negative.
-func (c *Conn) reducePendingOutbound(n int) int64 {
-	if n <= 0 {
-		return 0
-	}
-	for {
-		current := c.writes.close.pendingBytes.Load()
-		if current == 0 {
-			return 0
-		}
-		remaining := current - int64(n)
-		if remaining < 0 {
-			remaining = 0
-		}
-		if c.writes.close.pendingBytes.CompareAndSwap(current, remaining) {
-			return current - remaining
-		}
-	}
-}
-
-// rollbackOutbound removes bytes not accepted by UIO. They did not leave the
-// socket queue, so they must not advance heartbeat's retired byte position.
-func (c *Conn) rollbackOutbound(n int) {
-	if rolledBack := c.reducePendingOutbound(n); rolledBack != 0 && c.heartbeat != nil {
-		c.heartbeat.outboundAccepted.Add(^uint64(rolledBack - 1))
-	}
-}
-
-// transportSent is the transport's report that n bytes left its queue. On a
-// plain socket they are this connection's own bytes, retired one for one. A
-// tracked transport reports the wire's — a TLS record's, a frame of a layer
-// below — which match nothing this connection counted: there the report is
-// only the moment to retry a deferred Close frame, and the receipts carry
-// what has left.
+// transportSent is the transport's report that n bytes left its queue: it
+// advances Ping send progress and retries any Close frame waiting for room.
 func (c *Conn) transportSent(n int) {
-	if _, tracked := c.raw.(uio.TrackedWriter); tracked {
-		if c.writes.close.closeIsDeferred() {
-			c.sendDeferredClose()
+	if c.heartbeat != nil {
+		queued := 0
+		if c.raw != nil {
+			queued = c.raw.OutboundBuffered()
 		}
-		return
-	}
-	c.releaseOutbound(n)
-	// Only a plain transport's report is frame bytes, the unit the replies
-	// are counted in; see Conn.replies.
-	if replies := c.replies.Load(); replies != nil {
-		replies.sent.Add(int64(n))
-	}
-}
-
-// releaseOutbound advances protocol send progress only for UIO's OnOutbound
-// callback, which confirms bytes actually left its queue. Retiring bytes may
-// also make room for a deferred Close frame.
-func (c *Conn) releaseOutbound(n int) {
-	if retiredBytes := c.reducePendingOutbound(n); retiredBytes != 0 && c.heartbeat != nil {
-		retired := c.heartbeat.outboundRetired.Add(uint64(retiredBytes))
-		c.heartbeat.markPingSent(retired)
+		c.heartbeat.noteSendProgress(n, queued)
 	}
 	if c.writes.close.closeIsDeferred() {
-		c.sendDeferredClose()
+		if _, asLayer := c.handler.(layerSink); asLayer {
+			_ = c.raw.Wake()
+		} else {
+			c.sendDeferredClose()
+		}
 	}
 }
 
-func (c *Conn) markHeartbeatPingTarget(f frame.Frame) {
-	heartbeat := c.heartbeat
-	if heartbeat == nil || f.Opcode != frame.Ping || len(f.Payload) != 8 {
-		return
-	}
-	heartbeat.markPingTarget(binary.BigEndian.Uint64(f.Payload))
-}
-
-// setPingReceipt records the receipt of a tracked Ping; the wire passing it
-// proves the frame left, which markPingReceiptSent then notes.
-func (heartbeat *heartbeatState) setPingReceipt(r uio.SendReceipt) {
-	heartbeat.mu.Lock()
-	heartbeat.pingReceipt = r
-	heartbeat.mu.Unlock()
-}
-
-// claimPingReceipt reports r as the outstanding Ping's receipt, if it is.
-func (heartbeat *heartbeatState) claimPingReceipt(r uio.SendReceipt) bool {
-	heartbeat.mu.Lock()
-	defer heartbeat.mu.Unlock()
-	if r == (uio.SendReceipt{}) || heartbeat.pingReceipt != r || !heartbeat.pingOutstanding.Load() {
-		return false
-	}
-	heartbeat.pingReceipt = uio.SendReceipt{}
-	return true
-}
-
-// markPingReceiptSent starts the Pong timeout once the wire passed the
-// Ping's receipt, as markPingSent does for a plain transport's byte position.
-func (heartbeat *heartbeatState) markPingReceiptSent(now time.Time) {
+func (heartbeat *heartbeatState) armPing(now time.Time, queued int, waitEmpty bool) {
 	heartbeat.mu.Lock()
 	if heartbeat.pingOutstanding.Load() && heartbeat.pingSentAt == 0 {
-		heartbeat.pingSentAt = now.UnixNano()
-		heartbeat.sendStalledAt = 0
+		if queued <= 0 {
+			heartbeat.pingSentAt = now.UnixNano()
+			heartbeat.sendStalledAt = 0
+		} else {
+			heartbeat.pingWireWait = int64(queued)
+			heartbeat.pingWaitEmpty = waitEmpty
+		}
 	}
 	heartbeat.mu.Unlock()
 }
 
-func (heartbeat *heartbeatState) markPingSent(retired uint64) {
+func (heartbeat *heartbeatState) noteSendProgress(sent, queued int) {
 	if !heartbeat.pingOutstanding.Load() {
 		return
 	}
 	heartbeat.mu.Lock()
-	if heartbeat.pingOutstanding.Load() && heartbeat.pingSentAt == 0 &&
-		heartbeat.pingTarget != 0 && retired >= heartbeat.pingTarget {
-		heartbeat.pingSentAt = time.Now().UnixNano()
-		heartbeat.sendStalledAt = 0
+	if heartbeat.pingOutstanding.Load() && heartbeat.pingSentAt == 0 {
+		if sent > 0 && !heartbeat.pingWaitEmpty && heartbeat.pingWireWait > 0 {
+			heartbeat.pingWireWait -= int64(sent)
+		}
+		if queued == 0 || (!heartbeat.pingWaitEmpty && heartbeat.pingWireWait <= 0) {
+			heartbeat.pingSentAt = time.Now().UnixNano()
+			heartbeat.sendStalledAt = 0
+			heartbeat.pingWireWait = 0
+		}
 	}
 	heartbeat.mu.Unlock()
 }
@@ -1275,19 +1021,11 @@ func (heartbeat *heartbeatState) beginPing(now time.Time, nonce uint64) bool {
 	}
 	heartbeat.pingSentAt = 0
 	heartbeat.pingNonce = nonce
-	heartbeat.pingTarget = 0
-	heartbeat.pingReceipt = uio.SendReceipt{}
+	heartbeat.pingWireWait = 0
+	heartbeat.pingWaitEmpty = false
 	heartbeat.pingOutstanding.Store(true)
 	heartbeat.deferredAt = heartbeat.parsed.Load() // progress is measured from the Ping
 	return true
-}
-
-func (heartbeat *heartbeatState) markPingTarget(nonce uint64) {
-	heartbeat.mu.Lock()
-	if heartbeat.pingOutstanding.Load() && heartbeat.pingNonce == nonce {
-		heartbeat.pingTarget = heartbeat.outboundAccepted.Load()
-	}
-	heartbeat.mu.Unlock()
 }
 
 func (heartbeat *heartbeatState) acknowledgePing(nonce uint64) bool {
@@ -1311,7 +1049,7 @@ func (heartbeat *heartbeatState) cancelPing(nonce uint64) {
 
 // noteSendStall preserves the first send attempt the outbound limit refused
 // across retries. A later accepted Ping inherits this queue deadline until
-// OnOutbound proves that it was actually sent.
+// transport progress proves that it was actually sent.
 func (heartbeat *heartbeatState) noteSendStall(now time.Time) {
 	heartbeat.mu.Lock()
 	if !heartbeat.pingOutstanding.Load() && heartbeat.sendStalledAt == 0 {
@@ -1403,8 +1141,8 @@ func (heartbeat *heartbeatState) clearPingLocked() {
 	heartbeat.pingQueuedAt = 0
 	heartbeat.pingSentAt = 0
 	heartbeat.pingNonce = 0
-	heartbeat.pingTarget = 0
-	heartbeat.pingReceipt = uio.SendReceipt{}
+	heartbeat.pingWireWait = 0
+	heartbeat.pingWaitEmpty = false
 }
 
 func (c *Conn) flush() error {

@@ -68,6 +68,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/urpc/uio/internal/blockio"
 )
 
 const (
@@ -371,6 +373,13 @@ func (pool *Pool[T]) anyQueued() bool {
 // Submit does: a batch never waits behind a task its shard's worker is running.
 // It does not retain the slice.
 func (pool *Pool[T]) SubmitBatch(tasks []T) {
+	if len(tasks) == 0 {
+		return
+	}
+	if len(tasks) == 1 {
+		pool.Submit(tasks[0])
+		return
+	}
 	active := uint32(pool.active.Load())
 	if active > 64 {
 		pool.submitWideBatch(tasks, active)
@@ -633,6 +642,8 @@ func (pool *Pool[T]) hasIdle() bool {
 // shard again. A worker that ends any other way, through runtime.Goexit in a
 // task, starts its replacement on the way out.
 func (w *worker[T]) run(target *shard[T]) {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	pool := w.home.owner
 	exited := false
 	defer func() {
@@ -717,6 +728,8 @@ func (pool *Pool[T]) runOverflow(s *shard[T], task T) {
 // overflow runs a task its full shard could not queue, then helps drain the
 // shard.
 func (s *shard[T]) overflow(task T) {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	for ok := true; ok; task, ok = s.pop() {
 		s.owner.run(task)
 	}

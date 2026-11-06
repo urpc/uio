@@ -23,150 +23,77 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
-	"time"
 
-	"github.com/urpc/uio/internal/fdmap"
-	"github.com/urpc/uio/internal/poller"
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/taskqueue"
 )
 
-// eventLoop is the sole owner of poller registration, descriptor teardown,
-// socket options, deadlines, and interest changes for its connections. Native
-// stream I/O and callbacks run in ioPool tasks and communicate back through the
-// MPSC task queue; they never call epoll/kqueue control operations directly.
-// taskBudget bounds how many control commands one pass of the loop runs.
 const taskBudget = 256
 
+// eventLoop serializes connection registration, Wake, and teardown on the
+// portable blocking backend without synthetic descriptors or OS pollers.
 type eventLoop struct {
-	// Read-mostly state consulted by connection turns on every CPU.
-	events      *Events
-	poller      *poller.Poller
-	fdMap       *fdmap.Map[fdConn]
-	tasks       *taskqueue.Queue[*task] // public MPSC queue
-	ioPool      *ioTaskPool
-	ioPoolOwner bool
-	stopping    atomic.Bool
+	events *Events
+	tasks  *taskqueue.Queue[*task]
+	waker  chan struct{}
+	closed chan struct{}
+
+	closeOnce sync.Once
+	closeMu   sync.Mutex
+	closeErr  error
+
 	loopGoid    atomic.Int64
-
-	_       [cacheLineSize]byte
-	ioState atomic.Uint64 // stop bit plus scheduled connection-turn count
-	_       [cacheLineSize - 8]byte
-
-	wakePending atomic.Bool // coalesces producer wakeups
-
-	// Loop-owned.
-	yield       bool // hand the P to just-woken workers; see Serve
-	buffer      []byte
-	evbuf       []poller.Event
-	ioIdle      chan struct{}
-	ioIdleOnce  sync.Once
-	taskBatch   *taskqueue.Node[*task] // private FIFO remainder owned by this loop
-	ioReady     []*fdConn              // newly runnable connections in this poll batch
-	ioReadyArgs []IOTask               // scratch only when an external Executor is used
+	wakePending atomic.Bool
+	stopping    atomic.Bool
 	stopErr     error
+	taskBatch   *taskqueue.Node[*task]
+
+	connsMu sync.Mutex
+	conns   map[*fdConn]struct{}
 }
 
-// newEventLoop allocates one poller and its reusable batches. Events normally
-// shares one ioPool across all loops; tests and standalone loops may own one.
 func newEventLoop(events *Events) (*eventLoop, error) {
-	netPoller, err := poller.New()
-	if err != nil {
-		return nil, err
-	}
-	ioPool := events.ioPool
-	owner := false
-	if ioPool == nil {
-		ioPool = newIOTaskPool(events.Executor)
-		owner = true
-	}
-	loop := &eventLoop{
-		events:      events,
-		poller:      netPoller,
-		ioPool:      ioPool,
-		ioPoolOwner: owner,
-		yield:       events.Pollers > 1,
-		buffer:      make([]byte, events.MaxBufferSize),
-		fdMap:       newFdMap(),
-		evbuf:       make([]poller.Event, eventBatch),
-		tasks:       taskqueue.New[*task](),
-		ioReady:     make([]*fdConn, 0, eventBatch),
-		ioIdle:      make(chan struct{}),
-	}
-	if events.Executor != nil {
-		// Only the external-executor path hands the readiness batch over as
-		// an []IOTask; the owned typed queue takes the connections directly.
-		loop.ioReadyArgs = make([]IOTask, 0, eventBatch)
-	}
-	return loop, nil
+	return &eventLoop{
+		events: events,
+		tasks:  taskqueue.New[*task](),
+		waker:  make(chan struct{}, 1),
+		closed: make(chan struct{}),
+		conns:  make(map[*fdConn]struct{}),
+	}, nil
 }
 
-func (loop *eventLoop) acquireIO() bool {
-	// One add rather than a load and compare-and-swap: this line moves
-	// between CPUs on every turn, and a failed CAS would move it again.
-	if loop.ioState.Add(1)&ioStopBit != 0 {
-		loop.releaseIO()
+func (loop *eventLoop) closeLoop(err error) {
+	loop.closeOnce.Do(func() {
+		loop.closeMu.Lock()
+		loop.closeErr = err
+		loop.closeMu.Unlock()
+		close(loop.closed)
+	})
+}
+
+func (loop *eventLoop) loopClosed() bool {
+	select {
+	case <-loop.closed:
+		return true
+	default:
 		return false
 	}
-	return true
 }
 
-// Final close callbacks may be scheduled after the shutdown barrier. Their
-// lifetime is joined by waitIODrained, rather than by the fd teardown barrier.
-func (loop *eventLoop) acquireCloseIO() { loop.ioState.Add(1) }
-
-func (loop *eventLoop) releaseIO() {
-	if loop.ioState.Add(^uint64(0)) == ioStopBit {
-		loop.ioIdleOnce.Do(func() { close(loop.ioIdle) })
-	}
-}
-
-func (loop *eventLoop) ioStopped() bool { return loop.ioState.Load()&ioStopBit != 0 }
-
-// waitIODrained joins every connection turn counted by this loop, including
-// close callbacks scheduled after the shutdown barrier. It runs once per loop
-// during shutdown, so a short polling backoff costs nothing on the data path.
-func (loop *eventLoop) waitIODrained() {
-	delay := 20 * time.Microsecond
-	for loop.ioState.Load()&^ioStopBit != 0 {
-		time.Sleep(delay)
-		if delay < 2*time.Millisecond {
-			delay *= 2
-		}
-	}
-}
-
-func (loop *eventLoop) stopIO() {
-	if loop.ioIdle == nil {
-		loop.ioIdle = make(chan struct{})
-	}
-	for {
-		state := loop.ioState.Load()
-		if state&ioStopBit != 0 {
-			break
-		}
-		if loop.ioState.CompareAndSwap(state, state|ioStopBit) {
-			if state == 0 {
-				loop.ioIdleOnce.Do(func() { close(loop.ioIdle) })
-			}
-			break
-		}
-	}
-	<-loop.ioIdle
+func (loop *eventLoop) loopErr() error {
+	loop.closeMu.Lock()
+	defer loop.closeMu.Unlock()
+	return loop.closeErr
 }
 
 // inLoop prevents synchronous control methods from waiting on their own queue.
-// User stream callbacks run in connection tasks; UDP callbacks still run here.
 func (loop *eventLoop) inLoop() bool {
 	id := loop.loopGoid.Load()
 	return id != 0 && id == currentGoroutineID()
 }
 
-func (loop *eventLoop) pushTask(t *task) bool {
-	return loop.tasks.Push(&t.node)
-}
-
 func (loop *eventLoop) submitTask(t *task) bool {
-	if !loop.pushTask(t) {
+	if !loop.tasks.Push(&t.node) {
 		return false
 	}
 	loop.notify()
@@ -174,16 +101,17 @@ func (loop *eventLoop) submitTask(t *task) bool {
 }
 
 func (loop *eventLoop) notify() {
-	// One unread wake is enough regardless of how many tasks were submitted.
 	if loop.wakePending.CompareAndSwap(false, true) {
-		_ = loop.poller.Wake()
+		select {
+		case loop.waker <- struct{}{}:
+		default:
+		}
 	}
 }
 
 func (loop *eventLoop) beginStop(err error) {
 	t := acquireTask(stopTask, nil)
 	t.err = err
-	// Stop atomically rejects future pushes and appends behind accepted work.
 	if !loop.tasks.Stop(&t.node) {
 		releaseTask(t)
 		return
@@ -198,7 +126,6 @@ func (loop *eventLoop) hasPendingTasks() bool {
 func (loop *eventLoop) runTasks(limit int) {
 	processed := 0
 	for processed < limit {
-		// Finish the private remainder before draining newer public tasks.
 		if loop.taskBatch == nil {
 			loop.taskBatch = loop.tasks.Drain()
 			if loop.taskBatch == nil {
@@ -212,14 +139,9 @@ func (loop *eventLoop) runTasks(limit int) {
 	}
 }
 
-// runTask applies one control-plane command on the loop goroutine. Data-plane
-// readiness is deliberately absent: it is folded into fdConn.taskState and
-// submitted to ioPool after the entire poll batch has been collected.
 func (loop *eventLoop) runTask(t *task) {
 	done := t.done
-	udpDone := t.udpDone
 	var result error
-	var datagram udpWriteResult
 	switch t.kind {
 	case closeTask:
 		t.conn.closeOnLoop(t.err)
@@ -230,31 +152,17 @@ func (loop *eventLoop) runTask(t *task) {
 		}
 	case registerTask:
 		result = loop.runRegisterTask(t)
-	case optionTask:
-		result = t.conn.applySocketOption(t.optionKind, t.optionValue)
-	case deadlineTask:
-		result = t.conn.applyDeadline(t.deadlineKind, t.deadline)
-	case timeoutTask:
-		t.conn.handleTimeout(t.deadlineKind, t.generation)
 	case stopTask:
 		loop.stopErr = t.err
 		loop.stopping.Store(true)
-	case udpWriteTask:
-		datagram = t.conn.runUDPWriteTask(t.udpPayload)
 	}
 	releaseTask(t)
 	if done != nil {
 		done <- result
 	}
-	if udpDone != nil {
-		udpDone <- datagram
-	}
 }
 
 func (loop *eventLoop) runRegisterTask(t *task) error {
-	if t.acceptedTCP {
-		t.conn.prepareAccepted()
-	}
 	request := t.registration
 	if request == nil {
 		return loop.registerConn(t.conn)
@@ -270,25 +178,20 @@ func (loop *eventLoop) runRegisterTask(t *task) error {
 		}
 		return result
 	}
-	// The caller returned after canceling while registration was in progress,
-	// so the connection is not theirs: it closes before its read goroutine
-	// starts, without OnOpen or OnClose.
 	if result == nil {
 		t.conn.closeOnLoop(request.cause())
 	}
 	return request.cause()
 }
 
-// Serve alternates bounded command draining with poller waits. Clearing
-// wakePending before the second queue check closes the classic lost-wakeup
-// race between a producer enqueue and the loop entering a blocking wait.
-func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (result error) {
+// Serve drains control tasks until stopped or closed, then releases all
+// connections owned by this loop.
+func (loop *eventLoop) Serve(lockOSThread bool, onClose func(error)) (result error) {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	if lockOSThread {
 		runtime.LockOSThread()
 		defer runtime.UnlockOSThread()
-	}
-	if handler == nil {
-		handler = loop
 	}
 	owner := currentGoroutineID()
 	loop.loopGoid.Store(owner)
@@ -303,131 +206,56 @@ func (loop *eventLoop) Serve(lockOSThread bool, handler poller.EventHandler) (re
 		if loop.stopping.Load() {
 			break
 		}
-		timeout := -1
 		if loop.hasPendingTasks() {
-			timeout = 0
-		} else {
-			// Clear before the second queue check to close the lost-wakeup race.
-			loop.wakePending.Store(false)
-			if loop.hasPendingTasks() {
-				continue
-			}
-		}
-
-		n, err := loop.poller.Wait(loop.evbuf, timeout)
-		if err != nil || loop.poller.Closed() {
-			if loop.poller.Closed() {
-				err = loop.poller.Err()
-			}
-			result = err
-			loop.beginStop(err)
 			continue
 		}
-		// Dispatch the complete batch. Close requests only enqueue closeTask.
-		for _, event := range loop.evbuf[:n] {
-			handler.OnEvent(loop.poller, event.FD, event.Events)
+		loop.wakePending.Store(false)
+		if loop.hasPendingTasks() {
+			continue
 		}
-		loop.submitIOReady()
+		select {
+		case <-loop.closed:
+			result = loop.loopErr()
+			loop.beginStop(result)
+		case <-loop.waker:
+		}
 	}
 
 	if result == nil {
 		result = loop.stopErr
 	}
 	loop.shutdown(result)
-	if handler != loop {
-		handler.OnClose(loop.poller, result)
+	if onClose != nil {
+		onClose(result)
 	}
-	_ = loop.poller.Close(result)
+	loop.closeLoop(result)
 	return result
 }
 
-// submitIOReady hands one readiness batch to the connection scheduler. The
-// slice is loop-owned and immediately reused, so external batch executors must
-// copy any task references retained after SubmitBatch returns.
-func (loop *eventLoop) submitIOReady() bool {
-	if len(loop.ioReady) == 0 {
-		return false
-	}
-	connections := loop.ioReady
-	loop.ioReady = loop.ioReady[:0]
-	if !loop.ioPool.submitConnBatch(connections, loop.ioReadyArgs) {
-		for _, conn := range connections {
-			conn.handleIOSubmitFailure(net.ErrClosed)
-		}
-	}
-	loop.ioReadyArgs = loop.ioReadyArgs[:0]
-	clear(connections)
-	return true
-}
-
 func (loop *eventLoop) shutdown(err error) {
-	// Stop has sealed the control queue. Prevent new connection turns, then
-	// wait for current tasks to return ownership before touching loop-owned fd
-	// registration and UDP peer maps.
-	for _, conn := range loop.fdMap.Range() {
-		if conn.loop == loop {
-			conn.beginShutdown()
-		}
+	loop.connsMu.Lock()
+	conns := make([]*fdConn, 0, len(loop.conns))
+	for conn := range loop.conns {
+		conns = append(conns, conn)
 	}
-	loop.stopIO()
-	// fdMap is shared on Unix, so only close entries owned by this loop.
-	for fd, conn := range loop.fdMap.Range() {
-		if conn.loop == loop {
-			loop.fdMap.Delete(fd)
-			conn.closeOnLoop(err)
-		}
-	}
-	if loop.ioPoolOwner {
-		loop.waitIODrained()
-		loop.ioPool.stop()
+	clear(loop.conns)
+	loop.connsMu.Unlock()
+
+	for _, conn := range conns {
+		conn.closeOnLoop(err)
 	}
 }
 
-// OnEvent folds stream readiness into the connection's single scheduled task.
-// UDP remains on-loop because its peer map and shared listener socket require
-// one owner.
-func (loop *eventLoop) OnEvent(_ *poller.Poller, fd int, events poller.Events) {
-	conn := loop.getConn(fd)
-	if conn == nil || conn.isClosing() {
-		return
-	}
-	// UDP peer management remains loop-owned until the stream task model is
-	// complete for datagrams; do not route shared listener state through the TCP
-	// connection worker.
-	if conn.isDatagram() {
-		if events&poller.ReadEvents != 0 {
-			if err := conn.fireReadEvent(); err != nil {
-				conn.requestClose(err)
-			}
-		}
-		return
-	}
-	if conn.skipsEdge(events) {
-		return
-	}
-	if conn.noteIO(uint32(events)) {
-		loop.ioReady = append(loop.ioReady, conn)
-	}
-}
-
-// OnClose releases connections when eventLoop is used through poller.Serve.
-func (loop *eventLoop) OnClose(_ *poller.Poller, err error) { loop.shutdown(err) }
-
-func (loop *eventLoop) getBuffer() []byte      { return loop.buffer }
-func (loop *eventLoop) getConn(fd int) *fdConn { return loop.fdMap.Get(fd) }
-func (loop *eventLoop) listen(fd int) error    { return loop.poller.Add(fd, poller.Readable) }
 func (loop *eventLoop) delConn(conn *fdConn) {
-	loop.fdMap.Delete(conn.Fd())
-	_ = conn.watcher().Remove(conn.Fd(), conn.currentInterest())
+	loop.connsMu.Lock()
+	delete(loop.conns, conn)
+	loop.connsMu.Unlock()
 }
 
 // registeredForTest, when a test sets it, runs on the loop after a connection
-// is added to its poller and before the loop schedules its open event.
+// is recorded on its loop and before the loop starts its read goroutine.
 var registeredForTest func(*fdConn)
 
-// registerConn watches conn and starts its read goroutine, which runs OnOpen
-// first, so a connection it registers gets OnOpen and OnClose even when it is
-// closed meanwhile.
 func (loop *eventLoop) registerConn(conn *fdConn) error {
 	if err := loop.watchConn(conn); err != nil {
 		return err
@@ -436,28 +264,17 @@ func (loop *eventLoop) registerConn(conn *fdConn) error {
 	return nil
 }
 
-// watchConn publishes the fd before poller registration so every delivered
-// event can resolve it. Failure unwinds both publications before closing the fd.
 func (loop *eventLoop) watchConn(conn *fdConn) error {
-	// Publish before Watch so every delivered event can resolve the fd.
-	fd := conn.Fd()
-	watcher := conn.watcher()
-	tag := conn.assignWatchTag()
-	if err := loop.fdMap.Put(fd, conn); err != nil {
+	if loop.stopping.Load() || loop.loopClosed() {
 		conn.closeUnregistered()
-		return err
+		if err := loop.loopErr(); err != nil {
+			return err
+		}
+		return net.ErrClosed
 	}
-	interest := conn.initialInterest()
-	if !conn.isDatagram() {
-		conn.markOpenPending()
-	}
-	if err := watcher.Register(fd, interest, !conn.isDatagram(), tag); err != nil {
-		conn.clearOpenPending()
-		loop.fdMap.Delete(fd)
-		_ = watcher.Remove(fd, interest)
-		conn.closeUnregistered()
-		return err
-	}
+	loop.connsMu.Lock()
+	loop.conns[conn] = struct{}{}
+	loop.connsMu.Unlock()
 	if registeredForTest != nil {
 		registeredForTest(conn)
 	}

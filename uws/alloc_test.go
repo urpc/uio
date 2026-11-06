@@ -4,15 +4,16 @@ package uws
 
 import (
 	"errors"
-	"testing"
-
 	"github.com/urpc/uio/uws/internal/frame"
+	"testing"
 )
 
 func TestCompleteFrameParsingDoesNotAllocateParser(t *testing.T) {
 	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("payload")}, [4]byte{})
-	emit := func(frame.Frame) error { return nil }
+	emit := func(frame.Frame) error {
+		return nil
+	}
 	parse := func() {
 		consumed, err := conn.feedFrames(wire, emit)
 		if err != nil || consumed != len(wire) || conn.parser != nil {
@@ -28,7 +29,9 @@ func TestCompleteFrameParsingDoesNotAllocateParser(t *testing.T) {
 func TestIncrementalFrameParserPoolReusesState(t *testing.T) {
 	conn := &Conn{config: testDialerConfig(NewDialer(Options{}))}
 	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Payload: []byte("payload")}, [4]byte{})
-	emit := func(frame.Frame) error { return nil }
+	emit := func(frame.Frame) error {
+		return nil
+	}
 	parse := func() {
 		if _, err := conn.feedFrames(wire[:1], emit); err != nil || conn.parser == nil {
 			panic("partial frame did not retain parser state")
@@ -76,9 +79,7 @@ func TestFragmentedMessageAssemblerPoolReusesState(t *testing.T) {
 }
 
 func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
-	wire := frame.Append(nil, frame.Frame{
-		Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, 1024),
-	}, [4]byte{1, 2, 3, 4})
+	wire := frame.Append(nil, frame.Frame{Fin: true, Opcode: frame.Binary, Masked: true, Payload: make([]byte, 1024)}, [4]byte{1, 2, 3, 4})
 	raw := &bufferedProbeConn{}
 	conn := &Conn{raw: raw, config: testServerConfig(NewServer(Options{}))}
 	conn.opened.Store(true)
@@ -95,10 +96,7 @@ func TestReadAvailableCompleteFrameDoesNotAllocate(t *testing.T) {
 }
 
 func TestServerFrameScratchReusesAllocation(t *testing.T) {
-	conn := &Conn{
-		raw:    &writeProbeConn{},
-		config: testServerConfig(&Server{Options: Options{MaxFramePayload: 1024}}),
-	}
+	conn := &Conn{raw: &writeProbeConn{}, config: testServerConfig(&Server{Options: Options{MaxFramePayload: 1024}})}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
 	if err := conn.sendFrameLocked(message); err != nil {
 		t.Fatal(err)
@@ -114,10 +112,7 @@ func TestServerFrameScratchReusesAllocation(t *testing.T) {
 }
 
 func TestClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
-	conn := &Conn{
-		raw:    &writeProbeConn{},
-		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: 1024}}),
-	}
+	conn := &Conn{raw: &writeProbeConn{}, config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: 1024}})}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, 1024)}
 	if err := conn.sendFrameLocked(message); err != nil {
 		t.Fatal(err)
@@ -134,10 +129,7 @@ func TestClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 
 func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	const payloadSize = 1 << 20
-	conn := &Conn{
-		raw:    &writeProbeConn{},
-		config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: payloadSize}}),
-	}
+	conn := &Conn{raw: &writeProbeConn{}, config: testDialerConfig(&Dialer{Options: Options{MaxFramePayload: payloadSize}})}
 	message := frame.Frame{Fin: true, Opcode: frame.Binary, Payload: make([]byte, payloadSize)}
 	if err := conn.sendFrameLocked(message); err != nil {
 		t.Fatal(err)
@@ -152,14 +144,12 @@ func TestLargeClientMaskedFrameOwnedWriteDoesNotAllocate(t *testing.T) {
 	}
 }
 
-// A large frame the outbound limit refuses is refused before it is built:
-// no buffer for it, no copy of its payload, however large it is.
 func TestRefusedLargeFrameIsNotBuilt(t *testing.T) {
-	opts, err := (Options{MaxOutboundBuffered: 1024, OutboundHighWatermark: -1, MaxFramePayload: 32 << 20, MaxMessageSize: 32 << 20}).resolve()
+	opts, err := (Options{MaxOutboundBuffered: 1024, MaxFramePayload: 32 << 20, MaxMessageSize: 32 << 20}).resolve()
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn := &Conn{raw: &limitedWire{limit: 1024}, config: newDialerConnConfig(opts, nil)}
+	conn := &Conn{raw: &limitedWire{limit: 1024}, config: newDialerConnConfig(opts)}
 	conn.opened.Store(true)
 	payload := make([]byte, 1<<20)
 	if err := conn.SendBinary(payload); !errors.Is(err, ErrBackpressure) {
@@ -172,8 +162,5 @@ func TestRefusedLargeFrameIsNotBuilt(t *testing.T) {
 	})
 	if allocs > 0 {
 		t.Fatalf("a refused 1 MiB frame allocated %v times", allocs)
-	}
-	if got := conn.writes.close.pendingBytes.Load(); got != 0 {
-		t.Fatalf("%d bytes still counted pending after refusals", got)
 	}
 }

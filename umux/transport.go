@@ -50,7 +50,7 @@ func NewServer(cfg Config) *Server {
 		started:  make(chan struct{}),
 		announce: s.publishSession,
 	}
-	s.events = &uio.Events{Handler: s.router, Observer: s.router, Hooks: s.router, MaxBufferSize: cfg.ReadBufferSize, MaxInboundBuffered: transportReadLimit(cfg)}
+	s.events = &uio.Events{Handler: s.router, Observer: s.router, Hooks: s.router, ReadBufferSize: cfg.ReadBufferSize, MaxInboundBuffered: transportReadLimit(cfg)}
 	return s
 }
 
@@ -156,7 +156,7 @@ func NewClient(cfg Config) *Client {
 	cfg = cfg.resolve()
 	c := &Client{cfg: cfg, serveDone: make(chan struct{})}
 	c.router = &router{cfg: cfg, client: true, started: make(chan struct{})}
-	c.events = &uio.Events{Handler: c.router, Observer: c.router, Hooks: c.router, MaxBufferSize: cfg.ReadBufferSize, MaxInboundBuffered: transportReadLimit(cfg)}
+	c.events = &uio.Events{Handler: c.router, Observer: c.router, Hooks: c.router, ReadBufferSize: cfg.ReadBufferSize, MaxInboundBuffered: transportReadLimit(cfg)}
 	return c
 }
 
@@ -373,7 +373,7 @@ func (r *router) waitSession(ctx context.Context, conn uio.Conn) (*Session, erro
 			delete(r.waiting, conn)
 		}
 		r.mu.Unlock()
-		_ = conn.CloseWith(err)
+		_ = conn.Abort(err)
 		return nil, err
 	}
 	select {
@@ -385,7 +385,7 @@ func (r *router) waitSession(ctx context.Context, conn uio.Conn) (*Session, erro
 			delete(r.waiting, conn)
 		}
 		r.mu.Unlock()
-		_ = conn.CloseWith(ctx.Err())
+		_ = conn.Abort(ctx.Err())
 		return nil, ctx.Err()
 	}
 }

@@ -16,274 +16,990 @@
  * limitations under the License.
  */
 
-// The write claim and write turns: who writes the socket, when a turn hands
-// on, and what a blocked or failed socket asks of the next turn.
-
 package uio
 
 import (
+	"errors"
+	"io"
 	"net"
-	"runtime"
+	"sync"
+	"syscall"
+	"unsafe"
+
+	"github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/socket"
 )
 
-func claimerTag() uint32 { return uint32(currentGoroutineID()) << writeClaimerShift }
+// nativeWriteVecLimit bounds stack use while allowing a read event's small
+// owned writes to drain in one syscall.
+const nativeWriteVecLimit = 64
 
-func (conn *fdConn) writeBlocked() bool { return conn.writeState.Load()&writeBlockedFlag != 0 }
-
-func (conn *fdConn) writeFailed() bool { return conn.writeState.Load()&writeFailedFlag != 0 }
-
-func (conn *fdConn) setWriteBlocked(blocked bool) {
-	conn.updateWriteState(writeBlockedFlag, blocked)
+func (conn *fdConn) WriteByte(value byte) error {
+	var data [1]byte
+	data[0] = value
+	_, err := conn.Write(data[:])
+	return err
 }
 
-// noteWritable handles a writable edge: the socket has room again.
-func (conn *fdConn) noteWritable() {
-	for {
-		old := conn.writeState.Load()
-		next := old&^writeBlockedFlag | writeEdgeFlag
-		if next == old || conn.writeState.CompareAndSwap(old, next) {
-			return
+func (conn *fdConn) WriteString(value string) (int, error) {
+	data := unsafe.Slice(unsafe.StringData(value), len(value))
+	return conn.Write(data)
+}
+
+func (conn *fdConn) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+	if conn.outputClosed() {
+		return 0, net.ErrClosed
+	}
+	if conn.directOwner() {
+		return conn.writeOnLoop(data)
+	}
+	if conn.isDatagram() {
+		return conn.sendUDPOutside(data)
+	}
+	// This fast rejection belongs after the direct path: data sent straight to
+	// the kernel never counts against the user-space payload limit.
+	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
+		return 0, ErrOutboundOverflow
+	}
+	if err := conn.precheckOutbound(len(data)); err != nil {
+		return 0, err
+	}
+	owned := bytebuf.CloneBuffer(data)
+	n, err := conn.queueOwnedWrite(owned, len(data))
+	if errors.Is(err, ErrOutboundOverflow) {
+		// The clone never entered the queue, so Write still owns it.
+		bytebuf.ReleaseBuffer(owned)
+	}
+	return n, err
+}
+
+func (conn *fdConn) Writev(vec [][]byte) (int, error) {
+	total := 0
+	for _, segment := range vec {
+		if len(segment) > int(^uint(0)>>1)-total {
+			return 0, ErrOutboundOverflow
+		}
+		total += len(segment)
+	}
+	if total == 0 {
+		return 0, nil
+	}
+	if conn.outputClosed() {
+		return 0, net.ErrClosed
+	}
+	if conn.isDatagram() {
+		// Each buffer is one datagram, sent in one sendmmsg where the system
+		// has it; see writevUDP.
+		return conn.writevUDP(vec)
+	}
+	if conn.directOwner() {
+		return conn.writevOnLoop(vec, total)
+	}
+	if limit := conn.payloadLimit(); limit > 0 && total > limit {
+		return 0, ErrOutboundOverflow
+	}
+	if err := conn.precheckOutbound(total); err != nil {
+		return 0, err
+	}
+	owned := bytebuf.CloneBuffers(vec, total)
+	n, err := conn.queueOwnedWrite(owned, total)
+	if errors.Is(err, ErrOutboundOverflow) {
+		// The clone never entered the queue, so Writev still owns it.
+		bytebuf.ReleaseBuffer(owned)
+	}
+	return n, err
+}
+
+func (conn *fdConn) WriteOwned(owned *Buffer) (int, error) {
+	if owned == nil {
+		return 0, nil
+	}
+	size := owned.Len()
+	if size == 0 {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, nil
+	}
+	if conn.outputClosed() {
+		bytebuf.ReleaseBuffer(owned)
+		return 0, net.ErrClosed
+	}
+	if conn.directOwner() {
+		if conn.isDatagram() {
+			defer bytebuf.ReleaseBuffer(owned)
+			return conn.sendUDPOnLoop(owned.Bytes())
+		}
+		return conn.writeOwnedOnLoop(owned, size)
+	}
+	if conn.isDatagram() {
+		n, err := conn.sendUDPOutside(owned.Bytes())
+		if !errors.Is(err, ErrOutboundOverflow) {
+			bytebuf.ReleaseBuffer(owned)
+		}
+		return n, err
+	}
+	return conn.queueOwnedWrite(owned, size)
+}
+
+// coalesceBlockSize is the block size that small writes batched in one task
+// share: one read round's replies usually fit in one of them.
+// midFlushThreshold is how many queued replies a read round accumulates
+// before it sends them mid-round (see readRound).
+func (conn *fdConn) midFlushThreshold() int {
+	return min(64<<10, conn.events().readBufSize*4)
+}
+
+func (conn *fdConn) coalesceBlockSize() int {
+	return min(64<<10, conn.events().readBufSize*2)
+}
+
+// coalesceOwnedMax is the largest owned buffer a corked round copies into its
+// outbound tail for its size alone: up to here the copy costs less than the
+// writev segment it saves.
+const coalesceOwnedMax = 4 << 10
+
+// coalesceOwned reports whether a corked round copies owned, holding size
+// bytes, into its outbound blocks rather than queueing it as a segment of its
+// own: a small one, and one that is mostly empty, which a queue the peer is
+// slow to drain would otherwise hold on to many times over. A large, dense
+// buffer keeps its segment. Copying such buffers - write batches of a whole
+// read's replies, three of every four reads of a pipelining round - was 8% of
+// the server's user time, to save two writev segments a round.
+func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
+	if size > block/2 {
+		return false
+	}
+	return size <= coalesceOwnedMax || 2*size < owned.Cap()
+}
+
+// sendUDPOutside sends one datagram from outside the connection's turn. A
+// datagram is never queued, so the send happens here, holding the descriptor
+// owner's submitMu, which keeps the socket from closing under the syscall;
+// OnBytesWritten and a failure's close run after the lock is released. The lock
+// also orders the send before a later Close or Abort.
+func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
+	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
+		return 0, ErrOutboundOverflow
+	}
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events().closing.Load() || conn.loop.stopping.Load() {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	written, err := conn.sendDatagram(data)
+	gate.leave()
+	owner.submitMu.Unlock()
+	return conn.finishDatagram(data, written, err)
+}
+
+// writevUDP sends each buffer as one datagram, batched into one sendmmsg
+// where the system has it. A datagram the socket refuses is lost, as a
+// datagram transport allows: the protocol above retransmits what it needs.
+// The count reports the bytes of the datagrams the socket took.
+func (conn *fdConn) writevUDP(vec [][]byte) (int, error) {
+	if limit := conn.payloadLimit(); limit > 0 {
+		for _, segment := range vec {
+			if len(segment) > limit {
+				return 0, ErrOutboundOverflow
+			}
 		}
 	}
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	if conn.loop == nil || conn.isClosing() || owner.close.isReleased() || conn.events().closing.Load() || conn.loop.stopping.Load() {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	written, err := socket.SendUDPBatch(int(conn.fd), vec, conn.udp.remote)
+	gate.leave()
+	owner.submitMu.Unlock()
+	conn.reportOutbound(written)
+	if err != nil {
+		if isUDPSendBlocked(err) {
+			return written, err
+		}
+		conn.requestClose(err)
+		return written, err
+	}
+	return written, nil
 }
 
-// markWriteBlocked records the EAGAIN its caller just got. If a writable edge
-// was handled since the claim was taken, the room it reported may have come
-// after that send, so the edge is consumed and the caller retries.
-func (conn *fdConn) markWriteBlocked() (retry bool) {
-	for {
-		old := conn.writeState.Load()
-		next := old | writeBlockedFlag
-		if old&writeEdgeFlag != 0 {
-			next = old &^ writeEdgeFlag
-		}
-		if conn.writeState.CompareAndSwap(old, next) {
-			return next&writeBlockedFlag == 0
+func (conn *fdConn) precheckOutbound(size int) error {
+	if limit := int64(conn.payloadLimit()); limit > 0 {
+		pending := conn.pending.Load()
+		if int64(size) > limit-pending {
+			return ErrOutboundOverflow
 		}
 	}
+	return nil
 }
 
-func (conn *fdConn) markWriteFailed() { conn.updateWriteState(writeFailedFlag, true) }
-
-func (conn *fdConn) updateWriteState(flag uint32, enabled bool) {
-	for {
-		old := conn.writeState.Load()
-		next := old | flag
-		if !enabled {
-			next &^= flag
-		}
-		// Every flush clears the blocked flag; most find it clear already.
-		if next == old || conn.writeState.CompareAndSwap(old, next) {
-			return
-		}
+// queueOwnedWrite is the cross-goroutine write path. Ownership has already
+// moved into owned, so submitMu only covers admission, accounting, and pointer
+// insertion; payload allocation and copying never happen under the lock. The
+// bytes are sent by a write turn, beside whatever the connection's turn is
+// reading. ErrOutboundOverflow accepts nothing and returns owned to the caller.
+func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
+	if limit := conn.payloadLimit(); limit > 0 && size > limit {
+		return 0, ErrOutboundOverflow
 	}
+	// Allocation and the only payload copy have already happened off-lock.
+	conn.submitMu.Lock()
+	if conn.loop == nil || conn.outputClosed() || conn.events().closing.Load() || conn.loop.stopping.Load() {
+		conn.submitMu.Unlock()
+		bytebuf.ReleaseBuffer(owned)
+		return 0, net.ErrClosed
+	}
+	if !conn.reservePending(int64(size)) {
+		conn.submitMu.Unlock()
+		return 0, ErrOutboundOverflow
+	}
+	conn.outbound.AppendOwned(owned)
+	conn.submitMu.Unlock()
+	conn.kickWriterOutside()
+	return size, nil
 }
 
-func (conn *fdConn) writeClaimed() bool { return conn.writeState.Load()&writeOwnerFlag != 0 }
-
-// turnHoldsWrite reports a claim the connection's turn keeps for a reservation,
-// outside its own flush. Only the turn calls it.
-func (conn *fdConn) turnHoldsWrite() bool {
-	return conn.writeState.Load()&writeTurnHeldFlag != 0 && conn.turn&turnFlushing == 0
-}
-
-// turnOwnsClaim reports any claim the connection's turn must release.
-func (conn *fdConn) turnOwnsClaim() bool {
-	return conn.writeState.Load()&(writeTurnHeldFlag|writeTurnFlushFlag) != 0
-}
-
-// tryClaimWrite takes the write claim, adding extra (turn flags or a claimer
-// tag) in the same step. It never waits: a taken claim means its holder sends.
-func (conn *fdConn) tryClaimWrite(extra uint32) bool {
+func (conn *fdConn) reservePending(size int64) bool {
+	// Both callback partial writes and external producers reserve this counter.
+	limit := int64(conn.payloadLimit())
+	if limit <= 0 {
+		conn.pending.Add(size)
+		return true
+	}
 	for {
-		old := conn.writeState.Load()
-		if old&writeOwnerFlag != 0 {
+		old := conn.pending.Load()
+		if size > limit-old {
 			return false
 		}
-		next := old&^(writeEdgeFlag|writeContendedFlag|writeClaimerMask) | writeOwnerFlag | extra
-		if conn.writeState.CompareAndSwap(old, next) {
+		if conn.pending.CompareAndSwap(old, old+size) {
 			return true
 		}
 	}
 }
 
-// releaseWrite gives the claim up. A close that found it taken asked, through
-// writeCloseWaitFlag, to be handed back to the connection's turn now.
-func (conn *fdConn) releaseWrite() {
-	old := conn.writeState.And(^(writeOwnerFlag | writeTurnHeldFlag | writeTurnFlushFlag))
-	if old&writeCloseWaitFlag != 0 {
-		conn.writeState.And(^writeCloseWaitFlag)
-		// A stopped loop's shutdown pass releases the connection instead.
-		conn.scheduleTeardown()
+func (conn *fdConn) reservePendingAfterFlush(size int64) (bool, error) {
+	if conn.reservePending(size) {
+		return true, nil
 	}
-	if old&(writeShutFlag|writeShutDoneFlag) == writeShutFlag && conn.pending.Load() == 0 {
-		// Every send happens under the claim, so the release that leaves
-		// nothing pending is when a CloseWrite can shut the writing half.
-		// Output still pending waits for a writable edge, and the release
-		// after the send that drains it schedules this then; scheduling on
-		// every release would spin turns while the socket is full.
-		conn.scheduleIO(ioEventShutWrite)
+	if conn.outboundEmpty() || conn.writeBlocked() {
+		return false, nil
 	}
-	if conn.close.isDraining() && conn.pending.Load() == 0 {
-		// A graceful close's queue left the socket as this holder sent: a
-		// turn ends the drain, since none is owed for empty output.
-		conn.scheduleTeardown()
+	if _, err := conn.flushOnLoop(); err != nil {
+		return false, err
 	}
+	return conn.reservePending(size), nil
 }
 
-// releaseWriteAndKick releases the claim and then sends whatever producers
-// appended while it was held: they found the claim taken and left their
-// bytes to this holder.
-func (conn *fdConn) releaseWriteAndKick() {
-	conn.releaseWrite()
-	conn.kickWriter()
-}
-
-// kickWriterOutside is kickWriter for a goroutine outside the connection's
-// turns, such as a Write from an RPC handler. When the write turn it starts
-// needed a worker woken, the caller yields, so the worker runs now rather
-// than once the caller next blocks (see shardpool.Pool.Submit).
-func (conn *fdConn) kickWriterOutside() {
-	if conn.kickWriter() {
-		runtime.Gosched()
-	}
-}
-
-// kickWriter gives accepted output a sender. If the claim is free it takes it
-// and hands it to a write turn; if it is taken, the holder's release rechecks.
-// Output waits for the open turn before OnOpen returns, for a writable edge
-// while the socket is full, and for the close flush once closing started.
-// It reports whether the write turn it started needed a worker woken.
-func (conn *fdConn) kickWriter() bool {
-	if conn.isDatagram() || conn.pending.Load() == 0 || conn.isClosing() {
+// claimDirectSend reports whether the turn may send directly, holding the
+// claim it took for that. A claim the turn keeps for a reservation, or holds
+// for its own flush while OnBytesWritten runs, is never lent to a direct send: the
+// bytes are queued and that flush sends them, so OnBytesWritten never runs inside
+// itself. Once it holds the claim the turn must also find nothing queued:
+// another sender may have left part of its output there and released the
+// claim between the turn's check and its taking it, and those bytes go first.
+// A direct send therefore starts with nothing queued or in flight, which is
+// what lets it put an unsent suffix at the head of outbound.
+func (conn *fdConn) claimDirectSend() bool {
+	if !conn.tryClaimWrite(0) {
+		// Another sender, or this turn's own flush or reservation, owns the
+		// socket; its release or flush sends these bytes.
 		return false
 	}
-	state := conn.writeState.Load()
-	if state&writeOwnerFlag != 0 {
-		// The holder sends these bytes. Output from a goroutine other than
-		// the one its claim was taken for means several producers write now.
-		if state&writeContendedFlag == 0 && state&writeClaimerMask != claimerTag() {
-			conn.writeState.Or(writeContendedFlag)
+	if !conn.outboundEmpty() {
+		conn.releaseWriteAndKick()
+		return false
+	}
+	return true
+}
+
+// writeOnLoop is the task-owner fast path. It lends caller memory directly to
+// the non-blocking syscall when no batching is active and copies only an unsent
+// suffix that must outlive the call.
+func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
+	if conn.isDatagram() {
+		return conn.sendUDPOnLoop(data)
+	}
+	threshold := conn.events().WriteBufferedThreshold
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && len(data) < threshold)
+	if !queued && !conn.claimDirectSend() {
+		queued = true
+	}
+	if queued {
+		return conn.writeQueuedOnLoop(data)
+	}
+	defer conn.releaseWriteAndKick()
+
+	// The common callback path lends caller memory directly to the kernel.
+	written, err := socket.Send(int(conn.fd), data)
+	if written < 0 {
+		written = 0
+	}
+	if err != nil {
+		if isWouldBlock(err) {
+			written, err = 0, nil
+		} else {
+			conn.failDirectWrite(err)
+			return written, err
 		}
-		return false
 	}
-	if state&writeBlockedFlag != 0 || state&writeOpenedFlag == 0 {
-		return false
+	if written == 0 && testHookDirectSendRefused != nil {
+		testHookDirectSendRefused(conn)
 	}
-	if !conn.tryClaimWrite(claimerTag()) {
-		return false
+	if written == len(data) {
+		conn.events().onSocketBytesWrite(conn, written)
+		return written, nil
 	}
-	if !conn.loop.acquireIO() {
-		// Shutting down: its close pass sends the bounded final flush.
-		conn.releaseWrite()
-		return false
+	remaining := data[written:]
+	if !conn.reservePending(int64(len(remaining))) {
+		if written == 0 {
+			// Nothing left the socket: pure overflow.
+			return 0, ErrOutboundOverflow
+		}
+		// A partial payload is on the wire and its suffix cannot be queued:
+		// the stream is broken, so report a short write, not an overflow.
+		conn.events().onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
 	}
-	accepted, woke := conn.loop.ioPool.submitWriteWaking(conn)
-	if !accepted {
-		conn.handleWriteSubmitFailure()
-	}
-	return woke
+	// Only the unsent suffix must survive after Write returns.
+	conn.queueDirectSuffix(bytebuf.CloneBuffer(remaining))
+	conn.setWriteBlocked(written == 0)
+	// Reported once the suffix is accounted, so OnBytesWritten never observes a
+	// transient empty queue in the middle of this write.
+	conn.events().onSocketBytesWrite(conn, written)
+	return len(data), nil
 }
 
-// handleWriteSubmitFailure ends a write turn the scheduler refused. Its bytes
-// have no sender left, so the connection closes, as with a refused turn.
-func (conn *fdConn) handleWriteSubmitFailure() {
-	conn.releaseWrite()
-	conn.requestClose(net.ErrClosed)
-	conn.loop.releaseIO()
-}
-
-// writeTurn is a connection seen as its write task. It is the same value, so
-// submitting a write turn allocates nothing.
-type writeTurn fdConn
-
-// ShardKey implements IOTask: a connection's turns and its write turns share
-// one key; see turnKey.
-func (conn *fdConn) ShardKey() uint32 { return conn.turnKey() }
-
-func (turn *writeTurn) ShardKey() uint32 { return (*fdConn)(turn).turnKey() }
-
-// turnKey keys a connection's turns by its loop first, its descriptor second.
-// The loop collects their readiness and hands them over in one batch per
-// round, and where the shards are a multiple of the loops, as they are by
-// default, the loop's connections share a subset of the shards of their own:
-// a round's batch then wakes the few workers serving that subset with several
-// turns each, rather than one worker per turn. Keyed by descriptor alone, as
-// the loops pick connections in turn (see Events.loopAt), a closed-loop echo's
-// p99 at 512 connections rose by 60%.
-func (conn *fdConn) turnKey() uint32 {
-	if conn.loop == nil {
-		return uint32(conn.fd)
+// writevOnLoop mirrors writeOnLoop for scatter/gather input. A partial syscall
+// is collapsed into one owned suffix so later retries do not retain caller
+// slices or an unbounded vector list.
+func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
+	if conn.isDatagram() {
+		return 0, ErrUnsupported
 	}
-	return conn.loop.index + conn.loop.count*uint32(conn.fd)
+	threshold := conn.events().WriteBufferedThreshold
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && total < threshold)
+	if !queued && !conn.claimDirectSend() {
+		queued = true
+	}
+	if queued {
+		return conn.writevQueuedOnLoop(vec, total)
+	}
+	defer conn.releaseWriteAndKick()
+	written, err := socket.Writev(int(conn.fd), vec)
+	if written < 0 {
+		written = 0
+	}
+	if err != nil {
+		if isWouldBlock(err) {
+			written, err = 0, nil
+		} else {
+			conn.failDirectWrite(err)
+			return written, err
+		}
+	}
+	if written == total {
+		conn.events().onSocketBytesWrite(conn, written)
+		return written, nil
+	}
+	remaining := total - written
+	if !conn.reservePending(int64(remaining)) {
+		if written == 0 {
+			// Nothing left the socket: pure overflow.
+			return 0, ErrOutboundOverflow
+		}
+		// A partial vector is on the wire and its suffix cannot be queued:
+		// the stream is broken, so report a short write, not an overflow.
+		conn.events().onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
+	}
+	owned := bytebuf.CloneBuffersFrom(vec, written, remaining)
+	conn.queueDirectSuffix(owned)
+	conn.setWriteBlocked(written == 0)
+	conn.events().onSocketBytesWrite(conn, written)
+	return total, nil
 }
 
-// RunTask implements IOTask for the write turn.
-func (turn *writeTurn) RunTask() {
-	conn := (*fdConn)(turn)
-	if conn.loop == nil || conn.loop.ioPool == nil {
+// writeOwnedOnLoop consumes owned on every return path except
+// ErrOutboundOverflow, which accepts nothing and returns the buffer to the
+// caller; a partial direct write that cannot queue its suffix reports
+// io.ErrShortWrite and consumes the buffer instead. A corked read round's
+// first output goes straight to the socket when the write is one the
+// threshold sends directly anyway — a batch handed over mid-round leaves
+// without waiting for the round's end, and the threshold's promise for
+// smaller writes (join the outbound batch) holds in the first position too.
+// The frames that follow keep zero-copy ownership as outbound's first
+// segment or are coalesced into pooled blocks, to keep the final writev batch
+// short; see coalesceOwned for which are copied.
+func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, error) {
+	threshold := conn.events().WriteBufferedThreshold
+	// A corked read round never sends directly, exactly as writevOnLoop does
+	// not: its replies queue, coalesced, and leave together when the round
+	// ends, or at the mid-round flush once they pass midFlushThreshold.
+	// Sending the round's first reply from inside its callback measured a
+	// pipeline 4-6% slower - it made every later reply of the round its own
+	// writev segment - and no faster at echo, whose round has one reply.
+	queued := !conn.outboundEmpty() || conn.turn&turnCorked != 0 || (threshold > 0 && size < threshold)
+	if !queued && !conn.claimDirectSend() {
+		queued = true
+	}
+	if queued {
+		reserved, err := conn.reservePendingAfterFlush(int64(size))
+		if err != nil {
+			bytebuf.ReleaseBuffer(owned)
+			return 0, err
+		}
+		if !reserved {
+			return 0, ErrOutboundOverflow
+		}
+		conn.handOverScratch()
+		conn.submitMu.Lock()
+		if conn.turn&turnCorked != 0 && !conn.outbound.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
+			conn.outbound.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
+		} else {
+			conn.outbound.AppendOwned(owned)
+		}
+		conn.submitMu.Unlock()
+		return size, nil
+	}
+	defer conn.releaseWriteAndKick()
+
+	written, err := socket.Send(int(conn.fd), owned.Bytes())
+	if written < 0 {
+		written = 0
+	}
+	if err != nil {
+		if isWouldBlock(err) {
+			written, err = 0, nil
+		} else {
+			bytebuf.ReleaseBuffer(owned)
+			conn.failDirectWrite(err)
+			return written, err
+		}
+	}
+	if written == size {
+		bytebuf.ReleaseBuffer(owned)
+		conn.events().onSocketBytesWrite(conn, written)
+		return written, nil
+	}
+	remaining := size - written
+	if !conn.reservePending(int64(remaining)) {
+		if written == 0 {
+			// Nothing left the socket: pure overflow, so the buffer returns
+			// to the caller like every other ErrOutboundOverflow.
+			return 0, ErrOutboundOverflow
+		}
+		// A partial frame is on the wire and its suffix cannot be queued:
+		// the stream is broken, so the buffer is consumed and the caller is
+		// told the write was short rather than merely overflowed.
+		bytebuf.ReleaseBuffer(owned)
+		conn.events().onSocketBytesWrite(conn, written)
+		conn.failDirectWrite(ErrOutboundOverflow)
+		return written, io.ErrShortWrite
+	}
+	if written > 0 {
+		owned.Discard(written)
+	}
+	conn.queueDirectSuffix(owned)
+	conn.setWriteBlocked(written == 0)
+	conn.events().onSocketBytesWrite(conn, written)
+	return size, nil
+}
+
+// queueDirectSuffix queues owned at the head of outbound: what a direct send
+// left unsent, or a read round's reply space. Its holder has held the write
+// claim since it started with nothing queued or in flight, so bytes in
+// outbound now came from producers that wrote after it; behind them, they
+// would land inside a half-sent payload or ahead of replies accepted first.
+func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
+	conn.submitMu.Lock()
+	conn.outbound.PrependOwned(owned)
+	conn.submitMu.Unlock()
+}
+
+// sendUDPOnLoop sends one datagram from the connection's turn. Sends from
+// other goroutines share the socket and its destination address, so every
+// send holds the descriptor owner's submitMu.
+func (conn *fdConn) sendUDPOnLoop(data []byte) (written int, err error) {
+	owner := conn.descriptorOwner()
+	owner.submitMu.Lock()
+	gate, open := conn.enterDescriptor()
+	if !open {
+		owner.submitMu.Unlock()
+		return 0, net.ErrClosed
+	}
+	written, err = conn.sendDatagram(data)
+	gate.leave()
+	owner.submitMu.Unlock()
+	return conn.finishDatagram(data, written, err)
+}
+
+// sendDatagram is the send syscall alone. Its caller holds the descriptor
+// owner's submitMu: Sendto encodes the destination into the address value
+// it is given, which every send to this peer shares.
+func (conn *fdConn) sendDatagram(data []byte) (written int, err error) {
+	if conn.udp.remote == nil {
+		written, err = syscall.Write(int(conn.fd), data)
+	} else {
+		err = syscall.Sendto(int(conn.fd), data, 0, conn.udp.remote)
+		if err == nil {
+			written = len(data)
+		}
+	}
+	if written < 0 {
+		written = 0
+	}
+	return written, err
+}
+
+// finishDatagram preserves datagram atomicity. A blocked datagram is reported
+// to the caller rather than queued as a stream suffix, and a partial result is
+// fatal because retrying it would create a different packet.
+func (conn *fdConn) finishDatagram(data []byte, written int, err error) (int, error) {
+	conn.reportOutbound(written)
+	if err != nil {
+		if isUDPSendBlocked(err) {
+			return written, err
+		}
+		conn.requestClose(err)
+		return written, err
+	}
+	if written != len(data) {
+		// Datagram boundaries are atomic; never retry a partial suffix as a stream.
+		err = io.ErrShortWrite
+		conn.requestClose(err)
+		return written, err
+	}
+	return written, nil
+}
+
+// reportOutbound runs OnBytesWritten for a datagram send. Datagrams are sent on
+// whichever goroutine writes them, so the calls for one connection go through
+// a claim, as a stream's sends do: a sender adds its bytes and reports them
+// itself if it takes the claim, and otherwise leaves them to the holder, which
+// reports until nothing is pending, so the calls never overlap and a send made
+// inside OnBytesWritten is reported once that call returns. Nobody waits for the
+// claim, so OnBytesWritten callbacks that write to each other cannot deadlock.
+func (conn *fdConn) reportOutbound(n int) {
+	if n <= 0 || (conn.callbacks().onBytesWritten == nil && !conn.hasWriteControl()) {
 		return
 	}
-	conn.runWriteTurn()
-}
-
-// runWriteTurn sends output from other goroutines while the connection's turn
-// reads. It holds the write claim and one of its loop's turn counts, which
-// shutdown joins. It never runs callbacks other than OnBytesWritten.
-func (conn *fdConn) runWriteTurn() {
-	handedOn := false
-	defer func() {
-		// Every exit but the hand-on ends the turn here, including a panic in
-		// OnBytesWritten, which runs after a flush may have left the socket
-		// blocked: the claim and the count go back and writable interest is
-		// armed whether or not the flush returned.
-		if !handedOn {
-			conn.finishWriteTurn()
-		}
-	}()
-	for flushes := 0; ; flushes++ {
-		if conn.isClosing() || conn.pending.Load() == 0 || conn.writeBlocked() {
+	udp := conn.udp
+	udp.outboundPending.Add(int64(n))
+	for udp.outboundClaim.CompareAndSwap(false, true) {
+		conn.drainOutbound()
+		// Bytes added between the last drain and the release found the
+		// claim taken; look again.
+		if udp.outboundPending.Load() == 0 {
 			return
 		}
-		if flushes == maxWriteFlushes {
-			handedOn = true
-			// The claim and the count move to the next turn in the queue.
-			if !conn.loop.ioPool.submitWrite(conn) {
-				conn.handleWriteSubmitFailure()
+	}
+}
+
+// drainOutbound reports pending bytes while holding the claim, and releases it
+// even when OnBytesWritten panics.
+func (conn *fdConn) drainOutbound() {
+	udp := conn.udp
+	defer udp.outboundClaim.Store(false)
+	for {
+		pending := udp.outboundPending.Swap(0)
+		if pending == 0 {
+			return
+		}
+		conn.events().reportBytesWritten(conn, int(pending))
+	}
+}
+
+func isUDPSendBlocked(err error) bool {
+	return isWouldBlock(err) || err == syscall.ENOBUFS
+}
+
+func (conn *fdConn) failDirectWrite(err error) {
+	// Once a syscall has made the byte stream unusable, queued writes must not
+	// be appended ahead of the close task or flushed during close.
+	conn.markWriteFailed()
+	conn.requestClose(err)
+}
+
+func (conn *fdConn) Flush() error {
+	if conn.isClosing() {
+		return net.ErrClosed
+	}
+	if conn.loop == nil || conn.loop.stopping.Load() {
+		return net.ErrClosed
+	}
+	if conn.isDatagram() {
+		return nil
+	}
+	if conn.directOwner() {
+		_, err := conn.flushOnLoop()
+		return err
+	}
+	// Outside the task, Flush is a FIFO barrier and returns after giving the
+	// queued bytes a sender.
+	conn.kickWriterOutside()
+	return nil
+}
+
+// inflightPool lends flushes the buffer that holds a detached batch, so an idle
+// connection keeps no second queue.
+var inflightPool = sync.Pool{New: func() any { return new(bytebuf.CompositeBuffer) }}
+
+// releaseInflight returns the borrowed batch. Only the holder of the write
+// claim calls it; close keeps the claim it takes, so nothing sends afterwards.
+func (conn *fdConn) releaseInflight() {
+	if batch := conn.inflight; batch != nil {
+		conn.inflight = nil
+		batch.Reset()
+		inflightPool.Put(batch)
+	}
+}
+
+// flushOnLoop is the connection turn's flush. The turn sends inline when it
+// holds or can take the write claim, so replies produced by its callbacks
+// leave without a scheduler hop; when another sender holds the claim, that
+// sender's release rechecks and these bytes go with it.
+func (conn *fdConn) flushOnLoop() (int, error) {
+	// pending is incremented before a producer publishes its buffer and
+	// decremented only after the corresponding bytes are sent. A zero
+	// value therefore proves that there is no stream payload to flush, while
+	// avoiding any atomic read-modify-write on the common empty path. It
+	// counts the round's reply space too, which has nothing to hand over then.
+	if conn.isDatagram() || conn.pending.Load() == 0 {
+		return 0, nil
+	}
+	conn.handOverScratch()
+	// OnBytesWritten runs inside the flush, so the turn marks it: a Write that
+	// callback makes is queued rather than sent, and a flush it starts returns
+	// at once, so the callback never runs inside itself. A claim taken here
+	// is marked too, so the turn's cleanup releases it if the callback panics.
+	if conn.turn&turnFlushing != 0 {
+		return 0, nil
+	}
+	held := conn.writeState.Load()&writeTurnHeldFlag != 0
+	if !held && !conn.tryClaimWrite(writeTurnFlushFlag) {
+		return 0, nil
+	}
+	conn.turn |= turnFlushing
+	n, err := conn.flushWrite()
+	conn.turn &^= turnFlushing
+	if !held {
+		conn.releaseWriteAndKick()
+	}
+	return n, err
+}
+
+// flushWrite drains a bounded number of bytes and writev calls. It requires
+// the write claim, and submitMu never covers a send, so a producer appending
+// to outbound never waits for the socket. A queue of one block, the usual
+// shape after a round of replies, is sent in place: producers only append,
+// into the tail block's spare room or as new blocks, and only the claim holder
+// discards, so the bytes a send reads stay put while the lock is released.
+// A longer queue is detached into inflight in one step instead, so its sends
+// and the release of its sent blocks also run without the lock while producers
+// start the next batch; inflight goes out ahead of everything accepted since.
+// EAGAIN leaves the bytes queued and sets writeBlocked until a writable edge.
+func (conn *fdConn) flushWrite() (int, error) {
+	if conn.pending.Load() == 0 {
+		return 0, nil
+	}
+	if conn.writeBlocked() {
+		// Once EAGAIN is observed, only a Writable event should retry the fd.
+		return 0, nil
+	}
+	var totalWritten int
+	var writeErr error
+	if conn.inflight == nil {
+		conn.submitMu.Lock()
+		if conn.outbound.Blocks() == 1 {
+			totalWritten, writeErr = conn.sendOutboundBlock()
+		}
+		if writeErr != nil || conn.writeBlocked() || conn.outbound.Empty() {
+			conn.submitMu.Unlock()
+			return conn.retireFlush(totalWritten, writeErr)
+		}
+		batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
+		// batch is empty, so the swap leaves outbound empty for producers.
+		conn.outbound, *batch = *batch, conn.outbound
+		conn.submitMu.Unlock()
+		conn.inflight = batch
+	}
+	var written int
+	if conn.inflight.Blocks() == 1 {
+		written, writeErr = conn.sendInflightBlock()
+	} else {
+		written, writeErr = conn.sendInflightVec()
+	}
+	totalWritten += written
+	if conn.inflight.Empty() {
+		conn.releaseInflight()
+	}
+	return conn.retireFlush(totalWritten, writeErr)
+}
+
+// retireFlush accounts what a flush sent and reports it.
+func (conn *fdConn) retireFlush(written int, err error) (int, error) {
+	if written > 0 {
+		conn.retireSent(written)
+		conn.events().onSocketBytesWrite(conn, written)
+		if conn.close.isDraining() {
+			// A drain's queue is moving: its bound starts over, so a close
+			// waits as long as its output keeps leaving, not a fixed time.
+			if w := conn.wake.Load(); w != nil {
+				if bound := w.drain.Load(); bound != nil {
+					bound.timer.Reset(bound.wait)
+				}
 			}
-			return
 		}
-		if conn.writeState.Load()&writeContendedFlag != 0 &&
-			conn.pending.Load() < int64(conn.coalesceBlockSize()) {
-			// Other goroutines queued output while this turn held the claim,
-			// so more are likely about to: those ready to run go first and add
-			// to this batch, instead of costing a syscall each few messages.
-			// A lone producer never sets the flag and is sent at once; a queue
-			// that already fills a coalescing block is sent as it is.
-			conn.writeState.And(^writeContendedFlag)
-			runtime.Gosched()
+	}
+	return written, err
+}
+
+// retireSent retires bytes the socket took. Producers only add to pending and
+// every add and retire is atomic, so the decrement needs no further
+// coordination.
+func (conn *fdConn) retireSent(n int) {
+	conn.pending.Add(-int64(n))
+}
+
+// sendOutboundBlock sends a queue of one block in place, with plain write and
+// no vector. It is called and returns with submitMu held, releases it around
+// each send, and stops once producers have queued a second block.
+func (conn *fdConn) sendOutboundBlock() (int, error) {
+	totalWritten := 0
+	for calls := 0; calls < 16 && conn.outbound.Blocks() == 1; calls++ {
+		chunk := conn.outbound.PeekChunk()
+		conn.submitMu.Unlock()
+		written, err := socket.Send(int(conn.fd), chunk)
+		conn.submitMu.Lock()
+		if err != nil && !isWouldBlock(err) {
+			return totalWritten, err
 		}
-		if _, err := conn.flushWrite(); err != nil {
-			conn.requestClose(err)
-			return
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			return totalWritten, nil
 		}
+		conn.outbound.Discard(written)
+		totalWritten += written
+	}
+	return totalWritten, nil
+}
+
+// sendInflightBlock sends a detached batch of one block with plain write.
+func (conn *fdConn) sendInflightBlock() (int, error) {
+	totalWritten := 0
+	for calls := 0; calls < 16 && !conn.inflight.Empty(); calls++ {
+		written, err := socket.Send(int(conn.fd), conn.inflight.PeekChunk())
+		if err != nil && !isWouldBlock(err) {
+			return totalWritten, err
+		}
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			return totalWritten, nil
+		}
+		conn.inflight.Discard(written)
+		totalWritten += written
+	}
+	return totalWritten, nil
+}
+
+// sendInflightVec drains a detached multi-block batch in bounded writev
+// batches. Its vector is kept out of flushWrite's frame, which would otherwise
+// clear it on every flush.
+//
+//go:noinline
+func (conn *fdConn) sendInflightVec() (int, error) {
+	var vecStorage [nativeWriteVecLimit][]byte
+	totalWritten := 0
+	for calls := 0; calls < 16 && totalWritten < 1<<20 && !conn.inflight.Empty(); calls++ {
+		vec, _ := conn.inflight.PeekVecN(vecStorage[:0], len(vecStorage))
+		written, err := socket.Writev(int(conn.fd), vec)
+		if err != nil && !isWouldBlock(err) {
+			return totalWritten, err
+		}
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			break
+		}
+		conn.inflight.Discard(written)
+		totalWritten += written
+	}
+	return totalWritten, nil
+}
+
+func (conn *fdConn) outboundEmpty() bool {
+	// Queue admission reserves pending bytes before appending the owned buffer;
+	// flush retires the bytes only after removing them. This makes pending a
+	// conservative, lock-free empty check for stream connections. Callers still
+	// take submitMu before inspecting or mutating the segment list itself.
+	return conn.pending.Load() == 0
+}
+
+func (conn *fdConn) OutboundBuffered() int { return int(conn.pending.Load()) }
+
+// prepareScratch claims turn-local reply space in holder.out when nothing else
+// is queued ahead of it, or falls back with pending already reserved.
+func (conn *fdConn) prepareScratch(n int) (out *bytebuf.Buffer, reserved bool, err error) {
+	if holder := conn.scratch; holder != nil && conn.turn&turnFlushing == 0 {
+		took := !conn.turnHoldsWrite()
+		if !took || conn.tryClaimWrite(writeTurnHeldFlag) {
+			ok, ferr := conn.reservePendingAfterFlush(int64(n))
+			if ferr == nil && !ok {
+				ferr = ErrOutboundOverflow
+			}
+			if ferr != nil {
+				if took {
+					conn.releaseWriteAndKick()
+				}
+				return nil, false, ferr
+			}
+			buf := holder.out
+			used := 0
+			if buf != nil {
+				used = buf.Len()
+			}
+			if conn.pending.Load() == int64(used+n) {
+				if buf == nil {
+					buf = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
+					holder.out = buf
+				}
+				if buf.Available() >= n {
+					return buf, true, nil
+				}
+				conn.handOverScratch()
+			}
+			return nil, true, nil
+		}
+	}
+	ok, ferr := conn.reservePendingAfterFlush(int64(n))
+	if ferr != nil {
+		return nil, false, ferr
+	}
+	if !ok {
+		return nil, false, ErrOutboundOverflow
+	}
+	return nil, true, nil
+}
+
+func (conn *fdConn) writeQueuedOnLoop(data []byte) (int, error) {
+	n := len(data)
+	out, _, err := conn.prepareScratch(n)
+	if err != nil {
+		return 0, err
+	}
+	if out != nil {
+		dst := out.AvailableBuffer()[:n]
+		copy(dst, data)
+		out.CommitWrite(n)
+		return n, nil
+	}
+	conn.submitMu.Lock()
+	conn.outbound.WriteCoalesced(data, conn.coalesceBlockSize())
+	conn.submitMu.Unlock()
+	return n, nil
+}
+
+func (conn *fdConn) writevQueuedOnLoop(vec [][]byte, total int) (int, error) {
+	out, _, err := conn.prepareScratch(total)
+	if err != nil {
+		return 0, err
+	}
+	if out != nil {
+		dst := out.AvailableBuffer()[:total]
+		off := 0
+		for _, seg := range vec {
+			off += copy(dst[off:], seg)
+		}
+		out.CommitWrite(total)
+		return total, nil
+	}
+	conn.submitMu.Lock()
+	conn.outbound.WritevCoalesced(vec, conn.coalesceBlockSize())
+	conn.submitMu.Unlock()
+	return total, nil
+}
+
+func (conn *fdConn) handOverScratch() {
+	if holder := conn.scratch; holder != nil && holder.out != nil && holder.out.Len() > 0 {
+		conn.queueDirectSuffix(holder.out)
+		holder.out = nil
 	}
 }
 
-// finishWriteTurn ends a write turn. A socket that refused its bytes needs no
-// interest armed: write interest has been on since registration, so the edge
-// that drains the socket starts the next turn by itself. Bytes appended after
-// its last flush found the claim taken and were left to it, so it looks again
-// and hands them, with its turn count, to a new write turn.
-func (conn *fdConn) finishWriteTurn() {
-	conn.releaseWrite()
-	if conn.pending.Load() != 0 && !conn.writeBlocked() && !conn.isClosing() &&
-		!conn.loop.ioStopped() && conn.tryClaimWrite(0) {
-		if !conn.loop.ioPool.submitWrite(conn) {
-			conn.handleWriteSubmitFailure()
-		}
+func (conn *fdConn) dropScratch() {
+	holder := conn.scratch
+	if holder == nil {
 		return
 	}
-	// Released last: shutdown joins write turns through this count.
-	conn.loop.releaseIO()
+	conn.scratch = nil
+	if out := holder.out; out != nil {
+		if n := out.Len(); n > 0 {
+			conn.pending.Add(-int64(n))
+		}
+		bytebuf.ReleaseBuffer(out)
+		holder.out = nil
+	}
+	conn.events().readPool.Put(holder)
+}
+
+func (conn *fdConn) sendScratch(holder *readBuffer) error {
+	out := holder.out
+	if conn.pending.Load() != int64(out.Len()) || conn.writeBlocked() || conn.isClosing() {
+		conn.queueDirectSuffix(out)
+		holder.out = nil
+		return nil
+	}
+	var sendErr error
+	unsent := out.Bytes()
+	for len(unsent) > 0 {
+		written, err := socket.Send(int(conn.fd), unsent)
+		if err != nil && !isWouldBlock(err) {
+			sendErr = err
+			break
+		}
+		if err != nil || written <= 0 {
+			if conn.markWriteBlocked() {
+				continue
+			}
+			break
+		}
+		unsent = unsent[written:]
+	}
+	sent := out.Len() - len(unsent)
+	if len(unsent) > 0 {
+		if sent > 0 {
+			out.Discard(sent)
+		}
+		conn.queueDirectSuffix(out)
+		holder.out = nil
+	} else {
+		out.Reset()
+	}
+	if sent > 0 {
+		conn.turn |= turnFlushing
+		_, _ = conn.retireFlush(sent, nil)
+		conn.turn &^= turnFlushing
+	}
+	return sendErr
 }

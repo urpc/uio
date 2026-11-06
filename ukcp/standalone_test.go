@@ -83,7 +83,7 @@ func expectEcho(t *testing.T, conn uio.Conn, client *collector, size int) {
 
 // The standalone server and dialer carry an echo over UDP.
 func TestStandaloneEcho(t *testing.T) {
-	srv := startServer(t, Options{Handler: echoHandler, Pollers: 2}, "udp://127.0.0.1:0")
+	srv := startServer(t, Options{Handler: echoHandler, Transport: TransportOptions{Pollers: 2}}, "udp://127.0.0.1:0")
 	client := newCollector()
 	dialer := NewDialer(Options{Handler: client.handler()})
 	t.Cleanup(func() { _ = dialer.Close() })
@@ -187,7 +187,7 @@ func TestStandaloneValidation(t *testing.T) {
 		{"no handler", Options{}, []string{"udp://127.0.0.1:0"}},
 		{"no address", Options{Handler: echoHandler}, nil},
 		{"mtu above the engine's", Options{Handler: echoHandler, MTU: maxMTU + 1}, []string{"udp://127.0.0.1:0"}},
-		{"read buffer below the mtu", Options{Handler: echoHandler, MaxBufferSize: 512}, []string{"udp://127.0.0.1:0"}},
+		{"read buffer below the mtu", Options{Handler: echoHandler, Transport: TransportOptions{ReadBufferSize: 512}}, []string{"udp://127.0.0.1:0"}},
 	}
 	for _, tc := range cases {
 		if err := NewServer(tc.opts).Serve(tc.addrs...); !errors.Is(err, ErrInvalidOptions) {

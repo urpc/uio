@@ -2,13 +2,12 @@
 
 package uio
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestStdWriteOwnedReusesAllocation(t *testing.T) {
-	conn := &fdConn{
-		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
-		writeSig:   make(chan struct{}, 1),
-	}
+	conn := &fdConn{commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()}, writeSig: make(chan struct{}, 1)}
 	payload := make([]byte, 1024)
 	write := func() {
 		buffer := AcquireBuffer(len(payload))
@@ -29,18 +28,10 @@ func TestStdWriteOwnedReusesAllocation(t *testing.T) {
 	}
 }
 
-// TestStdDrainOutboundAllocatesNothing pins that a drain cycle reuses its
-// write vector. The vector used to be a stack array in the writer goroutine,
-// which net.Buffers.WriteTo forces onto the heap for the connection's whole
-// life; it now comes from a pool held only for the length of one drain.
 func TestStdDrainOutboundAllocatesNothing(t *testing.T) {
 	raw := newStdRegistrationConn(30004)
 	raw.openReturned.Store(true)
-	conn := &fdConn{
-		commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()},
-		conn:       raw,
-		writeSig:   make(chan struct{}, 1),
-	}
+	conn := &fdConn{commonConn: commonConn{entry: (&Events{MaxOutboundBuffered: -1}).plainEntry()}, conn: raw, writeSig: make(chan struct{}, 1)}
 	payload := make([]byte, 64)
 	drain := func() {
 		if _, err := conn.Write(payload); err != nil {

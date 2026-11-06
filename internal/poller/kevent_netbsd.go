@@ -1,4 +1,4 @@
-//go:build netbsd && !stdio
+//go:build netbsd
 
 /*
  * Copyright 2024 the urpc project

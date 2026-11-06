@@ -15,8 +15,8 @@
  */
 
 // The stack engine: the driver the Events install when a chain is present,
-// one connection's layer nodes, its turn state machine, inbound pacing,
-// timers and send reports.
+// one connection's layer nodes, its turn state machine, inbound pacing, and
+// per-layer timers.
 
 package uio
 
@@ -27,33 +27,54 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/urpc/uio/internal/blockio"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
+type driverSlot interface {
+	driverData() any
+	setDriverData(any)
+}
+
+func stackStateOf(socket Conn) any {
+	if d, ok := socket.(driverSlot); ok {
+		return d.driverData()
+	}
+	return socket.Userdata()
+}
+
+func setStackState(socket Conn, value any) {
+	if d, ok := socket.(driverSlot); ok {
+		d.setDriverData(value)
+		return
+	}
+	socket.SetUserdata(value)
+}
+
+func stackOf(socket Conn) *stack {
+	c, _ := stackStateOf(socket).(*stack)
+	return c
+}
+
 // stackDriver is the socket's Handler when layers are installed: it builds
-// each connection's stack on OnOpen and drives it from then on. The stack
-// lives in the socket's userdata slot; the userdata the connection came with
-// moves to the stack, where every layer's Userdata reads it.
+// each connection's stack on OnOpen and drives it from then on.
 type stackDriver struct {
 	layers   []Layer
 	top      Handler
-	topSent  func(Conn, SendReceipt) // the Handler's receipt notice; see SentObserver
-	drained  func(Conn)              // the Observer's QueueDrainedObserver, if any
-	limit    int                     // MaxOutboundBuffered, which the stack's top enforces
-	inLimit  int                     // MaxInboundBuffered, which bounds what the layers hold too
-	halfOpen bool                    // AllowHalfOpen: the Handler may outlive its peer's end
+	limit    int  // MaxOutboundBuffered, which the stack's top enforces
+	inLimit  int  // MaxInboundBuffered, which bounds what the layers hold too
+	halfOpen bool // AllowHalfOpen: the Handler may outlive its peer's end
 }
 
 func (h *stackDriver) OnOpen(socket Conn) {
 	packetBottom := len(h.layers) > 0 && isPacketLayer(h.layers[0]) &&
 		socket.LocalAddr() != nil && packetNetwork(socket.LocalAddr().Network())
-	c := &stack{top: h.top, topSent: h.topSent, queueDrained: h.drained, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen, packetBottom: packetBottom}
-	held := socket.Userdata()
-	if probe, ok := held.(*dialProbe); ok {
+	c := &stack{top: h.top, socket: socket, limit: h.limit, inLimit: h.inLimit, halfOpen: h.halfOpen, packetBottom: packetBottom}
+	if probe, ok := stackStateOf(socket).(*dialProbe); ok {
 		c.probe.Store(probe)
-		held = probe.user
 	}
 	layers := h.layers
-	c.userdata.Store(&held)
 	c.layers = make([]*layerNode, len(layers))
 	// Nodes share one allocation; the pointer slice keeps their indexed faces.
 	nodes := make([]layerNode, len(layers))
@@ -63,52 +84,31 @@ func (h *stackDriver) OnOpen(socket Conn) {
 		node.stack = c
 		node.index = i
 		node.lower = below
-		node.up = layerUp{node}
+		node.upper = layerUpper{node}
 		c.layers[i] = node
 		below = node
 	}
-	socket.SetUserdata(c)
-	var flushCount int
+	setStackState(socket, c)
+	c.firstHeld = -1
 	for i, layer := range layers {
 		node := c.layers[i]
 		node.conn = layer.Attach(layerCtx{node})
 		node.ops = opsOf(node.conn)
-		if node.ops.wireSent != nil {
-			// Later Attach calls may write below and synchronously report a
-			// send. Register this observer before attaching the next layer.
-			c.sends = append(c.sends, node)
-		}
-		if node.ops.flush != nil {
-			flushCount++
-		}
 		if node.ops.held != nil {
 			c.holders = true
-		}
-	}
-	// Flushers are first used after attachment, so their list can be sized once.
-	if flushCount > 0 {
-		c.flushers = make([]*layerNode, 0, flushCount)
-	}
-	c.firstHeld = -1
-	for i := len(c.layers) - 1; i >= 0; i-- {
-		node := c.layers[i]
-		if node.ops.flush != nil {
-			c.flushers = append(c.flushers, node) // flushes run top down
-		}
-		if node.ops.held != nil {
-			c.firstHeld = i
+			if c.firstHeld < 0 {
+				c.firstHeld = i
+			}
 		}
 	}
 	c.inTurn.Store(true)
 	defer c.inTurn.Store(false)
 	c.openUpTo()
-	if err := c.finishTurn(); err != nil {
-		_ = c.failTurn(err)
-	}
+	c.finishTurn()
 }
 
 func (h *stackDriver) OnRead(socket Conn) error {
-	if c, ok := socket.Userdata().(*stack); ok {
+	if c := stackOf(socket); c != nil {
 		return c.turn()
 	}
 	return nil
@@ -120,7 +120,7 @@ func (h *stackDriver) OnRead(socket Conn) error {
 func (h *stackDriver) OnTimer(socket Conn) error { return nil }
 
 func (h *stackDriver) OnClose(socket Conn, err error) {
-	switch held := socket.Userdata().(type) {
+	switch held := stackStateOf(socket).(type) {
 	case *stack:
 		held.closed(err)
 	case *dialProbe:
@@ -134,7 +134,6 @@ func (h *stackDriver) OnClose(socket Conn, err error) {
 // and the state they share.
 type stack struct {
 	top      Handler
-	topSent  func(Conn, SendReceipt) // the Handler's receipt notice; see SentObserver
 	socket   Conn
 	layers   []*layerNode
 	probe    atomic.Pointer[dialProbe] // a dial waiting for the stack to open, until it does
@@ -142,26 +141,25 @@ type stack struct {
 	reserved atomic.Int64              // bytes admitted at the top, not yet queued below
 	halfOpen bool                      // AllowHalfOpen
 	inLimit  int                       // MaxInboundBuffered; see inboundFull
-	// queueDrained is the Observer's QueueDrainedObserver, if any;
-	// heldPeak the most output the layers held since the last turn ended,
-	// and writeRefused a write the stack refused for capacity since then.
+	// writeWatched marks that at least one layer node has a write-progress
+	// watcher; heldPeak is the most output the layers held since the last turn
+	// ended, and writeRefused a write the stack refused for capacity since then.
 	// See noteQueueRoom.
-	queueDrained func(Conn)
-	heldPeak     atomic.Int64
-	writeRefused atomic.Bool
+	writeWatchOnce sync.Once
+	writeWatched   atomic.Bool
+	heldPeak       atomic.Int64
+	writeRefused   atomic.Bool
+	block          atomic.Pointer[blockio.State]
+	pullRead       atomic.Bool
+	localClosed    atomic.Bool
 
 	// packetBottom marks a stack on a packet connection whose bottom layer is
 	// a PacketLayer: its turns carry one datagram each, and the bottom layer
 	// is never paced, because a datagram it does not take is gone.
 	packetBottom bool
 	// firstHeld is the index of the lowest layer that holds output, or -1.
-	// A tracked write into that layer or any above it passes a holder — the
-	// layers below the write are the ones whose flushes can expand it — so
-	// its position cannot be exact; see SendReceipt.
 	firstHeld int
-	sends     []*layerNode // the layers that observe sends, bottom up
-	holders   bool         // some layer holds output of its own
-	flushers  []*layerNode // the layers that hold output to flush, top down
+	holders   bool // some layer holds output of its own
 
 	// closeCause is the cause of the close that began the stack's, for the
 	// dial a closing open stage fails; closePlan is a close a layer began for
@@ -169,21 +167,9 @@ type stack struct {
 	closeCause atomic.Pointer[error]
 	closePlan  atomic.Pointer[closePlan]
 
-	// receiptMu guards receipts, the outstanding tracked writes in the order
-	// they entered the stack; receiptCount spares a turn the lock while none
-	// is outstanding.
-	receiptMu    sync.Mutex
-	receipts     []pendingReceipt
-	receiptCount atomic.Int32
-
 	// inHeld marks a stack that stopped pulling from below because what its
 	// layers hold reached inLimit; a read above that makes room wakes it.
 	inHeld atomic.Bool
-	// moved counts reads out of the layers' deliveries, on the turn: a
-	// continuation that moves nothing waits for bytes from the socket.
-	moved uint64
-
-	userdata atomic.Pointer[any] // every layer's Userdata, the Handler's
 
 	topOpen atomic.Bool // the Handler's OnOpen ran; set on a turn
 	// openedCount is how many layers opened, bottom up: the prefix of the
@@ -200,23 +186,12 @@ type stack struct {
 	// yet; see shutDown.
 	shutsPending atomic.Int32
 
-	// inTurn is set while a turn runs; what waits for one — send reports for
-	// the layers, an end CloseWrite left waiting — is done as it ends rather
-	// than asking for another. sentPending is what the socket reported sent
-	// that the layers have not heard; see stackSent. turnAsked marks a turn
-	// requestTurn asked for and no turn has begun since: one is enough for
-	// any number of requests.
-	inTurn      atomic.Bool
-	turnAsked   atomic.Bool
-	sentPending atomic.Int64
-	// upPending marks a layer that wrote up in OnWireSent: the turn running
-	// has delivered already, so settle asks for the one that carries it.
-	upPending atomic.Bool
-
-	// wireQueued and wireSent count, on the wire, what the socket was handed
-	// and what it reported sent; see WireCounter.
-	wireQueued atomic.Uint64
-	wireSent   atomic.Uint64
+	// inTurn is set while a turn runs; what waits for one — an end CloseWrite
+	// left waiting, or a layer's close plan — is done as it ends rather than
+	// asking for another. turnAsked marks a turn requestTurn asked for and no
+	// turn has begun since: one is enough for any number of requests.
+	inTurn    atomic.Bool
+	turnAsked atomic.Bool
 
 	// timers holds the timer of every layer, and in its last slot the one
 	// the Handler armed with SetWakeDeadline; the socket's own wake slot
@@ -275,10 +250,10 @@ func (c *stack) turn() error {
 	err := c.run()
 	if err != nil {
 		c.inTurn.Store(false) // the failed callback is the last this turn runs
-	} else if err = c.finishTurn(); err == nil {
-		return nil
+		return c.failTurn(err)
 	}
-	return c.failTurn(err)
+	c.finishTurn()
+	return nil
 }
 
 // failTurn ends a connection whose turn failed — a layer's callback returned
@@ -291,10 +266,10 @@ func (c *stack) turn() error {
 // graceful close is the socket's now: reporting its cause would close the
 // socket at once and cut the drain short.
 func (c *stack) failTurn(err error) error {
-	graceful := gracefulCause(err)
+	graceful := errors.Is(err, io.EOF)
 	if !c.over() {
 		c.recordCloseCause(err)
-		c.beginClosing(len(c.layers), false)
+		c.beginClosing(len(c.layers), graceful)
 		c.closePlan.Store(&closePlan{cause: err, graceful: graceful, from: int32(len(c.layers))})
 	}
 	c.runClosePlan()
@@ -305,10 +280,10 @@ func (c *stack) failTurn(err error) error {
 }
 
 // over reports a stack no layer is called on any more: one that ended, or
-// one that is closing. A layer's callback can end it — a close from OnWireSent,
-// a protocol error — so every call into a layer is followed by this check
-// before the next.
-func (c *stack) over() bool { return c.state.Load()&stackPhaseMask >= stackClosing }
+// one that is closing. A layer's callback can end it — a close from OnTimer or
+// OnRead, or a protocol error — so every call into a layer is followed by this
+// check before the next.
+func (c *stack) over() bool { return c.state.Load()&stackPhaseMask >= stackDraining }
 
 // closedStack reports the socket's OnClose run: no turn and no callback is
 // owed any more.
@@ -340,29 +315,23 @@ func (c *stack) moveToEnding() {
 const stackNoWriters = -1
 
 // beginClosing publishes the stack as closing on behalf of the layer at
-// initiator, reporting whether this call published it; drain marks a close a
-// graceful drain request began, which a CloseWith may cut short later. The
-// close that does runs the goodbyes; one that finds the stack closing
-// already passes its cause to the socket alone.
-func (c *stack) beginClosing(initiator int, drain bool) bool {
+// initiator, reporting whether this call published it.
+func (c *stack) beginClosing(initiator int, graceful bool) bool {
+	phase := stackAborting
+	if graceful {
+		phase = stackDraining
+	}
 	for {
 		state := c.state.Load()
-		if state&stackPhaseMask >= stackClosing {
+		if state&stackPhaseMask >= stackDraining {
 			return false
 		}
-		next := uint32(initiator+1)<<stackPhaseBits | stackClosing
-		if drain {
-			next |= stackDrainBit
-		}
+		next := uint32(initiator+1)<<stackPhaseBits | phase
 		if c.state.CompareAndSwap(state, next) {
 			return true
 		}
 	}
 }
-
-// drainBegun reports a close a graceful drain request began; see
-// stackDrainBit.
-func (c *stack) drainBegun() bool { return c.state.Load()&stackDrainBit != 0 }
 
 // markOpen turns an opening stack open: every layer and the Handler opened.
 func (c *stack) markOpen() {
@@ -398,8 +367,8 @@ func (c *stack) markClosed() bool {
 func (c *stack) mayWriteDown(index int) bool {
 	state := c.state.Load()
 	switch state & stackPhaseMask {
-	case stackClosing:
-		return uint32(index+1) < (state>>stackPhaseBits)&stackInitiatorMask
+	case stackDraining, stackAborting:
+		return uint32(index+1) < state>>stackPhaseBits
 	case stackEnding, stackClosed:
 		return false
 	}
@@ -408,85 +377,53 @@ func (c *stack) mayWriteDown(index int) bool {
 
 // stackPhase is the stack's lifecycle; the low bits of stack.state.
 const (
-	stackOpening uint32 = iota // the layers open; the dial waits
-	stackOpen                  // settled: turns, writes and goodbyes flow
-	stackClosing               // a close began: its walk may still call layers
-	// stackEnding: the close reached the socket — the walk finished, or a
-	// cut ended it first. No layer is called from here; OnClose has not run.
-	stackEnding
-	stackClosed // the socket's OnClose ran
+	stackOpening  uint32 = iota // the layers open; the dial waits
+	stackOpen                   // settled: turns, writes and closes flow
+	stackDraining               // graceful Close walk in progress
+	stackAborting               // Abort walk in progress
+	stackEnding                 // close committed to socket; no layer called from here
+	stackClosed                 // the socket's OnClose ran
 )
 
 const (
 	stackPhaseBits = 8
 	stackPhaseMask = 1<<stackPhaseBits - 1
-	// stackInitiatorMask keeps the initiator's bits apart from the drain bit
-	// above them; an initiator is a layer index+1, at most maxLayers.
-	stackInitiatorMask = 0x7F
-	// stackDrainBit marks a close a graceful drain request began — a
-	// Handler's CloseGracefully or a layer's LayerContext.Close, published
-	// with the closing transition itself. A CloseWith arriving while that
-	// close is under way ends it at once, as Conn's documentation promises;
-	// repeated CloseWith calls on a close one of them began keep yielding.
-	stackDrainBit = 1 << (stackPhaseBits + 7)
 )
 
-// finishTurn ends a turn: the layers hear what was sent, then flush what
-// they hold — what OnWireSent wrote too — unless the connection is closing, an
-// abort dropping it and a graceful close having flushed already. A flush
-// can send, and the socket report it right away, inside the flush: the loop
-// takes each report on the turn it ended, so what the layers write for it
-// is flushed too, and only a report that lands after the last look waits
-// for a turn of its own.
-func (c *stack) finishTurn() error {
-	var err error
-	if len(c.sends) == 0 && len(c.flushers) == 0 {
-		// Receipts can owe wire progress even without byte observers. Clear
-		// that notification before settle: a partial send must wait for the
-		// next real report, rather than repeatedly scheduling empty turns.
-		if c.sentPending.Load() != 0 {
-			c.deliverSent()
-		}
-		c.noteQueueRoom()
-		c.inTurn.Store(false)
-		if c.shutsPending.Load() > 0 || c.receiptCount.Load() != 0 || c.over() {
-			c.settle()
-		}
-		return nil
-	}
-	for !c.over() {
-		c.deliverSent()
-		if c.over() {
-			break // a layer ended the connection: nothing more reaches any
-		}
-		c.openUpTo() // an Up().Open an OnWireSent made opens the layers above now
-		if flushErr := c.flushHeld(); err == nil {
-			err = flushErr
-		}
-		if c.sentPending.Load() == 0 || c.over() {
-			break
-		}
-	}
+// finishTurn ends a turn: outbound room changes are reported and deferred
+// close or CloseWrite work settles once no layer callback is on the stack.
+func (c *stack) finishTurn() {
 	c.noteQueueRoom()
 	c.inTurn.Store(false)
-	c.settle()
-	return err
+	if c.shutsPending.Load() > 0 || c.over() {
+		c.settle()
+	}
 }
 
-// noteQueueRoom tells an Observer implementing QueueDrainedObserver that the
-// connection's queue may have room again where no socket write reports it:
-// the output the layers hold shrank — a reliable transport's queue its peer
-// acknowledged — or a write was refused for capacity since the last turn
-// ended, which only a turn's work, an acknowledgement opening a window, can
-// make room for. A relay waiting on the queue would otherwise wait for a
-// write report that never comes. Held output is compared with the most the
-// layers held since the last turn ended, which the turn's start and every
-// write into the stack record. A write still in flight at the top counts as
-// a refusal: its refusal can land between its decision and its record. It
-// runs as the turn ends; a refusal no room was made for since is reported
-// again on the next turn, until the writer gets in.
+func (c *stack) enableWriteWatch() {
+	c.writeWatchOnce.Do(func() {
+		c.writeWatched.Store(true)
+		writecontrol.Watch(c.socket, c.notifyWrite)
+	})
+}
+
+func (c *stack) notifyWrite(sent int) {
+	if c.closedStack() {
+		return
+	}
+	for _, layer := range c.layers {
+		if ctrl := layer.writeControl.Load(); ctrl != nil {
+			ctrl.Notify(sent)
+		}
+	}
+}
+
+// noteQueueRoom notifies write-control watchers when the connection's queue
+// may have room again where no socket write reports it: the output the layers
+// hold shrank — a reliable transport's queue its peer acknowledged — or a
+// write was refused for capacity since the last turn ended.
 func (c *stack) noteQueueRoom() {
-	if c.queueDrained == nil || c.over() || !c.topOpen.Load() {
+	if !c.writeWatched.Load() || c.over() || !c.topOpen.Load() {
 		return
 	}
 	room := c.layers[len(c.layers)-1].writers.Load() > 0 ||
@@ -498,14 +435,14 @@ func (c *stack) noteQueueRoom() {
 		}
 	}
 	if room {
-		c.queueDrained(c.topConn())
+		c.notifyWrite(0)
 	}
 }
 
 // noteRefused records a write at the top refused for capacity, before the
 // write leaves; see noteQueueRoom.
 func (c *stack) noteRefused(err error) {
-	if c.queueDrained != nil && errors.Is(err, ErrOutboundOverflow) {
+	if c.writeWatched.Load() && errors.Is(err, ErrOutboundOverflow) {
 		c.writeRefused.Store(true)
 	}
 }
@@ -513,7 +450,7 @@ func (c *stack) noteRefused(err error) {
 // noteHeldPeak records what the layers hold now, if it is the most since
 // the last turn ended.
 func (c *stack) noteHeldPeak() {
-	if c.queueDrained == nil || !c.holders {
+	if !c.writeWatched.Load() || !c.holders {
 		return
 	}
 	held := int64(c.heldOutput())
@@ -536,14 +473,11 @@ func (c *stack) heldOutput() int {
 	return held
 }
 
-// settle does, as a turn ends, what waits for one: ends CloseWrite left
-// waiting for output to go below. Send reports that came after the turn's own
-// delivery — during its flush — get a turn of their own, which delivers them
-// and then flushes what OnWireSent writes. It runs only where no layer is in
-// a callback — the framework never calls a layer from inside another's — so a
-// layer holding its own lock while it writes or flushes below is never called
-// back. Once the connection is closing, nothing reaches the layers: the
-// socket's own graceful close carries the queue from there.
+// settle does, as a turn ends, what waits for one: a layer's close plan or
+// ends CloseWrite left waiting for output to go below. It runs only where no
+// layer is in a callback — the framework never calls a layer from inside
+// another's — so a layer holding its own lock while it writes below is never
+// called back.
 func (c *stack) settle() {
 	if c.closePlan.Load() != nil {
 		// A close a layer began during this turn walks here, at its end, off
@@ -551,12 +485,7 @@ func (c *stack) settle() {
 		c.runClosePlan()
 	}
 	if c.over() {
-		c.sentPending.Store(0)
 		return
-	}
-	c.retireReceipts() // before the look: an OnSent write asks for its own turn
-	if c.sentPending.Load() > 0 || c.upPending.Swap(false) {
-		c.requestTurn()
 	}
 	c.finishShuts()
 }
@@ -564,49 +493,13 @@ func (c *stack) settle() {
 // requestTurn asks for a turn to settle what waits for one; a turn running
 // now settles it as it ends. Requests made before the asked-for turn begins
 // share it: that turn settles everything any of them waits for, so writes
-// refused or send reports coming fast while turns are held up — a slow
-// Observer, a busy loop — schedule one wake, not one each.
+// refused while turns are held up schedule one wake, not one each.
 func (c *stack) requestTurn() {
 	if !c.inTurn.Load() && !c.turnAsked.Load() && c.turnAsked.CompareAndSwap(false, true) {
 		if c.socket.Wake() != nil {
 			c.turnAsked.Store(false)
 		}
 	}
-}
-
-// deliverSent passes the layers that observe sends what the socket reported
-// sent since they last heard.
-func (c *stack) deliverSent() {
-	// The count is consumed even with no layer to deliver it to: a turn's
-	// finish loops while it is non-zero, and a stack whose only send traffic
-	// is its own tracked writes (receipts, no OnWireSent observer) would spin
-	// there forever — and hold every later turn of the connection, writes
-	// included, out.
-	n := c.sentPending.Swap(0)
-	if n == 0 {
-		return
-	}
-	if len(c.sends) == 0 {
-		return
-	}
-	c.sent(int(n))
-}
-
-// flushHeld flushes what the layers hold, top down, so what one flushes
-// reaches the next: a turn ends with nothing held that a write in it made.
-func (c *stack) flushHeld() error {
-	for _, layer := range c.flushers {
-		if !layer.opened.Load() {
-			continue
-		}
-		if c.over() {
-			return nil
-		}
-		if err := layer.ops.flush(layerCtx{layer}); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // run is a turn's work: the layers bottom up, then the Handler.
@@ -625,14 +518,14 @@ func (c *stack) run() error {
 			}
 		}
 		// A pause stops this boundary's consumer, never the whole turn:
-		// timers, higher layers, send reports and flushes still run.
+		// timers and higher layers still run.
 		if err := c.inbound(layer); err != nil {
 			return err
 		}
 		if c.over() {
 			return nil // a layer closed the connection: nothing above runs
 		}
-		c.openUpTo() // an Up().Open the layer made opens the layers above now
+		c.openUpTo() // a ctx.Open() the layer made opens the layers above now
 	}
 	if !c.topOpen.Load() {
 		return c.endOfStream(false)
@@ -646,9 +539,16 @@ func (c *stack) run() error {
 		}
 	}
 	top := c.layers[len(c.layers)-1]
-	if control := top.readControl.Load(); !control.ReadsPaused() {
+	if control := top.readControl.Load(); !control.ReadPaused() {
+		top.woken.Store(false)
 		control.ConsumerRuns()
-		if err := c.top.OnRead(top); err != nil {
+		if c.pullRead.Load() {
+			if st := c.block.Load(); st != nil {
+				if r := st.ActiveReader(); r != nil {
+					r.Pump()
+				}
+			}
+		} else if err := c.top.OnRead(top); err != nil {
 			return err
 		}
 	}
@@ -656,15 +556,20 @@ func (c *stack) run() error {
 }
 
 // endOfStream closes a stack without half-open once the peer's end reached
-// the Handler, as a plain socket's end closes it. A Handler that is paused,
-// owed a resume turn, or owed a continuation it asked for holds the end
-// back; one that has not opened has nothing to hold it back with. The socket's own end never closes a stack:
-// what its layers still hold reaches the Handler first.
+// the Handler, or a half-open stack once both halves ended and drained.
 func (c *stack) endOfStream(handlerRan bool) error {
-	if c.halfOpen || !c.ended() {
+	if !c.ended() {
 		return nil
 	}
-	if handlerRan && (c.handlerHeld() || c.yieldOwed()) {
+	top := c.layers[len(c.layers)-1]
+	heldByConsumer := c.handlerHeld() || (top.held() > 0 && top.woken.Load())
+	if c.halfOpen {
+		if !c.writeSideEnded(top) || !c.drained() || c.socket.InboundBuffered() != 0 || heldByConsumer {
+			return nil
+		}
+		return io.EOF
+	}
+	if handlerRan && heldByConsumer {
 		return nil
 	}
 	if c.socket.InboundBuffered() != 0 || c.heldBelowTop() != 0 {
@@ -672,6 +577,12 @@ func (c *stack) endOfStream(handlerRan bool) error {
 		return io.ErrUnexpectedEOF
 	}
 	return io.EOF
+}
+
+func (c *stack) writeSideEnded(top *layerNode) bool {
+	return top.gate.Load()&gateWriteShut != 0 &&
+		c.shutsPending.Load() == 0 &&
+		c.socket.State()&StateWriteEnded != 0
 }
 
 // heldBelowTop is the input the layers below the Handler's layer hold for
@@ -693,19 +604,19 @@ func (c *stack) handlerHeld() bool {
 // ended reports a stream whose end reached the Handler: the top layer ended
 // it, or the socket ended with every layer able to move its input on — the
 // turn ran each one unpaused and it took what it could. A layer that never
-// calls Up().End() still lets the connection close then. What a layer left
+// calls Upper().End() still lets the connection close then. What a layer left
 // below the Handler at the socket's end can never be completed — its peer
 // sent a partial unit, or a delivery its consumer above declined to read —
 // and endOfStream reports that as a truncation. Pacing is not a hold: at
 // the socket's end no turn can come to unpace the layer, so its delivery is
-// as declined as a smaller one. A paused or yielded layer may still move
+// as declined as a smaller one. A paused or stalled layer may still move
 // its input, and holds the end back, as a paused Handler does.
 func (c *stack) ended() bool {
 	last := len(c.layers) - 1
 	if last < 0 {
 		return false
 	}
-	if c.layers[last].ended {
+	if c.layers[last].ended.Load() {
 		return true
 	}
 	if !socketEndedBehind(c.socket) {
@@ -726,7 +637,7 @@ func socketEndedBehind(socket Conn) bool {
 	if s, ok := socket.(interface{ endedBehind() bool }); ok {
 		return s.endedBehind()
 	}
-	return socket.State()&StatePeerEnded != 0
+	return socket.State()&StateReadEnded != 0
 }
 
 // drained reports a stack that handed up everything the peer sent, the
@@ -741,15 +652,6 @@ func (c *stack) drained() bool {
 	return true
 }
 
-// yieldOwed reports a continuation the Handler asked for with YieldRead and
-// has not had yet; the socket keeps it.
-func (c *stack) yieldOwed() bool {
-	if socket, ok := c.socket.(interface{ yieldOwed() bool }); ok {
-		return socket.yieldOwed()
-	}
-	return false
-}
-
 // inbound runs a layer's OnRead until it takes nothing more: the bytes
 // below may sit in several chunks, and a layer reads one at a time, so it is
 // called again while what waits below shrinks. It stops once nothing waits,
@@ -760,7 +662,7 @@ func (c *stack) yieldOwed() bool {
 func (c *stack) inbound(layer *layerNode) error {
 	packetBottom := c.packetBottom && layer.index == 0
 	for {
-		if layer.lower.ReadsPaused() {
+		if layer.lower.ReadPaused() {
 			return nil
 		}
 		// Only the bottom layer stops at the limit: it is the one taking new
@@ -780,14 +682,19 @@ func (c *stack) inbound(layer *layerNode) error {
 			layer.paced.Store(true)
 			return nil
 		}
+		below, _ := layer.lower.(*layerNode)
+		if below != nil {
+			below.woken.Store(false)
+			below.readControl.Load().ConsumerRuns()
+		}
 		before := layer.waitingBelow()
 		if err := layer.conn.OnRead(layerCtx{layer}); err != nil {
 			return err
 		}
-		if c.over() || layer.stalled.Load() {
+		if c.over() || layer.stalled.Load() || (below != nil && below.woken.Load()) {
 			return nil
 		}
-		// An Up().Open the layer made takes effect here, before the round
+		// A ctx.Open() the layer made takes effect here, before the round
 		// reads on into bytes that arrived behind its handshake.
 		c.openUpTo()
 		if packetBottom {
@@ -914,9 +821,10 @@ func (c *stack) closed(err error) {
 		return
 	}
 	c.stopTimers()
-	c.sentPending.Store(0)
 	c.closePlan.Store(nil)
-	c.dropReceipts()
+	if st := c.block.Load(); st != nil {
+		st.OnClose(c.localClosed.Load(), err)
+	}
 	if c.topOpen.Load() {
 		c.top.OnClose(c.topConn(), err)
 	}
@@ -938,67 +846,6 @@ func (c *stack) closed(err error) {
 // topConn is the connection the Handler sees: the top layer's.
 func (c *stack) topConn() Conn { return c.layers[len(c.layers)-1] }
 
-// sent passes the socket's report of n bytes sent to the layers that
-// observe sends. A layer that writes up in OnWireSent marks the write to
-// wait for a turn: this one is running, and its pass has already delivered,
-// so the turn asked for carries the bytes to the layer above.
-func (c *stack) sent(n int) {
-	for _, layer := range c.sends {
-		if c.over() {
-			return // a layer below ended the connection: the rest hear nothing
-		}
-		held := layer.held()
-		layer.ops.wireSent(layerCtx{layer}, n)
-		if layer.held() != held {
-			c.upPending.Store(true)
-		}
-	}
-}
-
-// stackSent wraps the Observer's OnBytesWritten, if any, so a stack's send
-// reports reach its layers.
-//
-// A send report can run inside the write that made it — a layer's OnWrite
-// writing below while it holds a lock, crypto/tls its record lock — so it
-// calls no layer: it counts the bytes, for WireSent at once and for the
-// layers' OnWireSent on the next turn's end, and asks for that turn.
-// sentNoticeOf resolves the Handler's receipt notice, a FuncHandler's Sent
-// field or a SentObserver; nil when the Handler wants none.
-func sentNoticeOf(handler Handler) func(Conn, SendReceipt) {
-	if fh, ok := asFuncs(handler); ok {
-		if fh == nil {
-			return nil
-		}
-		return fh.Sent
-	}
-	if observer, ok := handler.(SentObserver); ok {
-		return observer.OnSent
-	}
-	return nil
-}
-
-func stackSent(next func(Conn, int)) func(Conn, int) {
-	return func(conn Conn, n int) {
-		if l, ok := conn.(*layerNode); ok && !l.stack.closedStack() {
-			c := l.stack
-			c.wireSent.Add(uint64(n))
-			if !c.over() && (len(c.sends) > 0 || c.receiptCount.Load() != 0) {
-				c.sentPending.Add(int64(n))
-				c.requestTurn()
-			}
-		}
-		if next != nil {
-			next(conn, n)
-		}
-	}
-}
-
-// gracefulCause reports a close that lets the queue drain first; see
-// GracefulCloser.
-func gracefulCause(cause error) bool {
-	return cause == nil || errors.Is(cause, io.EOF) || errors.Is(cause, io.ErrUnexpectedEOF)
-}
-
 // queued is what the connection still has to send: the socket's queue and
 // what the layers hold.
 func (c *stack) queued() int {
@@ -1008,14 +855,11 @@ func (c *stack) queued() int {
 	return c.socket.OutboundBuffered()
 }
 
-// closeSocket is a close reaching the socket with no layer above to say a
-// goodbye for: the stack moves to closing first, then the socket closes. A
-// graceful one is the socket's own CloseGracefully — writes refused, queue
-// drained, bounded by LingerTimeout without progress; see Conn.CloseGracefully.
-// An abort closes at once, and cuts a graceful close's wait short.
-func (c *stack) closeSocket(cause error) error {
+// closeSocket is a close reaching the socket with no layer above to run
+// OnClosing for: the stack moves to closing first, then the socket closes.
+func (c *stack) closeSocket(cause error, graceful bool) error {
 	c.recordCloseCause(cause)
-	return c.endAtSocket(cause, c.beginClosing(stackNoWriters, false), gracefulCause(cause))
+	return c.endAtSocket(cause, c.beginClosing(stackNoWriters, graceful), graceful)
 }
 
 // recordCloseCause keeps the first close's cause.
@@ -1025,26 +869,25 @@ func (c *stack) recordCloseCause(cause error) {
 	}
 }
 
-// socketClose ends the stack at the socket in the mode the walk carried, so a
-// graceful close a layer began drains whatever its cause — the cause is
-// reported, never re-read to choose the mode.
+// socketClose ends the stack at the socket in the mode the walk carried.
 func (s socketLower) socketClose(cause error, graceful bool) error {
 	s.stack.recordCloseCause(cause)
-	return s.stack.endAtSocket(cause, s.stack.beginClosing(stackNoWriters, false), graceful)
+	return s.stack.endAtSocket(cause, s.stack.beginClosing(stackNoWriters, graceful), graceful)
 }
 
 // endAtSocket hands cause to the socket, graceful choosing between the
-// socket's draining close and its one-shot one. first reports that this
-// close moved the stack to closing: a socket found closed already is then
-// the peer answering the close first, and the close reports itself done —
-// reported by the close that did not move the stack as it is.
+// socket's draining Close and its immediate Abort.
 func (c *stack) endAtSocket(cause error, first, graceful bool) error {
 	c.moveToEnding()
 	var err error
 	if graceful {
-		err = c.socket.CloseGracefully(cause)
+		if cg, ok := c.socket.(interface{ closeGracefully(error) error }); ok && cause != nil {
+			err = cg.closeGracefully(cause)
+		} else {
+			err = c.socket.Close()
+		}
 	} else {
-		err = c.socket.CloseWith(cause)
+		err = c.socket.Abort(cause)
 	}
 	if first && errors.Is(err, net.ErrClosed) {
 		return nil

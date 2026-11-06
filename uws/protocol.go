@@ -209,13 +209,16 @@ func (c *Conn) releaseHandshakeState(state *handshakeState) {
 // frames. It yields after the connection's frame budget for one chunk so a
 // hot connection returns to the scheduler and cannot monopolize one worker.
 // A round that carries several frames batches the small replies they send and
-// hands them to the transport together when it ends. While its queue holds
-// more than the low watermark, the round also marks itself in the round word,
-// so the sends it makes count as its replies (watchReplies).
+// hands them to the transport together when it ends.
 func (c *Conn) readAvailable() error {
 	err := c.readRound()
 	if round := c.round.Load(); round != 0 {
-		c.endRound(round)
+		if round&roundBatching != 0 {
+			c.endRound(round)
+		}
+		if round&roundDeferredClose != 0 {
+			c.sendDeferredClose()
+		}
 	}
 	if c.heartbeat != nil {
 		c.heartbeatTick(time.Now())
@@ -225,63 +228,42 @@ func (c *Conn) readAvailable() error {
 
 func (c *Conn) readRound() error {
 	c.readFrames = 0
-	high, low := 0, 0
-	if c.config != nil {
-		high, low = c.config.outboundHigh, c.config.outboundLow
-	}
-	metadata := c.metadata.Load()
 	for {
-		// The connection's own replies backed up to the high watermark, or a
-		// pause that has not drained to the low watermark: stop consuming, so
-		// the bytes build up in UIO's inbound and its hold stops the socket
-		// reads. The steady state — not paused, no replies followed, the
-		// queue at the low watermark or below — has nothing to decide.
-		if high > 0 && (c.internalReadsPaused() || c.raw.OutboundBuffered() > low || c.replies.Load() != nil) &&
-			c.holdsReplies(high) {
-			return nil
-		}
-		// A handshake can carry frames in its final read. Those bytes have
-		// already left the transport buffer and must precede subsequent input,
-		// even if OnOpen or one of their callbacks paused consumption.
-		staged := metadata != nil && len(metadata.staged) != 0
-		var data []byte
-		if staged {
-			data = metadata.staged
-		} else {
-			data = c.raw.PeekChunk()
-		}
+		data := c.raw.PeekChunk()
 		if len(data) == 0 {
 			return nil
 		}
 		if !c.opened.Load() {
-			err := c.consumeHandshake(data)
+			discard, err := c.consumeHandshake(data)
 			if err != nil {
 				_, _ = c.raw.Discard(len(data))
 				return c.rejectHandshake(err)
 			}
-			_, _ = c.raw.Discard(len(data))
-			metadata = c.metadata.Load()
+			_, _ = c.raw.Discard(discard)
+			if !c.opened.Load() {
+				continue
+			}
+			if _, asLayer := c.handler.(layerSink); asLayer {
+				// Layers above open after this callback returns; any trailing
+				// frames remain in Lower() for the woken turn after open.
+				return nil
+			}
 			continue
 		}
 
 		consumed, err := c.consumeFrames(data)
 		if consumed > 0 {
-			if staged {
-				metadata.staged = metadata.staged[consumed:]
-				if len(metadata.staged) == 0 {
-					metadata.staged = nil
-				}
-			} else {
-				_, _ = c.raw.Discard(consumed)
-			}
+			_, _ = c.raw.Discard(consumed)
 		}
 		if err != nil {
 			if err == errReadPaused {
 				return nil
 			}
 			if err == errReadBudget || errors.Is(err, errReadBudget) {
-				if yieldErr := c.raw.YieldRead(); yieldErr != nil {
-					return fmt.Errorf("uws: yield buffered read: %w", yieldErr)
+				if c.raw.InboundBuffered() > 0 {
+					if wakeErr := c.raw.Wake(); wakeErr != nil {
+						return fmt.Errorf("uws: wake buffered read: %w", wakeErr)
+					}
 				}
 				return nil
 			}
@@ -464,19 +446,31 @@ func (c *Conn) consumeFrames(data []byte) (int, error) {
 	}
 	cfg := c.frameParserConfig()
 	limit := -1
+	frameBudget := int32(minFramesPerDataEvent)
 	if c.config != nil {
 		limit = c.config.shortReadLimit
+		if c.config.maxFramesPerDataEvent > 0 {
+			frameBudget = int32(c.config.maxFramesPerDataEvent)
+		}
 	}
+	heartbeat := c.heartbeat
 	for consumed < len(data) {
 		if size, ok, err := c.consumeShortFrame(data[consumed:], limit); ok {
 			consumed += size
 			if err == nil {
-				err = c.countFrame()
+				c.readFrames++
+				if heartbeat != nil {
+					heartbeat.parsed.Add(1)
+				}
+				if c.readPaused.Load() != 0 {
+					return consumed, errReadPaused
+				}
+				if c.readFrames >= frameBudget {
+					return consumed, errReadBudget
+				}
+				continue
 			}
-			if err != nil {
-				return consumed, err
-			}
-			continue
+			return consumed, err
 		}
 		parsed, size, complete, err := frame.ParseFrame(data[consumed:], cfg)
 		if err != nil {
@@ -590,32 +584,31 @@ func (c *Conn) releaseParser() {
 	c.parser = nil
 }
 
-// releaseReadState runs in the serialized terminal callback. A connection
-// aborted while explicitly paused must release its retained handshake tail
-// even when no read turn consumed that tail.
+// releaseReadState runs in the serialized terminal callback.
 func (c *Conn) releaseReadState() {
 	c.releaseParser()
 	c.releaseAssembler()
-	if metadata := c.metadata.Load(); metadata != nil {
-		metadata.staged = nil
-	}
 }
 
 // consumeHandshake incrementally accumulates the bounded HTTP header, installs
-// negotiated compression, writes the server response, and then feeds any
-// bytes received after the header as WebSocket frames.
-func (c *Conn) consumeHandshake(data []byte) error {
+// negotiated compression, writes the server response, and reports how many
+// bytes of data belonged to the HTTP handshake (leaving any trailing WebSocket
+// frame bytes in the transport's inbound buffer).
+func (c *Conn) consumeHandshake(data []byte) (int, error) {
 	state := c.handshake.Load()
 	if state == nil {
-		return ErrClosed
+		return len(data), ErrClosed
 	}
 	if c.isClient() {
 		state.data = append(state.data, data...)
-		err := c.consumeClientHandshake()
+		tail, err := c.consumeClientHandshake()
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return nil
+			return len(data), nil
 		}
-		return err
+		if err != nil {
+			return len(data), err
+		}
+		return len(data) - tail, nil
 	}
 	// A request that arrived in one read is parsed where it lies: the read
 	// round discards it only after this returns, and OnOpen, the last user of
@@ -635,14 +628,14 @@ func (c *Conn) consumeHandshake(data []byte) error {
 			if len(state.data) == 0 {
 				state.data = append(state.data, data...)
 			}
-			return nil
+			return len(data), nil
 		}
-		return err
+		return len(data), err
 	}
 	if authorize := c.config.authorize; authorize != nil {
 		request, err := req.BuildHTTP()
 		if err != nil {
-			return err
+			return len(data), err
 		}
 		if request.RemoteAddr == "" {
 			request.RemoteAddr = c.raw.RemoteAddr().String()
@@ -653,7 +646,7 @@ func (c *Conn) consumeHandshake(data []byte) error {
 		req.HTTP = request
 		userdata, err := authorize(request)
 		if err != nil {
-			return &authorizeError{err}
+			return len(data), &authorizeError{err}
 		}
 		c.userData = userdata
 	}
@@ -669,7 +662,7 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	protocol := handshake.SelectSubprotocol(req.Subprotocols, c.config.subprotocols)
 	params, extensions, err := extension.NegotiateServerWithPolicy(req.Extensions, c.config.compressionEnabled, !c.config.compressionContextTakeover)
 	if err != nil {
-		return err
+		return len(data), err
 	}
 	params.Level = c.config.compressionLevel
 	if params.Enabled {
@@ -683,78 +676,44 @@ func (c *Conn) consumeHandshake(data []byte) error {
 	wire := handshake.AppendServerResponse(response.AvailableBuffer()[:0], req, protocol, extensions)
 	response.CommitWrite(len(wire))
 	if err := c.writeTransportOwned(response); err != nil {
-		return err
+		return len(data), err
 	}
 	if err := c.raw.Flush(); err != nil {
-		return err
+		return len(data), err
 	}
 	c.setSubprotocol(protocol)
 	if !c.markOpened() {
-		return context.DeadlineExceeded
+		return len(data), context.DeadlineExceeded
 	}
 	if c.heartbeat != nil {
 		c.beginHeartbeat()
 	}
-	extra := append([]byte(nil), input[consumed:]...)
+	tail := len(input) - consumed
 	c.notifyOpen()
-	if len(extra) > 0 {
-		return c.feedBehindHandshake(extra)
-	}
-	return nil
-}
-
-// feedBehindHandshake takes the frames that arrived behind a handshake. A
-// plain Conn's OnOpen ran inside notifyOpen, so they are fed now. A Conn
-// running as a layer opens the layers above only on the turn's open stage,
-// after this callback returned — so the layer held the frames, and feeds
-// them in the round asked for after it; see wsLayerHandler.
-func (c *Conn) feedBehindHandshake(extra []byte) error {
-	if sink, ok := c.handler.(layerSink); ok {
-		sink.w.staged = append(sink.w.staged, extra...)
-		return nil
-	}
-	consumed, err := c.consumeFrames(extra)
-	if err == errReadPaused || err == errReadBudget {
-		if consumed < len(extra) {
-			c.ensureMetadata().staged = extra[consumed:]
-		}
-		if err == errReadBudget {
-			return c.raw.YieldRead()
-		}
-		return nil
-	}
-	if err != nil {
-		if errors.Is(err, ErrClosed) {
-			// OnOpen closed this end: stop consuming rather than treat it as
-			// a protocol error, which would end the transport before the peer
-			// answers the close handshake.
-			return nil
-		}
-		return c.protocolClose(err)
-	}
-	return nil
+	return len(data) - tail, nil
 }
 
 // consumeClientHandshake validates and parses the response once, negotiates
-// extensions from that result, and preserves post-header frame bytes.
-func (c *Conn) consumeClientHandshake() error {
+// extensions from that result, and reports the unconsumed post-header byte
+// length in state.data.
+func (c *Conn) consumeClientHandshake() (int, error) {
 	state := c.handshake.Load()
 	if state == nil {
-		return ErrClosed
+		return 0, ErrClosed
 	}
 	consumed, protocol, extensions, err := handshake.ValidateClientResponse(state.data, state.clientKey, c.config.subprotocols, c.config.maxHeaderBytes)
 	if err != nil {
 		if errors.Is(err, io.ErrUnexpectedEOF) {
-			return err
+			return 0, err
 		}
 		if refused := clientHandshakeError(err); refused != err {
-			return refused
+			return 0, refused
 		}
-		return fmt.Errorf("uws: validate server handshake: %w", err)
+		return 0, fmt.Errorf("uws: validate server handshake: %w", err)
 	}
 	params, err := extension.NegotiateClient(extensions, c.config.compressionEnabled)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	params.Level = c.config.compressionLevel
 	if params.Enabled {
@@ -765,17 +724,14 @@ func (c *Conn) consumeClientHandshake() error {
 	}
 	c.setSubprotocol(protocol)
 	if !c.markOpened() {
-		return context.DeadlineExceeded
+		return 0, context.DeadlineExceeded
 	}
 	if c.heartbeat != nil {
 		c.beginHeartbeat()
 	}
-	extra := append([]byte(nil), state.data[consumed:]...)
+	tail := len(state.data) - consumed
 	c.notifyOpen()
-	if len(extra) > 0 {
-		return c.feedBehindHandshake(extra)
-	}
-	return nil
+	return tail, nil
 }
 
 // rejectHandshake ends a connection whose handshake failed with err. A
@@ -805,17 +761,21 @@ func (c *Conn) rejectHandshake(err error) error {
 
 // requestClose asks this end's connection to close. A plain Conn closes its
 // transport; one running as a layer asks the stack, so the Close frame its
-// layer says and the drain the stack waits for run as one close from this
+// layer sends and the drain the stack waits for run as one close from this
 // layer. A graceful cause closes gracefully, anything else aborts.
 func (c *Conn) requestClose(cause error) error {
+	graceful := cause == nil || errors.Is(cause, io.EOF)
 	if sink, ok := c.handler.(layerSink); ok {
-		if cause == nil || errors.Is(cause, io.EOF) || errors.Is(cause, io.ErrUnexpectedEOF) {
-			return sink.w.ctx.Close(cause)
+		if graceful {
+			return sink.w.ctx.Close()
 		}
 		return sink.w.ctx.Abort(cause)
 	}
 	if closer, ok := c.raw.(uio.Conn); ok {
-		return closer.CloseWith(cause)
+		if graceful {
+			return closer.Close()
+		}
+		return closer.Abort(cause)
 	}
 	return net.ErrClosed
 }
@@ -895,8 +855,15 @@ func (c *Conn) tryCloseTransport() (bool, error) {
 }
 
 func (c *Conn) closePendingTransport() (bool, error) {
-	if !c.writes.close.claimPendingTransportClose(c.wireTracked()) {
-		return false, nil
+	if !c.writes.close.claimPendingTransportClose(c.OutboundBuffered()) {
+		if c.config != nil && c.config.heartbeatInterval <= 0 && !c.config.observeTraffic {
+			c.ensureCloseWatch()
+			if !c.writes.close.claimPendingTransportClose(c.OutboundBuffered()) {
+				return false, nil
+			}
+		} else {
+			return false, nil
+		}
 	}
 	c.stopCloseTimer()
 	return true, c.requestClose(io.EOF)

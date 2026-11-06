@@ -71,14 +71,14 @@ type xorConn struct{ uio.PassThrough }
 // OnRead runs when bytes arrived from below: it XORs them into the space the
 // layer above reads from, and consumes them below.
 func (xorConn) OnRead(ctx uio.LayerContext) error {
-	lower := ctx.Down()
+	lower := ctx.Lower()
 	chunk := lower.PeekChunk()
 	if len(chunk) == 0 {
 		return nil
 	}
-	out := ctx.Up().Reserve(len(chunk))[:len(chunk)]
+	out := ctx.Upper().Reserve(len(chunk))[:len(chunk)]
 	copy(out, xor(chunk))
-	ctx.Up().Commit(len(chunk))
+	ctx.Upper().Commit(len(chunk))
 	_, err := lower.Discard(len(chunk))
 	return err
 }
@@ -86,7 +86,7 @@ func (xorConn) OnRead(ctx uio.LayerContext) error {
 // OnWrite runs when the layer above writes: it XORs the bytes and writes
 // them below.
 func (xorConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
-	if _, err := ctx.Down().Write(xor(p)); err != nil {
+	if _, err := ctx.Lower().Write(xor(p)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -100,7 +100,7 @@ func (wiretap) Attach(uio.LayerContext) uio.LayerHandler { return tapConn{} }
 type tapConn struct{ uio.PassThrough }
 
 func (t tapConn) OnRead(ctx uio.LayerContext) error {
-	if chunk := ctx.Down().PeekChunk(); len(chunk) > 0 {
+	if chunk := ctx.Lower().PeekChunk(); len(chunk) > 0 {
 		fmt.Printf("wire in   % x\n", chunk)
 	}
 	return t.PassThrough.OnRead(ctx) // deliver them as they are
@@ -108,7 +108,7 @@ func (t tapConn) OnRead(ctx uio.LayerContext) error {
 
 func (t tapConn) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
 	fmt.Printf("wire out  % x\n", p)
-	return ctx.Down().Write(p)
+	return ctx.Lower().Write(p)
 }
 
 func main() {

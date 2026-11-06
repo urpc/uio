@@ -27,10 +27,10 @@ frame reaches you straight from the read buffer.
   from any goroutine and keep their order; they never block on the socket.
 - **Batched replies.** Small replies to the frames of one read are encoded
   together and handed to the socket as one write.
-- **Bounded by design.** Limits on frame and message size; replies are paced
-  by watermarks that pause the connection's reads instead of growing memory,
-  and an optional hard limit refuses any send past it; handshake and close
-  time are bounded, and heartbeats work on both ends.
+- **Bounded by design.** Limits on frame and message size, explicit
+  `PauseRead`/`ResumeRead` with `MaxInboundBuffered` TCP backpressure, an
+  optional `MaxOutboundBuffered` hard limit on queued output, bounded handshake
+  and close timeouts, and heartbeats on both ends.
 
 ## Install
 
@@ -88,9 +88,7 @@ finished.
    callbacks of one connection are ordered and never overlap.
 4. **Reply.** What the handler sends is queued; small replies to one read's
    frames are batched into one write. Sends from other goroutines join the same
-   queue in order. When a peer stops reading its replies and they back the
-   queue up to the high watermark, the connection stops reading its socket
-   until the queue drains.
+   queue in order.
 
 ## Behind `net/http`
 
@@ -203,8 +201,7 @@ are read when `Serve` or `Dial` first starts the transport and never again.
 | `WriteCoalesce` | 4 KiB | Writes smaller than this join the connection's outbound batch instead of taking a send of their own; a negative value turns size-based buffering off. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
 | `Executor` | uio default | Runs connection and write turns on the native backend; the `stdio` backend does not use it. |
-| `OutboundHighWatermark` | 64 KiB | Queued output at which a connection whose own replies fill it stops reading, so TCP flow control slows its peer instead of the replies piling up. Output sent from elsewhere never pauses reads. A negative value disables the pause. |
-| `OutboundLowWatermark` | High/4 | Queued output at or below which a paused connection reads again. |
+| `MaxInboundBuffered` | 64 KiB | Transport receive bound, allowing `Conn.PauseRead` to stop socket reads and apply TCP backpressure. |
 | `MaxOutboundBuffered` | off | Hard limit on one connection's queued output from any sender: a send past it returns `ErrBackpressure` and queues nothing. Size it to fit the largest message you send. |
 
 A `Server` adds `CheckOrigin` and `Authorize`, and a `Dialer` adds `Header`
@@ -212,63 +209,43 @@ and `RequestHeader` (see [Authentication](#authentication)). The `Handler`
 lives in `Options`, shared by every connection a server accepts or a dialer
 dials, with per-dial state passed as `Dial`'s userdata. The underlying transport is built from these
 options and is not otherwise exposed; `Executor` is the scheduling escape
-hatch. Invalid combinations, such as a low watermark not below the high
-one, a high watermark above `MaxOutboundBuffered`, or a compression level
-outside 1-9, make `Serve` and `Dial` return `ErrInvalidOptions`.
+hatch. Invalid combinations, such as a compression level outside 1-9, make
+`Serve` and `Dial` return `ErrInvalidOptions`.
 
-**Backpressure.** The watermarks pace what a connection's own reads produce
-while its peer is slow: the replies its `OnMessage` sends on the same
-connection, and the Pongs that answer the peer's Pings. A connection whose
-queue reaches the high watermark with its own replies filling at least the
-band between the watermarks stops consuming; the bytes pile up in the
-transport's inbound buffer until it stops reading the socket, and the peer's
-TCP window closes. Draining to the low watermark resumes reads; no message is
-dropped. `Server.Stats` and `Dialer.Stats` count the pauses and resumes. The
-pause is a plain transport's: a tracked one — a layer stack, TLS under the
-protocol — reports its sends in wire bytes, which are not the frame bytes
-replies are counted in, so over such a stack the watermarks pace nothing and
-`MaxOutboundBuffered` alone bounds the queue.
+**Backpressure.** Output is bounded at the sender by `MaxOutboundBuffered`:
+past the limit `SendText`, `SendBinary` and `Ping` return `ErrBackpressure` and
+queue nothing, so the caller decides to drop, retry later or close.
 
-Output that does not come from the connection's own reads — a broadcast, a
-subscription push, a client uploading from its own goroutine, messages another
-connection forwards — is queued all the same but never pauses reads: stopping
-them would not slow that output, only keep the peer from being read, and two
-ends that both did so would wait on each other for good. Bound it at the
-sender: set `MaxOutboundBuffered`, and past the limit `SendText`, `SendBinary`
-and `Ping` return `ErrBackpressure`, and the caller decides to drop, retry
-later or close.
-
-For a relay or an application work queue, `Conn.PauseReads()` and
-`Conn.ResumeReads()` provide an independent, concurrency-safe read switch.
+For a relay or an application work queue, `Conn.PauseRead()`,
+`Conn.ResumeRead()` and `Conn.ReadPaused()` provide a concurrency-safe read
+switch across plain TCP, TLS (`wss://`) and layer stacks alike.
 Pause from `OnMessage` stops before the next frame, including frames in the
 same socket read; an already running callback may finish. The frames wait in
-the transport, which stops reading a plain socket at once; resume delivers
-them without new network input, while automatic watermark backpressure
-remains in effect. Resuming without a pause does nothing. The switch and the
-automatic reply pause are independent reasons to pause, and neither releases
-the other. Calls are idempotent and are not reference counted, so one flow
-controller should own the switch. Both return `ErrNotReady` before the
+the transport, which stops reading the socket once `MaxInboundBuffered` is
+reached; resume delivers them without new network input. Resuming without a
+pause does nothing. Calls are idempotent and are not reference counted, so one
+flow controller should own the switch. Both return `ErrNotReady` before the
 WebSocket opens and `ErrClosed` after closing begins.
 
 `Conn.OutboundBuffered()` reports the WebSocket write batch plus the queue
 below it, including framing and lower-layer overhead. It is a concurrent
 snapshot: during a handoff it may briefly count bytes twice. Use it for watermarks;
 `MaxOutboundBuffered` provides the hard write limit. It is safe to query from
-`TrafficObserver.OnOutbound`, where a controller can resume the upstream
+`TrafficObserver.OnBytesWritten`, where a controller can resume the upstream
 connection after its destination drains. Call `pace` after forwarding to the
-destination and from its `OnOutbound` callback; resuming an upstream that is
+destination and from its `OnBytesWritten` callback; resuming an upstream that is
 not paused costs nothing. The second observation also catches a drain that
 raced with installing the pause:
 
 ```go
 func pace(upstream, destination *uws.Conn, high, low int) {
 	if destination.OutboundBuffered() >= high {
-		if err := upstream.PauseReads(); err != nil {
+		if err := upstream.PauseRead(); err != nil {
 			return
 		}
 	}
 	if destination.OutboundBuffered() <= low {
-		_ = upstream.ResumeReads()
+		_ = upstream.ResumeRead()
 	}
 }
 ```
@@ -277,28 +254,25 @@ Explicit pauses also work over TLS. They delay Ping/Pong and other incoming
 control frames; heartbeat deadlines continue to run, and a local Close
 releases UWS's own pauses to finish its handshake. A paused connection also
 keeps its peer's end of stream behind the frames it holds: a peer that sends
-and closes is answered after `ResumeReads`, so without a heartbeat or read
+and closes is answered after `ResumeRead`, so without a heartbeat or read
 deadline a paused connection whose peer left stays open until then.
-Disabling automatic watermarks retains a 64 KiB transport receive bound for
-explicit pauses. A custom layer stack uses its configured
-`Events.MaxInboundBuffered`, or UIO's default receive bound while explicit
-reads are paused. `Stats` counts automatic pauses and resumes only; a pause a
-local close ends counts as resumed.
+A custom layer stack uses its configured `Events.MaxInboundBuffered`, or UIO's
+default receive bound while explicit reads are paused.
 
 **Traffic metrics.** A `Handler` that also implements `TrafficObserver` sees
 transport bytes in both directions. Both callbacks are observation only: do
 not call anything that sends or closes on the connection from them, and do not
 block. A report is the result of I/O that just happened, and a send from it
-feeds the report it answers; `OnOutbound` can also run while the write lock a
-send holds is held, so a send there deadlocks the connection. `OnInbound` runs
-in the connection's turn like the other callbacks; `OnOutbound` runs wherever
+feeds the report it answers; `OnBytesWritten` can also run while the write lock a
+send holds is held, so a send there deadlocks the connection. `OnBytesRead` runs
+in the connection's turn like the other callbacks; `OnBytesWritten` runs wherever
 a send completes and may overlap them, so keep what it touches safe for
-concurrent use. `OutboundBuffered`, `PauseReads` and `ResumeReads` are safe in
+concurrent use. `OutboundBuffered`, `PauseRead` and `ResumeRead` are safe in
 these callbacks:
 
 ```go
-func (m metrics) OnInbound(c *uws.Conn, n int)  { m.read.Add(n) }
-func (m metrics) OnOutbound(c *uws.Conn, n int) { m.written.Add(n) }
+func (m metrics) OnBytesRead(c *uws.Conn, n int)  { m.read.Add(n) }
+func (m metrics) OnBytesWritten(c *uws.Conn, n int) { m.written.Add(n) }
 ```
 
 ## Authentication
@@ -407,7 +381,7 @@ For messages, keep to `Server` and `Dialer`.
   return `ErrBackpressure`.
 - **State without locks.** The `Handler` callbacks of one connection never
   overlap, so state kept with `SetUserdata` needs no locking from them;
-  `TrafficObserver.OnOutbound` is the exception, and it must only observe —
+  `TrafficObserver.OnBytesWritten` is the exception, and it must only observe —
   never send, close or block.
 - **Closing.** `Conn.Close(code, reason)` queues its close frame after
   everything already accepted and returns; the connection then completes the

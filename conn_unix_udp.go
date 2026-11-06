@@ -84,7 +84,7 @@ type unixUDPState struct {
 // owed when the budget runs out is redelivered to the next turn. A server's
 // children share this socket and its peer map, so their callbacks run here.
 func (conn *fdConn) onRecvUDP() error {
-	slot := conn.events().readBufferSize
+	slot := conn.events().readBufSize
 	if slot <= 0 {
 		slot = 1
 	}
@@ -126,7 +126,9 @@ func (conn *fdConn) onRecvUDP() error {
 			batch.grow(slot)
 		}
 	}
-	conn.setReadStalled(true)
+	if !conn.isClosing() {
+		conn.taskState.Or(ioEventRead)
+	}
 	return nil
 }
 
@@ -201,9 +203,7 @@ func (conn *fdConn) handleUDPPacket(packet []byte, source socket.UDPAddress) {
 
 // dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
 func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
-	if server.entry != nil && server.entry.layered {
-		// A chain's peer connection is the stack's: the socket-level Conn
-		// returned here would bypass every layer. Dial is the way in.
+	if server.entry != nil && !server.entry.directConsumer {
 		return nil, ErrUnsupported
 	}
 	udp := server.udp

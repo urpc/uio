@@ -45,7 +45,7 @@ type connConfig struct {
 	shortReadLimit  int
 	maxOutbound     int // MaxOutboundBuffered
 	batchBlockSize  int
-	// maxFramesPerDataEvent bounds the frames one OnInbound round consumes: at
+	// maxFramesPerDataEvent bounds the frames one read round consumes: at
 	// least minFramesPerDataEvent and always enough for one full read of the
 	// configured buffer, so a chunk of tiny frames never leaves a backlog.
 	maxFramesPerDataEvent int
@@ -67,17 +67,11 @@ type connConfig struct {
 
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
-
-	// outboundHigh pauses a connection's reads at this queued-output level;
-	// outboundLow resumes them. Zero disables the pause.
-	outboundHigh int
-	outboundLow  int
-	stats        *statsCounters
 }
 
 // newServerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Server's connections share.
-func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, authorize func(*http.Request) (any, error), stats *statsCounters) *connConfig {
+func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, authorize func(*http.Request) (any, error)) *connConfig {
 	config := &connConfig{
 		parser: frame.ParserConfig{
 			ExpectMask: true, AllowRSV1: opts.EnableCompression, MaxFramePayload: opts.MaxFramePayload,
@@ -101,10 +95,7 @@ func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, aut
 		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
-		outboundHigh:               opts.OutboundHighWatermark,
-		outboundLow:                opts.OutboundLowWatermark,
 		maxOutbound:                opts.MaxOutboundBuffered,
-		stats:                      stats,
 	}
 	config.settleShortLimits()
 	return config
@@ -151,7 +142,7 @@ func (config *connConfig) withinMessageLimits(limit int) int {
 
 // newDialerConnConfig freezes the resolved options into the immutable
 // per-connection policy a Dialer's connections share.
-func newDialerConnConfig(opts Options, stats *statsCounters) *connConfig {
+func newDialerConnConfig(opts Options) *connConfig {
 	config := &connConfig{
 		client: true,
 		parser: frame.ParserConfig{
@@ -174,10 +165,7 @@ func newDialerConnConfig(opts Options, stats *statsCounters) *connConfig {
 		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
-		outboundHigh:               opts.OutboundHighWatermark,
-		outboundLow:                opts.OutboundLowWatermark,
 		maxOutbound:                opts.MaxOutboundBuffered,
-		stats:                      stats,
 	}
 	config.settleShortLimits()
 	return config

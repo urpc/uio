@@ -22,17 +22,15 @@ and a FIN that settles only once the transport accepted it.
 ## Highlights
 
 - **Streams are Connections.** `umux.Stream` implements `uio.Conn` — `Read`,
-  `Write`, `Writev`, `WriteOwned`, `CloseWrite`, `CloseWith`, `State`,
+  `Write`, `Writev`, `WriteOwned`, `Close`, `CloseWrite`, `Abort`, `State`,
   timers, `Wake` — so code written for a socket works on a stream, including
-  `uio.Bridge`.
-- **Scoped read pauses.** `PauseReads`, `ResumeReads` and `ReadsPaused` control
+  `ubridge.Bridge`.
+- **Scoped read pauses.** `PauseRead`, `ResumeRead` and `ReadPaused` control
   one stream's `OnRead` delivery; its receive window bounds what it retains
   meanwhile, and sibling streams and session control frames go on. Resuming
   hands the retained input to `OnRead`; `Wake` asks for a callback for input
-  a callback left unconsumed without pausing. `YieldRead` schedules the next
-  read turn without clearing a pause. FIN completion waits for the consumer:
-  its running callback, a pause and the turn its release owes, and the
-  continuation a yield asked for.
+  a callback left unconsumed without pausing. FIN completion waits for the
+  consumer: its running callback, and a pause or the turn its release owes.
 - **Zero goroutines, zero timers per stream.** Frames arrive in the
   transport's read turn and are dispatched there; a stream's timer and the
   keepalive share the transport's one wake deadline.
@@ -46,9 +44,9 @@ and a FIN that settles only once the transport accepted it.
 - **A FIN that means it.** `CloseWrite` queues the FIN behind accepted data,
   and the stream settles — and reports `OnClose` — only after the transport
   took the FIN and both directions drained. An abort stays an abort: `RST`
-  travels through `CloseWith`, and a pairing whose partner is gone is reset,
+  travels through `Abort`, and a pairing whose partner is gone is reset,
   not left half-open.
-- **Tunnels out of the box.** A relay is a `uio.Bridge` whose `Dial` opens a
+- **Tunnels out of the box.** A relay is a `ubridge.Bridge` whose `Dial` opens a
   stream, which the bridge pairs with the user connection; an agent bridges
   each accepted stream to a local service. A session whose Handler is the
   bridge tells it when a stream's queue drains. See
@@ -118,7 +116,7 @@ log.Println(<-seen) // hello
 
 That is the whole loop: one transport carries any number of streams, and each
 stream behaves like a TCP connection. Half-close (`st.CloseWrite()`), abort
-(`st.CloseWith(err)`) and the write-side contract are under
+(`st.Abort(err)`) and the write-side contract are under
 [Rules of the road](#rules-of-the-road).
 
 Without a `Handler`, a server hands sessions and streams over instead; they
@@ -178,7 +176,7 @@ without failing a frame.
 A FIN is part of the queue: `CloseWrite` marks the stream and queues the FIN
 behind whatever data was accepted; the stream settles when the transport
 accepted the FIN and both directions drained. Aborts are immediate and
-independent: `CloseWith(err)` queues an `RST`, and the peer sees
+independent: `Abort(err)` queues an `RST`, and the peer sees
 `ErrStreamReset` through `OnClose`.
 
 Sessions close two ways. `Close(cause)` is immediate: GoAway, then the
@@ -199,7 +197,7 @@ complete, so a stream nobody ends is the shutdown context's to cut.
 | Field | Default | What it does |
 | --- | --- | --- |
 | `Handler` | none | Receives every stream's callbacks. When nil, sessions go to `Server.Sessions()` and streams to `Session.Accept()`. |
-| `Observer` | none | Hears every stream's read/written bytes, plus window reopenings (`n == 0`). An observer that also implements `QueueDrainedObserver` hears each flush that emptied a stream's queue — what a relay needs to resume a source it paused. |
+| `Observer` | none | Hears every stream's read/written bytes, plus window reopenings (`n == 0`). |
 | `Accept` | none | Vets an inbound stream before it is accepted; a non-nil error refuses it with `RST`. |
 | `ReadBufferSize` | 256 KiB | Transport socket read size. A data frame spans several reads otherwise, and every read costs a turn. |
 | `WindowSize` | 256 KiB | Each stream's receive window (the protocol floor is 256 KiB). The send side starts from the peer's announced window, capped by this value. |
@@ -219,11 +217,11 @@ complete, so a stream nobody ends is the shutdown context's to cut.
 - **Callbacks run on the transport's turn.** `OnOpen`, `OnRead`, `OnTimer`
   and `OnClose` for every stream arrive on the transport connection's turn,
   one stream at a time. Do not block there: the turn carries every stream.
-- **OnClose never overlaps OnRead.** A `CloseWith` from another goroutine is
+- **OnClose never overlaps OnRead.** An `Abort` from another goroutine is
   queued and delivered on the turn; a stream's close is its last callback.
 - **One reader.** `Read`, `Discard` and `WriteTo` may be called from any
   goroutine, with one reader per stream at a time. `Read` never blocks:
-  `(0, nil)` means no bytes yet — the end is `State()&StatePeerEnded`, not a
+  `(0, nil)` means no bytes yet — the end is `State()&StateReadEnded`, not a
   zero-length read probe.
 - **Writes are non-blocking and safe from any goroutine.** A short write
   returns `(n, ErrOutboundOverflow)`; retry the remainder when the peer's
@@ -232,20 +230,19 @@ complete, so a stream nobody ends is the shutdown context's to cut.
 - **Borrowed slices.** `PeekChunk`'s slice is valid for the current handler
   callback (or until a consuming call). `WriteTo` copies out of a borrowed
   transport frame before handing it to the writer, so its bytes stay put.
-- **Socket-only methods** — `SetLinger`, `Sendmsg` paths and
-  `ReserveOutbound` — return `uio.ErrUnsupported` on a stream. The three
-  deadline methods are supported as absolute stream deadlines: when one
-  expires, the stream resets with an error wrapping
-  `os.ErrDeadlineExceeded`; a zero time clears it. Reads and writes remain
-  non-blocking, so a deadline closes the stream rather than interrupting a
-  blocked operation.
+- **Deadlines and socket options.** Streams have no dedicated OS socket, so
+  `uio.SocketOf(stream)` reports false. The three deadline methods are
+  supported as absolute stream deadlines: when one expires, the stream resets
+  with an error wrapping `os.ErrDeadlineExceeded`; a zero time clears it.
+  Reads and writes remain non-blocking, so a deadline closes the stream rather
+  than interrupting a blocked operation.
 
 ## Composing
 
 A session's transport is an ordinary `uio` connection, so layers apply on the
 dial: `Client.Dial(ctx, addr, uio.WithLayers(...))` runs umux over TLS, KCP,
 or a tunnel stream. `Server.Serve` and `Listen` take the matching listen
-options. Above, a stream is a `uio.Conn`, which is what lets `uio.Bridge`
+options. Above, a stream is a `uio.Conn`, which is what lets `ubridge.Bridge`
 carry a tunnel: a relay dials a stream per user connection and pairs them, an
 agent bridges each stream to a local service —
 [examples/umux-tunnel](../examples/umux-tunnel) is the complete shape as a

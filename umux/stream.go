@@ -25,24 +25,19 @@ import (
 	"time"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/blockio"
+	"github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/readcontrol"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
-// inbound is a stream's unread receive queue. A borrowed run aliases the
-// transport's inbound buffer until the frame is consumed; an owned run lives
-// in an arena reused across arrivals, so a reader that falls behind does not
-// reallocate the queue on every frame.
+// inbound wraps bytebuf.CompositeBuffer with a borrowed transport tail slice,
+// mirroring uio's commonConn inbound storage while pooling multi-frame blocks.
 type inbound struct {
-	run      []byte
-	borrowed bool
-	// arena backs an owned run, which is arena[off:]; data before off was
-	// consumed and is kept only for its capacity.
-	arena []byte
-	off   int
-	// borrows counts slices handed out for writing (WriteTo) whose bytes must
-	// stay valid while the writer holds them; compaction and adoption then
-	// allocate instead of writing into the space those slices cover.
-	borrows int
+	buf     bytebuf.CompositeBuffer
+	tail    []byte // borrowed transport slice during synchronous OnRead
+	borrows int    // active external WriteTo slice borrows
+	dropped bool   // deferred Reset while borrows > 0
 }
 
 // streamFINState is guarded by the session lock. Closing the writing direction
@@ -56,92 +51,104 @@ const (
 	finSent
 )
 
-func (b *inbound) len() int { return len(b.run) }
+func (b *inbound) len() int {
+	if b.dropped {
+		return 0
+	}
+	return b.buf.Len() + len(b.tail)
+}
 
-func (b *inbound) bytes() []byte { return b.run }
-
-// setBorrowed points the queue at a run aliasing the transport's buffer; the
-// queue must be empty, and the run is valid until the frame is consumed.
 func (b *inbound) setBorrowed(run []byte) {
-	b.run = run
-	b.borrowed = true
+	b.tail = run
 }
 
-// setOwned points the queue at a run the stream owns outright.
-func (b *inbound) setOwned(run []byte) {
-	b.borrowed = false
-	b.arena = run
-	b.off = 0
-	b.run = run
-}
-
-// own copies a borrowed run into the arena.
 func (b *inbound) own() {
-	if !b.borrowed {
-		return
+	if len(b.tail) > 0 {
+		_, _ = b.buf.Write(b.tail)
+		b.tail = nil
 	}
-	b.borrowed = false
-	if b.borrows == 0 {
-		b.arena = append(b.arena[:0], b.run...)
-	} else {
-		b.arena = append([]byte(nil), b.run...)
-	}
-	b.off = 0
-	b.run = b.arena
 }
 
-// append copies p onto the queue, reusing the arena when it can.
 func (b *inbound) append(p []byte) {
-	if b.borrowed {
-		b.own()
+	b.own()
+	_, _ = b.buf.Write(p)
+}
+
+func (b *inbound) peekChunk() []byte {
+	if b.dropped {
+		return nil
 	}
-	if len(b.run) == 0 && b.off == 0 && cap(b.arena) == 0 {
-		// Nothing to reuse yet: adopt the run instead of copying it.
-		b.setOwned(p)
-		return
+	if !b.buf.Empty() {
+		return b.buf.PeekChunk()
 	}
-	if need := b.off + len(b.run) + len(p); need > cap(b.arena) {
-		if b.borrows == 0 && b.off > 0 && len(b.run)+len(p) <= cap(b.arena) {
-			copy(b.arena, b.run)
-			b.arena = b.arena[:len(b.run)]
-			b.off = 0
-			b.run = b.arena
-		} else {
-			size := 2 * cap(b.arena)
-			if size < need {
-				size = need
-			}
-			next := make([]byte, len(b.run), size)
-			copy(next, b.run)
-			b.arena = next
-			b.off = 0
-			b.run = next
+	return b.tail
+}
+
+func (b *inbound) peek(dst []byte) []byte {
+	if len(dst) == 0 || b.len() == 0 {
+		return nil
+	}
+	if b.buf.Empty() {
+		return dst[:copy(dst, b.tail)]
+	}
+	data := b.buf.Peek(dst)
+	if len(data) == len(dst) {
+		return data
+	}
+	n := copy(dst, data)
+	n += copy(dst[n:], b.tail)
+	return dst[:n]
+}
+
+func (b *inbound) read(dst []byte) int {
+	if b.dropped {
+		return 0
+	}
+	n := 0
+	if !b.buf.Empty() {
+		n, _ = b.buf.Read(dst)
+		if n == len(dst) {
+			return n
 		}
 	}
-	b.arena = append(b.arena, p...)
-	b.run = b.arena[b.off:]
+	if len(b.tail) > 0 {
+		k := copy(dst[n:], b.tail)
+		b.tail = b.tail[k:]
+		if len(b.tail) == 0 {
+			b.tail = nil
+		}
+		n += k
+	}
+	return n
 }
 
-// consume drops n unread bytes from the front.
 func (b *inbound) consume(n int) {
-	b.run = b.run[n:]
-	if b.borrowed {
+	if n <= 0 || b.dropped {
 		return
 	}
-	b.off += n
-	if len(b.run) == 0 {
-		b.off = 0
-		b.arena = b.arena[:0]
-		b.run = b.arena
+	bufLen := b.buf.Len()
+	if bufLen > 0 {
+		if n <= bufLen {
+			b.buf.Discard(n)
+			return
+		}
+		b.buf.Discard(bufLen)
+		n -= bufLen
+	}
+	if n >= len(b.tail) {
+		b.tail = nil
+	} else {
+		b.tail = b.tail[n:]
 	}
 }
 
-// drop releases the queue and its arena.
 func (b *inbound) drop() {
-	b.run = nil
-	b.arena = nil
-	b.borrowed = false
-	b.off = 0
+	b.tail = nil
+	if b.borrows > 0 {
+		b.dropped = true
+		return
+	}
+	b.buf.Reset()
 }
 
 // Stream is one multiplexed byte stream: a uio.Conn without a socket. Read,
@@ -150,9 +157,15 @@ func (b *inbound) drop() {
 // slices returned by PeekChunk have the narrower callback lifetime below.
 type Stream struct {
 	streamReadAccess
-	sess        *Session
-	id          uint32
-	readControl atomic.Pointer[readcontrol.Control]
+	streamWriteAccess
+	streamBlockAccess
+	sess         *Session
+	id           uint32
+	readControl  atomic.Pointer[readcontrol.Control]
+	writeControl atomic.Pointer[writecontrol.Control]
+	blockControl atomic.Pointer[blockio.State]
+	pullRead     atomic.Bool
+	localClosed  atomic.Bool
 
 	mu sync.Mutex
 	// wmu orders a write's credit-taking and frame enqueues against
@@ -165,9 +178,6 @@ type Stream struct {
 	// callbackActive keeps FIN completion behind the active read/timer callback:
 	// draining its last bytes must leave time to publish a pause, yield, or error.
 	callbackActive bool
-	// yieldOwed marks a YieldRead whose continuation has not run; FIN
-	// completion waits for it.
-	yieldOwed bool
 	// peerFIN reports the peer ended its writing direction.
 	peerFIN bool
 	// localFIN reports this end ended its writing direction.
@@ -323,7 +333,7 @@ func (st *Stream) grantWindow(delta int64) bool {
 }
 
 // deliverClose hands OnClose to the session, which runs it on the transport
-// turn: a CloseWith from another goroutine must never run the handler's
+// turn: an Abort from another goroutine must never run the handler's
 // callback concurrently with that stream's OnRead.
 func (st *Stream) deliverClose(err error) {
 	st.mu.Lock()
@@ -333,6 +343,7 @@ func (st *Stream) deliverClose(err error) {
 	}
 	st.closeDelivered = true
 	st.mu.Unlock()
+	st.notifyBlockClose(err)
 	if st.sess.cfg.Handler != nil {
 		st.sess.queueClose(st, err)
 	}
@@ -392,14 +403,7 @@ func (st *Stream) dropOutLocked() {
 func (st *Stream) Peek(p []byte) []byte {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	buf := st.in.bytes()
-	if len(buf) == 0 || len(p) == 0 {
-		return nil
-	}
-	if len(p) > len(buf) {
-		p = p[:len(buf)]
-	}
-	return p[:copy(p, buf)]
+	return st.in.peek(p)
 }
 
 // PeekChunk borrows the current unread chunk during this stream's Handler
@@ -410,7 +414,7 @@ func (st *Stream) Peek(p []byte) []byte {
 func (st *Stream) PeekChunk() []byte {
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	return st.in.bytes()
+	return st.in.peekChunk()
 }
 
 // Read copies buffered inbound bytes; it never blocks and reports io.EOF only
@@ -424,8 +428,7 @@ func (st *Stream) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	if st.in.len() > 0 {
-		n := copy(p, st.in.bytes())
-		st.in.consume(n)
+		n := st.in.read(p)
 		grant := st.recvWin.consume(int64(n))
 		settle := st.in.len() == 0 && st.peerFIN && st.localFIN && !st.closedLocal
 		st.mu.Unlock()
@@ -484,23 +487,41 @@ func (st *Stream) InboundBuffered() int {
 	return st.in.len()
 }
 
-// ReserveInbound is a no-op for streams: their inbound grows as data arrives.
-func (st *Stream) ReserveInbound(n int) error { return nil }
+// ReserveInbound gathers the first n buffered inbound bytes into one contiguous
+// chunk when possible.
+func (st *Stream) ReserveInbound(n int) error {
+	if n <= 0 {
+		return nil
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.in.dropped || st.borrowsActive() {
+		return nil
+	}
+	if st.in.buf.Empty() {
+		if len(st.in.tail) >= n {
+			return nil
+		}
+	} else if len(st.in.buf.PeekChunk()) >= n {
+		return nil
+	}
+	st.in.tail = st.in.buf.Gather(n, st.in.tail)
+	if len(st.in.tail) == 0 {
+		st.in.tail = nil
+	}
+	return nil
+}
+
+func (st *Stream) borrowsActive() bool { return st.in.borrows > 0 }
 
 // WriteTo copies unread inbound bytes to w. The slice handed to w stays valid
-// for the length of that Write even while the transport keeps delivering: the
-// queue will not compact or adopt into the space the writer still reads.
+// for the length of that Write even while the transport keeps delivering.
 func (st *Stream) WriteTo(w io.Writer) (int64, error) {
 	var total int64
 	for {
 		st.mu.Lock()
-		if st.in.borrowed {
-			// The run aliases the transport's buffer, which is reused once
-			// the session consumes the frame: take the copy before a writer
-			// can hold it.
-			st.in.own()
-		}
-		buf := st.in.bytes()
+		st.in.own()
+		buf := st.in.peekChunk()
 		if len(buf) == 0 {
 			st.mu.Unlock()
 			return total, nil
@@ -513,6 +534,9 @@ func (st *Stream) WriteTo(w io.Writer) (int64, error) {
 
 		st.mu.Lock()
 		st.in.borrows--
+		if st.in.borrows == 0 && st.in.dropped {
+			st.in.buf.Reset()
+		}
 		st.mu.Unlock()
 		if n > 0 {
 			_, _ = st.Discard(n)
@@ -686,9 +710,6 @@ func (st *Stream) WriteOwned(buffer *uio.Buffer) (int, error) {
 	return n, nil
 }
 
-// ReserveOutbound is unsupported: streams frame their own writes.
-func (st *Stream) ReserveOutbound(n int) ([]byte, error) { return nil, uio.ErrUnsupported }
-
 // OutboundBuffered reports bytes queued but not yet handed to the transport.
 // The outbound queue is guarded by the session lock.
 func (st *Stream) OutboundBuffered() int {
@@ -736,29 +757,26 @@ func (st *Stream) CloseWrite() error {
 	return nil
 }
 
-// Close closes the stream both ways, draining queued data first.
-func (st *Stream) Close() error { return st.closeLocal(nil) }
-
-// CloseGracefully closes with cause, draining queued data first.
-func (st *Stream) CloseGracefully(cause error) error { return st.closeLocal(cause) }
-
-func (st *Stream) closeLocal(cause error) error {
+// Close closes the stream gracefully, draining queued data first.
+func (st *Stream) Close() error {
+	st.localClosed.Store(true)
 	st.mu.Lock()
 	if st.closedLocal {
 		st.mu.Unlock()
-		return nil
+		return net.ErrClosed
 	}
-	st.closedErr = cause
+	st.closedErr = nil
 	st.mu.Unlock()
 	return st.CloseWrite()
 }
 
-// CloseWith aborts the stream with err; a nil error closes it gracefully.
-func (st *Stream) CloseWith(err error) error {
-	if err == nil {
-		return st.closeLocal(nil)
+// Abort immediately resets the stream with cause, dropping unsent data.
+func (st *Stream) Abort(cause error) error {
+	if cause == nil {
+		cause = net.ErrClosed
 	}
-	st.sess.abortStream(st, err)
+	st.localClosed.Store(true)
+	st.sess.abortStream(st, cause)
 	return nil
 }
 
@@ -768,10 +786,10 @@ func (st *Stream) State() uio.ConnState {
 	defer st.mu.Unlock()
 	var state uio.ConnState
 	if st.peerFIN && st.in.len() == 0 {
-		state |= uio.StatePeerEnded
+		state |= uio.StateReadEnded
 	}
 	if st.localFIN {
-		state |= uio.StateWriteShut
+		state |= uio.StateWriteEnded
 	}
 	if st.closedLocal {
 		state |= uio.StateClosed
@@ -813,7 +831,7 @@ func (st *Stream) SetWakeInterval(interval time.Duration) error {
 // has no read callback to run.
 func (st *Stream) Wake() error {
 	s := st.sess
-	if s.cfg.Handler == nil {
+	if s.cfg.Handler == nil && !st.pullRead.Load() {
 		return nil
 	}
 	s.mu.Lock()
@@ -840,15 +858,6 @@ func (st *Stream) Wake() error {
 	return s.conn.Wake()
 }
 
-// YieldRead schedules the next read turn and keeps FIN completion behind
-// it. It never clears a pause. Call from a stream callback and return.
-func (st *Stream) YieldRead() error {
-	st.mu.Lock()
-	st.yieldOwed = true
-	st.mu.Unlock()
-	return st.Wake()
-}
-
 // ------------------------------------------------------------------ surface
 
 // LocalAddr mirrors the transport's local address.
@@ -870,27 +879,6 @@ func (st *Stream) SetUserdata(value any) {
 	st.userdata = value
 	st.mu.Unlock()
 }
-
-// SetLinger is unsupported on a stream.
-func (st *Stream) SetLinger(secs int) error { return uio.ErrUnsupported }
-
-// SetNoDelay is unsupported on a stream.
-func (st *Stream) SetNoDelay(nodelay bool) error { return uio.ErrUnsupported }
-
-// SetKeepAlive is unsupported on a stream.
-func (st *Stream) SetKeepAlive(keepalive bool) error { return uio.ErrUnsupported }
-
-// SetKeepAlivePeriod is unsupported on a stream.
-func (st *Stream) SetKeepAlivePeriod(secs int) error { return uio.ErrUnsupported }
-
-// Control is unsupported on a stream.
-func (st *Stream) Control(fn func(fd uintptr)) error { return uio.ErrUnsupported }
-
-// SetReadBuffer is unsupported on a stream.
-func (st *Stream) SetReadBuffer(size int) error { return uio.ErrUnsupported }
-
-// SetWriteBuffer is unsupported on a stream.
-func (st *Stream) SetWriteBuffer(size int) error { return uio.ErrUnsupported }
 
 // SetDeadline sets both stream deadlines. A deadline that passes resets the
 // stream with os.ErrDeadlineExceeded, matching uio.Conn's socket semantics.

@@ -6,40 +6,38 @@ import (
 	"github.com/urpc/uio/internal/readcontrol"
 )
 
-// inputReadControlGetter backs the package-private capability promoted by the
-// zero-sized Access field. A private provider assertion also supports wrappers
-// embedding a concrete connection without assuming source's dynamic type.
-type inputReadControlGetter struct{}
+// readControlGetter backs the package-private capability promoted by the
+// zero-sized readControlAccess field.
+type readControlGetter struct{}
 
-type inputReadControlAccess = readcontrol.Access[inputReadControlGetter]
+type readControlAccess = readcontrol.Access[readControlGetter]
 
-func (inputReadControlGetter) GetReadControl(source any) *readcontrol.Control {
-	if boundary, ok := source.(interface{ inputReadControl() *readcontrol.Control }); ok {
-		return boundary.inputReadControl()
+func (readControlGetter) GetReadControl(source any) *readcontrol.Control {
+	if boundary, ok := source.(interface{ connReadControl() *readcontrol.Control }); ok {
+		return boundary.connReadControl()
 	}
 	return nil
 }
 
-// The socket's own control pauses its consumer: the Handler of a plain
+// The socket's own control pauses its direct consumer: the Handler of a plain
 // connection, the first layer of a stack. A layer node's control pauses the
-// consumer of what that layer delivers — the layer above it, or the Handler
-// at the top.
+// consumer above it — the next layer, or the Handler at the top.
 
-func (conn *fdConn) inputReadControl() *readcontrol.Control {
+func (conn *fdConn) connReadControl() *readcontrol.Control {
 	if conn == nil || conn.isDatagram() {
 		return nil
 	}
 	return conn.ensureReadControl()
 }
 
-func (l *layerNode) inputReadControl() *readcontrol.Control {
+func (l *layerNode) connReadControl() *readcontrol.Control {
 	if l == nil {
 		return nil
 	}
 	return l.ensureReadControl()
 }
 
-func (s socketLower) inputReadControl() *readcontrol.Control {
+func (s socketLower) connReadControl() *readcontrol.Control {
 	return readcontrol.ControlOf(s.Conn)
 }
 
@@ -54,55 +52,44 @@ func (conn *fdConn) checkReadControl() error {
 	return nil
 }
 
-func (conn *fdConn) PauseReads() error {
+func (conn *fdConn) PauseRead() error {
 	if err := conn.checkReadControl(); err != nil {
 		return err
 	}
-	return conn.ensureReadControl().PauseReads()
+	return conn.ensureReadControl().PauseRead()
 }
 
-func (conn *fdConn) ResumeReads() error {
+func (conn *fdConn) ResumeRead() error {
 	if err := conn.checkReadControl(); err != nil {
 		return err
 	}
 	if c := conn.currentReadControl(); c != nil {
-		return c.ResumeReads()
+		return c.ResumeRead()
 	}
 	return nil // never paused: nothing to release
 }
 
-// ReadsPaused reports a pause of the socket's consumer. Paused, a plain
+// ReadPaused reports a pause of the socket's consumer. Paused, a plain
 // connection reads its socket no more and runs no OnRead; a stack reads on
 // into its bounds while its first layer waits.
-func (conn *fdConn) ReadsPaused() bool { return conn.currentReadControl().ReadsPaused() }
+func (conn *fdConn) ReadPaused() bool { return conn.currentReadControl().ReadPaused() }
 
 // readCloseReady reports whether a half-open connection whose two halves
 // ended may close once the socket's buffer is empty: its consumer holds the
-// end back while paused, owed a resume turn or a continuation it asked for,
-// and a stack's layers must also have handed up everything they hold.
+// end back while paused or owed a resume turn.
 func (conn *fdConn) readCloseReady() bool {
-	if conn.entry != nil && conn.entry.layered {
-		if c, ok := conn.Userdata().(*stack); ok {
-			return c.drained() && !c.handlerHeld() && !c.yieldOwed()
-		}
-	}
-	return !conn.currentReadControl().Held() && !conn.yieldOwed()
+	return !conn.currentReadControl().Held()
 }
 
-// inputLimit is a producer capacity bound. An explicitly paused stack still
-// needs a socket bound when its Events left the optional global limit off.
-// Keep that default bound until a previous capacity hold has actually drained.
+// inputLimit is a producer capacity bound. A non-direct consumer (such as a
+// protocol stack) still bounds retained socket input at DefaultDeliverBound
+// when its Events left the optional global limit off.
 func (conn *fdConn) inputLimit(held bool) int {
 	if limit := conn.events().MaxInboundBuffered; limit > 0 {
 		return limit
 	}
-	if held {
+	if held || (conn.entry != nil && !conn.entry.directConsumer) {
 		return DefaultDeliverBound
-	}
-	if conn.entry.layered {
-		if c, ok := conn.Userdata().(*stack); ok && c.hasReadPause() {
-			return DefaultDeliverBound
-		}
 	}
 	return 0
 }
@@ -125,30 +112,21 @@ func (l *layerNode) ensureReadControl() *readcontrol.Control {
 	return l.readControl.Load()
 }
 
-func (l *layerNode) PauseReads() error {
+func (l *layerNode) PauseRead() error {
 	if err := l.checkReadControl(); err != nil {
 		return err
 	}
-	return l.ensureReadControl().PauseReads()
+	return l.ensureReadControl().PauseRead()
 }
 
-func (l *layerNode) ResumeReads() error {
+func (l *layerNode) ResumeRead() error {
 	if err := l.checkReadControl(); err != nil {
 		return err
 	}
 	if c := l.readControl.Load(); c != nil {
-		return c.ResumeReads()
+		return c.ResumeRead()
 	}
 	return nil // never paused: nothing to release
 }
 
-func (l *layerNode) ReadsPaused() bool { return l.readControl.Load().ReadsPaused() }
-
-func (c *stack) hasReadPause() bool {
-	for _, layer := range c.layers {
-		if layer.ReadsPaused() {
-			return true
-		}
-	}
-	return false
-}
+func (l *layerNode) ReadPaused() bool { return l.readControl.Load().ReadPaused() }

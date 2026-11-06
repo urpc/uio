@@ -17,8 +17,11 @@
 package uio
 
 import (
+	"context"
 	"net"
+	"net/url"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/libp2p/go-reuseport"
@@ -258,4 +261,168 @@ func rawControl(control SocketControl) func(network, address string, conn syscal
 		}
 		return err
 	}
+}
+
+// Dial connects to the address on the named network.
+//
+// Known networks are "tcp", "tcp4", "tcp6", "udp", "udp4", "udp6", "ip",
+// "ip4", "ip6", "unix", "unixgram" and "unixpacket".
+func (ev *Events) Dial(addr string, opts ...DialOption) (Conn, error) {
+	return ev.defaultDialer().Dial(addr, opts...)
+}
+
+// DialContext connects synchronously and allows cancellation while resolving
+// or establishing the connection. Never call it from an event loop goroutine.
+// A connection it returns gets OnOpen and, at its end, OnClose, even if it is
+// closed first; after an error no callback runs for it.
+func (ev *Events) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
+	return ev.defaultDialer().DialContext(dialCtx, addr, opts...)
+}
+
+// Adopt transfers ownership of an established stream connection to ev. The
+// caller must not use conn after calling Adopt, including when Adopt returns an
+// error. ev must already be serving.
+func (ev *Events) Adopt(conn net.Conn, opts ...AdoptOption) (Conn, error) {
+	return ev.AdoptContext(context.Background(), conn, opts...)
+}
+
+// AdoptContext is Adopt with ctx bounding the wait for any installed layers to
+// open.
+func (ev *Events) AdoptContext(ctx context.Context, conn net.Conn, opts ...AdoptOption) (Conn, error) {
+	if conn == nil {
+		return nil, ErrUnsupported
+	}
+	if !ev.ready.Load() || ev.closing.Load() {
+		_ = conn.Close()
+		return nil, net.ErrClosed
+	}
+	cfg := adoptConfigFor(opts)
+	if cfg.hasLayers && isEventLoopGoroutine() {
+		_ = conn.Close()
+		return nil, ErrDialOnEventLoop
+	}
+	if err := refuseLayerPacket(conn.LocalAddr().Network(), cfg.layers, cfg.hasLayers); err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	entry, err := ev.entryFor(cfg.layers, cfg.hasLayers)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	fdc, err := ev.newAdoptedConn(conn)
+	if err != nil {
+		return nil, err
+	}
+	return ev.finishEndpointConn(ctx, fdc, entry, cfg.userdata)
+}
+
+// Dialer dials through one Events with private defaults — the options it was
+// built with, a chain among them — which each Dial's own options override.
+type Dialer struct {
+	ev  *Events
+	cfg dialConfig
+
+	entryOnce sync.Once
+	entry     *entry
+	entryErr  error
+}
+
+// Dialer returns a Dialer of ev with opts as its defaults.
+func (ev *Events) Dialer(opts ...DialOption) (*Dialer, error) {
+	cfg := dialConfigFor(opts)
+	if err := validateChain(cfg.layers, cfg.hasLayers); err != nil {
+		return nil, err
+	}
+	return &Dialer{ev: ev, cfg: cfg}, nil
+}
+
+func (ev *Events) defaultDialer() *Dialer { return &Dialer{ev: ev} }
+
+func (d *Dialer) dialerEntry() (*entry, error) {
+	if !d.cfg.hasLayers {
+		return d.ev.plainEntry(), nil
+	}
+	d.entryOnce.Do(func() { d.entry, d.entryErr = d.ev.newEntry(d.cfg.layers) })
+	return d.entry, d.entryErr
+}
+
+// Dial dials addr with this Dialer; see DialContext.
+func (d *Dialer) Dial(addr string, opts ...DialOption) (Conn, error) {
+	return d.DialContext(context.Background(), addr, opts...)
+}
+
+// DialContext connects synchronously through this Dialer's Events.
+func (d *Dialer) DialContext(dialCtx context.Context, addr string, opts ...DialOption) (Conn, error) {
+	ev := d.ev
+	config := d.cfg
+	callLayers := false
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if _, ok := opt.(layersOption); ok {
+			callLayers = true
+		}
+		opt.applyDial(&config)
+	}
+	if !ev.ready.Load() || ev.closing.Load() {
+		return nil, net.ErrClosed
+	}
+	if isEventLoopGoroutine() {
+		return nil, ErrDialOnEventLoop
+	}
+	if !strings.Contains(addr, "://") {
+		addr = "tcp://" + addr
+	}
+	u, err := url.Parse(addr)
+	if err != nil {
+		return nil, err
+	}
+	if err := refuseLayerPacket(u.Scheme, config.layers, config.hasLayers); err != nil {
+		return nil, err
+	}
+	var entry *entry
+	if callLayers {
+		entry, err = ev.newEntry(config.layers)
+	} else {
+		entry, err = d.dialerEntry()
+	}
+	if err != nil {
+		return nil, err
+	}
+	address := u.Host
+	if strings.HasPrefix(u.Scheme, "unix") {
+		address = u.Path
+	}
+	dialer, err := netDialerFor(u.Scheme, config)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := dialer.DialContext(dialCtx, u.Scheme, address)
+	if err != nil {
+		return nil, err
+	}
+	fdc, err := ev.newDialedConn(u.Scheme, conn)
+	if err != nil {
+		return nil, err
+	}
+	return ev.finishEndpointConn(dialCtx, fdc, entry, config.userdata)
+}
+
+func (ev *Events) finishEndpointConn(ctx context.Context, fdc *fdConn, entry *entry, userdata any) (Conn, error) {
+	fdc.entry = entry
+	fdc.SetUserdata(userdata)
+	var waitDial func(context.Context) (Conn, error)
+	if entry.dial != nil {
+		waitDial = entry.dial(fdc)
+	}
+	fdc.loop = ev.selectLoop()
+	if err := ev.addConnContext(ctx, fdc); err != nil {
+		return nil, err
+	}
+	if waitDial == nil {
+		return fdc, nil
+	}
+	return waitDial(ctx)
 }

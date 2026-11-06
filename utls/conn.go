@@ -70,7 +70,7 @@ type conn struct {
 var (
 	_ uio.LayerHandler                     = (*conn)(nil)
 	_ uio.CloseWriter                      = (*conn)(nil)
-	_ uio.GracefulCloser                   = (*conn)(nil)
+	_ uio.LayerCloser                      = (*conn)(nil)
 	_ interface{ State() ConnectionState } = (*conn)(nil)
 )
 
@@ -123,7 +123,7 @@ func (c *conn) settle(ctx uio.LayerContext) {
 		_ = ctx.Abort(err)
 		return
 	}
-	ctx.Up().Open()
+	ctx.Open()
 }
 
 func (c *conn) handshakeTimeout() time.Duration {
@@ -148,7 +148,7 @@ func handshake(c *conn) func(func(struct{}) bool) {
 // it settles, and from then on the turn's bytes are decrypted and delivered,
 // as far as the staging bound leaves room.
 func (c *conn) OnRead(ctx uio.LayerContext) error {
-	lower := ctx.Down()
+	lower := ctx.Lower()
 	c.mu.Lock()
 	if c.resume != nil {
 		// Take no more than the staging bound unread: the handshake reads
@@ -184,11 +184,11 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 	if !ready {
 		return nil
 	}
-	if ctx.Up().Buffered() >= c.stagingBound() {
+	if ctx.Upper().Buffered() >= c.stagingBound() {
 		// A full staging leaves what arrived below unread, so the pause
 		// travels to the wire; the read above that makes room runs the turn
 		// that takes it.
-		ctx.Up().Yield()
+		ctx.Upper().Yield()
 		return nil
 	}
 	chunk := lower.PeekChunk()
@@ -212,7 +212,7 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 // chunk back below. The chunk belongs to the layer below's delivery buffer:
 // valid until the turn returns, and Discarded here. It reports whether the
 // stream's end became visible with the discard.
-func (c *conn) finishLive(lower uio.LayerDown) bool {
+func (c *conn) finishLive(lower uio.Lower) bool {
 	c.mu.Lock()
 	if tail := c.live[c.liveAt:]; len(tail) > 0 {
 		c.pending = append(c.pending, tail...)
@@ -257,9 +257,9 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			return nil
 		}
 		c.mu.Unlock()
-		n, err := c.tls.Read(ctx.Up().Reserve(readBufferSize)[:readBufferSize])
+		n, err := c.tls.Read(ctx.Upper().Reserve(readBufferSize)[:readBufferSize])
 		if n > 0 {
-			ctx.Up().Commit(n)
+			ctx.Upper().Commit(n)
 		}
 		c.mu.Lock()
 		c.compactLocked()
@@ -272,7 +272,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 				c.mu.Lock()
 				c.readEnded = true
 				c.mu.Unlock()
-				ctx.Up().End()
+				ctx.Upper().End()
 				return nil
 			}
 			return err
@@ -285,8 +285,8 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 // an end at a record's edge — io.EOF, handed up as the end of the stream —
 // from one inside a record, a truncation it reports as an error. It requires
 // c.mu.
-func (c *conn) noteLowerEndLocked(lower uio.LayerDown) {
-	if lower.State()&uio.StatePeerEnded != 0 {
+func (c *conn) noteLowerEndLocked(lower uio.Lower) {
+	if lower.State()&uio.StateReadEnded != 0 {
 		c.lowerEnded = true
 	}
 }
@@ -325,9 +325,9 @@ func (c *conn) OnWrite(_ uio.LayerContext, p []byte) (int, error) {
 	return engine.Write(p)
 }
 
-// CloseGracefully sends the peer close_notify, once what was accepted has
-// left, as the layer above closes the connection.
-func (c *conn) CloseGracefully(uio.LayerContext, error) {
+// OnClosing sends the peer close_notify, once what was accepted has left, as
+// the layer above closes the connection.
+func (c *conn) OnClosing(uio.LayerContext, error) {
 	if engine, err := c.engine(); err == nil {
 		_ = engine.Close()
 	}
@@ -343,7 +343,7 @@ func (c *conn) CloseWrite(ctx uio.LayerContext) error {
 	if err := engine.CloseWrite(); err != nil {
 		return err
 	}
-	return ctx.Down().CloseWrite()
+	return ctx.Lower().CloseWrite()
 }
 
 // State reports what the handshake settled on; before it settles, the zero

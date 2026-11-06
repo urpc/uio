@@ -95,7 +95,7 @@ type conn struct {
 var (
 	_ uio.LayerHandler   = (*conn)(nil)
 	_ uio.CloseWriter    = (*conn)(nil)
-	_ uio.GracefulCloser = (*conn)(nil)
+	_ uio.LayerCloser    = (*conn)(nil)
 	_ uio.OutboundHolder = (*conn)(nil)
 	_ interface {
 		State() SessionState
@@ -116,13 +116,13 @@ type SessionState struct {
 	Inflight  int           // segments sent, not yet acknowledged
 }
 
-// packetDown reports whether the connection directly below carries datagrams:
+// packetLower reports whether the connection directly below carries datagrams:
 // only the socket of a packet connection does. What a layer builds above
 // another one is a byte stream, whatever the socket beneath it carries, so
 // the address's network — which passes through a stack — says nothing about
-// the direct lower; the framework answers for it: PacketSource.
-func packetDown(down uio.LayerDown) bool {
-	source, ok := down.(interface{ PacketSource() bool })
+// the direct lower; the framework answers for it via PacketSource.
+func packetLower(lower uio.Lower) bool {
+	source, ok := lower.(interface{ PacketSource() bool })
 	return ok && source.PacketSource()
 }
 
@@ -137,11 +137,11 @@ func (c *conn) OnOpen(uio.LayerContext) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.packet = packetDown(c.ctx.Down())
+	c.packet = packetLower(c.ctx.Lower())
 	if c.packet {
 		// A datagram the socket's read buffer cannot hold is truncated below
 		// this layer: refuse the session rather than lose segments quietly.
-		if source, ok := c.ctx.Down().(interface{ SocketReadSize() int }); ok {
+		if source, ok := c.ctx.Lower().(interface{ SocketReadSize() int }); ok {
 			if size := source.SocketReadSize(); size > 0 && c.opts.MTU > size {
 				c.ended = true
 				_ = c.ctx.Abort(fmt.Errorf("%w: MTU %d does not fit the Events' read buffer of %d bytes",
@@ -165,7 +165,7 @@ func (c *conn) OnOpen(uio.LayerContext) {
 		return
 	}
 	c.establish(binary.LittleEndian.Uint32(seed[:]))
-	c.ctx.Up().Open()
+	c.ctx.Open()
 }
 
 // establish builds the engine a conversation runs on.
@@ -225,7 +225,7 @@ func (c *conn) sendBatch(hold bool) {
 		c.armFor(time.Now().Add(ackHoldDelay))
 		return
 	}
-	_, err := c.ctx.Down().Writev(c.outVec)
+	_, err := c.ctx.Lower().Writev(c.outVec)
 	c.releaseStaging()
 	if err != nil && !(c.packet && !errors.Is(err, net.ErrClosed) && !errors.Is(err, io.ErrClosedPipe)) {
 		c.fatal(err)
@@ -271,7 +271,7 @@ func (c *conn) fatal(err error) {
 // packet connection, the whole segments a stream connection completed — then
 // in-order bytes go up, and what the engine has to answer leaves at once.
 func (c *conn) OnRead(uio.LayerContext) error {
-	lower := c.ctx.Down()
+	lower := c.ctx.Lower()
 	chunk := lower.PeekChunk()
 	now := time.Now()
 	c.mu.Lock()
@@ -463,7 +463,7 @@ func (c *conn) feed(seg []byte) bool {
 			return false
 		}
 		c.establish(binary.LittleEndian.Uint32(seg[0:4]))
-		c.ctx.Up().Open()
+		c.ctx.Open()
 	}
 	return c.kcp.Input(seg, kcp.IKCP_PACKET_REGULAR, true) == 0
 }
@@ -474,7 +474,7 @@ func (c *conn) deliver() {
 	if c.ended || c.peerFin || c.kcp == nil {
 		return
 	}
-	up := c.ctx.Up()
+	up := c.ctx.Upper()
 	limit := c.opts.RecvWindow * c.mss
 	for {
 		if up.Buffered() >= limit {
@@ -512,11 +512,11 @@ func (c *conn) deliver() {
 // boundary the peer's stream is over and the end travels up once the receive
 // queue drained, inside one it is a truncation the connection aborts. The
 // keepalive would otherwise wait its periods out. It requires mu, on a turn.
-func (c *conn) streamLowerEnded(lower uio.LayerDown) {
+func (c *conn) streamLowerEnded(lower uio.Lower) {
 	if c.ended || c.peerFin || c.closed || c.kcp == nil {
 		return
 	}
-	if lower.State()&uio.StatePeerEnded == 0 {
+	if lower.State()&uio.StateReadEnded == 0 {
 		return
 	}
 	if len(c.pending) > 0 {
@@ -543,7 +543,7 @@ func (c *conn) endLower() {
 	}
 	c.peerFin = true
 	c.debugNote("lower-eof")
-	c.ctx.Up().End()
+	c.ctx.Upper().End()
 }
 
 // OnWrite takes what the writer wrote into the engine and puts it on the
@@ -602,10 +602,10 @@ func (c *conn) CloseWrite(uio.LayerContext) error {
 	return nil
 }
 
-// CloseGracefully queues the end of the stream as the whole connection closes
-// and sends it best-effort: the connection below closes with it, so the end
+// OnClosing queues the end of the stream as the whole connection closes and
+// sends it best-effort: the connection below closes with it, so the end
 // retransmits no further.
-func (c *conn) CloseGracefully(uio.LayerContext, error) {
+func (c *conn) OnClosing(uio.LayerContext, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.ended && !c.closed && !c.finQueued && c.kcp != nil {

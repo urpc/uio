@@ -97,13 +97,6 @@ func (c *Conn) timerTick(now time.Time, unparsed bool) {
 	c.heartbeatTick(now)
 }
 
-// stagedInput reports frames the handshake's last read carried that wait
-// outside the transport for the parser.
-func (c *Conn) stagedInput() bool {
-	metadata := c.metadata.Load()
-	return metadata != nil && len(metadata.staged) != 0
-}
-
 // heartbeatTick runs on every turn, at the turn's moment: the timed turns
 // the wake timer guarantees and the data turns that arrive on their own. It
 // expires the states the timeout ends, sends a Ping at the interval while
@@ -125,7 +118,7 @@ func (c *Conn) heartbeatTick(now time.Time) {
 		return
 	}
 	heartbeat.mu.Unlock()
-	if heartbeat.deferExpiry(now, c.config.heartbeatTimeout, c.stagedInput()) {
+	if heartbeat.deferExpiry(now, c.config.heartbeatTimeout, false) {
 		// The deadline passed with input waiting or the parser making
 		// progress — a Pong may still be behind it: wait, and come back.
 		c.armHeartbeatWake(now)

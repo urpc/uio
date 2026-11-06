@@ -88,16 +88,7 @@ func (s *Server) Serve(addrs ...string) error {
 	}
 	s.started = true
 
-	events := &uio.Events{
-		Pollers:                resolved.Pollers,
-		ReusePort:              resolved.ReusePort,
-		Executor:               resolved.Executor,
-		MaxBufferSize:          resolved.MaxBufferSize,
-		WriteBufferedThreshold: resolved.WriteBufferedThreshold,
-		MaxOutboundBuffered:    resolved.MaxOutboundBuffered,
-		AllowHalfOpen:          resolved.AllowHalfOpen,
-		Handler:                resolved.Handler,
-	}
+	events := resolved.Transport.events(resolved.Handler)
 	chain := []uio.Layer{newResolvedLayer(resolved, false)}
 	listenOpts := []uio.ListenOption{uio.WithLayers(chain...)}
 	if control := resolved.socketControl(); control != nil {

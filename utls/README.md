@@ -179,7 +179,7 @@ the layer with `ErrInvalidOptions`. The layer form is the only form: a
 
 **Size the transport's reads to the record.** A TLS record carries up to
 16 KiB, and a socket read smaller than that splits one record across several
-rounds. On uio that is `uio.Events.MaxBufferSize`, whose default of 4 KiB
+rounds. On uio that is `uio.Events.ReadBufferSize`, whose default of 4 KiB
 turns one record into four reads; set it to at least 16 KiB — bulk transfers
 speed up measurably from it, and 64 KiB measured fastest on the hosts we ran.
 

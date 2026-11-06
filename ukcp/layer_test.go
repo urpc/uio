@@ -835,10 +835,10 @@ func TestLayerMTUFitsTheReadBuffer(t *testing.T) {
 
 	started := make(chan struct{})
 	events := &uio.Events{
-		Pollers:       1,
-		MaxBufferSize: 512,
-		Handler:       newCollector().handler(),
-		Hooks:         uio.FuncHandler{Start: func(*uio.Events) { close(started) }},
+		Pollers:        1,
+		ReadBufferSize: 512,
+		Handler:        newCollector().handler(),
+		Hooks:          uio.FuncHandler{Start: func(*uio.Events) { close(started) }},
 	}
 	done := make(chan error, 1)
 	go func() { done <- events.Serve() }()
@@ -859,14 +859,10 @@ func TestLayerMTUFitsTheReadBuffer(t *testing.T) {
 // they would be silently inert, so they fail every connection instead.
 func TestLayerRefusesStandaloneOptions(t *testing.T) {
 	cases := map[string]Options{
-		"Handler":             {Handler: echoHandler},
-		"WriteBuffered":       {WriteBufferedThreshold: 1 << 20},
-		"MaxOutboundBuffered": {MaxOutboundBuffered: 1 << 20},
-		"AllowHalfOpen":       {AllowHalfOpen: true},
-		"Pollers":             {Pollers: 2},
-		"ReusePort":           {ReusePort: true},
-		"SocketReadBuffer":    {SocketReadBuffer: 1 << 20},
-		"SocketWriteBuffer":   {SocketWriteBuffer: 1 << 20},
+		"Handler":           {Handler: echoHandler},
+		"Transport":         {Transport: TransportOptions{Pollers: 2}},
+		"SocketReadBuffer":  {SocketReadBuffer: 1 << 20},
+		"SocketWriteBuffer": {SocketWriteBuffer: 1 << 20},
 	}
 	for name, opts := range cases {
 		layer, ok := ServerLayer(opts).(*kcpLayer)

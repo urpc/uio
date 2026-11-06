@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/shardpool"
 )
 
@@ -280,6 +281,8 @@ func (queue *rejectQueue) push(tasks []IOTask) {
 }
 
 func (queue *rejectQueue) drain() {
+	blockio.EnterTurn()
+	defer blockio.LeaveTurn()
 	defer queue.done.Done()
 	for {
 		queue.mu.Lock()

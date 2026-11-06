@@ -14,22 +14,22 @@ func TestRejectedPauseDoesNotChangeState(t *testing.T) {
 		return nil
 	})
 	p := c.NewPause()
-	for _, operation := range []func() error{c.Check, p.Pause, c.PauseReads} {
+	for _, operation := range []func() error{c.Check, p.Pause, c.PauseRead} {
 		if err := operation(); !errors.Is(err, closed) {
 			t.Fatalf("rejected operation = %v, want lifecycle error", err)
 		}
 	}
 	// Releasing what was never held is not a lifecycle question.
-	for _, operation := range []func() error{p.Resume, c.ResumeReads} {
+	for _, operation := range []func() error{p.Resume, c.ResumeRead} {
 		if err := operation(); err != nil {
 			t.Fatalf("idle resume = %v", err)
 		}
 	}
-	if c.ReadsPaused() || p.Paused() {
+	if c.ReadPaused() || p.Paused() {
 		t.Fatal("rejected operations changed boundary state")
 	}
 	var unavailable *Control
-	for _, operation := range []func() error{unavailable.Check, unavailable.PauseReads, unavailable.ResumeReads} {
+	for _, operation := range []func() error{unavailable.Check, unavailable.PauseRead, unavailable.ResumeRead} {
 		if err := operation(); !errors.Is(err, ErrUnsupported) {
 			t.Fatalf("unavailable boundary = %v", err)
 		}
@@ -40,14 +40,14 @@ func TestIdleResumeSchedulesNothing(t *testing.T) {
 	var resumes atomic.Int64
 	c := New(nil, func() error { resumes.Add(1); return nil })
 	for range 10 {
-		if err := c.ResumeReads(); err != nil {
+		if err := c.ResumeRead(); err != nil {
 			t.Fatal(err)
 		}
 		if err := c.NewPause().Resume(); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if resumes.Load() != 0 || c.ReadsPaused() {
+	if resumes.Load() != 0 || c.ReadPaused() {
 		t.Fatalf("idle resumes scheduled %d turns", resumes.Load())
 	}
 }
@@ -59,17 +59,17 @@ func TestPauseAfterReleaseSchedulesAgain(t *testing.T) {
 	var resumes atomic.Int64
 	c := New(nil, func() error { resumes.Add(1); return nil })
 	for i := 1; i <= 3; i++ {
-		if err := c.PauseReads(); err != nil {
+		if err := c.PauseRead(); err != nil {
 			t.Fatal(err)
 		}
-		if !c.ReadsPaused() {
+		if !c.ReadPaused() {
 			t.Fatal("pause not visible")
 		}
-		if err := c.ResumeReads(); err != nil {
+		if err := c.ResumeRead(); err != nil {
 			t.Fatal(err)
 		}
-		if c.ReadsPaused() || resumes.Load() != int64(i) {
-			t.Fatalf("release %d: paused=%v resumes=%d", i, c.ReadsPaused(), resumes.Load())
+		if c.ReadPaused() || resumes.Load() != int64(i) {
+			t.Fatalf("release %d: paused=%v resumes=%d", i, c.ReadPaused(), resumes.Load())
 		}
 	}
 }
@@ -77,13 +77,13 @@ func TestPauseAfterReleaseSchedulesAgain(t *testing.T) {
 func TestResumeHookErrorIsReported(t *testing.T) {
 	gone := errors.New("gone")
 	c := New(nil, func() error { return gone })
-	if err := c.PauseReads(); err != nil {
+	if err := c.PauseRead(); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.ResumeReads(); !errors.Is(err, gone) {
+	if err := c.ResumeRead(); !errors.Is(err, gone) {
 		t.Fatalf("resume = %v, want the hook's error", err)
 	}
-	if c.ReadsPaused() {
+	if c.ReadPaused() {
 		t.Fatal("a failed hook kept the pause")
 	}
 }
@@ -101,7 +101,7 @@ func TestConcurrentDefaultPauseHasOneOwnerAndOneResume(t *testing.T) {
 			defer done.Done()
 			ready.Done()
 			<-start
-			if err := c.PauseReads(); err != nil {
+			if err := c.PauseRead(); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -109,16 +109,16 @@ func TestConcurrentDefaultPauseHasOneOwnerAndOneResume(t *testing.T) {
 	ready.Wait()
 	close(start)
 	done.Wait()
-	if !c.ReadsPaused() {
+	if !c.ReadPaused() {
 		t.Fatal("concurrent default pauses failed to hold input")
 	}
 	for range workers {
 		done.Add(1)
-		go func() { defer done.Done(); _ = c.ResumeReads() }()
+		go func() { defer done.Done(); _ = c.ResumeRead() }()
 	}
 	done.Wait()
-	if c.ReadsPaused() || resumes.Load() != 1 {
-		t.Fatalf("default slot was not idempotent: paused=%v resumes=%d", c.ReadsPaused(), resumes.Load())
+	if c.ReadPaused() || resumes.Load() != 1 {
+		t.Fatalf("default slot was not idempotent: paused=%v resumes=%d", c.ReadPaused(), resumes.Load())
 	}
 }
 
@@ -141,7 +141,7 @@ func TestConcurrentOwnersBalance(t *testing.T) {
 		}()
 	}
 	done.Wait()
-	if c.ReadsPaused() || c.owners.Load() != 0 {
+	if c.ReadPaused() || c.owners.Load() != 0 {
 		t.Fatalf("owners left = %d", c.owners.Load())
 	}
 	if resumes.Load() == 0 {
@@ -174,7 +174,7 @@ func TestHeldCoversPauseAndOwedResumeTurn(t *testing.T) {
 		t.Fatal("the consumer running cleared another owner's pause")
 	}
 	_ = second.Resume()
-	if !c.Held() || c.ReadsPaused() {
+	if !c.Held() || c.ReadPaused() {
 		t.Fatal("the last release owed no resume turn")
 	}
 	c.ConsumerRuns()

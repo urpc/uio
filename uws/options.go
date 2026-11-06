@@ -20,15 +20,14 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"sync/atomic"
 	"time"
 
 	"github.com/urpc/uio"
 )
 
-// DefaultOutboundHighWatermark is the default queued-output level at which a
-// connection stops reading its socket.
-const DefaultOutboundHighWatermark = 64 << 10
+// DefaultMaxInboundBuffered is the default transport receive bound, so an
+// explicit Conn.PauseRead stops socket reads once buffered input reaches it.
+const DefaultMaxInboundBuffered = 64 << 10
 
 // ErrInvalidOptions reports Options a server or dialer cannot run with.
 var ErrInvalidOptions = errors.New("uws: invalid options")
@@ -122,23 +121,11 @@ type Options struct {
 	// The TLS handshake runs before the WebSocket one, each bounded by
 	// HandshakeTimeout, and a dial that fails it reports its cause.
 	TLSConfig *tls.Config
-	// OutboundHighWatermark is the queued output at which a connection stops
-	// reading its socket, so TCP flow control slows its peer instead of the
-	// replies to its requests piling up. It paces only what the connection's
-	// own reads produce — what OnMessage sends on the same connection, and
-	// the Pongs answering the peer's Pings — and pauses once those replies
-	// fill at least the band between the two watermarks. Output sent from
-	// elsewhere, such as a broadcast or another connection forwarding, is
-	// queued too but never pauses reads; MaxOutboundBuffered bounds it. A
-	// tracked transport — a layer stack, TLS under the protocol — is not
-	// paced either: its send reports are wire bytes, not the frame bytes
-	// replies are counted in. A negative value disables the pause. Zero uses
-	// 64 KiB. Disabling this automatic pause still leaves a 64 KiB transport
-	// receive bound, so an explicit Conn.PauseReads can stop socket reads.
-	OutboundHighWatermark int
-	// OutboundLowWatermark is the queued level at or below which a paused
-	// connection reads again. Zero uses a quarter of the high watermark.
-	OutboundLowWatermark int
+	// MaxInboundBuffered bounds unread input buffered in the transport, which
+	// lets an explicit Conn.PauseRead apply TCP backpressure to the peer. Zero
+	// uses DefaultMaxInboundBuffered (64 KiB); a negative value disables the
+	// explicit bound beyond UIO's pause floor.
+	MaxInboundBuffered int
 	// MaxOutboundBuffered bounds the bytes queued for one connection from any
 	// sender: a send that would pass it returns ErrBackpressure and queues
 	// nothing, so a slow peer cannot grow the queue without bound however the
@@ -156,19 +143,19 @@ type Options struct {
 // the report it answers — it retires more bytes, which reports again. In uws
 // the report can also run while the write lock a send holds is still held, so
 // a write here deadlocks the connection. They must not block either.
-// OutboundBuffered, PauseReads and ResumeReads are safe here: they do not
+// OutboundBuffered, PauseRead and ResumeRead are safe here: they do not
 // acquire the write lock or write to the transport.
 //
-// OnInbound runs in the connection's turn and never overlaps its Handler
-// callbacks. OnOutbound runs wherever the transport finishes a send — a write
-// turn, a writer goroutine, or the goroutine closing the connection, possibly
-// with internal locks held — and may overlap the connection's Handler
-// callbacks and OnInbound, so state it shares with them must be safe for
+// OnBytesRead runs in the connection's turn and never overlaps its Handler
+// callbacks. OnBytesWritten runs wherever the transport finishes a send — a
+// write turn, a writer goroutine, or the goroutine closing the connection,
+// possibly with internal locks held — and may overlap the connection's Handler
+// callbacks and OnBytesRead, so state it shares with them must be safe for
 // concurrent use. Reports made inside a WebSocket batch handoff may be
 // combined and delivered just after handoff, preserving their byte total.
 type TrafficObserver interface {
-	OnInbound(*Conn, int)
-	OnOutbound(*Conn, int)
+	OnBytesRead(*Conn, int)
+	OnBytesWritten(*Conn, int)
 }
 
 // implementsTrafficObserver reports whether h wants per-connection traffic
@@ -176,28 +163,6 @@ type TrafficObserver interface {
 func implementsTrafficObserver(h Handler) bool {
 	_, ok := h.(TrafficObserver)
 	return ok
-}
-
-// Stats reports per-connection read pausing, the effect of
-// OutboundHighWatermark: a pause means the peer is not keeping up with its
-// replies.
-type Stats struct {
-	ReadsPaused  uint64
-	ReadsResumed uint64
-}
-
-// statsCounters is the atomic state behind Stats, shared by every connection
-// of one Server or Dialer.
-type statsCounters struct {
-	paused  atomic.Uint64
-	resumed atomic.Uint64
-}
-
-func (c *statsCounters) snapshot() Stats {
-	if c == nil {
-		return Stats{}
-	}
-	return Stats{ReadsPaused: c.paused.Load(), ReadsResumed: c.resumed.Load()}
 }
 
 // resolve returns a copy of o with the defaults applied and the values
@@ -226,13 +191,10 @@ func (o Options) resolve() (Options, error) {
 	if r.WriteCoalesce == 0 {
 		r.WriteCoalesce = defaultWriteBufferedThreshold
 	}
-	if r.OutboundHighWatermark < 0 {
-		r.OutboundHighWatermark = 0
-	} else if r.OutboundHighWatermark == 0 {
-		r.OutboundHighWatermark = DefaultOutboundHighWatermark
-	}
-	if r.OutboundLowWatermark == 0 && r.OutboundHighWatermark > 0 {
-		r.OutboundLowWatermark = r.OutboundHighWatermark / 4
+	if r.MaxInboundBuffered == 0 {
+		r.MaxInboundBuffered = DefaultMaxInboundBuffered
+	} else if r.MaxInboundBuffered < 0 {
+		r.MaxInboundBuffered = 0
 	}
 	r.Subprotocols = append([]string(nil), o.Subprotocols...)
 
@@ -261,20 +223,12 @@ func (r *Options) validate() error {
 		return invalid("Pollers %d is negative", r.Pollers)
 	case r.ReadBufferSize < 0:
 		return invalid("ReadBufferSize %d is negative", r.ReadBufferSize)
-	case r.OutboundLowWatermark < 0:
-		return invalid("OutboundLowWatermark %d is negative", r.OutboundLowWatermark)
 	case r.MaxOutboundBuffered < 0:
 		return invalid("MaxOutboundBuffered %d is negative", r.MaxOutboundBuffered)
-	case r.MaxOutboundBuffered > 0 && r.OutboundHighWatermark > r.MaxOutboundBuffered:
-		return invalid("OutboundHighWatermark %d is above MaxOutboundBuffered %d: reads would never pause before sends fail",
-			r.OutboundHighWatermark, r.MaxOutboundBuffered)
-	case r.OutboundHighWatermark > 0 && r.OutboundLowWatermark >= r.OutboundHighWatermark:
-		return invalid("OutboundLowWatermark %d is not below OutboundHighWatermark %d",
-			r.OutboundLowWatermark, r.OutboundHighWatermark)
 	case r.EnableCompression && r.CompressionLevel != 0 && (r.CompressionLevel < 1 || r.CompressionLevel > 9):
 		return invalid("CompressionLevel %d is outside 1..9", r.CompressionLevel)
 	case !r.EnableCompression && r.CompressionLevel != 0:
-		return invalid("CompressionLevel %d set while compression is disabled", r.CompressionLevel)
+		return invalid("CompressionLevel %d is outside 1..9 while compression is disabled", r.CompressionLevel)
 	}
 	return nil
 }
@@ -283,26 +237,22 @@ func (r *Options) validate() error {
 // value belongs to the Server or Dialer after this call; nothing else may
 // keep or mutate it.
 func (o Options) transportEvents() *uio.Events {
-	inboundLimit := o.OutboundHighWatermark
+	inboundLimit := o.MaxInboundBuffered
 	if inboundLimit <= 0 {
-		// Disabling automatic reply watermarks does not disable the receive
-		// bound that an explicit PauseReads relies on.
-		inboundLimit = DefaultOutboundHighWatermark
+		inboundLimit = DefaultMaxInboundBuffered
 	}
 	return &uio.Events{
 		Pollers:                o.Pollers,
-		MaxBufferSize:          o.ReadBufferSize,
+		ReadBufferSize:         o.ReadBufferSize,
 		WriteBufferedThreshold: o.WriteCoalesce,
 		ReusePort:              o.ReusePort,
 		Executor:               o.Executor,
 		MaxOutboundBuffered:    o.MaxOutboundBuffered,
-		// Bound retained input while delivery is paused, including what a
-		// transport layer below the protocol can still deliver.
-		MaxInboundBuffered: inboundLimit,
+		MaxInboundBuffered:     inboundLimit,
 	}
 }
 
-// framesPerDataRead bounds the frames one OnInbound round consumes: a full read
+// framesPerDataRead bounds the frames one read round consumes: a full read
 // of the configured buffer at six bytes per frame (the smallest a masked
 // client frame can be), never below the fairness floor.
 func (o Options) framesPerDataRead() int {
@@ -317,7 +267,7 @@ func (o Options) framesPerDataRead() int {
 func (o Options) batchBlockSize() int {
 	readSize := o.ReadBufferSize
 	if readSize <= 0 {
-		readSize = 4 << 10 // UIO's MaxBufferSize default
+		readSize = 4 << 10 // UIO's ReadBufferSize default
 	}
 	return min(max(readSize, minWriteBatchBlock), maxWriteBatchBlock)
 }

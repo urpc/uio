@@ -14,7 +14,7 @@ import (
 )
 
 type contractLower struct {
-	uio.LayerDown
+	uio.Lower
 	inbound []byte
 	wire    [][]byte
 }
@@ -36,12 +36,11 @@ func (*contractLower) PacketSource() bool   { return true }
 func (*contractLower) State() uio.ConnState { return 0 }
 
 type contractUp struct {
-	uio.LayerUp
+	uio.Upper
 	data   []byte
 	opened bool
 }
 
-func (u *contractUp) Open()                       { u.opened = true }
 func (u *contractUp) Buffered() int               { return len(u.data) }
 func (u *contractUp) Write(p []byte) (int, error) { u.data = append(u.data, p...); return len(p), nil }
 
@@ -53,8 +52,9 @@ type contractContext struct {
 	deadline time.Time
 }
 
-func (c *contractContext) Down() uio.LayerDown           { return c.lower }
-func (c *contractContext) Up() uio.LayerUp               { return c.up }
+func (c *contractContext) Lower() uio.Lower              { return c.lower }
+func (c *contractContext) Upper() uio.Upper              { return c.up }
+func (c *contractContext) Open()                         { c.up.opened = true }
 func (c *contractContext) Abort(err error) error         { c.cause = err; return nil }
 func (c *contractContext) SetTimer(when time.Time) error { c.deadline = when; return nil }
 
@@ -144,7 +144,7 @@ func TestStandaloneValidationAndFailedListenCleanup(t *testing.T) {
 	if _, err := Dial("127.0.0.1:1"); !errors.Is(err, ErrInvalidOptions) {
 		t.Fatal(err)
 	}
-	for _, opts := range []Options{{Handler: echoHandler, MaxBufferSize: 1}, {Handler: echoHandler, MTU: -1}} {
+	for _, opts := range []Options{{Handler: echoHandler, Transport: TransportOptions{ReadBufferSize: 1}}, {Handler: echoHandler, MTU: -1}} {
 		if _, err := NewDialer(opts).DialContext(context.Background(), "127.0.0.1:1"); !errors.Is(err, ErrInvalidOptions) {
 			t.Fatal(err)
 		}

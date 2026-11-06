@@ -129,15 +129,12 @@ acknowledgement to open: the first segments retransmit until the peer answers.
 type (`LayerOptions` names it where a layer is built), the zero value is the
 defaults — KCP's **Fast profile** — and `LayerOptions.Validate` reports up
 front what a session would refuse. A layer refuses the settings only the
-standalone endpoints own — `Handler`, `WriteBufferedThreshold`,
-`MaxOutboundBuffered`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`
-and the socket buffers — with `ErrInvalidOptions`, since under a layer they
-would be silently inert; `MaxBufferSize` stays allowed, because it must still
-hold a segment.
+standalone endpoints own — `Handler`, `Transport` and the socket buffers —
+with `ErrInvalidOptions`, since under a layer they would be silently inert.
 
 | Field | Default | What it does |
 | --- | --- | --- |
-| `MTU` | 1400 | Largest segment, header included (24..1500). Must not exceed the Events' `MaxBufferSize` — on both ends, since the peer's segments arrive into this end's read buffer. |
+| `MTU` | 1400 | Largest segment, header included (24..1500). Must not exceed the Events' `ReadBufferSize` — on both ends, since the peer's segments arrive into this end's read buffer. |
 | `SendWindow` / `RecvWindow` | 1024 | Windows in segments, each at most 65535 — the header's window field is a `uint16`. A window times the MTU bounds what a session holds, about 1.4 MiB each way. |
 | `NoDelay` | off | The engine's low-latency RTO mode: a 30 ms floor instead of 100 ms. |
 | `Interval` | 30 ms | The engine's flush cadence, 10 ms to 5 s. Data never waits for it. |
@@ -148,13 +145,7 @@ hold a segment.
 | `KeepAlive` | 10 s | An idle session probes the peer's window this often; silence for three periods ends it with `ErrKeepAliveTimeout`. A negative value disables keepalive. |
 | `MaxBuffered` | 4 MiB | Bytes a session holds for the writer; a write past it returns `ErrOutboundOverflow`. |
 | `Handler` | none | The connection callbacks. Required by `Server` and `Dialer`; a layer hands its stream to the layer above instead, and refuses Handler. |
-| `MaxBufferSize` | Events default | The Events' socket read size; must be at least `MTU`. |
-| `WriteBufferedThreshold` | off | Passed to the Events: writes below it join the turn's batch. |
-| `MaxOutboundBuffered` | off | Passed to the Events: a hard limit on the socket's queue, returning `ErrOutboundOverflow`. |
-| `AllowHalfOpen` | off | Keeps a session open after the peer ends its stream, as a TCP connection would be. |
-| `Pollers` | Events default | Event loops. |
-| `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
-| `Executor` | uio default | Runs connection turns on the native backend. |
+| `Transport` | zero (`TransportOptions{}`) | Configures the private `uio.Events` of a standalone `Server` or `Dialer` (`ReadBufferSize`, `WriteBufferedThreshold`, `MaxOutboundBuffered`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`). |
 | `SocketReadBuffer` / `SocketWriteBuffer` | 4 MiB | Kernel socket buffers the standalone endpoints size their UDP sockets with. A session bursts a whole window and the kernel default — a few hundred KiB — drops much of it; a negative value leaves the socket alone. A layer endpoint sizes its own sockets with `uio.WithListenControl` and `uio.WithDialControl`. |
 
 Invalid combinations — an MTU past the engine's buffers, a window past 65535, an
@@ -198,7 +189,7 @@ stream connection below that ends travels up as `io.EOF` at a segment boundary
 and `io.ErrUnexpectedEOF` inside one. The stream dialect frames with `frg=0`;
 a segment in message mode — which the dialect never sends — ends the session
 with `ErrProtocol`, because its sequence number could never be delivered in
-order. A datagram the Events' `MaxBufferSize` cannot hold would be truncated
+order. A datagram the Events' `ReadBufferSize` cannot hold would be truncated
 below the layer, so a session whose MTU exceeds it is refused with
 `ErrInvalidOptions` instead.
 

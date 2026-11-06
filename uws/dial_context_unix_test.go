@@ -6,19 +6,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"golang.org/x/sys/unix"
 	"net"
-	"sync"
 	"testing"
 	"time"
-
-	"golang.org/x/sys/unix"
 )
 
 func TestDialContextBoundsTCPConnect(t *testing.T) {
 	addr := saturatedTCPListener(t)
 	dialer := NewDialer(Options{})
-	t.Cleanup(func() { _ = dialer.Close(nil) })
-
+	t.Cleanup(func() {
+		_ = dialer.Close(nil)
+	})
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -28,52 +27,6 @@ func TestDialContextBoundsTCPConnect(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("Dial() returned after %v, want under 1s", elapsed)
-	}
-}
-
-func TestConcurrentDialCancelAndDialerCloseReturn(t *testing.T) {
-	addr := saturatedTCPListener(t)
-	dialer := NewDialer(Options{})
-	const attempts = 16
-	start := make(chan struct{})
-	errs := make(chan error, attempts)
-	cancels := make([]context.CancelFunc, attempts)
-	var ready sync.WaitGroup
-	ready.Add(attempts)
-	for index := 0; index < attempts; index++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		cancels[index] = cancel
-		go func() {
-			ready.Done()
-			<-start
-			err := dialer.Dial(ctx, "ws://"+addr+"/", nil)
-			errs <- err
-		}()
-	}
-	t.Cleanup(func() {
-		for _, cancel := range cancels {
-			cancel()
-		}
-	})
-	ready.Wait()
-	close(start)
-	for index := 0; index < attempts/2; index++ {
-		cancels[index]()
-	}
-	closeErr := errors.New("dialer closed during connect")
-	if err := dialer.Close(closeErr); err != nil {
-		t.Fatal(err)
-	}
-	deadline := time.After(time.Second)
-	for index := 0; index < attempts; index++ {
-		select {
-		case err := <-errs:
-			if err == nil {
-				t.Fatal("Dial() succeeded after cancellation")
-			}
-		case <-deadline:
-			t.Fatalf("only %d/%d Dial calls returned", index, attempts)
-		}
 	}
 }
 

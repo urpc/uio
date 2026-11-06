@@ -92,8 +92,10 @@ the listener's address and the peer's answers reach that connection, as they
 would had the peer spoken first — which is the entry point for hole punching;
 `WriteTo` sends a single datagram the same way.
 
-For the socket options no setter carries, `Conn.Control(fn)` runs fn with the
-connection's descriptor — IP_TTL for a NAT probe, IP_TOS, SO_MARK — and the
+For OS socket options (`SetNoDelay`, `SetKeepAlive`, `SetLinger`, buffer sizes)
+and raw descriptor access, `uio.SocketOf(c)` returns the underlying
+`SocketConn`, and `SocketConn.Control(fn)` runs `fn` with the connection's
+descriptor — IP_TTL for a NAT probe, IP_TOS, SO_MARK — while the
 `SocketControl` options run before a socket connects or binds:
 `WithDialControl` on a dial, `WithLocalAddr` binds the dial's socket first,
 and `WithListenControl` runs on a `Listen`'s socket before it binds. `fd` is
@@ -209,14 +211,14 @@ type xorHandler struct {
 }
 
 func (x *xorHandler) OnRead(ctx uio.LayerContext) error {
-	in := ctx.Down().PeekChunk()
-	_, _ = ctx.Up().Write(xor(in, x.key))
-	_, err := ctx.Down().Discard(len(in))
+	in := ctx.Lower().PeekChunk()
+	_, _ = ctx.Upper().Write(xor(in, x.key))
+	_, err := ctx.Lower().Discard(len(in))
 	return err
 }
 
 func (x *xorHandler) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
-	if _, err := ctx.Down().Write(xor(p, x.key)); err != nil {
+	if _, err := ctx.Lower().Write(xor(p, x.key)); err != nil {
 		return 0, err
 	}
 	return len(p), nil
@@ -234,8 +236,9 @@ cross the wire XOR'd, and arrive as plaintext again.
 
 The layer above — the next layer or your Handler — gets a `Conn` UIO builds
 over this one: its reads are what the layer delivered, its writes reach
-`OnWrite`, and its addresses, userdata, deadlines and socket options are the
-connection's own. A layer writes none of that.
+`OnWrite`, its addresses, userdata, and deadlines are the connection's own,
+and `uio.SocketOf(conn)` reaches the underlying OS socket options. A layer
+writes none of that.
 
 ### One connection through the stack
 
@@ -259,32 +262,32 @@ connection
    │
    ├─ stackDriver.OnOpen
    ├─ Attach(kcp) → Attach(tls) → Attach(trace)
-   └─ kcp.OnOpen ─Up().Open()→ tls.OnOpen ─Up().Open()→ trace.OnOpen
-      ─Up().Open()→ Handler.OnOpen   (each opens after the one below
+   └─ kcp.OnOpen ─ctx.Open()→ tls.OnOpen ─ctx.Open()→ trace.OnOpen
+      ─ctx.Open()→ Handler.OnOpen   (each opens after the one below
       returned — never inside another callback — and the dial settles
       once the Handler's OnOpen returned)
 
 one turn: inbound goes up, outbound goes down
 
 inbound  socket ──► [kcp] ──► [tls] ──► [trace] ──► Handler.OnRead
-                    Down().Read  Up().Write   Up().Write   Conn.Read
+                    Lower().Read Upper().Write Upper().Write Conn.Read
 
 outbound socket ◄── [kcp] ◄── [tls] ◄── [trace] ◄── Handler.Conn.Write
-                    Down().Write Down().Write Down().Write
+                    Lower().Write Lower().Write Lower().Write
 
 close
 
 Handler calls Close, or a layer ctx.Close/Abort (walked on a turn)
-   └─ closing published once; the close passes downward, goodbyes and
-      flushes first on a graceful close ──► the socket drains, then closes
+   └─ closing published once; the close passes downward, OnClosing frames
+      queued first on a graceful close ──► the socket drains, then closes
       └─ Handler.OnClose → trace.OnClose → tls.OnClose → kcp.OnClose
 ```
 
-Every layer reads the connection `ctx.Down()` and writes the layer above's
-input `ctx.Up()`: Read and Write, the same verbs at every level, up to the
+Every layer reads the connection `ctx.Lower()` and writes the layer above's
+input `ctx.Upper()`: Read and Write, the same verbs at every level, up to the
 Handler's own `Conn`. A write from above arrives as `OnWrite`, transforms,
-and leaves through `Down().Write`. A due layer timer runs before that
-layer's `OnRead`; optional `OnWireSent` and `Flush` run when the turn ends.
+and leaves through `Lower().Write`. A due layer timer runs before that
+layer's `OnRead`.
 
 ### What UIO guarantees every layer
 
@@ -293,36 +296,30 @@ These are UIO's to keep, not each layer's to remember:
 1. **Every turn reaches the layers above**, whether or not a layer delivered
    anything. A wake, or a timer armed higher up, reaches the Handler through
    any stack — a layer cannot swallow it.
-2. **Every layer has a timer of its own.** `LayerContext.SetTimer` arms the
-   layer's, and the Handler's `SetWakeDeadline` is a slot of its own too: no
-   layer replaces another's.
+2. **Every layer has a timer of its own.** `LayerContext.SetTimer` and
+   `LayerContext.SetTimerInterval` arm the layer's timer, and the Handler's
+   `SetWakeDeadline` is a slot of its own too: no layer replaces another's.
 3. **The turn callbacks never overlap.** `OnOpen`, `OnRead`, `OnTimer`,
-   `OnWireSent`, `OnClose` and the Handler's callbacks run on the connection's
-   turns, and so does a close's walk: `CloseGracefully` runs on a turn,
-   whatever asked for the close. The others run where they are called for and
-   may overlap the turns: `OnWrite` on the writer's goroutine, `CloseWrite` on
-   the goroutine closing the connection or on the turn that finishes its end,
-   `OutboundHeld` on writers' and `Flush` on a turn's or the caller of
-   `Flush`. State they share needs a lock. UIO never calls a layer from below
-   or from inside another layer's callback — `Up().Open()` records a request,
-   and the layers above open on the turn's open stage, after the calling
-   callback returned — so a layer may hold its lock while it writes, flushes
-   or closes below.
+   `OnClosing`, `OnClose` and the Handler's callbacks run on the connection's
+   turns, whatever asked for the close. The others run where they are called
+   for and may overlap the turns: `OnWrite` on the writer's goroutine,
+   `CloseWrite` on the goroutine closing the connection or on the turn that
+   finishes its end, and `OutboundHeld` on writers'. State they share needs a
+   lock. UIO never calls a layer from below or from inside another layer's
+   callback — `ctx.Open()` records a request, and the layers above open on the
+   turn's open stage, after the calling callback returned — so a layer may
+   hold its lock while it writes or closes below.
 4. **A connection ends once, top down.** The Handler's `OnClose` comes first,
    if its `OnOpen` ran, then every layer's. A connection whose stack never
    opened — a failed handshake — ends without a Handler callback. Once a
-   close has begun — from the Handler or from any layer, even inside its
-   `OnWireSent` or `Flush` — no new call reaches a layer from a turn: writes
-   and flushes return `net.ErrClosed`, and only `OnClose` follows. A close
-   asked after that follows its own API's repeated-request contract — a
-   repeated `CloseWith` reports `net.ErrClosed`, unless it meets a graceful
-   drain, which it cuts short; `CloseGracefully` and a layer's `Close` yield
-   to the close under way — and no second goodbye starts. The close itself is
-   the one caller left: the goodbyes it walks, and the flushes it makes below
-   the layer that began it.
+   close has begun — from the Handler or from any layer — no new call reaches a
+   layer from a turn: writes and flushes return `net.ErrClosed`, and only
+   `OnClose` follows. A repeated `Close` reports `net.ErrClosed` (or yields when
+   called via `ctx.Close`), while `Abort` cuts any graceful drain short at once
+   — and no second close walk starts. The close itself is the one caller left:
+   the `OnClosing` hooks it walks below the layer that began it.
 5. **The end of a stream travels up.** A layer whose peer ended its stream
-   calls `LayerContext.Up().End()`; the layer above reads `io.EOF` after the
-   rest.
+   calls `ctx.Upper().End()`; the layer above reads `io.EOF` after the rest.
    At the top it closes the connection, or, with `AllowHalfOpen`, leaves the
    Handler to end its own half with `CloseWrite`.
 6. **`MaxOutboundBuffered` refuses whole writes, at the top.** The Handler's
@@ -330,13 +327,12 @@ These are UIO's to keep, not each layer's to remember:
    and reserves its room, so concurrent writers cannot pass the limit
    together; what a layer writes below is never refused — a TLS record, once
    encrypted, has to reach the wire.
-7. **A graceful close lets the queue leave first.** `Close` on a layered
-   connection closes the socket once what was queued — the layers' goodbyes
+7. **A graceful close lets the queue leave first.** `Close` on a connection
+   closes the socket once what was queued — the layers' `OnClosing` frames
    included — has left, or once it stopped moving for `uio.LingerTimeout`;
-   what arrives meanwhile is discarded. A `CloseWith` with any other error,
-   and `ctx.Abort`, end it at once. A layer closing the connection itself
-   does so through `ctx.Close(cause)` or `ctx.Abort(cause)`: the same one
-   close algorithm, begun at that layer.
+   what arrives meanwhile is discarded. `Abort` and `ctx.Abort` end it at once.
+   A layer closing the connection itself does so through `ctx.Close()` or
+   `ctx.Abort(cause)`: the same one close algorithm, begun at that layer.
 8. **`MaxInboundBuffered` covers the whole stack.** Bytes the layers hold for
    the Handler count against it with the socket's buffer: a stack holding the
    limit takes nothing more from the socket until the Handler reads.
@@ -377,23 +373,14 @@ A `LayerHandler` may also implement optional interfaces:
   A layer without it does not support `CloseWrite` — embedding `PassThrough`
   does not grant it (`PassThroughLayer` does, as the layer that changes
   nothing). UIO calls it only after what was written before `CloseWrite` has
-  gone below: writes in flight finished, the layer flushed, held output
-  sent.
-- `GracefulCloser` says goodbye as the layer above closes, told the close's
-  cause.
-- `WireCounterObserver` hears every byte the socket sends, on the connection's
-  turn — for a protocol whose state moves as its output leaves, a ping's
-  timeout or a close waiting for its frame.
-- `OutboundHolder` and `Flusher` are for a layer that holds output of its own,
-  a send window or a compressor's buffer: what it holds counts as queued, and
-  `Flush` reaches it.
-- `TrackedWriter` answers when one tracked write has left the wire:
-  `ctx.Down().(uio.TrackedWriter).WriteTracked(p)` returns a `SendReceipt`,
-  and a `ReceiptObserver` hears it on the turn it retires — which is how a
-  protocol knows its own frame is out.
+  gone below: writes in flight finished and held output sent.
+- `LayerCloser` sends a protocol close frame (`OnClosing`) as the connection
+  closes, told the close's cause.
+- `OutboundHolder` is for a layer that holds output of its own, such as a send
+  window: what it holds counts in `OutboundBuffered` and `MaxOutboundBuffered`.
 
-`Conn.State()` reports where the streams stand — `StatePeerEnded`,
-`StateWriteShut`, `StateClosing`, `StateClosed` — read on the connection's
+`Conn.State()` reports where the streams stand — `StateReadEnded`,
+`StateWriteEnded`, `StateClosing`, `StateClosed` — read on the connection's
 turn, replacing the old probe reads.
 
 ### What it is not
@@ -423,7 +410,7 @@ turn, replacing the old probe reads.
   or `MaxInboundBuffered`): the framework stops calling a layer whose
   delivery is full until the layer above reads. The bound is a pacing
   threshold, not a cap on one write: the write that crosses it — and any a
-  layer makes from `OnOpen`, `OnWireSent` or `OnSent` — lands whole. A
+  layer makes from `OnOpen` — lands whole. A
   Handler that peeks a whole frame without consuming (ReserveInbound +
   PeekChunk) therefore sees about one bound's worth from a layer that
   delivers in chunks; set `MaxInboundBuffered` to size such frames.
@@ -436,7 +423,7 @@ Everything is optional; the zero `Events` is ready to use.
 | --- | --- | --- |
 | `Pollers` | one per 4 Ps: 1–8 native, at least 2 on stdio | Number of event loops, never more than `GOMAXPROCS`. |
 | `Executor` | built-in sharded pool | Your own scheduler for connection and write turns (native backend). |
-| `MaxBufferSize` | 4 KiB | Bytes read per socket read. |
+| `ReadBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnRead` are batched either way. |
 | `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow`. |
 | `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnRead` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. A packet connection keeps no buffer to hold and is never paced by it: its bottom `PacketLayer` carries whatever backpressure its protocol provides. |
@@ -461,15 +448,15 @@ nothing; the three are read once, when `Serve` starts.
 
 When a connection's data goes somewhere slower — a peer it forwards to, an
 upstream call, a work queue — stop its input once that destination is behind,
-and release it when the destination has room again. `PauseReads` and
-`ResumeReads` are that switch:
+and release it when the destination has room again. `PauseRead` and
+`ResumeRead` are that switch:
 
 ```go
 relay := uio.FuncHandler{
 	Read: func(c uio.Conn) error {
 		peer := peerOf(c) // the destination this connection forwards to
 		if peer.OutboundBuffered() >= high {
-			_ = c.PauseReads() // the destination is behind: stop the source
+			_ = c.PauseRead() // the destination is behind: stop the source
 		}
 		_, err := c.WriteTo(peer)
 		return err
@@ -478,45 +465,43 @@ relay := uio.FuncHandler{
 // The destination drained: let the source's input through again.
 relay.BytesWritten = func(dest uio.Conn, _ int) {
 	if dest.OutboundBuffered() <= low {
-		_ = sourceOf(dest).ResumeReads()
+		_ = sourceOf(dest).ResumeRead()
 	}
 }
 ```
 
 While a plain stream is paused its socket is not read, so TCP flow control
 slows the peer at once and what was already read stays in the connection:
-`ResumeReads` schedules the turn that hands it to OnRead, and a write past
+`ResumeRead` schedules the turn that hands it to OnRead, and a write past
 the destination's own `MaxOutboundBuffered` fails with `ErrOutboundOverflow`,
 so the pause above keeps memory bounded without closing anyone. Pausing keeps
-timers, writes, send reports and close work running; it never releases
-another owner's pause (protocol layers and helpers hold pauses of their own),
-and it is safe from any goroutine. A full `Wake`-based variant of the same
-loop — leave the bytes unconsumed until `MaxInboundBuffered` stops the
-socket, then `Wake` the source when the destination drains — needs no API
-beyond `OutboundBuffered`, and a destination whose queue drains without a
-write to report it tells an Observer that implements `QueueDrainedObserver`.
+timers, writes and close work running; it never releases another owner's
+pause (protocol layers and helpers hold pauses of their own), and it is safe
+from any goroutine. A full `Wake`-based variant of the same loop — leave the
+bytes unconsumed until `MaxInboundBuffered` stops the socket, then `Wake` the
+source when the destination drains — needs no API beyond `OutboundBuffered`.
 
-`PauseReads` is the application's one switch, idempotent rather than
+`PauseRead` is the application's one switch, idempotent rather than
 reference counted. What was read is kept and handed to the first OnRead
-after `ResumeReads`, and the peer's end of the stream waits behind it: a
+after `ResumeRead`, and the peer's end of the stream waits behind it: a
 paused connection does not close for its peer's end until it resumed and saw
 what it kept. A reset, a fatal error or a local close ends it regardless (on
-the portable stdio backend a reset behind a pause is seen once reads resume
+the portable stdio backend a reset behind a pause is seen once reading resumes
 or a read deadline passes: the socket is not read while paused). A layered
 stack keeps reading its socket into its bounds (`MaxInboundBuffered`, or
 64 KiB when that is zero) while its Handler is paused. A callback or socket
 read already in flight finishes, so a protocol handling several messages in
-one callback checks `ReadsPaused()` between them. Raw datagram connections
+one callback checks `ReadPaused()` between them. Raw datagram connections
 report `ErrUnsupported`: their peers share a socket.
 
-`Bridge` is this loop packaged for one shape: a relay whose every accepted
-connection is dialed to one upstream. A leg whose destination queue reaches
-`InboundLimit` (256 KiB by default) leaves its input unconsumed, forwards
-again once the queue drains to half, and splits a read larger than the
+`ubridge.Bridge` is this loop packaged for one shape: a relay whose every
+accepted connection is dialed to one upstream. A leg whose destination queue
+reaches `InboundLimit` (256 KiB by default) leaves its input unconsumed,
+forwards again once the queue drains to half, and splits a read larger than the
 destination's write budget:
 
 ```go
-bridge := &uio.Bridge{Upstream: "tcp://127.0.0.1:9527"}
+bridge := &ubridge.Bridge{Upstream: "tcp://127.0.0.1:9527"}
 events := bridge.Events()
 err := events.Serve("tcp://:9528")
 ```
@@ -524,19 +509,12 @@ err := events.Serve("tcp://:9528")
 For anything else — many destinations per source, a choice of upstream per
 connection, a store between the sides — drive the pause yourself, as above.
 
-**Yielding.** `YieldRead()` splits work across turns: the callback returns,
-and a later turn calls OnRead again with what it left, before the end of the
-stream is reported. A continuation that consumed nothing reads the socket
-first, so a callback waiting for a whole message gets it; once the stream has
-ended, such a continuation closes the connection. Before that end, yield only
-after making progress, or the callbacks spin.
-
 ## Going faster
 
 These are optional. Plain `Read`, `Write` and `WriteTo` work on every backend.
 
 **Read a TLS record whole.** A TLS record carries up to 16 KiB, and crypto/tls
-reads a record per socket read: the default 4 KiB `MaxBufferSize` splits
+reads a record per socket read: the default 4 KiB `ReadBufferSize` splits
 every record across four rounds, and each round carries its ciphertext
 through the stack again. At 16 KiB — the record size, the socket-read cadence
 the standard library runs at — a TLS layer moves about 1.4× the bytes of the
@@ -551,7 +529,7 @@ For a length-prefixed protocol, `ReserveInbound` gathers a packet that spans
 several reads into one chunk, so it can still be decoded in place:
 
 ```go
-func onData(c uio.Conn) error { // a Handler's OnRead, or a FuncHandler's Data
+func onRead(c uio.Conn) error { // a Handler's OnRead, or a FuncHandler's Read
 	var header [4]byte
 	for {
 		h := c.Peek(header[:]) // copies only if the header spans reads
@@ -576,21 +554,15 @@ func onData(c uio.Conn) error { // a Handler's OnRead, or a FuncHandler's Data
 }
 ```
 
-**Encode in place.** Inside a stream connection's own callback on the native
-backend, `ReserveOutbound` hands you room in the send queue to encode a reply
-into. Anywhere else it returns an error; encode into a pooled buffer and give
-it away with `WriteOwned` instead:
+**Zero-copy pooled writes.** Encode into a pooled `uio.Buffer` and transfer
+ownership with `WriteOwned`:
 
 ```go
-if dst, err := c.ReserveOutbound(n); err == nil {
-	encode(dst) // fill every byte before the callback returns or flushes
-} else {
-	buf := uio.AcquireBuffer(n)
-	encode(buf.AvailableBuffer()[:n])
-	buf.CommitWrite(n)
-	if _, err := c.WriteOwned(buf); err == uio.ErrOutboundOverflow {
-		uio.ReleaseBuffer(buf) // overflow is the only error that hands it back
-	}
+buf := uio.AcquireBuffer(n)
+encode(buf.AvailableBuffer()[:n])
+buf.CommitWrite(n)
+if _, err := c.WriteOwned(buf); err == uio.ErrOutboundOverflow {
+	uio.ReleaseBuffer(buf) // overflow is the only error that hands it back
 }
 ```
 
@@ -601,17 +573,17 @@ if dst, err := c.ReserveOutbound(n); err == nil {
   connection's own callback. Slices they return are valid until the callback
   returns or consumes more input; copy anything you hand to another goroutine.
   Builds with `-race` catch most misuse with a panic.
-- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`,
-  `CloseWith` and `CloseGracefully` are safe from any goroutine.
+- `Write`, `Writev`, `WriteString`, `WriteOwned`, `Flush`, `Close`, `CloseWrite`
+  and `Abort` are safe from any goroutine.
 - `CloseWrite` shuts a stream connection's writing half after everything
   accepted has been sent; later writes return `net.ErrClosed`. On a layered
-  connection it runs the layer's own `CloseWrite` inline — flushing it, and
-  writing a TLS close_notify — so it may wait on I/O.
-- `CloseGracefully` closes after everything accepted has been sent: writes are
+  connection it runs the layer's own `CloseWrite` inline — writing a TLS
+  close_notify — so it may wait on I/O.
+- `Close` closes gracefully after everything accepted has been sent: writes are
   refused from the call, reads go on, and the connection releases once its
   queue is empty or `LingerTimeout` passes without progress, reporting
-  leftover output as `UnflushedError` appended to the cause. A `CloseWith`
-  ends the wait at once.
+  leftover output as `UnflushedError`. `Abort(cause)` cuts the wait short at
+  once and reports `cause` to `OnClose`.
 - `OnBytesWritten` can run concurrently with the connection's other callbacks.
 - `OnClose` means the connection is released, not that its socket is closed.
   With `GOMAXPROCS` of 33 or more, or `Pollers` above 8, an accepted

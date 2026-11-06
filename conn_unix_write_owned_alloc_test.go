@@ -2,7 +2,9 @@
 
 package uio
 
-import "testing"
+import (
+	"testing"
+)
 
 func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 	loop := &eventLoop{}
@@ -11,7 +13,6 @@ func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 	conn.ioOwner.Store(currentGoroutineID())
 	conn.loop = loop
 	payload := make([]byte, 1024)
-
 	write := func() {
 		buffer := AcquireBuffer(len(payload))
 		dst := buffer.AvailableBuffer()[:len(payload)]

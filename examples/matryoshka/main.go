@@ -168,20 +168,20 @@ type xorHandler struct{}
 
 const mask = 0x5a
 
-func (xorHandler) OnOpen(ctx uio.LayerContext) { ctx.Up().Open() }
+func (xorHandler) OnOpen(ctx uio.LayerContext) { ctx.Open() }
 
 // OnRead hands what waits below up, scrambled.
 func (xorHandler) OnRead(ctx uio.LayerContext) error {
-	down := ctx.Down()
+	lower := ctx.Lower()
 	for {
-		chunk := down.PeekChunk()
+		chunk := lower.PeekChunk()
 		if len(chunk) == 0 {
 			return nil
 		}
-		if _, err := ctx.Up().Write(xor(chunk)); err != nil {
+		if _, err := ctx.Upper().Write(xor(chunk)); err != nil {
 			return err
 		}
-		if _, err := down.Discard(len(chunk)); err != nil {
+		if _, err := lower.Discard(len(chunk)); err != nil {
 			return err
 		}
 	}
@@ -189,7 +189,7 @@ func (xorHandler) OnRead(ctx uio.LayerContext) error {
 
 // OnWrite carries what the layer above wrote down, scrambled.
 func (xorHandler) OnWrite(ctx uio.LayerContext, p []byte) (int, error) {
-	return ctx.Down().Write(xor(p))
+	return ctx.Lower().Write(xor(p))
 }
 
 func (xorHandler) OnTimer(uio.LayerContext) error { return nil }

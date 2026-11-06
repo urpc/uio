@@ -1,4 +1,4 @@
-//go:build (darwin || netbsd || freebsd || openbsd || dragonfly) && !stdio
+//go:build darwin || netbsd || freebsd || openbsd || dragonfly
 
 package poller
 

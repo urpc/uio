@@ -65,7 +65,6 @@ type Dialer struct {
 	header          http.Header // Header, canonical, fixed at first Dial
 	events          *uio.Events // private transport configuration
 	clients         sync.Map    // the open pull Clients, for Close to release
-	stats           statsCounters
 
 	// startHook runs inside the transport's OnStart before the start result
 	// is published; it lets tests observe or block startup.
@@ -76,9 +75,6 @@ type Dialer struct {
 func NewDialer(opts Options) *Dialer {
 	return &Dialer{Options: opts}
 }
-
-// Stats reports the read pausing of this dialer's connections.
-func (d *Dialer) Stats() Stats { return d.stats.snapshot() }
 
 // Dial starts a WebSocket connection and returns once the upgrade request is
 // on its way — with a TLSConfig, once the transport's stack opened, which is
@@ -194,7 +190,7 @@ func (d *Dialer) dialWithHandler(ctx context.Context, addr string, userdata any,
 // sendRequest writes the upgrade request once the stack under it has
 // settled — with a TLS layer, its OnOpen runs after that layer's handshake,
 // and the request must not go out in the clear before it. The request's
-// OnOutbound retires pending bytes like any frame's, so it must be counted,
+// transportSent retires pending bytes like any frame's, so it must be counted,
 // or it would retire the bytes of a later Close frame and let the graceful
 // close drop that frame.
 func (d *Dialer) sendRequest(raw uio.Conn, setup *dialSetup) {
@@ -202,22 +198,18 @@ func (d *Dialer) sendRequest(raw uio.Conn, setup *dialSetup) {
 	if conn == nil {
 		return
 	}
-	conn.trackOutbound(len(setup.request))
 	n, err := raw.Write(setup.request)
 	if err == nil && n != len(setup.request) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		conn.rollbackOutbound(len(setup.request) - n)
 		if !errors.Is(err, net.ErrClosed) {
-			// A connection already closed, possibly after the whole
-			// handshake ran, reports its own cause.
-			_ = raw.CloseWith(err)
+			_ = raw.Abort(err)
 		}
 		return
 	}
 	if err := raw.Flush(); err != nil && !errors.Is(err, net.ErrClosed) {
-		_ = raw.CloseWith(err)
+		_ = raw.Abort(err)
 	}
 }
 
@@ -283,7 +275,7 @@ func (d *Dialer) start(ctx context.Context) error {
 		}
 		d.opts = opts
 		d.header = canonicalHeader(d.Header)
-		d.config = newDialerConnConfig(opts, &d.stats)
+		d.config = newDialerConnConfig(opts)
 		events := opts.transportEvents()
 		d.events = events
 		handler := uio.FuncHandler{
@@ -307,7 +299,6 @@ func (d *Dialer) start(ctx context.Context) error {
 			Close:        d.onClose,
 			BytesWritten: d.onOutbound,
 			BytesRead:    d.onInbound,
-			Sent:         d.onSentReceipt,
 		}
 		if d.config.heartbeatInterval > 0 {
 			handler.Timer = d.onTimer // see Server.Serve
@@ -442,7 +433,7 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 	config := d.config
 	if config == nil {
 		opts, _ := d.Options.resolve()
-		config = newDialerConnConfig(opts, &d.stats)
+		config = newDialerConnConfig(opts)
 	}
 	handler := config.handler
 	if setup.handler != nil {
@@ -453,10 +444,10 @@ func (d *Dialer) newClientConn(raw uio.Conn, setup *dialSetup) *Conn {
 		handler:  handler,
 		userData: setup.userdata,
 	}
-	conn.setRaw(raw)
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
+	conn.setRaw(raw)
 	conn.handshake.Store(&handshakeState{
 		clientKey: setup.key,
 		cleanup:   setup.cleanup,
@@ -478,7 +469,7 @@ func (d *Dialer) onData(raw uio.Conn) error {
 
 func (d *Dialer) onTimer(raw uio.Conn) error {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.timerTick(time.Now(), raw.InboundBuffered() > 0 || conn.stagedInput())
+		conn.timerTick(time.Now(), raw.InboundBuffered() > 0)
 	}
 	return nil
 }
@@ -487,26 +478,14 @@ func (d *Dialer) onTimer(raw uio.Conn) error {
 func (d *Dialer) onInbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		if observer, ok := conn.handler.(TrafficObserver); ok {
-			observer.OnInbound(conn, n)
+			observer.OnBytesRead(conn, n)
 		}
-	}
-}
-
-// onSentReceipt hears the receipts of the Handler's own tracked writes over a
-// layer chain: the Close frame and the heartbeat Ping the connection waits on.
-func (d *Dialer) onSentReceipt(raw uio.Conn, r uio.SendReceipt) {
-	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.receiptSent(r)
 	}
 }
 
 func (d *Dialer) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.transportSent(n)
-		if conn.writes.close.closePending() {
-			conn.tryCloseTransport()
-		}
-		conn.resumeReadsAfterDrain()
+		conn.onTransportProgress(n)
 		conn.observeOutbound(n)
 	}
 }
@@ -554,6 +533,9 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 	conn.stopCloseTimer()
 	info := conn.closeInfo()
 	if info.Err == nil {
+		if err == nil {
+			err = io.EOF
+		}
 		info.Err = err
 	}
 	conn.notifyClose(info)

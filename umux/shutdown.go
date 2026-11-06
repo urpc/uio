@@ -63,7 +63,7 @@ func (s *Session) Shutdown(ctx context.Context) error {
 	if ferr != nil {
 		// The transport is broken; its close path ends the session and the
 		// drain with it.
-		_ = s.conn.CloseWith(ferr)
+		_ = s.conn.Abort(ferr)
 	}
 	// A session with nothing to drain closes as soon as the GoAway was
 	// accepted.
@@ -102,7 +102,7 @@ func (s *Session) forceDrain(cause error) {
 	for _, st := range streams {
 		s.abortStream(st, ErrShutdownTimeout)
 	}
-	_ = s.conn.CloseWith(cause)
+	_ = s.conn.Abort(cause)
 }
 
 // maybeFinishDrain closes the transport once a draining session settled every
@@ -122,7 +122,7 @@ func (s *Session) maybeFinishDrain() {
 	if !ready {
 		return
 	}
-	_ = s.conn.CloseWith(nil)
+	_ = s.conn.Close()
 }
 
 // finishDrainLocked closes the drain's done channel once and records how it

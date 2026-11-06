@@ -10,19 +10,14 @@ import (
 	"time"
 )
 
-// TestUnixConnectionAddressesAreKept pins that non-IP peers keep their address
-// objects. Unix addresses have no value form, and dropping them made
-// RemoteAddr return nil, which panicked callers that use it.
 func TestUnixConnectionAddressesAreKept(t *testing.T) {
-	// The socket path is limited to about 100 bytes, shorter than a test
-	// TempDir on darwin.
 	dir, err := os.MkdirTemp("/tmp", "uio-unix-")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-
-	// Dial side: the uio connection must report the listener's Unix path.
+	t.Cleanup(func() {
+		_ = os.RemoveAll(dir)
+	})
 	dialPath := filepath.Join(dir, "peer.sock")
 	listener, err := net.Listen("unix", dialPath)
 	if err != nil {
@@ -35,12 +30,15 @@ func TestUnixConnectionAddressesAreKept(t *testing.T) {
 			peerAccepted <- conn
 		}
 	}()
-
 	clientEvents := &Events{Pollers: 1}
 	clientStarted := make(chan struct{}, 1)
-	funcs(clientEvents).Start = func(*Events) { clientStarted <- struct{}{} }
+	funcs(clientEvents).Start = func(*Events) {
+		clientStarted <- struct{}{}
+	}
 	clientDone := make(chan error, 1)
-	go func() { clientDone <- clientEvents.Serve() }()
+	go func() {
+		clientDone <- clientEvents.Serve()
+	}()
 	t.Cleanup(func() {
 		_ = clientEvents.Close(nil)
 		<-clientDone
@@ -56,22 +54,25 @@ func TestUnixConnectionAddressesAreKept(t *testing.T) {
 		t.Fatalf("dialed RemoteAddr = %v (%T), want unix %s", addr, addr, dialPath)
 	}
 	_ = dialed.Close()
-
-	// Accept side: a uio Unix listener must report its peer and its own path.
 	servePath := filepath.Join(dir, "server.sock")
 	serverEvents := &Events{Pollers: 1}
 	serverStarted := make(chan struct{}, 1)
-	funcs(serverEvents).Start = func(*Events) { serverStarted <- struct{}{} }
+	funcs(serverEvents).Start = func(*Events) {
+		serverStarted <- struct{}{}
+	}
 	accepted := make(chan Conn, 1)
-	funcs(serverEvents).Open = func(conn Conn) { accepted <- conn }
+	funcs(serverEvents).Open = func(conn Conn) {
+		accepted <- conn
+	}
 	serverDone := make(chan error, 1)
-	go func() { serverDone <- serverEvents.Serve("unix://" + servePath) }()
+	go func() {
+		serverDone <- serverEvents.Serve("unix://" + servePath)
+	}()
 	t.Cleanup(func() {
 		_ = serverEvents.Close(nil)
 		<-serverDone
 	})
 	<-serverStarted
-
 	var peerConn net.Conn
 	for deadline := time.Now().Add(5 * time.Second); peerConn == nil && time.Now().Before(deadline); {
 		peerConn, err = net.Dial("unix", servePath)

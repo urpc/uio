@@ -17,6 +17,7 @@
 package uws
 
 import (
+	"io"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -49,7 +50,6 @@ type Server struct {
 	config  *connConfig
 	opts    Options     // resolved snapshot, fixed at Serve
 	events  *uio.Events // private transport configuration
-	stats   statsCounters
 	started atomic.Bool
 	ready   atomic.Bool
 	closeMu sync.Mutex
@@ -76,9 +76,6 @@ func NewServer(opts Options) *Server {
 // before taking traffic: an upgrade that arrives earlier gets HTTP 500.
 func (s *Server) Ready() <-chan struct{} { return s.readyCh }
 
-// Stats reports the read pausing of this server's connections.
-func (s *Server) Stats() Stats { return s.stats.snapshot() }
-
 // Serve starts the event loops and listens on each supplied address. Calling
 // Serve without an address prepares the Server for use as an http.Handler.
 func (s *Server) Serve(addrs ...string) error {
@@ -96,7 +93,7 @@ func (s *Server) Serve(addrs ...string) error {
 		return ErrServerStarted
 	}
 	s.opts = opts
-	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
+	s.config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize)
 	events := opts.transportEvents()
 	s.events = events
 	// One listener per address, each carrying the TLS chain when a TLSConfig
@@ -142,11 +139,12 @@ func (s *Server) Serve(addrs ...string) error {
 				s.readyOnce.Do(func() { close(s.readyCh) })
 			}
 		},
-		Open:         s.onOpen,
-		Read:         s.onData,
-		Close:        s.onClose,
-		BytesWritten: s.onOutbound,
-		Sent:         s.onSentReceipt,
+		Open:  s.onOpen,
+		Read:  s.onData,
+		Close: s.onClose,
+	}
+	if s.config.heartbeatInterval > 0 || s.config.observeTraffic {
+		handler.BytesWritten = s.onOutbound
 	}
 	if s.config.heartbeatInterval > 0 {
 		// Only the heartbeat needs a timer callback: OnRead ticks it on
@@ -217,16 +215,16 @@ func (s *Server) newConnection(raw uio.Conn) *Conn {
 	config := s.config
 	if config == nil {
 		opts, _ := s.Options.resolve()
-		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize, &s.stats)
+		config = newServerConnConfig(opts, s.CheckOrigin, s.Authorize)
 	}
 	conn := &Conn{
 		config:  config,
 		handler: config.handler,
 	}
-	conn.setRaw(raw)
 	if config.heartbeatInterval > 0 {
 		conn.heartbeat = &heartbeatState{}
 	}
+	conn.setRaw(raw)
 	return conn
 }
 
@@ -247,7 +245,7 @@ func (s *Server) onData(raw uio.Conn) error {
 
 func (s *Server) onTimer(raw uio.Conn) error {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.timerTick(time.Now(), raw.InboundBuffered() > 0 || conn.stagedInput())
+		conn.timerTick(time.Now(), raw.InboundBuffered() > 0)
 	}
 	return nil
 }
@@ -256,26 +254,14 @@ func (s *Server) onTimer(raw uio.Conn) error {
 func (s *Server) onInbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
 		if observer, ok := conn.handler.(TrafficObserver); ok {
-			observer.OnInbound(conn, n)
+			observer.OnBytesRead(conn, n)
 		}
-	}
-}
-
-// onSentReceipt hears the receipts of the Handler's own tracked writes over a
-// layer chain: the Close frame and the heartbeat Ping the connection waits on.
-func (s *Server) onSentReceipt(raw uio.Conn, r uio.SendReceipt) {
-	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.receiptSent(r)
 	}
 }
 
 func (s *Server) onOutbound(raw uio.Conn, n int) {
 	if conn, ok := raw.Userdata().(*Conn); ok && conn != nil {
-		conn.transportSent(n)
-		if conn.writes.close.closePending() {
-			conn.tryCloseTransport()
-		}
-		conn.resumeReadsAfterDrain()
+		conn.onTransportProgress(n)
 		conn.observeOutbound(n)
 	}
 }
@@ -302,6 +288,9 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 	conn.stopCloseTimer()
 	info := conn.closeInfo()
 	if info.Err == nil {
+		if err == nil {
+			err = io.EOF
+		}
 		info.Err = err
 	}
 	conn.notifyClose(info)

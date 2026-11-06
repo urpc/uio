@@ -24,21 +24,14 @@ import (
 	"github.com/urpc/uio/internal/readcontrol"
 )
 
-// The bits of Conn.readPaused.
-const (
-	readPauseInternal uint32 = 1 << iota // the automatic reply watermark's
-	readPauseExternal                    // the application's
-)
+const readPauseExternal uint32 = 1
 
-// connReadPauses holds this connection's two pauses of the transport, each
-// its own owner there: neither ever releases the other, nor a pause another
-// owner of the transport holds. The mutex orders each pause's transition and
-// its mirror bit in Conn.readPaused against a local Close; it covers no
-// protocol callback and no socket I/O.
+// connReadPauses holds this connection's application read pause on the
+// transport. The mutex orders transitions and its mirror bit in Conn.readPaused
+// against a local Close; it covers no protocol callback and no socket I/O.
 type connReadPauses struct {
 	mu       sync.Mutex
 	external *readcontrol.Pause
-	internal *readcontrol.Pause
 }
 
 func (c *Conn) ensureReadPauses() *connReadPauses {
@@ -46,7 +39,7 @@ func (c *Conn) ensureReadPauses() *connReadPauses {
 	if pauses := metadata.readPauses.Load(); pauses != nil {
 		return pauses
 	}
-	pauses := &connReadPauses{external: readcontrol.NewPause(c.raw), internal: readcontrol.NewPause(c.raw)}
+	pauses := &connReadPauses{external: readcontrol.NewPause(c.raw)}
 	if metadata.readPauses.CompareAndSwap(nil, pauses) {
 		return pauses
 	}
@@ -60,13 +53,13 @@ func (c *Conn) loadReadPauses() *connReadPauses {
 	return nil
 }
 
-// PauseReads stops consuming incoming WebSocket frames until ResumeReads.
+// PauseRead stops consuming incoming WebSocket frames until ResumeRead.
 // It is safe from any goroutine and from OnOpen or OnMessage. A callback
 // already in progress may finish; a pause made by OnMessage takes effect
 // before the next frame, including frames buffered in the same socket read.
 // The frames wait in the transport, which stops reading a plain socket at
 // once and keeps the end of the stream behind them: a peer that sends and
-// then closes its side is answered after ResumeReads, so a paused connection
+// then closes its side is answered after ResumeRead, so a paused connection
 // whose peer left lingers until then, or until a heartbeat or read deadline
 // ends it. Writes and timers continue normally. This also works over TLS.
 //
@@ -75,7 +68,7 @@ func (c *Conn) loadReadPauses() *connReadPauses {
 // the close handshake can finish. Calls are idempotent, not reference
 // counted: callers sharing this switch must coordinate their ownership.
 // The connection must have opened and must not be closing or closed.
-func (c *Conn) PauseReads() error {
+func (c *Conn) PauseRead() error {
 	if err := c.checkReadControl(); err != nil {
 		return err
 	}
@@ -92,13 +85,12 @@ func (c *Conn) PauseReads() error {
 	return nil
 }
 
-// ResumeReads clears the pause requested by PauseReads and schedules a read
-// turn, so already buffered frames need no new network input to be
-// delivered. Without that pause it does nothing. It leaves automatic
-// watermark backpressure in effect. It is safe from any goroutine, including
-// TrafficObserver.OnOutbound, and is idempotent.
+// ResumeRead clears the pause requested by PauseRead and schedules a read
+// turn, so already buffered frames need no new network input to be delivered.
+// Without that pause it does nothing. It is safe from any goroutine, including
+// TrafficObserver.OnBytesWritten, and is idempotent.
 // The connection must have opened and must not be closing or closed.
-func (c *Conn) ResumeReads() error {
+func (c *Conn) ResumeRead() error {
 	if err := c.checkReadControl(); err != nil {
 		return err
 	}
@@ -118,6 +110,12 @@ func (c *Conn) ResumeReads() error {
 	return readControlError(pauses.external.Resume())
 }
 
+// ReadPaused reports whether PauseRead currently holds incoming WebSocket
+// frames.
+func (c *Conn) ReadPaused() bool {
+	return c != nil && !c.closed.Load() && !c.closing.Load() && c.externalReadPaused()
+}
+
 func readControlError(err error) error {
 	if errors.Is(err, net.ErrClosed) {
 		return ErrClosed
@@ -133,34 +131,32 @@ func readControlError(err error) error {
 // This is a concurrent observation, not a write reservation: a handoff can
 // briefly count bytes in both the batch and transport. MaxOutboundBuffered
 // remains the hard admission limit. The method takes no write lock and is
-// safe from any goroutine, including TrafficObserver.OnOutbound. An unattached
+// safe from any goroutine, including TrafficObserver.OnBytesWritten. An unattached
 // connection reports zero.
 func (c *Conn) OutboundBuffered() int {
 	if c == nil || c.raw == nil {
 		return 0
 	}
-	// Read the upper buffer first. During handoff its bytes enter the lower
-	// queue before this snapshot is cleared, avoiding a gap between them.
-	batch := c.batchBuffered.Load()
-	if batch < 0 {
-		batch = ^batch // a handoff retains the upper size until accepted
+	batch := 0
+	if c.batchHandoff.Load() >= 0 && c.writes.mu.TryLock() {
+		if c.batch != nil {
+			batch = c.batch.Len()
+		}
+		c.writes.mu.Unlock()
 	}
-	return int(batch) + c.raw.OutboundBuffered()
+	return batch + c.raw.OutboundBuffered()
 }
 
-// observeOutbound defers user reports made inside a batch handoff. They must
-// see the queue after handoff: otherwise its final drain could still include
-// the upper batch and a watermark-based ResumeReads would miss the drain.
-// Internal byte retirement is never deferred. Reports can race the writer,
-// so publish deferred bytes before checking whether handoff already ended.
+// observeOutbound defers user reports made inside a batch handoff so
+// observers see the queue after handoff.
 func (c *Conn) observeOutbound(n int) {
 	if c.config == nil || !c.config.observeTraffic {
 		return
 	}
 	metadata := c.ensureMetadata()
-	if c.batchBuffered.Load() < 0 {
+	if c.batchHandoff.Load() < 0 {
 		metadata.outboundDeferred.Add(int64(n))
-		if c.batchBuffered.Load() >= 0 {
+		if c.batchHandoff.Load() >= 0 {
 			c.flushOutboundObservation()
 		}
 		return
@@ -168,20 +164,20 @@ func (c *Conn) observeOutbound(n int) {
 	if observer, ok := c.handler.(TrafficObserver); ok {
 		metadata.outboundMu.Lock()
 		defer metadata.outboundMu.Unlock()
-		observer.OnOutbound(c, n)
+		observer.OnBytesWritten(c, n)
 	}
 }
 
 func (c *Conn) flushOutboundObservation() {
 	metadata := c.metadata.Load()
-	if metadata == nil || c.batchBuffered.Load() < 0 {
+	if metadata == nil || c.batchHandoff.Load() < 0 {
 		return
 	}
 	if n := metadata.outboundDeferred.Swap(0); n != 0 {
 		if observer, ok := c.handler.(TrafficObserver); ok {
 			metadata.outboundMu.Lock()
 			defer metadata.outboundMu.Unlock()
-			observer.OnOutbound(c, int(n))
+			observer.OnBytesWritten(c, int(n))
 		}
 	}
 }
@@ -199,53 +195,16 @@ func (c *Conn) checkReadControl() error {
 	return nil
 }
 
-func (c *Conn) externalReadsPaused() bool { return c.readPaused.Load()&readPauseExternal != 0 }
-func (c *Conn) internalReadsPaused() bool { return c.readPaused.Load()&readPauseInternal != 0 }
+func (c *Conn) externalReadPaused() bool { return c.readPaused.Load()&readPauseExternal != 0 }
 
-// setInternalReadPause changes only the automatic pause and reports whether
-// it changed. In particular, a drain must never clear an application's pause.
-func (c *Conn) setInternalReadPause(paused bool) bool {
-	pauses := c.loadReadPauses()
-	if pauses == nil {
-		if !paused || c.closing.Load() {
-			return false
-		}
-		pauses = c.ensureReadPauses()
-	}
-	pauses.mu.Lock()
-	defer pauses.mu.Unlock()
-	if c.closing.Load() {
-		paused = false
-	}
-	if c.internalReadsPaused() == paused {
-		return false
-	}
-	if paused {
-		if pauses.internal.Pause() != nil {
-			return false
-		}
-		c.readPaused.Or(readPauseInternal)
-		return true
-	}
-	c.readPaused.And(^readPauseInternal)
-	_ = pauses.internal.Resume()
-	return true
-}
-
-// releaseReadPauses lets the Close handshake consume again. It releases this
-// connection's own pauses only, never one another owner of the transport
-// holds, and counts the automatic one it ends as resumed.
+// releaseReadPauses lets the Close handshake consume again.
 func (c *Conn) releaseReadPauses() {
 	pauses := c.loadReadPauses()
 	if pauses == nil {
 		return
 	}
 	pauses.mu.Lock()
-	released := c.readPaused.Swap(0)
+	c.readPaused.Store(0)
 	_ = pauses.external.Resume()
-	_ = pauses.internal.Resume()
 	pauses.mu.Unlock()
-	if released&readPauseInternal != 0 && c.config != nil && c.config.stats != nil {
-		c.config.stats.resumed.Add(1)
-	}
 }

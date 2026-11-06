@@ -31,11 +31,10 @@ type Handler interface {
 	OnOpen(c Conn)
 
 	// OnRead fires on a turn once the connection opened, with inbound data
-	// available or none: a Wake, a YieldRead's continuation or a released
-	// pause runs one too, so it may arrive with nothing to read. While reads
-	// are paused it does not run; OnTimer and a stack's layer work go on.
-	// Inbound access methods are valid only for this callback invocation. An
-	// error closes the connection.
+	// available or none: a Wake or a released pause runs one too, so it may
+	// arrive with nothing to read. While read is paused it does not run;
+	// OnTimer and a stack's layer work go on. Inbound access methods are valid
+	// only for this callback invocation. An error closes the connection.
 	// A layer hears the same moment as its OnRead; here, at the top of the
 	// stack, outbound is Write, a method the Handler calls, which is why there
 	// is no OnWrite next to it.
@@ -56,21 +55,11 @@ type Handler interface {
 	// or more, or Pollers above 8 — an accepted connection's socket is closed
 	// on a goroutine of its loop, so the peer can see the end shortly after
 	// OnClose ran; its descriptor number is not reused before then. A
-	// connection with a positive linger time (SetLinger), one that ran
-	// Control, and one accepted from a listener with a SocketControl close
-	// their socket before OnClose, as do dialed and adopted connections.
+	// connection with a positive linger time (SocketConn.SetLinger), one that
+	// ran SocketConn.Control, and one accepted from a listener with a
+	// SocketControl close their socket before OnClose, as do dialed and adopted
+	// connections.
 	OnClose(c Conn, err error)
-}
-
-// QueueDrainedObserver is an optional capability of an Observer: it hears a
-// connection whose queue made room without a socket write to report it —
-// output a layer held and its peer acknowledged, a multiplexed stream's
-// queue its transport accepted, or a write the queue refused that a turn's
-// work has made room for again. A relay resumes a source waiting on that
-// queue from it, as from OnBytesWritten. It may run on any goroutine,
-// concurrently with the connection's other callbacks, and must not block.
-type QueueDrainedObserver interface {
-	OnQueueDrained(c Conn)
 }
 
 // TrafficObserver, set as Events.Observer, is told the bytes each connection
@@ -121,11 +110,8 @@ type FuncHandler struct {
 	Close        func(c Conn, err error)
 	BytesRead    func(c Conn, n int)
 	BytesWritten func(c Conn, n int)
-	// Sent hears the receipts of the Handler's own tracked writes over a
-	// layer stack; see SentObserver.
-	Sent  func(c Conn, r SendReceipt)
-	Start func(ev *Events)
-	Stop  func(ev *Events)
+	Start        func(ev *Events)
+	Stop         func(ev *Events)
 }
 
 func (h FuncHandler) OnOpen(c Conn) {
@@ -158,13 +144,6 @@ func (h FuncHandler) OnClose(c Conn, err error) {
 func (h FuncHandler) OnBytesRead(c Conn, n int) {
 	if h.BytesRead != nil {
 		h.BytesRead(c, n)
-	}
-}
-
-// OnSent implements SentObserver.
-func (h FuncHandler) OnSent(c Conn, r SendReceipt) {
-	if h.Sent != nil {
-		h.Sent(c, r)
 	}
 }
 

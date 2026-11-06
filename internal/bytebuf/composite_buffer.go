@@ -563,3 +563,20 @@ func (b *CompositeBuffer) WriteCoalesced(p []byte, blockSize int) int {
 	b.length += total
 	return total
 }
+
+// PopBlock detaches and returns the front unread block, transferring ownership
+// to the caller, or returns nil when empty.
+func (b *CompositeBuffer) PopBlock() *Buffer {
+	for len(b.bufList) > 0 {
+		head := b.bufList[0]
+		copy(b.bufList, b.bufList[1:])
+		b.bufList[len(b.bufList)-1] = nil
+		b.bufList = b.bufList[:len(b.bufList)-1]
+		if n := head.Len(); n > 0 {
+			b.length -= n
+			return head
+		}
+		putBuffer(head)
+	}
+	return nil
+}
