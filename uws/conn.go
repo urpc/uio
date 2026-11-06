@@ -82,7 +82,9 @@ func (c *Conn) setRaw(raw uio.Lower) {
 		c.writes.close.flags.Or(inexactWireFlag)
 	}
 	if ctrl != nil {
-		c.writes.close.flags.Or(closeWatchArmed)
+		if asLayer {
+			c.writes.close.flags.Or(closeWatchArmed)
+		}
 		ctrl.Watch(func(sent int) {
 			if asLayer || sent == 0 {
 				c.onTransportProgress(sent)
@@ -314,10 +316,6 @@ func (c *Conn) SetDeadline(deadline time.Time) error {
 	if c == nil || c.raw == nil {
 		return ErrNotReady
 	}
-	if h, ok := c.handler.(*pullHandler); ok {
-		h.client.setReadDeadline(deadline)
-		return c.raw.SetWriteDeadline(deadline)
-	}
 	return c.raw.SetDeadline(deadline)
 }
 
@@ -325,13 +323,6 @@ func (c *Conn) SetDeadline(deadline time.Time) error {
 func (c *Conn) SetReadDeadline(deadline time.Time) error {
 	if c == nil || c.raw == nil {
 		return ErrNotReady
-	}
-	// A pull client's turn cannot observe the transport's expiry while its
-	// OnMessage waits on a full queue, so the client owns the deadline; see
-	// Client.setReadDeadline.
-	if h, ok := c.handler.(*pullHandler); ok {
-		h.client.setReadDeadline(deadline)
-		return nil
 	}
 	return c.raw.SetReadDeadline(deadline)
 }

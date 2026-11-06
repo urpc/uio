@@ -877,16 +877,14 @@ func (c *Conn) abortTransport(err error) {
 		return
 	}
 	c.stopCloseTimer()
-	c.releasePullClient()
 	_ = c.requestClose(err)
 }
 
 // markClosing records that this end is closing the connection: messages
-// that arrive meanwhile are dropped, and a pull Client's full queue no longer
-// holds the close up.
+// that arrive meanwhile are dropped, and any held read pause is released so
+// the peer's Close reply can finish the handshake.
 func (c *Conn) markClosing() {
 	c.closing.Store(true)
-	c.releasePullClient()
 	c.releaseReadPauses()
 }
 

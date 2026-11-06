@@ -28,32 +28,6 @@ import (
 // the timer. No scanner walks the server's connections, and a stuck
 // connection delays no other.
 
-// heartbeatBoundary is the moment a callback of this connection may block
-// until: the next heartbeat decision — the next ping, or the deadline the
-// outstanding one runs on. Zero when no heartbeat runs or has not begun; the
-// pull client's queue wait is bounded by it, so a client nobody reads still
-// reaches the tick that expires it.
-func (c *Conn) heartbeatBoundary() time.Time {
-	heartbeat := c.heartbeat
-	if heartbeat == nil {
-		return time.Time{}
-	}
-	heartbeat.mu.Lock()
-	defer heartbeat.mu.Unlock()
-	if heartbeat.nextPingAt == 0 {
-		return time.Time{}
-	}
-	next := time.Unix(0, heartbeat.nextPingAt)
-	// The same minimum heartbeatTick arms at: an outstanding or stalled Ping
-	// ends before the next interval does.
-	if deadline := heartbeat.expiryLocked(c.config.heartbeatTimeout); heartbeat.pingOutstanding.Load() {
-		return deadline
-	} else if !deadline.IsZero() && deadline.Before(next) {
-		return deadline
-	}
-	return next
-}
-
 // beginHeartbeat arms the first ping interval of an opened connection.
 func (c *Conn) beginHeartbeat() {
 	next := time.Now().Add(c.config.heartbeatInterval)

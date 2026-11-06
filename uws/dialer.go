@@ -64,7 +64,6 @@ type Dialer struct {
 	opts            Options     // resolved snapshot, fixed at first Dial
 	header          http.Header // Header, canonical, fixed at first Dial
 	events          *uio.Events // private transport configuration
-	clients         sync.Map    // the open pull Clients, for Close to release
 
 	// startHook runs inside the transport's OnStart before the start result
 	// is published; it lets tests observe or block startup.
@@ -236,7 +235,6 @@ func (d *Dialer) Close(err error) error {
 	}
 	d.closeMu.Unlock()
 
-	d.releaseClients()
 	if events == nil {
 		return nil
 	}
@@ -294,11 +292,15 @@ func (d *Dialer) start(ctx context.Context) error {
 				}
 				d.publishStartResult(nil)
 			},
-			Open:         d.onOpen,
-			Read:         d.onData,
-			Close:        d.onClose,
-			BytesWritten: d.onOutbound,
-			BytesRead:    d.onInbound,
+			Open:  d.onOpen,
+			Read:  d.onData,
+			Close: d.onClose,
+		}
+		if d.config.heartbeatInterval > 0 || d.config.observeTraffic {
+			handler.BytesWritten = d.onOutbound
+		}
+		if d.config.observeTraffic {
+			handler.BytesRead = d.onInbound
 		}
 		if d.config.heartbeatInterval > 0 {
 			handler.Timer = d.onTimer // see Server.Serve

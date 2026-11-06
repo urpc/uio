@@ -43,6 +43,7 @@ type connConfig struct {
 	shortSendLimit  int
 	shortSendDirect int
 	shortReadLimit  int
+	maxInbound      int // MaxInboundBuffered
 	maxOutbound     int // MaxOutboundBuffered
 	batchBlockSize  int
 	// maxFramesPerDataEvent bounds the frames one read round consumes: at
@@ -95,6 +96,7 @@ func newServerConnConfig(opts Options, checkOrigin func(*http.Request) bool, aut
 		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
+		maxInbound:                 opts.MaxInboundBuffered,
 		maxOutbound:                opts.MaxOutboundBuffered,
 	}
 	config.settleShortLimits()
@@ -165,6 +167,7 @@ func newDialerConnConfig(opts Options) *connConfig {
 		observeTraffic:             implementsTrafficObserver(opts.Handler),
 		heartbeatInterval:          opts.HeartbeatInterval,
 		heartbeatTimeout:           opts.HeartbeatTimeout,
+		maxInbound:                 opts.MaxInboundBuffered,
 		maxOutbound:                opts.MaxOutboundBuffered,
 	}
 	config.settleShortLimits()

@@ -682,37 +682,27 @@ func TestDialRequestFailuresRollbackAndPreserveCloseCause(t *testing.T) {
 }
 
 func TestPullClientCloseAndDeadlineLifecycle(t *testing.T) {
-	client := newClient()
-	if client.CloseEventInfo() != (CloseEvent{}) || client.closedConn() {
-		t.Fatal("new client already closed")
+	bc := newBlockingConn(nil, resolveBlockingOpts(nil, []BlockingOption{
+		WithReadQueueBytes(4096),
+		WithReadQueueMessages(8),
+		WithWriteBuffer(4096),
+	}))
+	if bc.CloseEventInfo() != (CloseEvent{}) || bc.InboundMessages() != 0 || bc.InboundBytes() != 0 {
+		t.Fatal("new blocking conn had unexpected initial state")
 	}
-	client.queue <- Message{Type: BinaryMessage, Payload: []byte("queued")}
-	if got, err := client.ReadMessage(nil); err != nil || string(got.Payload) != "queued" {
-		t.Fatalf("message=%v err=%v", got, err)
+	bc.enqueue(nil, Message{Type: BinaryMessage, Payload: []byte("queued")})
+	if bc.InboundMessages() != 1 || bc.InboundBytes() != 6 {
+		t.Fatalf("queued stats = %d msgs / %d bytes", bc.InboundMessages(), bc.InboundBytes())
 	}
-	client.readDeadline = time.Now().Add(time.Hour)
-	client.expireReadDeadline()
-	client.deadlineTimer = time.AfterFunc(time.Hour, func() {
-	})
-	client.stopDeadlines()
-	if client.deadlineTimer != nil || !client.readDeadline.IsZero() {
-		t.Fatal("deadline retained on shutdown")
+	var dst [16]byte
+	typ, out, err := bc.ReadMessageInto(nil, dst[:0])
+	if err != nil || typ != BinaryMessage || string(out) != "queued" {
+		t.Fatalf("ReadMessageInto = %v, %q, %v", typ, out, err)
 	}
-	close(client.ended)
-	if !client.closedConn() {
-		t.Fatal("closed client not observed")
+	bc.onConnClose(CloseEvent{Code: 1000, Reason: "bye"})
+	if bc.CloseEventInfo().Code != 1000 {
+		t.Fatalf("CloseEventInfo = %+v", bc.CloseEventInfo())
 	}
-	d := new(Dialer)
-	if err := d.Close(io.EOF); err != nil {
-		t.Fatal(err)
-	}
-	d.trackClient(client)
-	select {
-	case <-client.stop:
-	default:
-		t.Fatal("registration after Dialer.Close did not release client")
-	}
-	d.clients.Delete(client)
 }
 
 type contractLower struct {
@@ -838,10 +828,13 @@ func TestClientLayerRequestWriteFailures(t *testing.T) {
 }
 
 func TestPullReadCancellationWhileCloseFinishes(t *testing.T) {
-	client := newClient()
-	client.finish()
+	client := newBlockingConn(nil, resolveBlockingOpts(nil, nil))
+	client.intakeDone = true
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	go func() {
+		time.Sleep(10 * time.Millisecond)
+		cancel()
+	}()
 	if _, err := client.ReadMessage(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}

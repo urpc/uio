@@ -1,6 +1,7 @@
 package uws
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/base64"
@@ -309,9 +310,9 @@ func floodClient(t *testing.T, dialer *Dialer) *Client {
 		t.Fatal(err)
 	}
 	deadline := time.Now().Add(testIOTimeout())
-	for len(client.queue) < clientQueueMessages {
+	for client.InboundMessages() < clientQueueMessages {
 		if time.Now().After(deadline) {
-			t.Fatalf("queue holds %d messages, want it full", len(client.queue))
+			t.Fatalf("queue holds %d messages, want it full", client.InboundMessages())
 		}
 		time.Sleep(time.Millisecond)
 	}
@@ -362,7 +363,7 @@ func TestDialerCloseEndsUnreadClient(t *testing.T) {
 	case <-time.After(testIOTimeout()):
 		t.Fatal("the dialer's transport did not stop")
 	}
-	queued := len(client.queue)
+	queued := client.InboundMessages()
 	if queued < clientQueueMessages {
 		t.Fatalf("%d queued messages left, want the full queue", queued)
 	}
@@ -804,6 +805,299 @@ func TestDialHostDefaultsThePort(t *testing.T) {
 		}
 		if got := dialHost(target); got != tc.host {
 			t.Fatalf("dialHost(%s) = %q, want %q", tc.url, got, tc.host)
+		}
+	}
+}
+
+type serverBlockingUpgradeHandler struct {
+	ready       chan *BlockingConn
+	closeCalled atomic.Int32
+	turnErr     chan error
+}
+
+func (h *serverBlockingUpgradeHandler) OnOpen(conn *Conn) {
+	bc, err := NewBlockingConn(conn, WithReadQueueBytes(4<<10), WithReadQueueMessages(8), WithWriteBuffer(4<<10))
+	if err != nil {
+		h.turnErr <- err
+		return
+	}
+	// Idempotent second call returns the same instance.
+	bc2, err := NewBlockingConn(conn)
+	if err != nil || bc2 != bc {
+		h.turnErr <- fmt.Errorf("idempotence failed: %v, %v", bc2, err)
+		return
+	}
+	// Calling blocking methods or DialClient on a turn fails fast with ErrBlockingOnTurn!
+	if _, rerr := bc.ReadMessage(context.Background()); !errors.Is(rerr, ErrBlockingOnTurn) {
+		h.turnErr <- fmt.Errorf("ReadMessage on turn = %v", rerr)
+		return
+	}
+	if werr := bc.WriteText(context.Background(), "x"); !errors.Is(werr, ErrBlockingOnTurn) {
+		h.turnErr <- fmt.Errorf("WriteText on turn = %v", werr)
+		return
+	}
+	if ferr := bc.Flush(context.Background()); !errors.Is(ferr, ErrBlockingOnTurn) {
+		h.turnErr <- fmt.Errorf("Flush on turn = %v", ferr)
+		return
+	}
+	if _, derr := DefaultDialer.DialClient(context.Background(), "ws://127.0.0.1:1/"); !errors.Is(derr, ErrBlockingOnTurn) {
+		h.turnErr <- fmt.Errorf("DialClient on turn = %v", derr)
+		return
+	}
+	h.turnErr <- nil
+	h.ready <- bc
+}
+
+func (*serverBlockingUpgradeHandler) OnMessage(*Conn, Message) {}
+
+func (h *serverBlockingUpgradeHandler) OnClose(*Conn, CloseEvent) {
+	h.closeCalled.Add(1)
+}
+
+func TestServerAndClientSymmetricBlockingConnAndBackpressure(t *testing.T) {
+	upg := &serverBlockingUpgradeHandler{
+		ready:   make(chan *BlockingConn, 1),
+		turnErr: make(chan error, 1),
+	}
+	server, addr, serveDone := startTestServer(t, func() *Server {
+		return NewServer(Options{
+			Handler:             upg,
+			MaxInboundBuffered:  8 << 10,
+			MaxOutboundBuffered: 8 << 10,
+		})
+	})
+	t.Cleanup(func() {
+		stopTestServer(t, server, serveDone)
+	})
+
+	dialer := NewDialer(Options{
+		MaxInboundBuffered:  8 << 10,
+		MaxOutboundBuffered: 8 << 10,
+	})
+	t.Cleanup(func() { _ = dialer.Close(nil) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout())
+	defer cancel()
+
+	cliBC, err := dialer.DialClient(ctx, "ws://"+addr+"/", WithReadQueueBytes(4<<10), WithWriteBuffer(4<<10))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := <-upg.turnErr; err != nil {
+		t.Fatal(err)
+	}
+	srvBC := <-upg.ready
+
+	// Server echoes every message using ReadMessageInto (zero-alloc reuse) + WriteMessage/WriteText + Flush!
+	srvDone := make(chan error, 1)
+	go func() {
+		var scratch [4 << 10]byte
+		for {
+			typ, payload, err := srvBC.ReadMessageInto(ctx, scratch[:0])
+			if err != nil {
+				var ce *CloseError
+				if errors.As(err, &ce) {
+					srvDone <- nil
+					return
+				}
+				srvDone <- err
+				return
+			}
+			if typ == TextMessage {
+				err = srvBC.WriteText(ctx, string(payload))
+			} else {
+				err = srvBC.WriteBinary(ctx, payload)
+			}
+			if err != nil {
+				srvDone <- err
+				return
+			}
+		}
+	}()
+
+	//Oversized single message (> MaxOutboundBuffered 8 KiB on empty queue) fails fast with ErrBackpressure!
+	if err := cliBC.WriteBinary(ctx, make([]byte, 16<<10)); !errors.Is(err, ErrBackpressure) {
+		t.Fatalf("oversized WriteBinary = %v, want ErrBackpressure", err)
+	}
+
+	// Stream 48 messages of 1.5 KiB (72 KiB >> 8 KiB outbound/inbound caps) + empty text message!
+	const count = 48
+	chunk := bytes.Repeat([]byte(" symmetric-uws-block "), 70)
+	sendDone := make(chan error, 1)
+	go func() {
+		if err := cliBC.WriteText(ctx, ""); err != nil {
+			sendDone <- err
+			return
+		}
+		for i := range count {
+			var err error
+			if i%2 == 0 {
+				err = cliBC.WriteBinary(ctx, chunk)
+			} else {
+				err = cliBC.WriteText(ctx, string(chunk))
+			}
+			if err != nil {
+				sendDone <- err
+				return
+			}
+		}
+		sendDone <- cliBC.Flush(ctx)
+	}()
+
+	var recvScratch [2 << 10]byte
+	// First empty text frame
+	typ0, out0, err := cliBC.ReadMessageInto(ctx, recvScratch[:0])
+	if err != nil || typ0 != TextMessage || len(out0) != 0 {
+		t.Fatalf("empty text echo = %v, len=%d, err=%v", typ0, len(out0), err)
+	}
+	for i := range count {
+		if i%2 == 0 {
+			m, err := cliBC.ReadMessage(ctx)
+			if err != nil || m.Type != BinaryMessage || !bytes.Equal(m.Payload, chunk) {
+				t.Fatalf("msg %d ReadMessage err=%v len=%d", i, err, len(m.Payload))
+			}
+		} else {
+			typ, out, err := cliBC.ReadMessageInto(ctx, recvScratch[:0])
+			if err != nil || typ != TextMessage || !bytes.Equal(out, chunk) {
+				t.Fatalf("msg %d ReadMessageInto err=%v len=%d", i, err, len(out))
+			}
+		}
+	}
+	if err := <-sendDone; err != nil {
+		t.Fatalf("sendDone = %v", err)
+	}
+
+	if err := cliBC.Close(1000, "bye"); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-srvDone; err != nil {
+		t.Fatalf("srvDone = %v", err)
+	}
+	for deadline := time.Now().Add(time.Second); upg.closeCalled.Load() != 1; {
+		if time.Now().After(deadline) {
+			t.Fatal("upgraded server prevHandler.OnClose was not called")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestBlockingConnErrorAndCancellationGuards(t *testing.T) {
+	// 1. NewBlockingConn error guards (nil, closed, off-turn active conn).
+	if _, err := NewBlockingConn(nil); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("nil NewBlockingConn = %v", err)
+	}
+	closedConn := testServerConn(newScriptedConn())
+	closedConn.closed.Store(true)
+	if _, err := NewBlockingConn(closedConn); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed NewBlockingConn = %v", err)
+	}
+	activeConn := testServerConn(newScriptedConn())
+	if _, err := NewBlockingConn(activeConn); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("off-turn NewBlockingConn = %v", err)
+	}
+
+	// 2. Unattached and canceled ctx guards on WriteMessage / Flush / ReadMessage + queued empty message.
+	unattached := newBlockingConn(nil, resolveBlockingOpts(nil, []BlockingOption{
+		WithReadQueueBytes(-1),
+		WithReadQueueMessages(-1),
+		WithWriteBuffer(-1),
+	}))
+	unattached.enqueue(nil, Message{Type: TextMessage, Payload: nil})
+	var smallDst [4]byte
+	if typ, out, err := unattached.ReadMessageInto(nil, smallDst[:0]); err != nil || typ != TextMessage || len(out) != 0 {
+		t.Fatalf("queued empty ReadMessageInto = %v, %q, %v", typ, out, err)
+	}
+	unattached.enqueue(nil, Message{Type: BinaryMessage, Payload: nil})
+	if m, err := unattached.ReadMessage(nil); err != nil || m.Type != BinaryMessage || m.Payload != nil {
+		t.Fatalf("queued empty ReadMessage = %+v, %v", m, err)
+	}
+	if err := unattached.WriteBinary(nil, []byte("x")); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("unattached WriteBinary = %v", err)
+	}
+	if err := unattached.Flush(nil); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("unattached Flush = %v", err)
+	}
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := unattached.ReadMessage(canceledCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ReadMessage = %v", err)
+	}
+	if err := unattached.Flush(canceledCtx); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("unattached canceled Flush = %v", err)
+	}
+
+	// 3. Blocked WriteBinary & Flush interrupted by short ctx timeout, non-backpressure errors, and close!
+	if (&CloseError{}).Error() != "uws: connection closed" {
+		t.Fatal("empty CloseError string mismatch")
+	}
+	raw := &limitedWire{limit: 32}
+	conn := newLimitedConn(raw, time.Hour)
+	bc := newBlockingConn(conn, blockingOptions{readBytes: 1024, readMsgs: 8, writeBytes: 32})
+	if err := bc.Flush(context.Background()); err != nil { // OutboundBuffered == 0 fast return
+		t.Fatalf("empty Flush = %v", err)
+	}
+	if err := bc.WriteText(canceledCtx, "x"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled WriteText = %v", err)
+	}
+	if err := bc.Flush(canceledCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Flush = %v", err)
+	}
+	if err := bc.WriteMessage(context.Background(), MessageType(99), []byte("bad")); err == nil {
+		t.Fatal("invalid MessageType accepted")
+	}
+	// Parked ReadMessage receiving empty nil-payload message directly!
+	emptyDirect := make(chan Message, 1)
+	go func() {
+		m, _ := bc.ReadMessage(context.Background())
+		emptyDirect <- m
+	}()
+	time.Sleep(10 * time.Millisecond)
+	bc.enqueue(conn, Message{Type: BinaryMessage, Payload: nil})
+	if gotM := <-emptyDirect; gotM.Type != BinaryMessage || gotM.Payload != nil {
+		t.Fatalf("direct empty message = %+v", gotM)
+	}
+
+	if err := bc.WriteBinary(context.Background(), make([]byte, 28)); err != nil {
+		t.Fatal(err)
+	}
+	shortCtx, shortCancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer shortCancel()
+	if err := bc.WriteBinary(shortCtx, make([]byte, 20)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked WriteBinary timeout = %v", err)
+	}
+	shortFlush, shortFlushCancel := context.WithTimeout(context.Background(), 15*time.Millisecond)
+	defer shortFlushCancel()
+	if err := bc.Flush(shortFlush); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("blocked Flush timeout = %v", err)
+	}
+
+	// Closed before event stored -> ErrClosed!
+	conn.closed.Store(true)
+	if err := bc.WriteBinary(context.Background(), []byte("x")); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed pre-event WriteBinary = %v", err)
+	}
+	conn.closed.Store(false)
+
+	// Closing wakes blocked Flush & WriteBinary with CloseError!
+	flushWait := make(chan error, 1)
+	go func() { flushWait <- bc.Flush(context.Background()) }()
+	time.Sleep(10 * time.Millisecond)
+	conn.closed.Store(true)
+	bc.onConnClose(CloseEvent{Code: 1001, Err: ErrClosed})
+	if err := <-flushWait; err == nil {
+		t.Fatal("closed Flush returned nil")
+	}
+	if err := bc.WriteBinary(context.Background(), []byte("x")); err == nil {
+		t.Fatal("closed WriteBinary returned nil")
+	}
+	if err := bc.Flush(context.Background()); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed Flush = %v", err)
+	}
+	bc.enqueue(conn, Message{Type: TextMessage, Payload: []byte("late")}) // intakeDone drops late frame
+	if err := bc.WriteMessage(context.Background(), MessageType(99), []byte("bad")); !errors.Is(err, ErrClosed) {
+		var ce *CloseError
+		if !errors.As(err, &ce) {
+			t.Fatalf("closed invalid WriteMessage = %v", err)
 		}
 	}
 }

@@ -901,7 +901,6 @@ func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) err
 			return ErrBackpressure
 		}
 		// Any other failure leaves the transport closing.
-		c.releasePullClient()
 		if errors.Is(err, net.ErrClosed) {
 			return ErrClosed
 		}

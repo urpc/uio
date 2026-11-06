@@ -18,11 +18,16 @@ package uws
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"sync"
 	"sync/atomic"
-	"time"
+	"unsafe"
+
+	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/blockio"
+	_ "github.com/urpc/uio/internal/bytebuf"
+	"github.com/urpc/uio/internal/writecontrol"
 )
 
 // DefaultDialer is the Dialer the package-level Dial uses. It runs with the
@@ -30,59 +35,329 @@ import (
 // close it and every connection it made by calling DefaultDialer.Close.
 var DefaultDialer = &Dialer{}
 
-// clientQueueMessages bounds how many received messages a Client holds before
-// its connection stops reading; see Client.ReadMessage.
-const clientQueueMessages = 64
+const (
+	// DefaultBlockingQueueMessages bounds queued inbound messages before reads
+	// pause on the underlying transport.
+	DefaultBlockingQueueMessages = 64
+	// DefaultBlockingQueueBytes is the default byte budget (64 KiB) for
+	// inbound message queuing and soft outbound write backpressure.
+	DefaultBlockingQueueBytes = uio.DefaultBlockingBuffer
 
-// Dial connects with DefaultDialer and returns the client once the handshake
-// completes. See Dialer.DialClient for the contract.
-func Dial(ctx context.Context, addr string) (*Client, error) {
-	return DefaultDialer.DialClient(ctx, addr)
+	clientQueueMessages = DefaultBlockingQueueMessages
+)
+
+// ErrBlockingOnTurn reports an attempt to invoke a blocking operation on a
+// connection turn or event-loop goroutine.
+var ErrBlockingOnTurn = uio.ErrBlockingOnTurn
+
+type blockingOptions struct {
+	readBytes  int
+	readMsgs   int
+	writeBytes int
 }
 
-// Client is a WebSocket client connection whose messages are read on demand:
-// DialClient hands one over after the handshake, SendText and SendBinary
-// write, and ReadMessage returns the next received message. The connection
-// must be read continuously: a Client whose messages are not being read
-// stops reading, so the peer's flow control slows it and its control frames,
-// Ping included, go unanswered. Its own sends slow with it: one made while
-// the queue is full waits for reading to resume before it leaves. Client.Close
-// always ends a Client, however many messages are waiting, and so do the
-// closes this end starts itself — Dialer.Close, a deadline, a heartbeat
-// timeout, a failed send: a message that arrives once one has begun and finds
-// the queue full is dropped rather than holding the close up.
-type Client struct {
+// BlockingOption configures a BlockingConn (or Client).
+type BlockingOption interface {
+	applyBlocking(*blockingOptions)
+}
+
+type blockingOptionFunc func(*blockingOptions)
+
+func (f blockingOptionFunc) applyBlocking(o *blockingOptions) { f(o) }
+
+// WithReadQueueBytes sets the inbound byte watermark at which BlockingConn
+// pauses reading from the underlying transport.
+func WithReadQueueBytes(bytes int) BlockingOption {
+	return blockingOptionFunc(func(o *blockingOptions) { o.readBytes = bytes })
+}
+
+// WithReadQueueMessages sets the maximum number of queued inbound messages
+// before BlockingConn pauses reading from the underlying transport.
+func WithReadQueueMessages(count int) BlockingOption {
+	return blockingOptionFunc(func(o *blockingOptions) { o.readMsgs = count })
+}
+
+// WithWriteBuffer sets the soft outbound byte window for BlockingConn's
+// blocking WriteMessage / WriteText / WriteBinary methods.
+func WithWriteBuffer(bytes int) BlockingOption {
+	return blockingOptionFunc(func(o *blockingOptions) { o.writeBytes = bytes })
+}
+
+func resolveBlockingOpts(conn *Conn, opts []BlockingOption) blockingOptions {
+	res := blockingOptions{
+		readBytes:  DefaultBlockingQueueBytes,
+		readMsgs:   DefaultBlockingQueueMessages,
+		writeBytes: DefaultBlockingQueueBytes,
+	}
+	if conn != nil && conn.config != nil {
+		if conn.config.maxInbound > 0 {
+			res.readBytes = conn.config.maxInbound
+		}
+		if conn.config.maxOutbound > 0 {
+			res.writeBytes = conn.config.maxOutbound
+		}
+	}
+	for _, opt := range opts {
+		if opt != nil {
+			opt.applyBlocking(&res)
+		}
+	}
+	if res.readBytes <= 0 {
+		res.readBytes = DefaultBlockingQueueBytes
+	}
+	if res.readMsgs <= 0 {
+		res.readMsgs = DefaultBlockingQueueMessages
+	}
+	if res.writeBytes <= 0 {
+		res.writeBytes = DefaultBlockingQueueBytes
+	}
+	return res
+}
+
+type queuedMessage struct {
+	typ MessageType
+	buf *uio.Buffer
+}
+
+type msgRing struct {
+	items []queuedMessage
+	head  int
+	count int
+	bytes int
+}
+
+func (r *msgRing) push(typ MessageType, payload []byte) {
+	if r.count == len(r.items) {
+		nextCap := max(16, len(r.items)*2)
+		next := make([]queuedMessage, nextCap)
+		for i := range r.count {
+			next[i] = r.items[(r.head+i)%len(r.items)]
+		}
+		r.items = next
+		r.head = 0
+	}
+	var b *uio.Buffer
+	if len(payload) > 0 {
+		b = uio.AcquireBuffer(len(payload))
+		dst := b.AvailableBuffer()[:len(payload)]
+		copy(dst, payload)
+		b.CommitWrite(len(payload))
+	}
+	idx := (r.head + r.count) % len(r.items)
+	r.items[idx] = queuedMessage{typ: typ, buf: b}
+	r.count++
+	r.bytes += len(payload)
+}
+
+func (r *msgRing) pop() (queuedMessage, int) {
+	item := r.items[r.head]
+	r.items[r.head] = queuedMessage{}
+	r.head = (r.head + 1) % len(r.items)
+	r.count--
+	if r.count == 0 {
+		r.head = 0
+	}
+	n := 0
+	if item.buf != nil {
+		n = item.buf.Len()
+	}
+	r.bytes -= n
+	return item, n
+}
+
+type parkedMsgReader struct {
+	into   bool
+	dst    []byte
+	typ    MessageType
+	out    []byte
+	filled bool
+}
+
+// BlockingConn is a synchronous, message-oriented WebSocket endpoint usable on
+// both client connections (via Dial / Dialer.DialClient) and upgraded server
+// connections (via NewBlockingConn in OnOpen or OnMessage).
+//
+// Inbound backpressure pauses the underlying transport via Conn.PauseRead
+// without ever blocking connection turn workers, so heartbeats, transport
+// deadlines, and shutdowns continue to run natively on the event loop.
+type BlockingConn struct {
 	*Conn
 
-	// queue carries messages from the connection's OnMessage to ReadMessage.
-	// A full queue blocks OnMessage, which is the backpressure: the
-	// connection stops reading until the application catches up.
-	queue chan Message
-	// done is closed once no more input is accepted, by Client.Close or by
-	// the connection's OnClose. It releases an OnMessage blocked on a full
-	// queue, and ends ReadMessage once the queue has drained.
-	done     chan struct{}
-	doneOnce sync.Once
-	// stop is closed once this end starts closing the connection. It releases
-	// an OnMessage blocked on a full queue, which would otherwise keep the
-	// connection from ever closing, without ending reading.
-	stop     chan struct{}
-	stopOnce sync.Once
-	// readDeadline is the read deadline set through the Client's Conn. The
-	// client owns it — the connection's turn cannot observe the transport's
-	// own expiry while its OnMessage waits on a full queue — and its expiry
-	// closes the connection, which releases the queue; see setReadDeadline.
-	deadlineMu    sync.Mutex
-	readDeadline  time.Time
-	deadlineTimer *time.Timer
-	// ended is closed after the connection's OnClose stored its event, so a
-	// ReadMessage that drained the queue never reports an empty close.
-	ended chan struct{}
-	event atomic.Pointer[CloseEvent]
+	rmu     sync.Mutex // serializes concurrent ReadMessage / ReadMessageInto callers
+	wmu     sync.Mutex // serializes concurrent WriteMessage / WriteText / WriteBinary / Flush callers
+	pauseMu sync.Mutex // serializes Conn.PauseRead / ResumeRead transitions
+	mu      sync.Mutex // guards ring, parked reader, pause flag, and intake state
+
+	ring         msgRing
+	parkedReader *parkedMsgReader
+	maxReadBytes int
+	maxReadMsgs  int
+	maxWrite     int
+	paused       bool
+	intakeDone   bool
+
+	inGen  atomic.Uint64
+	inPark atomic.Bool
+	inSig  chan struct{}
+
+	outGen         atomic.Uint64
+	outPark        atomic.Bool
+	outSig         chan struct{}
+	writeWatchOnce sync.Once
+
+	ended     chan struct{}
+	endedOnce sync.Once
+	event     atomic.Pointer[CloseEvent]
 }
 
-// CloseError reports how a Client's connection ended. ReadMessage returns it
-// after the connection closed and every queued message was returned.
+// Client is a type alias for BlockingConn, preserving full backward
+// compatibility for Dial and Dialer.DialClient callers.
+type Client = BlockingConn
+
+// Dial connects with DefaultDialer and returns the synchronous client once the
+// WebSocket handshake completes.
+func Dial(ctx context.Context, addr string, opts ...BlockingOption) (*Client, error) {
+	return DefaultDialer.DialClient(ctx, addr, opts...)
+}
+
+func newBlockingConn(conn *Conn, cfg blockingOptions) *BlockingConn {
+	return &BlockingConn{
+		Conn:         conn,
+		maxReadBytes: cfg.readBytes,
+		maxReadMsgs:  cfg.readMsgs,
+		maxWrite:     cfg.writeBytes,
+		inSig:        make(chan struct{}, 1),
+		outSig:       make(chan struct{}, 1),
+		ended:        make(chan struct{}),
+	}
+}
+
+// NewBlockingConn switches an open *Conn (such as a server connection inside
+// OnOpen or OnMessage) from push OnMessage callbacks to synchronous pull/push
+// BlockingConn operations. Calling NewBlockingConn again on the same *Conn
+// returns the existing *BlockingConn.
+//
+// When upgrading an already-open push *Conn, call NewBlockingConn inside OnOpen
+// or OnMessage so the handler handoff is serialized with frame delivery.
+func NewBlockingConn(conn *Conn, opts ...BlockingOption) (*BlockingConn, error) {
+	if conn == nil || conn.raw == nil || !conn.opened.Load() {
+		return nil, ErrNotReady
+	}
+	if conn.closed.Load() {
+		return nil, ErrClosed
+	}
+	if bh, ok := conn.handler.(*blockingHandler); ok {
+		return bh.bc, nil
+	}
+	if !blockio.OnTurn() {
+		return nil, fmt.Errorf("%w: NewBlockingConn on an active connection must run in OnOpen or OnMessage", ErrInvalidOptions)
+	}
+	cfg := resolveBlockingOpts(conn, opts)
+	bc := newBlockingConn(conn, cfg)
+	conn.handler = &blockingHandler{
+		bc:   bc,
+		prev: conn.handler,
+	}
+	return bc, nil
+}
+
+// InboundMessages reports the number of unread messages currently queued.
+func (c *BlockingConn) InboundMessages() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ring.count
+}
+
+// InboundBytes reports the total payload bytes of unread messages currently queued.
+func (c *BlockingConn) InboundBytes() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ring.bytes
+}
+
+func (c *BlockingConn) notifyIn() {
+	c.inGen.Add(1)
+	if c.inPark.Swap(false) {
+		select {
+		case c.inSig <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *BlockingConn) notifyWriteSpace() {
+	c.outGen.Add(1)
+	if c.outPark.Swap(false) {
+		select {
+		case c.outSig <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (c *BlockingConn) syncReadPause(conn *Conn) {
+	if conn == nil {
+		return
+	}
+	c.pauseMu.Lock()
+	defer c.pauseMu.Unlock()
+	c.mu.Lock()
+	wantPaused := c.paused && !c.intakeDone
+	c.mu.Unlock()
+	if wantPaused {
+		_ = conn.PauseRead()
+	} else if conn.externalReadPaused() {
+		_ = conn.ResumeRead()
+	}
+}
+
+func (c *BlockingConn) enqueue(conn *Conn, msg Message) {
+	c.mu.Lock()
+	if c.intakeDone {
+		c.mu.Unlock()
+		return
+	}
+	if slot := c.parkedReader; slot != nil {
+		slot.typ = msg.Type
+		if slot.into {
+			slot.out = append(slot.dst[:0], msg.Payload...)
+		} else if len(msg.Payload) > 0 {
+			slot.out = append([]byte(nil), msg.Payload...)
+		} else {
+			slot.out = nil
+		}
+		slot.filled = true
+		c.parkedReader = nil
+		c.mu.Unlock()
+		c.notifyIn()
+		return
+	}
+
+	c.ring.push(msg.Type, msg.Payload)
+	needPause := false
+	if (c.ring.count >= c.maxReadMsgs || c.ring.bytes >= c.maxReadBytes) && !c.paused {
+		c.paused = true
+		needPause = true
+	}
+	c.mu.Unlock()
+
+	if needPause {
+		c.syncReadPause(conn)
+	}
+	c.notifyIn()
+}
+
+func (c *BlockingConn) checkResumeLocked() bool {
+	if c.paused && c.ring.count <= c.maxReadMsgs/2 && c.ring.bytes <= c.maxReadBytes/2 {
+		c.paused = false
+		return true
+	}
+	return false
+}
+
+// CloseError reports how a BlockingConn's connection ended. ReadMessage and
+// ReadMessageInto return it after the connection closed and every queued
+// message was returned.
 type CloseError struct {
 	CloseEvent
 }
@@ -94,268 +369,367 @@ func (e *CloseError) Error() string {
 	return "uws: connection closed"
 }
 
-// Unwrap exposes the transport, protocol or application error in CloseEvent,
-// so a deadline or cancellation that ended the dial still matches with
-// errors.Is.
 func (e *CloseError) Unwrap() error { return e.Err }
 
-// ReadMessage returns the next received message, waiting for ctx to allow one.
-// It reports a *CloseError after the connection closed and every message that
-// was received before that has been returned; a canceled or timed-out ctx
-// returns its error with the connection unaffected.
-func (c *Client) ReadMessage(ctx context.Context) (Message, error) {
+// ReadMessage returns the next received WebSocket message, blocking until one
+// arrives, the connection closes, or ctx ends. A canceled or timed-out ctx
+// returns ctx.Err() without closing the connection.
+func (c *BlockingConn) ReadMessage(ctx context.Context) (Message, error) {
+	typ, payload, err := c.readNext(ctx, false, nil)
+	if err != nil {
+		return Message{}, err
+	}
+	return Message{Type: typ, Payload: payload}, nil
+}
+
+// ReadMessageInto appends the next received message's payload into dst[:0]
+// (reusing dst's backing array when large enough for zero heap allocations)
+// and returns the message type and populated slice.
+func (c *BlockingConn) ReadMessageInto(ctx context.Context, dst []byte) (MessageType, []byte, error) {
+	return c.readNext(ctx, true, dst)
+}
+
+func (c *BlockingConn) readNext(ctx context.Context, into bool, dst []byte) (MessageType, []byte, error) {
+	if blockio.OnTurn() {
+		return 0, nil, ErrBlockingOnTurn
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	select {
-	case message := <-c.queue:
-		return message, nil
-	case <-c.done:
-		// Messages received before the close still come out first.
-		select {
-		case message := <-c.queue:
-			return message, nil
-		default:
+	if err := ctx.Err(); err != nil {
+		return 0, nil, err
+	}
+
+	c.rmu.Lock()
+	defer c.rmu.Unlock()
+
+	c.mu.Lock()
+	var slot parkedMsgReader
+	for {
+		tok := c.inGen.Load()
+		c.inPark.Store(true)
+
+		if c.ring.count > 0 {
+			c.parkedReader = nil
+			c.inPark.Store(false)
+			item, _ := c.ring.pop()
+			resume := c.checkResumeLocked()
+			c.mu.Unlock()
+			if resume {
+				c.syncReadPause(c.Conn)
+			}
+			typ, out := consumeQueuedItem(item, into, dst)
+			return typ, out, nil
 		}
-		if event := c.event.Load(); event != nil {
-			return Message{}, &CloseError{CloseEvent: *event}
+		if c.intakeDone {
+			c.parkedReader = nil
+			c.inPark.Store(false)
+			c.mu.Unlock()
+			return 0, nil, c.awaitCloseError(ctx)
 		}
-		// The close is still finishing; its event is set before ended.
-		select {
-		case <-c.ended:
-			return Message{}, &CloseError{CloseEvent: *c.event.Load()}
-		case <-ctx.Done():
-			return Message{}, ctx.Err()
+		if err := ctx.Err(); err != nil {
+			c.parkedReader = nil
+			c.inPark.Store(false)
+			c.mu.Unlock()
+			return 0, nil, err
 		}
-	case <-ctx.Done():
-		return Message{}, ctx.Err()
+
+		slot = parkedMsgReader{into: into, dst: dst}
+		c.parkedReader = &slot
+		c.mu.Unlock()
+
+		if c.inGen.Load() == tok {
+			select {
+			case <-c.inSig:
+			case <-c.ended:
+			case <-ctx.Done():
+			}
+		} else {
+			c.inPark.Store(false)
+		}
+
+		c.mu.Lock()
+		if slot.filled {
+			c.mu.Unlock()
+			return slot.typ, slot.out, nil
+		}
+		c.parkedReader = nil
 	}
 }
 
-// CloseEventInfo reports how the connection ended. It is meaningful once
-// ReadMessage has returned a CloseError, or after Close returned and the
-// connection finished closing.
-func (c *Client) CloseEventInfo() CloseEvent {
+func consumeQueuedItem(item queuedMessage, into bool, dst []byte) (MessageType, []byte) {
+	if item.buf == nil {
+		if into {
+			return item.typ, dst[:0]
+		}
+		return item.typ, nil
+	}
+	src := item.buf.Bytes()
+	var out []byte
+	if into {
+		out = append(dst[:0], src...)
+	} else {
+		out = append([]byte(nil), src...)
+	}
+	uio.ReleaseBuffer(item.buf)
+	return item.typ, out
+}
+
+func (c *BlockingConn) awaitCloseError(ctx context.Context) error {
+	if ev := c.event.Load(); ev != nil {
+		return &CloseError{CloseEvent: *ev}
+	}
+	select {
+	case <-c.ended:
+		if ev := c.event.Load(); ev != nil {
+			return &CloseError{CloseEvent: *ev}
+		}
+		return &CloseError{CloseEvent: CloseEvent{Err: ErrClosed}}
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// WriteText sends a text WebSocket message, suspending when the outbound
+// buffer is full until space drains, the connection closes, or ctx ends.
+func (c *BlockingConn) WriteText(ctx context.Context, text string) error {
+	if len(text) == 0 {
+		return c.WriteMessage(ctx, TextMessage, nil)
+	}
+	data := unsafe.Slice(unsafe.StringData(text), len(text))
+	return c.WriteMessage(ctx, TextMessage, data)
+}
+
+// WriteBinary sends a binary WebSocket message, suspending when the outbound
+// buffer is full until space drains, the connection closes, or ctx ends.
+func (c *BlockingConn) WriteBinary(ctx context.Context, payload []byte) error {
+	return c.WriteMessage(ctx, BinaryMessage, payload)
+}
+
+// WriteMessage sends one message of typ, suspending on outbound backpressure
+// until space drains, the connection closes, or ctx ends.
+func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payload []byte) error {
+	if blockio.OnTurn() {
+		return ErrBlockingOnTurn
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.Conn == nil {
+		return ErrNotReady
+	}
+
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
+	c.ensureWriteWatch()
+	limit := c.maxWrite
+	for {
+		tok := c.outGen.Load()
+		c.outPark.Store(true)
+
+		if err := ctx.Err(); err != nil {
+			c.outPark.Store(false)
+			return err
+		}
+		if c.Conn.closed.Load() || c.Conn.closing.Load() {
+			c.outPark.Store(false)
+			if ev := c.event.Load(); ev != nil {
+				return &CloseError{CloseEvent: *ev}
+			}
+			return ErrClosed
+		}
+		if buffered := c.Conn.OutboundBuffered(); buffered == 0 || buffered < limit {
+			err := c.Conn.send(typ, payload)
+			if err == nil {
+				c.outPark.Store(false)
+				return nil
+			}
+			if !errors.Is(err, ErrBackpressure) {
+				c.outPark.Store(false)
+				return err
+			}
+			if c.Conn.OutboundBuffered() == 0 && c.Conn.maxOutbound() > 0 && len(payload)+2 > c.Conn.maxOutbound() {
+				c.outPark.Store(false)
+				return err
+			}
+		}
+		if c.outGen.Load() != tok {
+			c.outPark.Store(false)
+			continue
+		}
+		select {
+		case <-c.outSig:
+		case <-c.ended:
+		case <-ctx.Done():
+			c.outPark.Store(false)
+			return ctx.Err()
+		}
+	}
+}
+
+// Flush flushes queued outbound frames and blocks until the outbound buffer
+// drains, the connection closes, or ctx ends.
+func (c *BlockingConn) Flush(ctx context.Context) error {
+	if blockio.OnTurn() {
+		return ErrBlockingOnTurn
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if c.Conn == nil {
+		return ErrNotReady
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+
+	if err := c.Conn.flush(); err != nil {
+		return err
+	}
+	if c.Conn.OutboundBuffered() == 0 {
+		return nil
+	}
+	c.ensureWriteWatch()
+	for {
+		tok := c.outGen.Load()
+		c.outPark.Store(true)
+		if err := ctx.Err(); err != nil {
+			c.outPark.Store(false)
+			return err
+		}
+		if c.Conn.closed.Load() {
+			c.outPark.Store(false)
+			if ev := c.event.Load(); ev != nil {
+				return &CloseError{CloseEvent: *ev}
+			}
+			return ErrClosed
+		}
+		if c.Conn.OutboundBuffered() == 0 {
+			c.outPark.Store(false)
+			return nil
+		}
+		if c.outGen.Load() != tok {
+			c.outPark.Store(false)
+			continue
+		}
+		select {
+		case <-c.outSig:
+		case <-c.ended:
+		case <-ctx.Done():
+			c.outPark.Store(false)
+			return ctx.Err()
+		}
+	}
+}
+
+func (c *BlockingConn) ensureWriteWatch() {
+	c.writeWatchOnce.Do(func() {
+		if c.Conn != nil && c.Conn.raw != nil {
+			writecontrol.Watch(c.Conn.raw, func(int) {
+				c.notifyWriteSpace()
+			})
+		}
+	})
+}
+
+// CloseEventInfo reports how the connection ended once closed.
+func (c *BlockingConn) CloseEventInfo() CloseEvent {
 	if event := c.event.Load(); event != nil {
 		return *event
 	}
 	return CloseEvent{}
 }
 
-// Close closes the connection with code and reason. It also ends reading:
-// messages still in the queue are returned by further ReadMessage calls until
-// they run out, and an OnMessage stuck on a full queue gives up at once. An
-// invalid code or reason returns the error with the connection untouched,
-// still reading.
-func (c *Client) Close(code uint16, reason string) error {
+// Close validates code and reason, stops further inbound message intake (while
+// preserving already-queued messages for subsequent ReadMessage calls), and
+// initiates the WebSocket Close handshake.
+func (c *BlockingConn) Close(code uint16, reason string) error {
 	if _, err := c.Conn.closePayload(code, reason); err != nil {
 		return err
 	}
-	c.finish()
+	c.mu.Lock()
+	c.intakeDone = true
+	c.paused = false
+	c.mu.Unlock()
+	c.notifyIn()
+	c.notifyWriteSpace()
 	return c.Conn.Close(code, reason)
 }
 
-// finish ends message intake exactly once.
-func (c *Client) finish() {
-	c.doneOnce.Do(func() { close(c.done) })
+func (c *BlockingConn) onConnClose(event CloseEvent) {
+	c.event.Store(&event)
+	c.mu.Lock()
+	c.intakeDone = true
+	c.paused = false
+	c.mu.Unlock()
+	c.endedOnce.Do(func() { close(c.ended) })
+	c.notifyIn()
+	c.notifyWriteSpace()
 }
 
-// release lets the connection close past a full queue; see stop.
-func (c *Client) release() {
-	c.stopOnce.Do(func() { close(c.stop) })
-}
-
-// setReadDeadline arms the client-owned read deadline; a zero time clears
-// it. An expiry the application pushed back since the timer was armed is
-// discarded here, and the timer the later deadline armed is already waiting.
-func (c *Client) setReadDeadline(deadline time.Time) {
-	c.deadlineMu.Lock()
-	defer c.deadlineMu.Unlock()
-	c.readDeadline = deadline
-	if c.deadlineTimer != nil {
-		c.deadlineTimer.Stop()
-		c.deadlineTimer = nil
-	}
-	if c.readDeadline.IsZero() || c.closedConn() {
-		return
-	}
-	c.deadlineTimer = time.AfterFunc(time.Until(deadline), c.expireReadDeadline)
-}
-
-// expireReadDeadline closes the connection once its read deadline arrived.
-// Only the deadline decides: nothing else observes it while a full queue
-// holds the connection's turn, so this timer is its one owner.
-func (c *Client) expireReadDeadline() {
-	c.deadlineMu.Lock()
-	if c.readDeadline.IsZero() || c.readDeadline.After(time.Now()) {
-		c.deadlineMu.Unlock()
-		return
-	}
-	c.deadlineTimer = nil
-	c.deadlineMu.Unlock()
-	if conn := c.Conn; conn != nil {
-		conn.failStream(os.ErrDeadlineExceeded)
-	}
-}
-
-// stopDeadlines drops the deadline timer once the connection closed.
-func (c *Client) stopDeadlines() {
-	c.deadlineMu.Lock()
-	c.readDeadline = time.Time{}
-	if c.deadlineTimer != nil {
-		c.deadlineTimer.Stop()
-		c.deadlineTimer = nil
-	}
-	c.deadlineMu.Unlock()
-}
-
-// closedConn reports whether the connection's OnClose has run.
-func (c *Client) closedConn() bool {
-	select {
-	case <-c.ended:
-		return true
-	default:
-		return false
-	}
-}
-
-// newClient is the Client a DialClient wires its internal handler to.
-func newClient() *Client {
-	return &Client{
-		queue: make(chan Message, clientQueueMessages),
-		done:  make(chan struct{}),
-		stop:  make(chan struct{}),
-		ended: make(chan struct{}),
-	}
-}
-
-// enqueue offers a message to the reader. With the queue full it waits for
-// room — the backpressure that pauses a client which has stopped reading — and
-// gives up once intake ended or the connection started closing; from then on
-// every message gives up, queued or not, so a close under way loses messages
-// whole rather than leaving gaps between delivered ones. While it waits, the
-// connection's turn is here, so the heartbeat decisions that fall due — a
-// Ping to send, a timeout to end the connection — are made here too: a client
-// nobody reads still pings, and is closed once its Ping goes unanswered,
-// without dropping the message it holds. The boundary is read only when the
-// queue is full, so a reading client pays nothing for it.
-func (c *Client) enqueue(message Message, conn *Conn) {
-	select {
-	case <-c.stop:
-		return
-	case <-c.done:
-		return
-	default:
-	}
-	select {
-	case c.queue <- message:
-		return
-	default:
-	}
-	for {
-		var deadline <-chan time.Time
-		var timer *time.Timer
-		if until := conn.heartbeatBoundary(); !until.IsZero() {
-			// A timer this wait stops on the way out: time.After's would
-			// keep the runtime's wheel busy until the boundary passed.
-			timer = time.NewTimer(time.Until(until))
-			deadline = timer.C
-		}
-		select {
-		case c.queue <- message:
-		case <-c.done:
-		case <-c.stop:
-		case <-deadline:
-			// The decision the turn would have made: it may ping, or close
-			// the connection, which releases this wait through stop.
-			conn.heartbeatTick(time.Now())
-			continue
-		}
-		if timer != nil {
-			timer.Stop()
-		}
-		return
-	}
-}
-
-// pullHandler is the Handler a DialClient installs in place of the dialer's
-// own: it reports the handshake to the dialing goroutine and feeds the
-// client's queue.
-type pullHandler struct {
-	client *Client
-	dialer *Dialer
-	// ready receives the handshake outcome: nil after OnOpen, the close
-	// otherwise. One receiver, so one buffer never blocks a callback.
+type blockingHandler struct {
+	bc    *BlockingConn
+	prev  Handler
 	ready chan error
+	opts  []BlockingOption
 }
 
-func (h *pullHandler) OnOpen(conn *Conn) {
-	h.client.Conn = conn
-	h.dialer.trackClient(h.client)
-	h.ready <- nil
-}
-
-func (h *pullHandler) OnMessage(conn *Conn, message Message) {
-	h.client.enqueue(message.Clone(), conn)
-}
-
-func (h *pullHandler) OnClose(_ *Conn, event CloseEvent) {
-	h.dialer.clients.Delete(h.client)
-	h.client.stopDeadlines()
-	h.client.event.Store(&event)
-	h.client.finish()
-	close(h.client.ended)
-	select {
-	case h.ready <- &CloseError{CloseEvent: event}:
-	default:
+func (h *blockingHandler) OnOpen(conn *Conn) {
+	cfg := resolveBlockingOpts(conn, h.opts)
+	h.bc.Conn = conn
+	h.bc.maxReadBytes = cfg.readBytes
+	h.bc.maxReadMsgs = cfg.readMsgs
+	h.bc.maxWrite = cfg.writeBytes
+	if h.ready != nil {
+		h.ready <- nil
 	}
 }
 
-// DialClient connects and returns the client once the handshake completes,
-// ready to send and read: the pull-mode counterpart of Dial, which reports
-// connection events to Options.Handler instead. The dialer's Handler must be
-// nil, since the client takes the callbacks; DialClient returns
-// ErrInvalidOptions otherwise. ctx bounds the TCP connection and the
-// handshake, not the connection after it.
-func (d *Dialer) DialClient(ctx context.Context, addr string) (*Client, error) {
+func (h *blockingHandler) OnMessage(conn *Conn, message Message) {
+	h.bc.enqueue(conn, message)
+}
+
+func (h *blockingHandler) OnClose(conn *Conn, event CloseEvent) {
+	h.bc.onConnClose(event)
+	if h.ready != nil {
+		select {
+		case h.ready <- &CloseError{CloseEvent: event}:
+		default:
+		}
+	}
+	if h.prev != nil {
+		h.prev.OnClose(conn, event)
+	}
+}
+
+// DialClient connects and returns the synchronous Client (*BlockingConn) once
+// the WebSocket handshake completes. Options.Handler must be nil.
+func (d *Dialer) DialClient(ctx context.Context, addr string, opts ...BlockingOption) (*Client, error) {
+	if blockio.OnTurn() {
+		return nil, ErrBlockingOnTurn
+	}
 	if d.Options.Handler != nil {
 		return nil, fmt.Errorf("%w: Handler is set: DialClient owns the callbacks", ErrInvalidOptions)
 	}
-	client := newClient()
-	handler := &pullHandler{client: client, dialer: d, ready: make(chan error, 1)}
+	bc := newBlockingConn(nil, blockingOptions{
+		readBytes:  DefaultBlockingQueueBytes,
+		readMsgs:   DefaultBlockingQueueMessages,
+		writeBytes: DefaultBlockingQueueBytes,
+	})
+	handler := &blockingHandler{
+		bc:    bc,
+		ready: make(chan error, 1),
+		opts:  opts,
+	}
 	if err := d.dialWithHandler(ctx, addr, nil, handler); err != nil {
-		// An error means no connection was made and no callback follows.
 		return nil, err
 	}
-	// The handshake completes asynchronously: OnOpen lets DialClient return,
-	// a failed one reports OnClose here.
 	if err := <-handler.ready; err != nil {
 		return nil, err
 	}
-	return client, nil
-}
-
-// trackClient lets Dialer.Close release client. Registered first and checked
-// after, so a client either is seen by the Close or sees it.
-func (d *Dialer) trackClient(client *Client) {
-	d.clients.Store(client, struct{}{})
-	if d.closedCause() != nil {
-		client.release()
-	}
-}
-
-// releaseClients lets every pull client's connection close past its queue.
-func (d *Dialer) releaseClients() {
-	d.clients.Range(func(key, _ any) bool {
-		key.(*Client).release()
-		return true
-	})
-}
-
-// releasePullClient lets a pull Client's connection close past its full
-// queue once this end starts closing it.
-func (c *Conn) releasePullClient() {
-	if h, ok := c.handler.(*pullHandler); ok {
-		h.client.release()
-	}
+	return bc, nil
 }
