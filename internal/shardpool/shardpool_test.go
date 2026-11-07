@@ -923,3 +923,37 @@ func TestStopWaitsForOverflowGoroutines(t *testing.T) {
 		})
 	}
 }
+
+func TestPoolStatsSnapshotZeroAlloc(t *testing.T) {
+	var nilPool *Pool[*task]
+	if st := nilPool.Stats(); st != (Stats{}) {
+		t.Fatalf("nil pool Stats = %+v, want zero", st)
+	}
+	block := make(chan struct{})
+	started := make(chan struct{}, 1)
+	pool := New(2, 8, func(one *task) uint32 { return one.key }, func(*task) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-block
+	})
+	pool.AddKey()
+	pool.Submit(&task{key: 0})
+	<-started
+	pool.SubmitBehind(&task{key: 0})
+
+	st := pool.Stats()
+	if st.ActiveShards != 2 || st.Keys != 1 || st.RunningWorkers < 1 || st.Queued < 1 {
+		t.Fatalf("Stats while busy = %+v", st)
+	}
+	close(block)
+	waitFor(t, "workers idle", func() bool { return pool.Stats().RunningWorkers == 0 && pool.Stats().Queued == 0 })
+	if pool.Stats().IdleWorkers < 1 {
+		t.Fatalf("expected parked worker in Stats = %+v", pool.Stats())
+	}
+	if allocs := testing.AllocsPerRun(100, func() { _ = pool.Stats() }); allocs != 0 {
+		t.Fatalf("Pool.Stats allocs = %v, want 0", allocs)
+	}
+	pool.Stop()
+}

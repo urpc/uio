@@ -229,6 +229,7 @@ type eventLoop struct {
 	// and is nil elsewhere; see deferClose.
 	accepts *acceptRunner
 	closer  *loopCloser
+	stats   loopStats
 }
 
 // loopWaiter is one waiter goroutine's private dispatch state.

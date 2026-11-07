@@ -223,3 +223,39 @@ func TestStandaloneKeepsNegativeOptions(t *testing.T) {
 			session.opts.KeepAlive, session.opts.HandshakeTimeout, session.opts.Resend)
 	}
 }
+
+func TestStandaloneServerAndDialerStatsZeroAlloc(t *testing.T) {
+	var nilSrv *Server
+	var nilDialer *Dialer
+	if nilSrv.Stats().Pollers != 0 || nilDialer.Stats().Pollers != 0 {
+		t.Fatal("nil Server/Dialer Stats not zero")
+	}
+	unstarted := NewServer(Options{Handler: echoHandler})
+	if unstarted.Stats().Pollers != 0 {
+		t.Fatal("unstarted Server Stats not zero")
+	}
+	srv := startServer(t, Options{Handler: echoHandler}, "127.0.0.1:0")
+	addr := srv.Addrs()[0].String()
+
+	dialer := NewDialer(Options{Handler: echoHandler})
+	if dialer.Stats().Pollers != 0 {
+		t.Fatal("unstarted Dialer Stats not zero")
+	}
+	t.Cleanup(func() { _ = dialer.Close() })
+	conn, err := dialer.Dial(addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_, _ = conn.Write([]byte("ping"))
+
+	for deadline := time.Now().Add(time.Second); (srv.Stats().ActiveConnections < 1 || dialer.Stats().ActiveConnections < 1) && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	if allocs := testing.AllocsPerRun(100, func() {
+		_ = srv.Stats()
+		_ = dialer.Stats()
+	}); allocs != 0 {
+		t.Fatalf("ukcp Stats allocs = %v, want 0", allocs)
+	}
+}

@@ -206,7 +206,9 @@ func (s *Server) onOpen(raw uio.Conn) {
 		}
 	}
 	conn := s.newConnection(raw)
-	conn.handshake.Store(newServerHandshake())
+	hs := newServerHandshake()
+	conn.handshake.Store(hs)
+	conn.beginHandshakeCount(hs)
 	raw.SetUserdata(conn)
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 }
@@ -279,11 +281,17 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 		if !conn.closed.CompareAndSwap(false, true) {
 			return
 		}
+		if conn.config != nil {
+			conn.config.stats.noteHandshakeFailed(conn, false)
+		}
 		conn.stopCloseTimer()
 		return
 	}
 	if !conn.closed.CompareAndSwap(false, true) {
 		return
+	}
+	if conn.config != nil {
+		conn.config.stats.noteClosed(conn)
 	}
 	conn.stopCloseTimer()
 	info := conn.closeInfo()
@@ -294,4 +302,23 @@ func (s *Server) onClose(raw uio.Conn, err error) {
 		info.Err = err
 	}
 	conn.notifyClose(info)
+}
+
+// Stats returns a point-in-time, zero-allocation runtime snapshot of s.
+func (s *Server) Stats() Stats {
+	if s == nil {
+		return Stats{}
+	}
+	s.closeMu.Lock()
+	ev := s.events
+	cfg := s.config
+	s.closeMu.Unlock()
+	var tr uio.Stats
+	if ev != nil {
+		tr = ev.Stats()
+	}
+	if cfg == nil {
+		return Stats{Transport: tr}
+	}
+	return cfg.stats.snapshot(tr)
 }

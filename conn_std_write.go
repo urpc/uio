@@ -83,7 +83,7 @@ func (fc *fdConn) writeNonBlocking(p []byte) (n int, err error) {
 	}
 	if len(p) >= stdOwnedWriteThreshold {
 		if limit := fc.payloadLimit(); limit > 0 && len(p) > limit {
-			return 0, ErrOutboundOverflow
+			return 0, fc.errOutboundOverflow()
 		}
 		owned := bytebuf.CloneBuffer(p)
 		n, err := fc.writeOwnedNonBlocking(owned)
@@ -101,7 +101,7 @@ func (fc *fdConn) writeNonBlocking(p []byte) (n int, err error) {
 	}
 	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-len(p) {
 		fc.mux.Unlock()
-		return 0, ErrOutboundOverflow
+		return 0, fc.errOutboundOverflow()
 	}
 	n = fc.outbound.WriteCoalesced(p, fc.coalesceBlockSize())
 	fc.mux.Unlock()
@@ -187,7 +187,7 @@ func (fc *fdConn) writevNonBlocking(vec [][]byte) (n int, err error) {
 	segments := 0
 	for _, segment := range vec {
 		if len(segment) > int(^uint(0)>>1)-total {
-			return 0, ErrOutboundOverflow
+			return 0, fc.errOutboundOverflow()
 		}
 		total += len(segment)
 		if len(segment) > 0 {
@@ -199,7 +199,7 @@ func (fc *fdConn) writevNonBlocking(vec [][]byte) (n int, err error) {
 	}
 	if total >= stdOwnedWriteThreshold {
 		if limit := fc.payloadLimit(); limit > 0 && total > limit {
-			return 0, ErrOutboundOverflow
+			return 0, fc.errOutboundOverflow()
 		}
 		var inline [8]*bytebuf.Buffer
 		owned := inline[:0]
@@ -221,7 +221,7 @@ func (fc *fdConn) writevNonBlocking(vec [][]byte) (n int, err error) {
 		if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 			fc.mux.Unlock()
 			releaseStdBuffers(owned)
-			return 0, ErrOutboundOverflow
+			return 0, fc.errOutboundOverflow()
 		}
 		for _, buffer := range owned {
 			fc.outbound.AppendOwned(buffer)
@@ -240,7 +240,7 @@ func (fc *fdConn) writevNonBlocking(vec [][]byte) (n int, err error) {
 	}
 	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-total {
 		fc.mux.Unlock()
-		return 0, ErrOutboundOverflow
+		return 0, fc.errOutboundOverflow()
 	}
 	n = fc.outbound.WritevCoalesced(vec, fc.coalesceBlockSize())
 	fc.mux.Unlock()
@@ -287,7 +287,7 @@ func (fc *fdConn) writeOwnedNonBlocking(owned *Buffer) (n int, err error) {
 	if limit := fc.payloadLimit(); limit > 0 && fc.outbound.Len()+fc.writeBytes > limit-size {
 		fc.mux.Unlock()
 		// An overflowed buffer was never accepted, so it remains the caller's.
-		return 0, ErrOutboundOverflow
+		return 0, fc.errOutboundOverflow()
 	}
 	fc.outbound.AppendOwned(owned)
 	fc.mux.Unlock()

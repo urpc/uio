@@ -616,11 +616,19 @@ func (conn *fdConn) fireCloseCallback() {
 	err := conn.takeDeferredCloseCause()
 	if conn.udp != nil && conn.udp.openOwed.CompareAndSwap(true, false) {
 		// A DialPeer child closed before its OnOpen ran gets it first.
+		if !conn.internal && conn.loop != nil && !conn.statOpened {
+			conn.statOpened = true
+			conn.loop.stats.noteConnOpened()
+		}
 		if callback := conn.callbacks().onOpen; callback != nil {
 			started := conn.beginInboundCallback()
 			callback(conn)
 			conn.endInboundCallback(started)
 		}
+	}
+	if conn.statOpened && conn.loop != nil {
+		conn.statOpened = false
+		conn.loop.stats.noteConnClosed()
 	}
 	if callback := conn.callbacks().onClose; callback != nil && !conn.internal {
 		started := conn.beginInboundCallback()

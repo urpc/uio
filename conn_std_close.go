@@ -335,6 +335,10 @@ func (fc *fdConn) deliverCloseCallback(err error) {
 	if !atomic.CompareAndSwapInt32(&fc.closeDelivered, 0, 1) {
 		return
 	}
+	if fc.statOpened && fc.loop != nil {
+		fc.statOpened = false
+		fc.loop.stats.noteConnClosed()
+	}
 	if fc.lifecycle {
 		fc.lifecycle = false
 		defer fc.events().callbackWG.Done()

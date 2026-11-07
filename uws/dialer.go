@@ -425,6 +425,7 @@ func (d *Dialer) onOpen(raw uio.Conn) {
 	}
 	setup.attach(raw)
 	conn := setup.conn
+	conn.beginHandshakeCount(conn.handshake.Load())
 	raw.SetUserdata(conn)
 	conn.startHandshakeTimer(conn.config.handshakeTimeout)
 	conn.watchHandshakeContext(setup.Context)
@@ -518,6 +519,9 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 		if !conn.closed.CompareAndSwap(false, true) {
 			return
 		}
+		if conn.config != nil {
+			conn.config.stats.noteHandshakeFailed(conn, false)
+		}
 		conn.stopCloseTimer()
 		if err == nil {
 			err = ErrClosed
@@ -531,6 +535,9 @@ func (d *Dialer) onClose(raw uio.Conn, err error) {
 	}
 	if !conn.closed.CompareAndSwap(false, true) {
 		return
+	}
+	if conn.config != nil {
+		conn.config.stats.noteClosed(conn)
 	}
 	conn.stopCloseTimer()
 	info := conn.closeInfo()
@@ -560,4 +567,23 @@ func (setup *dialSetup) attach(raw uio.Conn) {
 	setup.attachOnce.Do(func() {
 		setup.conn.setRaw(raw)
 	})
+}
+
+// Stats returns a point-in-time, zero-allocation runtime snapshot of d.
+func (d *Dialer) Stats() Stats {
+	if d == nil {
+		return Stats{}
+	}
+	d.closeMu.Lock()
+	ev := d.events
+	cfg := d.config
+	d.closeMu.Unlock()
+	var tr uio.Stats
+	if ev != nil {
+		tr = ev.Stats()
+	}
+	if cfg == nil {
+		return Stats{Transport: tr}
+	}
+	return cfg.stats.snapshot(tr)
 }

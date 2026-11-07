@@ -505,6 +505,13 @@ func (c *Conn) sendLocked(opcode frame.OpCode, payload []byte) error {
 	return c.sendMessageLocked(opcode, false, payload)
 }
 
+func (c *Conn) errBackpressure() error {
+	if c != nil && c.config != nil {
+		c.config.stats.noteBackpressure(c)
+	}
+	return ErrBackpressure
+}
+
 // sendMessageLocked queues one message payload, split into fragments of at most
 // MaxFramePayload. It requires writes.mu. A fragmented message is admitted
 // whole or not at all: once its first fragment is accepted, the rest must
@@ -515,7 +522,7 @@ func (c *Conn) sendMessageLocked(opcode frame.OpCode, compressed bool, payload [
 		return c.sendFrameLocked(frame.Frame{Fin: true, RSV1: compressed, Opcode: opcode, Payload: payload})
 	}
 	if !c.outboundHasRoom(fragmentedWireSize(len(payload), maxFrame, c.isClient())) {
-		return ErrBackpressure
+		return c.errBackpressure()
 	}
 	for offset := 0; offset < len(payload); {
 		end := offset + int(min(uint64(len(payload)-offset), maxFrame))
@@ -731,7 +738,7 @@ func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error
 		wireSize, head = size+4, 4
 	}
 	if c.outboundRefuses(wireSize) {
-		return true, ErrBackpressure
+		return true, c.errBackpressure()
 	}
 	if reserver, ok := c.raw.(writecontrol.TurnReserver); ok {
 		if dst, reserved, err := reserver.ReserveTurnWrite(wireSize); reserved {
@@ -905,7 +912,7 @@ func (c *Conn) failStream(err error) {
 func (c *Conn) finishFrameWrite(opcode frame.OpCode, n, want int, err error) error {
 	if err != nil {
 		if errors.Is(err, uio.ErrOutboundOverflow) {
-			return ErrBackpressure
+			return c.errBackpressure()
 		}
 		// Any other failure leaves the transport closing.
 		if errors.Is(err, net.ErrClosed) {

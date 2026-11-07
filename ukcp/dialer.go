@@ -61,6 +61,21 @@ type Dialer struct {
 // fields are the configuration, this constructor only fills them in.
 func NewDialer(opts Options) *Dialer { return &Dialer{Options: opts} }
 
+// Stats returns a point-in-time, zero-allocation snapshot of the dialer's
+// underlying UIO transport.
+func (d *Dialer) Stats() uio.Stats {
+	if d == nil {
+		return uio.Stats{}
+	}
+	d.mu.Lock()
+	ev := d.events
+	d.mu.Unlock()
+	if ev == nil {
+		return uio.Stats{}
+	}
+	return ev.Stats()
+}
+
 // Dial is DialContext with no deadline, as a server's Serve takes none.
 func (d *Dialer) Dial(addr string) (uio.Conn, error) {
 	return d.DialContext(context.Background(), addr)

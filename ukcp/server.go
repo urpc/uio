@@ -56,6 +56,21 @@ func (s *Server) Addrs() []net.Addr {
 	return append([]net.Addr(nil), s.addrs...)
 }
 
+// Stats returns a point-in-time, zero-allocation snapshot of the server's
+// underlying UIO transport.
+func (s *Server) Stats() uio.Stats {
+	if s == nil {
+		return uio.Stats{}
+	}
+	s.mu.Lock()
+	ev := s.events
+	s.mu.Unlock()
+	if ev == nil {
+		return uio.Stats{}
+	}
+	return ev.Stats()
+}
+
 // Serve listens on each address, in Serve's syntax, and serves until Close:
 // it blocks, and reports why the transport stopped. An address without a
 // scheme listens for UDP, the network KCP runs on commonly. A listener's

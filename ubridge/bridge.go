@@ -116,9 +116,67 @@ type Bridge struct {
 	// becomes the Events' MaxInboundBuffered.
 	InboundLimit int
 
-	mu     sync.Mutex
-	events *uio.Events
-	pairs  map[uio.Conn]*bridgePair
+	mu           sync.Mutex
+	events       *uio.Events
+	pairs        map[uio.Conn]*bridgePair
+	totalPaired  atomic.Uint64
+	dialFailures atomic.Uint64
+}
+
+// Stats is a point-in-time, zero-allocation runtime snapshot of a [Bridge].
+type Stats struct {
+	// Transport is the underlying uio.Events snapshot when the bridge owns or
+	// started with an Events.
+	Transport uio.Stats
+	// ActivePairs is the number of live relayed connection pairs.
+	ActivePairs int
+	// ActiveLegs is the number of individual legs currently registered in the
+	// bridge (2 per full-duplex pair, 1 while half-closed/orphaned).
+	ActiveLegs int
+	// PausedLegs is the number of active legs currently read-paused by bridge
+	// backpressure because their destination leg reached InboundLimit.
+	PausedLegs int
+	// TotalPaired counts completed pairings since the Bridge was created.
+	TotalPaired uint64
+	// DialFailures counts upstream dials in OnOpen that failed.
+	DialFailures uint64
+}
+
+// Stats returns a point-in-time, zero-allocation snapshot of b.
+func (b *Bridge) Stats() Stats {
+	if b == nil {
+		return Stats{}
+	}
+	b.mu.Lock()
+	ev := b.events
+	legs := len(b.pairs)
+	activePairs := 0
+	pausedLegs := 0
+	for conn, p := range b.pairs {
+		if p.a.conn == conn {
+			if !p.closed.Load() {
+				activePairs++
+			}
+			if p.a.pause.Paused() {
+				pausedLegs++
+			}
+		} else if p.b.pause.Paused() {
+			pausedLegs++
+		}
+	}
+	b.mu.Unlock()
+	var tr uio.Stats
+	if ev != nil {
+		tr = ev.Stats()
+	}
+	return Stats{
+		Transport:    tr,
+		ActivePairs:  activePairs,
+		ActiveLegs:   legs,
+		PausedLegs:   pausedLegs,
+		TotalPaired:  b.totalPaired.Load(),
+		DialFailures: b.dialFailures.Load(),
+	}
 }
 
 // DialFunc dials through the bridge's Events; the bridge adds its own mark
@@ -133,13 +191,13 @@ var (
 	ErrAlreadyPaired = errors.New("ubridge: connection already belongs to another bridge pair")
 )
 
-func resolveControlBase(c uio.Lower) uio.Lower {
+func resolveControlConn(c uio.Conn) uio.Conn {
 	for c != nil {
 		if readcontrol.ControlOf(c) != nil || writecontrol.ControlOf(c) != nil {
 			return c
 		}
-		next := uio.Unwrap(c)
-		if next == nil {
+		next, ok := uio.Unwrap(c).(uio.Conn)
+		if !ok || next == nil {
 			return c
 		}
 		c = next
@@ -154,13 +212,13 @@ func resolveControlBase(c uio.Lower) uio.Lower {
 // connection already paired with another is refused with ErrAlreadyPaired.
 // On failure the caller remains responsible for closing its connections.
 func (b *Bridge) Pair(a, c uio.Conn) error {
+	a, c = resolveControlConn(a), resolveControlConn(c)
 	if a == nil || c == nil || a == c {
 		return uio.ErrUnsupported
 	}
-	baseA, baseC := resolveControlBase(a), resolveControlBase(c)
 	p := &bridgePair{
-		a: bridgeLeg{conn: a, pause: readcontrol.NewPause(baseA)},
-		b: bridgeLeg{conn: c, pause: readcontrol.NewPause(baseC)},
+		a: bridgeLeg{conn: a, pause: readcontrol.NewPause(a)},
+		b: bridgeLeg{conn: c, pause: readcontrol.NewPause(c)},
 	}
 	b.mu.Lock()
 	if b.pairs == nil {
@@ -190,11 +248,12 @@ func (b *Bridge) Pair(a, c uio.Conn) error {
 		b.mu.Unlock()
 		return ErrPeerGone
 	}
+	b.totalPaired.Add(1)
 	if b.OnPair != nil {
 		b.OnPair(a, c)
 	}
-	writecontrol.Watch(baseA, func(int) { b.resumeSource(a) })
-	writecontrol.Watch(baseC, func(int) { b.resumeSource(c) })
+	writecontrol.Watch(a, func(int) { b.resumeSource(a) })
+	writecontrol.Watch(c, func(int) { b.resumeSource(c) })
 	// Bytes either leg received before the pairing wait for a turn.
 	_ = a.Wake()
 	_ = c.Wake()
@@ -204,7 +263,7 @@ func (b *Bridge) Pair(a, c uio.Conn) error {
 func (b *Bridge) pairOf(c uio.Conn) *bridgePair {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.pairs[c]
+	return b.pairs[resolveControlConn(c)]
 }
 
 func (b *Bridge) inboundLimit() int {
@@ -262,6 +321,9 @@ func (b *Bridge) OnOpen(c uio.Conn) {
 	dial := func(ctx context.Context, addr string, opts ...uio.DialOption) (uio.Conn, error) {
 		opts = append(opts[:len(opts):len(opts)], uio.WithUserdata(bridgePeerMark{}))
 		up, err := b.Events().DialContext(ctx, addr, opts...)
+		if helper != nil && helper != up && b.pairOf(helper) == nil {
+			bridgeAbort(helper, ErrPeerGone)
+		}
 		helper = up
 		return up, err
 	}
@@ -270,10 +332,17 @@ func (b *Bridge) OnOpen(c uio.Conn) {
 	switch {
 	case b.Dial != nil:
 		up, err = b.Dial(context.Background(), c, dial)
+		if err != nil {
+			b.dialFailures.Add(1)
+		}
 	case b.Upstream != "":
 		up, err = dial(context.Background(), b.Upstream)
+		if err != nil {
+			b.dialFailures.Add(1)
+		}
 	default:
 		err = errors.New("ubridge: bridge has no upstream")
+		b.dialFailures.Add(1)
 	}
 	if err == nil {
 		err = b.Pair(c, up)
@@ -421,6 +490,7 @@ func (b *Bridge) OnTimer(uio.Conn) error { return nil }
 // partner's writing half; the partner then discards what still arrives for
 // the gone leg and closes once it ended too.
 func (b *Bridge) OnClose(c uio.Conn, err error) {
+	c = resolveControlConn(c)
 	b.mu.Lock()
 	p := b.pairs[c]
 	delete(b.pairs, c)
@@ -462,7 +532,7 @@ func peerGone(peer uio.Conn, err error) bool {
 // The lifecycle check of a built-in connection reads no callback-scoped
 // state, as State's end-of-stream bit does; a custom Conn has only State.
 func bridgeConnGone(c uio.Conn) bool {
-	if control := readcontrol.ControlOf(resolveControlBase(c)); control != nil {
+	if control := readcontrol.ControlOf(c); control != nil {
 		return errors.Is(control.Check(), net.ErrClosed)
 	}
 	return c.State()&(uio.StateClosing|uio.StateClosed) != 0

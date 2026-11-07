@@ -68,7 +68,7 @@ func (conn *fdConn) writeNonBlocking(data []byte) (int, error) {
 		return conn.sendUDPOutside(data)
 	}
 	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
-		return 0, ErrOutboundOverflow
+		return 0, conn.errOutboundOverflow()
 	}
 	if err := conn.precheckOutbound(len(data)); err != nil {
 		return 0, err
@@ -93,7 +93,7 @@ func (conn *fdConn) writevNonBlocking(vec [][]byte) (int, error) {
 	total := 0
 	for _, segment := range vec {
 		if len(segment) > int(^uint(0)>>1)-total {
-			return 0, ErrOutboundOverflow
+			return 0, conn.errOutboundOverflow()
 		}
 		total += len(segment)
 	}
@@ -112,7 +112,7 @@ func (conn *fdConn) writevNonBlocking(vec [][]byte) (int, error) {
 		return conn.writevOnLoop(vec, total)
 	}
 	if limit := conn.payloadLimit(); limit > 0 && total > limit {
-		return 0, ErrOutboundOverflow
+		return 0, conn.errOutboundOverflow()
 	}
 	if err := conn.precheckOutbound(total); err != nil {
 		return 0, err
@@ -201,7 +201,7 @@ func coalesceOwned(owned *bytebuf.Buffer, size, block int) bool {
 // also orders the send before a later Close or Abort.
 func (conn *fdConn) sendUDPOutside(data []byte) (int, error) {
 	if limit := conn.payloadLimit(); limit > 0 && len(data) > limit {
-		return 0, ErrOutboundOverflow
+		return 0, conn.errOutboundOverflow()
 	}
 	owner := conn.descriptorOwner()
 	owner.submitMu.Lock()
@@ -228,7 +228,7 @@ func (conn *fdConn) writevUDP(vec [][]byte) (int, error) {
 	if limit := conn.payloadLimit(); limit > 0 {
 		for _, segment := range vec {
 			if len(segment) > limit {
-				return 0, ErrOutboundOverflow
+				return 0, conn.errOutboundOverflow()
 			}
 		}
 	}
@@ -261,7 +261,7 @@ func (conn *fdConn) precheckOutbound(size int) error {
 	if limit := int64(conn.payloadLimit()); limit > 0 {
 		pending := conn.pending.Load()
 		if int64(size) > limit-pending {
-			return ErrOutboundOverflow
+			return conn.errOutboundOverflow()
 		}
 	}
 	return nil
@@ -274,7 +274,7 @@ func (conn *fdConn) precheckOutbound(size int) error {
 // reading. ErrOutboundOverflow accepts nothing and returns owned to the caller.
 func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error) {
 	if limit := conn.payloadLimit(); limit > 0 && size > limit {
-		return 0, ErrOutboundOverflow
+		return 0, conn.errOutboundOverflow()
 	}
 	// Allocation and the only payload copy have already happened off-lock.
 	conn.submitMu.Lock()
@@ -285,7 +285,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 	}
 	if !conn.reservePending(int64(size)) {
 		conn.submitMu.Unlock()
-		return 0, ErrOutboundOverflow
+		return 0, conn.errOutboundOverflow()
 	}
 	conn.outbound.AppendOwned(owned)
 	conn.submitMu.Unlock()
@@ -387,7 +387,7 @@ func (conn *fdConn) writeOnLoop(data []byte) (int, error) {
 	if !conn.reservePending(int64(len(remaining))) {
 		if written == 0 {
 			// Nothing left the socket: pure overflow.
-			return 0, ErrOutboundOverflow
+			return 0, conn.errOutboundOverflow()
 		}
 		// A partial payload is on the wire and its suffix cannot be queued:
 		// the stream is broken, so report a short write, not an overflow.
@@ -440,7 +440,7 @@ func (conn *fdConn) writevOnLoop(vec [][]byte, total int) (int, error) {
 	if !conn.reservePending(int64(remaining)) {
 		if written == 0 {
 			// Nothing left the socket: pure overflow.
-			return 0, ErrOutboundOverflow
+			return 0, conn.errOutboundOverflow()
 		}
 		// A partial vector is on the wire and its suffix cannot be queued:
 		// the stream is broken, so report a short write, not an overflow.
@@ -485,7 +485,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 			return 0, err
 		}
 		if !reserved {
-			return 0, ErrOutboundOverflow
+			return 0, conn.errOutboundOverflow()
 		}
 		conn.handOverScratch()
 		conn.submitMu.Lock()
@@ -522,7 +522,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		if written == 0 {
 			// Nothing left the socket: pure overflow, so the buffer returns
 			// to the caller like every other ErrOutboundOverflow.
-			return 0, ErrOutboundOverflow
+			return 0, conn.errOutboundOverflow()
 		}
 		// A partial frame is on the wire and its suffix cannot be queued:
 		// the stream is broken, so the buffer is consumed and the caller is
@@ -886,7 +886,7 @@ func (conn *fdConn) prepareScratch(n int) (out *bytebuf.Buffer, reserved bool, e
 		if !took || conn.tryClaimWrite(writeTurnHeldFlag) {
 			ok, ferr := conn.reservePendingAfterFlush(int64(n))
 			if ferr == nil && !ok {
-				ferr = ErrOutboundOverflow
+				ferr = conn.errOutboundOverflow()
 			}
 			if ferr != nil {
 				if took {
@@ -917,7 +917,7 @@ func (conn *fdConn) prepareScratch(n int) (out *bytebuf.Buffer, reserved bool, e
 		return nil, false, ferr
 	}
 	if !ok {
-		return nil, false, ErrOutboundOverflow
+		return nil, false, conn.errOutboundOverflow()
 	}
 	return nil, true, nil
 }

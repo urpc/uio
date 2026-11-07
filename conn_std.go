@@ -82,6 +82,7 @@ type fdConn struct {
 	// counts the Wakes that arrived before OnOpen, for the read goroutine to
 	// deliver right after it, one OnRead each. Both are guarded by callbackMu.
 	opened         bool
+	statOpened     bool
 	wakesAfterOpen int
 	wakesPending   atomic.Int32
 	cbOwner        atomic.Int64
@@ -239,6 +240,10 @@ func (fc *fdConn) ensureOpenLocked() {
 }
 
 func (fc *fdConn) fireOnOpen() {
+	if !fc.internal && fc.loop != nil && !fc.statOpened {
+		fc.statOpened = true
+		fc.loop.stats.noteConnOpened()
+	}
 	if callback := fc.callbacks().onOpen; callback != nil {
 		started := fc.beginInboundCallback()
 		callback(fc)

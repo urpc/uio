@@ -989,6 +989,9 @@ func (c *stack) reserve(n int) error {
 		if reserved > int64(n) {
 			c.reserveRefused.Store(true)
 		}
+		if fc, ok := c.socket.(*fdConn); ok {
+			return fc.errOutboundOverflow()
+		}
 		return ErrOutboundOverflow
 	}
 	return nil

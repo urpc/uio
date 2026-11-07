@@ -817,3 +817,34 @@ func (pool *Pool[T]) Stop() {
 		}
 	}
 }
+
+// Stats is a point-in-time, zero-allocation snapshot of a Pool's queues and
+// worker goroutines.
+type Stats struct {
+	ActiveShards   int
+	Keys           int64
+	Queued         int64
+	RunningWorkers int
+	IdleWorkers    int
+}
+
+// Stats reads the pool's lock-free shard counters without allocating or taking
+// any mutex. Because shards run concurrently, the returned totals are an
+// approximate point-in-time view.
+func (pool *Pool[T]) Stats() Stats {
+	if pool == nil {
+		return Stats{}
+	}
+	var st Stats
+	st.ActiveShards = int(pool.active.Load())
+	st.Keys = max(pool.keys.Load(), 0)
+	for i := range pool.shards {
+		s := &pool.shards[i]
+		if q := int64(s.tail.Load() - s.head.Load()); q > 0 {
+			st.Queued += q
+		}
+		st.RunningWorkers += int(max(s.running.Load(), 0))
+		st.IdleWorkers += int(max(s.idleCount.Load(), 0))
+	}
+	return st
+}

@@ -238,3 +238,34 @@ func (ev *Events) addConnContext(ctx context.Context, fdc *fdConn) error {
 	}
 	return fdc.loop.registerConn(fdc)
 }
+
+func (ev *Events) collectStats() Stats {
+	var st Stats
+	loops := ev.loops
+	st.Pollers = len(loops)
+	for _, loop := range loops {
+		if loop == nil {
+			continue
+		}
+		st.ActiveConnections += loop.stats.activeConns.Load()
+		st.TotalConnections += loop.stats.totalConns.Load()
+		st.OutboundOverflows += loop.stats.outboundOverflows.Load()
+	}
+	st.ActiveConnections = max(st.ActiveConnections, 0)
+	if pool := ev.ioPool; pool != nil {
+		if pool.turns != nil {
+			ts := pool.turns.Stats()
+			st.TurnQueue = ts.Queued
+			st.ActiveTurnShards = ts.ActiveShards
+			st.RunningWorkers += ts.RunningWorkers
+			st.IdleWorkers += ts.IdleWorkers
+		}
+		if pool.writes != nil {
+			ws := pool.writes.Stats()
+			st.WriteQueue = ws.Queued
+			st.RunningWorkers += ws.RunningWorkers
+			st.IdleWorkers += ws.IdleWorkers
+		}
+	}
+	return st
+}

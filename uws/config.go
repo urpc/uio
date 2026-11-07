@@ -68,6 +68,8 @@ type connConfig struct {
 
 	heartbeatInterval time.Duration
 	heartbeatTimeout  time.Duration
+
+	stats wsStatsCollector
 }
 
 // newServerConnConfig freezes the resolved options into the immutable

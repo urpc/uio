@@ -212,6 +212,22 @@ func (ev *Events) addConn(fdc *fdConn) error {
 	return ev.addConnContext(nil, fdc)
 }
 
+func (ev *Events) collectStats() Stats {
+	var st Stats
+	workers := ev.workers
+	st.Pollers = len(workers)
+	for _, loop := range workers {
+		if loop == nil {
+			continue
+		}
+		st.ActiveConnections += loop.stats.activeConns.Load()
+		st.TotalConnections += loop.stats.totalConns.Load()
+		st.OutboundOverflows += loop.stats.outboundOverflows.Load()
+	}
+	st.ActiveConnections = max(st.ActiveConnections, 0)
+	return st
+}
+
 const (
 	registerPending uint32 = iota
 	registerCanceled

@@ -110,11 +110,28 @@ func (c *Conn) expireHandshake(state *handshakeState, epoch uint64, cause error)
 		return
 	}
 	state.expired = true
+	wasHandshaking := state.counted
+	state.counted = false
 	resources := state.detachResourcesLocked(c)
 	c.handshake.CompareAndSwap(state, nil)
 	state.mu.Unlock()
+	if wasHandshaking && c.config != nil {
+		c.config.stats.stripeFor(c).handshaking.Add(-1)
+	}
 	resources.stop()
 	_ = c.requestClose(cause)
+}
+
+func (c *Conn) beginHandshakeCount(state *handshakeState) {
+	if c == nil || c.config == nil || state == nil {
+		return
+	}
+	state.mu.Lock()
+	if !state.counted {
+		state.counted = true
+		c.config.stats.noteHandshaking(c)
+	}
+	state.mu.Unlock()
 }
 
 // stopHandshakeTimer tears down the complete handshake state on rejection or
@@ -126,9 +143,14 @@ func (c *Conn) stopHandshakeTimer() {
 	}
 	state.mu.Lock()
 	state.expired = true
+	wasHandshaking := state.counted
+	state.counted = false
 	resources := state.detachResourcesLocked(c)
 	c.handshake.CompareAndSwap(state, nil)
 	state.mu.Unlock()
+	if wasHandshaking && c.config != nil {
+		c.config.stats.stripeFor(c).handshaking.Add(-1)
+	}
 	resources.stop()
 }
 
@@ -145,9 +167,14 @@ func (c *Conn) markOpened() bool {
 		state.mu.Unlock()
 		return false
 	}
+	wasHandshaking := state.counted
+	state.counted = false
 	resources := state.detachResourcesLocked(c)
 	c.opened.Store(true)
 	state.mu.Unlock()
+	if c.config != nil {
+		c.config.stats.noteUpgraded(c, wasHandshaking)
+	}
 	resources.stop()
 	return true
 }

@@ -116,6 +116,7 @@ type fdConn struct {
 	writeState atomic.Uint32 // send state and the write claim; see writeOwnerFlag
 	turn       uint8         // turn-owned bits: turnCorked, turnFlushing, sticky turnHangup
 	internal   bool          // framework-owned endpoint, not a user connection
+	statOpened bool          // turn-owned: noteConnOpened ran on loop.stats
 }
 
 const (
@@ -878,6 +879,10 @@ func (conn *fdConn) RunTask() {
 var testHookSocketClosePublished atomic.Pointer[func(*fdConn)]
 
 func (conn *fdConn) fireOnOpen() {
+	if !conn.internal && conn.loop != nil && !conn.statOpened {
+		conn.statOpened = true
+		conn.loop.stats.noteConnOpened()
+	}
 	if callback := conn.callbacks().onOpen; callback != nil {
 		started := conn.beginInboundCallback()
 		callback(conn)

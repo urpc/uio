@@ -54,6 +54,15 @@ func NewServer(cfg Config) *Server {
 	return s
 }
 
+// Stats returns a point-in-time, zero-allocation snapshot of the server's
+// underlying UIO transport.
+func (s *Server) Stats() uio.Stats {
+	if s == nil || s.events == nil {
+		return uio.Stats{}
+	}
+	return s.events.Stats()
+}
+
 // Sessions reports accepted transports and closes when the server stops. The
 // queue holds 64 sessions; with a Handler, an undelivered session continues
 // through its stream callbacks. Without a Handler, a full queue refuses the
@@ -158,6 +167,15 @@ func NewClient(cfg Config) *Client {
 	c.router = &router{cfg: cfg, client: true, started: make(chan struct{})}
 	c.events = &uio.Events{Handler: c.router, Observer: c.router, Hooks: c.router, ReadBufferSize: cfg.ReadBufferSize, MaxInboundBuffered: transportReadLimit(cfg)}
 	return c
+}
+
+// Stats returns a point-in-time, zero-allocation snapshot of the client's
+// underlying UIO transport.
+func (c *Client) Stats() uio.Stats {
+	if c == nil || c.events == nil {
+		return uio.Stats{}
+	}
+	return c.events.Stats()
 }
 
 // transportReadLimit leaves room to assemble one complete legal data frame.

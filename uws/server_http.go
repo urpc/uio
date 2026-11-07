@@ -70,18 +70,21 @@ func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		CheckOrigin: config.checkOrigin,
 	})
 	if err != nil {
+		config.stats.noteRejectedUpgrade()
 		writeHTTPError(writer, http.StatusBadRequest, httpErrorInvalidUpgrade)
 		return
 	}
 	var userdata any
 	if authorize := config.authorize; authorize != nil {
 		if userdata, err = authorize(request); err != nil {
+			config.stats.noteRejectedUpgrade()
 			writeRejection(writer, &authorizeError{err})
 			return
 		}
 	}
 	upgrade, err := prepareHTTPUpgrade(parsed, config)
 	if err != nil {
+		config.stats.noteRejectedUpgrade()
 		writeHTTPError(writer, http.StatusBadRequest, httpErrorInvalidUpgrade)
 		return
 	}

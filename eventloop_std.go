@@ -50,6 +50,7 @@ type eventLoop struct {
 
 	connsMu sync.Mutex
 	conns   map[*fdConn]struct{}
+	stats   loopStats
 }
 
 func newEventLoop(events *Events) (*eventLoop, error) {

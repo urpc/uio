@@ -80,8 +80,9 @@ type Session struct {
 	goAwaySent bool
 	// goAwayFlushed reports the transport accepted the GoAway frame, not
 	// merely that it was queued.
-	goAwayFlushed bool
-	closed        bool
+	goAwayFlushed   bool
+	closed          bool
+	controlOverflow bool
 	// closeErr is why the transport went away, for streams closed by it.
 	closeErr error
 	// draining reports a Shutdown in progress: new streams are refused while
@@ -207,6 +208,48 @@ func (s *Session) Close(cause error) error {
 	return s.conn.Abort(cause)
 }
 
+// SessionStats is a point-in-time, zero-allocation snapshot of a [Session].
+type SessionStats struct {
+	// ActiveStreams is the number of currently open streams in this session.
+	ActiveStreams int
+	// PendingOpens is the number of outbound Open calls awaiting the peer's ACK.
+	PendingOpens int
+	// AcceptBacklog is the number of inbound streams queued for Session.Accept.
+	AcceptBacklog int
+	// ControlQueue is the number of control frames queued for transport flush.
+	ControlQueue int
+	// PendingStreamQueue is the number of streams with queued data or FIN.
+	PendingStreamQueue int
+	// InboundBuffered is the unread stream payload bytes held in this session.
+	InboundBuffered int64
+	// GoAway reports whether GoAway has been sent or received.
+	GoAway bool
+	// Closed reports whether the session's transport has closed.
+	Closed bool
+}
+
+// Stats returns a point-in-time, zero-allocation snapshot of s.
+func (s *Session) Stats() SessionStats {
+	if s == nil {
+		return SessionStats{}
+	}
+	s.mu.Lock()
+	st := SessionStats{
+		ActiveStreams:      len(s.streams),
+		PendingOpens:       len(s.openWait),
+		ControlQueue:       len(s.control),
+		PendingStreamQueue: len(s.pending),
+		InboundBuffered:    s.pendingBytes,
+		GoAway:             s.goAway,
+		Closed:             s.closed,
+	}
+	if s.acceptCh != nil {
+		st.AcceptBacklog = len(s.acceptCh)
+	}
+	s.mu.Unlock()
+	return st
+}
+
 // Open starts a stream and waits for the peer's ACK. The ACK names the peer's
 // initial window.
 func (s *Session) Open(ctx context.Context) (*Stream, error) {
@@ -260,6 +303,8 @@ func (s *Session) open(ctx context.Context, metadata []byte) (*Stream, error) {
 	// payload is the same delta followed by the opener's opaque bytes.
 	if len(metadata) == 0 {
 		s.sendControlLocked(typeWindowUpdate, flagSYN, id, uint32(s.cfg.WindowSize-minWindow))
+	} else if len(s.control) >= s.maxControlFrames() {
+		s.controlOverflow = true
 	} else {
 		frame := make([]byte, headerSize+4+len(metadata))
 		encodeHeader(frame, frameHeader{
@@ -786,9 +831,19 @@ func (s *Session) checkPeerStreamID(id uint32) error {
 
 // ---------------------------------------------------------------- outbound
 
+const minControlQueueCap = 4096
+
+func (s *Session) maxControlFrames() int {
+	return max(4*s.cfg.MaxStreams, minControlQueueCap)
+}
+
 // sendControlLocked queues one control frame. The caller holds s.mu.
 func (s *Session) sendControlLocked(typ uint8, flags uint16, sid uint32, length uint32) {
-	if s.closed {
+	if s.closed || s.controlOverflow {
+		return
+	}
+	if len(s.control) >= s.maxControlFrames() {
+		s.controlOverflow = true
 		return
 	}
 	frame := make([]byte, headerSize)
@@ -955,6 +1010,9 @@ func (s *Session) flushLocked() error {
 	if s.conn == nil || s.closed {
 		return nil
 	}
+	if s.controlOverflow {
+		return ErrProtocol
+	}
 	for budget := 0; budget < maxFlushFrames; budget++ {
 		if s.goAwaySent && len(s.control) == 0 {
 			s.goAwayFlushed = true
@@ -967,7 +1025,11 @@ func (s *Session) flushLocked() error {
 				}
 				return err
 			}
+			s.control[0] = nil
 			s.control = s.control[1:]
+			if len(s.control) == 0 {
+				s.control = nil
+			}
 			continue
 		}
 		if len(s.pending) == 0 {

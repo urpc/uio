@@ -245,6 +245,7 @@ type handshakeState struct {
 	shardSet    bool  // the shard is picked once and then never changes
 	expired     bool
 	pooled      bool // a native server handshake, recycled once OnOpen returns
+	counted     bool // counted in config.stats.handshaking
 }
 
 // serverHandshake is a native server connection's handshake state together
@@ -298,7 +299,7 @@ func (state *handshakeState) recycle() {
 	state.contextStop = nil
 	state.cleanup = nil
 	state.epoch++
-	state.shard, state.shardSet, state.expired = 0, false, false
+	state.shard, state.shardSet, state.expired, state.counted = 0, false, false, false
 	h.request = handshake.Request{}
 	state.mu.Unlock()
 	serverHandshakes.Put(h)

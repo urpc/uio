@@ -169,6 +169,7 @@ type bridgeDecorator struct {
 func (d *bridgeDecorator) Unwrap() uio.Conn { return d.Conn }
 
 func TestBridgePairUnwrapsDecorators(t *testing.T) {
+	// Simple mocks that don't need deep integration
 	a := newBridgeOwnedConn(nil)
 	c := newBridgeOwnedConn(nil)
 	da := &bridgeDecorator{Conn: a}
@@ -176,5 +177,54 @@ func TestBridgePairUnwrapsDecorators(t *testing.T) {
 	br := &Bridge{}
 	if err := br.Pair(da, dc); err != nil {
 		t.Fatal(err)
+	}
+	// Duplicate wrapped reference to an already-paired base connection is rejected.
+	if err := br.Pair(&bridgeDecorator{Conn: a}, newBridgeOwnedConn(nil)); !errors.Is(err, ErrAlreadyPaired) {
+		t.Fatalf("duplicate wrapped Pair = %v, want ErrAlreadyPaired", err)
+	}
+	br.OnClose(a, io.EOF)
+	if br.pairOf(a) != nil {
+		t.Fatal("closed leg stayed registered after OnClose")
+	}
+	br.OnClose(c, io.EOF)
+	if br.pairOf(c) != nil {
+		t.Fatal("partner leg stayed registered after OnClose")
+	}
+}
+
+func TestBridgeStatsZeroAlloc(t *testing.T) {
+	var nilBr *Bridge
+	if nilBr.Stats() != (Stats{}) {
+		t.Fatal("nil Bridge.Stats not zero")
+	}
+	a := newBridgeOwnedConn(nil)
+	c := newBridgeOwnedConn(nil)
+	br := &Bridge{}
+	// Trigger DialFailures with missing upstream.
+	br.OnOpen(newBridgeOwnedConn(nil))
+	if err := br.Pair(a, c); err != nil {
+		t.Fatal(err)
+	}
+	_ = br.Events()
+	p := br.pairOf(a)
+	_ = p.a.pause.Pause()
+	_ = p.b.pause.Pause()
+	st := br.Stats()
+	if st.ActivePairs != 1 || st.ActiveLegs != 2 || st.PausedLegs != 2 || st.TotalPaired != 1 || st.DialFailures != 1 {
+		t.Fatalf("Bridge.Stats = %+v", st)
+	}
+	_ = p.a.pause.Resume()
+	_ = p.b.pause.Resume()
+	if allocs := testing.AllocsPerRun(100, func() { _ = br.Stats() }); allocs != 0 {
+		t.Fatalf("Bridge.Stats allocs = %v, want 0", allocs)
+	}
+	// Half-close one leg: ActiveLegs=1, ActivePairs=0 (closed=true).
+	br.OnClose(a, io.EOF)
+	if mid := br.Stats(); mid.ActiveLegs != 1 || mid.ActivePairs != 0 {
+		t.Fatalf("half-closed Bridge.Stats = %+v", mid)
+	}
+	br.OnClose(c, io.EOF)
+	if end := br.Stats(); end.ActiveLegs != 0 || end.ActivePairs != 0 || end.TotalPaired != 1 {
+		t.Fatalf("closed Bridge.Stats = %+v", end)
 	}
 }
