@@ -467,3 +467,35 @@ func TestStreamLastBytesCallbackKeepsItsCompletionDecision(t *testing.T) {
 		}
 	}
 }
+
+func TestWindowOverflowAndControlQueueFloodBounds(t *testing.T) {
+	sw := newSendWindow(1 << 20)
+	_ = sw.take(512 << 10)
+	if err := sw.grant(int64(^uint64(0) >> 1)); !errors.Is(err, errWindowExceeded) {
+		t.Fatalf("sendWindow.grant(MaxInt64) = %v, want errWindowExceeded", err)
+	}
+	rw := newRecvWindow(1 << 20)
+	if err := rw.onData(512 << 10); err != nil {
+		t.Fatal(err)
+	}
+	if err := rw.onData(int64(^uint64(0) >> 1)); !errors.Is(err, errWindowExceeded) {
+		t.Fatalf("recvWindow.onData(MaxInt64) = %v, want errWindowExceeded", err)
+	}
+
+	// Control queue flood protection when outbound transport is stalled (ErrOutboundOverflow).
+	s, _, _, _ := productionStreamPair(t)
+	s.mu.Lock()
+	limit := s.maxControlFrames()
+	for i := range limit + 8 {
+		s.sendControlLocked(typePing, flagACK, 0, uint32(i))
+	}
+	if len(s.control) != limit || !s.controlOverflow {
+		s.mu.Unlock()
+		t.Fatalf("control len=%d overflow=%v, want %d/true", len(s.control), s.controlOverflow, limit)
+	}
+	err := s.flushLocked()
+	s.mu.Unlock()
+	if !errors.Is(err, ErrProtocol) {
+		t.Fatalf("flushLocked on control queue overflow = %v, want ErrProtocol", err)
+	}
+}

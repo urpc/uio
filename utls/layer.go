@@ -154,10 +154,17 @@ type LayerOptions struct {
 }
 
 // Validate reports what a layer built from o would refuse: a missing
-// TLSConfig, today.
+// TLSConfig, TLS renegotiation, or a version bound below TLS 1.2.
 func (o LayerOptions) Validate() error {
 	if o.TLSConfig == nil {
 		return fmt.Errorf("%w: TLSConfig is required", ErrInvalidOptions)
+	}
+	if o.TLSConfig.Renegotiation != stdtls.RenegotiateNever {
+		return fmt.Errorf("%w: TLS renegotiation is unsupported", ErrInvalidOptions)
+	}
+	if (o.TLSConfig.MinVersion != 0 && o.TLSConfig.MinVersion < stdtls.VersionTLS12) ||
+		(o.TLSConfig.MaxVersion != 0 && o.TLSConfig.MaxVersion < stdtls.VersionTLS12) {
+		return fmt.Errorf("%w: TLS versions below 1.2 are unsupported", ErrInvalidOptions)
 	}
 	return nil
 }

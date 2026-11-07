@@ -1013,6 +1013,15 @@ func TestInvalidOptionsRefused(t *testing.T) {
 	if err := (LayerOptions{TLSConfig: &Config{}}).Validate(); err != nil {
 		t.Fatalf("Validate of a TLSConfig = %v, want nil", err)
 	}
+	if err := (LayerOptions{TLSConfig: &Config{Renegotiation: tls.RenegotiateOnceAsClient}}).Validate(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("Validate of RenegotiateOnceAsClient = %v, want ErrInvalidOptions", err)
+	}
+	if err := (LayerOptions{TLSConfig: &Config{MinVersion: tls.VersionTLS11}}).Validate(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("Validate of TLS 1.1 MinVersion = %v, want ErrInvalidOptions", err)
+	}
+	if err := (LayerOptions{TLSConfig: &Config{MaxVersion: tls.VersionTLS10}}).Validate(); !errors.Is(err, ErrInvalidOptions) {
+		t.Fatalf("Validate of TLS 1.0 MaxVersion = %v, want ErrInvalidOptions", err)
+	}
 }
 
 type windowedLowerLayer struct {
@@ -1125,4 +1134,87 @@ func TestUTLSOutboundOverflowStagingPreservesSession(t *testing.T) {
 		t.Fatalf("fatal lower error = %v, want %v", err, boom)
 	}
 	_ = cli2.Abort(boom)
+}
+
+func TestPostCloseNotifyTrailingBytesDoNotAccumulatePending(t *testing.T) {
+	srvCfg, cliCfg := testConfigs(t)
+	halfDone := make(chan uio.Conn, 1)
+	started := make(chan struct{})
+	var ln uio.Listener
+	var listenErr error
+	srvEvents := &uio.Events{
+		Pollers:            1,
+		AllowHalfOpen:      true,
+		ReadBufferSize:     16 << 10,
+		MaxInboundBuffered: 32 << 10,
+		Handler: uio.FuncHandler{
+			Read: func(c uio.Conn) error {
+				buf := make([]byte, 64)
+				for {
+					n, err := c.Read(buf)
+					if errors.Is(err, io.EOF) {
+						signal(halfDone, c)
+						break
+					}
+					if n == 0 || err != nil {
+						break
+					}
+				}
+				return nil
+			},
+		},
+		Hooks: uio.FuncHandler{Start: func(ev *uio.Events) {
+			ln, listenErr = ev.Listen("tcp://127.0.0.1:0", uio.WithLayers(ServerLayer(LayerOptions{TLSConfig: srvCfg})))
+			close(started)
+		}},
+	}
+	done := make(chan error, 1)
+	go func() { done <- srvEvents.Serve() }()
+	t.Cleanup(func() {
+		_ = srvEvents.Close(nil)
+		<-done
+	})
+	<-started
+	if listenErr != nil {
+		t.Fatal(listenErr)
+	}
+	defer ln.Close()
+
+	// Connect with standard net + crypto/tls so we can send close_notify and then raw garbage on the open TCP socket.
+	rawConn, err := net.DialTimeout("tcp", ln.Addr().String(), testWait)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rawConn.Close()
+	tlsCli := tls.Client(rawConn, cliCfg)
+	if err := tlsCli.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tlsCli.Write([]byte("hi")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tlsCli.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	var srvConn uio.Conn
+	select {
+	case srvConn = <-halfDone:
+	case <-time.After(testWait):
+		t.Fatal("server did not observe close_notify EOF")
+	}
+	// Flood raw bytes after close_notify without closing TCP: server must not grow c.pending!
+	_, _ = rawConn.Write(bytes.Repeat([]byte("X"), 64<<10))
+	time.Sleep(40 * time.Millisecond)
+
+	layerConn, ok := uio.FindLayer[*conn](srvConn)
+	if !ok {
+		t.Fatal("FindLayer[*conn] failed")
+	}
+	layerConn.mu.Lock()
+	pendingLen := len(layerConn.pending)
+	layerConn.mu.Unlock()
+	if pendingLen != 0 {
+		t.Fatalf("post-close_notify c.pending grew to %d bytes, want 0", pendingLen)
+	}
+	_ = srvConn.Close()
 }

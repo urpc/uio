@@ -194,15 +194,16 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 		}
 		return nil
 	}
-	ready := c.ready
+	ready, ended := c.ready, c.readEnded
 	c.mu.Unlock()
-	if !ready {
+	if !ready || ended {
 		return nil
 	}
-	if ctx.Upper().Buffered() >= c.stagingBound() {
-		// A full staging leaves what arrived below unread, so the pause
-		// travels to the wire; the read above that makes room runs the turn
-		// that takes it.
+	bound := c.stagingBound()
+	if ctx.Upper().Buffered() >= bound || int(c.outHeld.Load()) >= bound {
+		// A full staging (or backed-up protocol control output) leaves what
+		// arrived below unread, so the pause travels to the wire; the read or
+		// drain that makes room runs the turn that takes it.
 		ctx.Upper().Yield()
 		return nil
 	}
@@ -229,8 +230,10 @@ func (c *conn) OnRead(ctx uio.LayerContext) error {
 // stream's end became visible with the discard.
 func (c *conn) finishLive(lower uio.Lower) bool {
 	c.mu.Lock()
-	if tail := c.live[c.liveAt:]; len(tail) > 0 {
-		c.pending = append(c.pending, tail...)
+	if !c.readEnded {
+		if tail := c.live[c.liveAt:]; len(tail) > 0 {
+			c.pending = append(c.pending, tail...)
+		}
 	}
 	length := len(c.live)
 	c.live, c.liveAt = nil, 0
@@ -286,6 +289,7 @@ func (c *conn) pump(ctx uio.LayerContext) error {
 			if err == io.EOF { // the peer's close_notify
 				c.mu.Lock()
 				c.readEnded = true
+				c.pending, c.readAt = nil, 0
 				c.mu.Unlock()
 				ctx.Upper().End()
 				return nil
@@ -325,6 +329,7 @@ func (c *conn) OnClose(uio.LayerContext, error) {
 	c.ended = true
 	stop := c.stop
 	c.resume, c.stop, c.yield = nil, nil, nil
+	c.pending, c.readAt = nil, 0
 	c.mu.Unlock()
 	c.outMu.Lock()
 	c.outPending = nil

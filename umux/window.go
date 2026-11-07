@@ -56,7 +56,7 @@ func (w *sendWindow) grant(delta int64) error {
 	if delta <= 0 {
 		return errWindowInvalid
 	}
-	if w.avail+delta > w.max {
+	if w.max-w.avail < delta {
 		return errWindowExceeded
 	}
 	w.avail += delta
@@ -105,10 +105,10 @@ func (w *recvWindow) onData(n int64) error {
 	if n < 0 {
 		return errWindowInvalid
 	}
-	w.buffered += n
-	if w.buffered > w.size {
+	if w.size-w.buffered < n {
 		return errWindowExceeded
 	}
+	w.buffered += n
 	return nil
 }
 
