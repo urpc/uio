@@ -19,6 +19,7 @@ package uio
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/rand"
 	"errors"
 	"io"
@@ -806,6 +807,21 @@ func TestBlockingAttachToClosingConnAndLayerWriteToContracts(t *testing.T) {
 	_ = sbs.MaxInbound()
 	_ = sbs.Wake()
 	_ = sbs.IsOverflow(ErrOutboundOverflow)
+	_ = overStack.layers[0].InOwnTurn()
+	_ = (socketLower{Conn: &contractTransport{}, stack: overStack}).InOwnTurn()
+	fbs := fdBlockSource{conn: plainCli.(*fdConn)}
+	_ = fbs.Wake()
+	_ = fbs.IsOverflow(ErrOutboundOverflow)
+	_ = plainCli.(*fdConn).InOwnTurn()
+	if OnTurn() {
+		t.Fatal("test goroutine unexpectedly OnTurn")
+	}
+	cctx, ccancel := context.WithCancel(context.Background())
+	ccancel()
+	_, _ = bc.WriteContext(cctx, []byte("x"))
+	_, _ = bc.Writer().WritevContext(cctx, [][]byte{[]byte("x")})
+	_, _ = bc.Writer().WriteOwnedContext(cctx, AcquireBuffer(4))
+	_ = bc.FlushContext(cctx)
 }
 
 type partialOverflowLayer struct{ PassThrough }

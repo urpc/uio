@@ -108,10 +108,6 @@ func (l *layerNode) connBlockState() (*blockio.State, bool) {
 	return st, true
 }
 
-func (l *layerNode) hasWaitingBlockWriter() bool {
-	return l.stack.block.Load().HasWaitingWriter()
-}
-
 func (l *layerNode) ensureBlockWriter() *blockio.Writer {
 	st, _ := l.connBlockState()
 	return st.Writer(0)

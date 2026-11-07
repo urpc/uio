@@ -17,6 +17,7 @@
 package blockio
 
 import (
+	"context"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -72,13 +73,29 @@ func (w *waiter) notify() {
 // wait blocks until notify, SetDeadline expiry, or closeWake fires, unless gen
 // already advanced past tok.
 func (w *waiter) wait(tok uint64) {
+	_ = w.waitContext(nil, tok)
+}
+
+func (w *waiter) waitContext(ctx context.Context, tok uint64) error {
 	if w.gen.Load() != tok {
 		w.parked.Store(false)
-		return
+		return nil
+	}
+	if ctx == nil || ctx.Done() == nil {
+		select {
+		case <-w.sig:
+		case <-w.closed:
+		}
+		return nil
 	}
 	select {
 	case <-w.sig:
+		return nil
 	case <-w.closed:
+		return nil
+	case <-ctx.Done():
+		w.parked.Store(false)
+		return ctx.Err()
 	}
 }
 

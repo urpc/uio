@@ -17,6 +17,7 @@
 package blockio
 
 import (
+	"context"
 	"io"
 	"net"
 	"sync"
@@ -30,24 +31,18 @@ const readFromChunkSize = 32 << 10
 
 // Writer is a stream connection's blocking outbound endpoint.
 type Writer struct {
-	src     Source
-	waiting atomic.Int32 // active or queued blocking writers; prevents fast-path barging
-	wmu     sync.Mutex   // serializes multi-goroutine Write / Writev / ReadFrom calls
-	mu      sync.Mutex   // protects closed/closeErr
-	waiter  waiter
+	src    Source
+	wsem   chan struct{} // 1-slot FIFO semaphore serializing multi-goroutine writes with ctx cancellation
+	mu     sync.Mutex    // protects closed/closeErr
+	waiter waiter
 
 	customWin atomic.Int64
 	closed    bool
 	closeErr  error
 }
 
-// HasWaiters reports whether any blocking write call is currently in progress or waiting.
-func (w *Writer) HasWaiters() bool {
-	return w != nil && w.waiting.Load() > 0
-}
-
 func newWriter(src Source, window int) *Writer {
-	w := &Writer{src: src, waiter: newWaiter()}
+	w := &Writer{src: src, wsem: make(chan struct{}, 1), waiter: newWaiter()}
 	if window > 0 {
 		w.customWin.Store(int64(window))
 	}
@@ -123,10 +118,19 @@ func (w *Writer) SetWriteDeadline(t time.Time) error { return w.waiter.setDeadli
 // until the outbound buffer drains, the connection closes, or the write
 // deadline expires.
 func (w *Writer) Flush() error {
+	return w.FlushContext(context.Background())
+}
+
+// FlushContext asks the underlying transport to flush queued outbound data and
+// waits until the outbound buffer drains, the connection closes, the write
+// deadline expires, or ctx ends.
+func (w *Writer) FlushContext(ctx context.Context) error {
 	if OnTurn() {
 		return ErrBlockingOnTurn
 	}
-	w.enterWrite()
+	if err := w.enterWrite(ctx); err != nil {
+		return err
+	}
 	defer w.leaveWrite()
 
 	if err := w.src.Flush(); err != nil {
@@ -138,6 +142,12 @@ func (w *Writer) Flush() error {
 			w.waiter.cancelPrepare()
 			return err
 		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				w.waiter.cancelPrepare()
+				return err
+			}
+		}
 		if err := w.waiter.checkDeadline(); err != nil {
 			w.waiter.cancelPrepare()
 			return err
@@ -146,34 +156,68 @@ func (w *Writer) Flush() error {
 			w.waiter.cancelPrepare()
 			return nil
 		}
-		w.waiter.wait(tok)
+		if err := w.waiter.waitContext(ctx, tok); err != nil {
+			return err
+		}
 	}
 }
 
-func (w *Writer) enterWrite() {
-	w.waiting.Add(1)
-	w.wmu.Lock()
+func (w *Writer) enterWrite(ctx context.Context) error {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	select {
+	case w.wsem <- struct{}{}:
+		return nil
+	default:
+	}
+	if ctx == nil || ctx.Done() == nil {
+		w.wsem <- struct{}{}
+		return nil
+	}
+	select {
+	case w.wsem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 func (w *Writer) leaveWrite() {
-	w.wmu.Unlock()
-	w.waiting.Add(-1)
+	<-w.wsem
 }
 
 // Write writes all of p to the connection, suspending when the outbound window
 // is full. Concurrent calls on the same Writer are serialized atomically.
 func (w *Writer) Write(p []byte) (int, error) {
+	return w.WriteContext(context.Background(), p)
+}
+
+// WriteContext writes all of p to the connection, suspending until space is
+// available, the connection closes, the write deadline expires, or ctx ends.
+func (w *Writer) WriteContext(ctx context.Context, p []byte) (int, error) {
 	if OnTurn() {
 		return 0, ErrBlockingOnTurn
 	}
-	w.enterWrite()
+	if err := w.enterWrite(ctx); err != nil {
+		return 0, err
+	}
 	defer w.leaveWrite()
-	return w.writeLocked(p)
+	return w.writeLocked(ctx, p)
 }
 
 // Writev writes all segments of vec atomically among blocking writers,
 // suspending when the outbound window is full.
 func (w *Writer) Writev(vec [][]byte) (int, error) {
+	return w.WritevContext(context.Background(), vec)
+}
+
+// WritevContext writes all segments of vec atomically among blocking writers,
+// suspending until space is available, the connection closes, the write
+// deadline expires, or ctx ends.
+func (w *Writer) WritevContext(ctx context.Context, vec [][]byte) (int, error) {
 	if OnTurn() {
 		return 0, ErrBlockingOnTurn
 	}
@@ -181,7 +225,9 @@ func (w *Writer) Writev(vec [][]byte) (int, error) {
 	for _, seg := range vec {
 		total += len(seg)
 	}
-	w.enterWrite()
+	if err := w.enterWrite(ctx); err != nil {
+		return 0, err
+	}
 	defer w.leaveWrite()
 	if err := w.terminalErr(); err != nil {
 		return 0, err
@@ -209,7 +255,7 @@ func (w *Writer) Writev(vec [][]byte) (int, error) {
 				vec = vec[1:]
 			}
 			if rem > 0 && len(vec) > 0 {
-				nw, werr := w.writeLocked(vec[0][rem:])
+				nw, werr := w.writeLocked(ctx, vec[0][rem:])
 				n += nw
 				if werr != nil {
 					return n, werr
@@ -217,7 +263,7 @@ func (w *Writer) Writev(vec [][]byte) (int, error) {
 				vec = vec[1:]
 			}
 			for _, seg := range vec {
-				nw, werr := w.writeLocked(seg)
+				nw, werr := w.writeLocked(ctx, seg)
 				n += nw
 				if werr != nil {
 					return n, werr
@@ -231,7 +277,7 @@ func (w *Writer) Writev(vec [][]byte) (int, error) {
 		if len(seg) == 0 {
 			continue
 		}
-		n, err := w.writeLocked(seg)
+		n, err := w.writeLocked(ctx, seg)
 		written += n
 		if err != nil {
 			return written, err
@@ -240,9 +286,14 @@ func (w *Writer) Writev(vec [][]byte) (int, error) {
 	return written, nil
 }
 
-func (w *Writer) writeLocked(p []byte) (int, error) {
+func (w *Writer) writeLocked(ctx context.Context, p []byte) (int, error) {
 	if err := w.terminalErr(); err != nil {
 		return 0, err
+	}
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
 	}
 	if err := w.waiter.checkDeadline(); err != nil {
 		return 0, err
@@ -257,6 +308,12 @@ func (w *Writer) writeLocked(p []byte) (int, error) {
 		if err := w.terminalErr(); err != nil {
 			w.waiter.cancelPrepare()
 			return written, err
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				w.waiter.cancelPrepare()
+				return written, err
+			}
 		}
 		if err := w.waiter.checkDeadline(); err != nil {
 			w.waiter.cancelPrepare()
@@ -286,7 +343,9 @@ func (w *Writer) writeLocked(p []byte) (int, error) {
 				break
 			}
 		}
-		w.waiter.wait(tok)
+		if err := w.waiter.waitContext(ctx, tok); err != nil {
+			return written, err
+		}
 	nextWrite:
 	}
 	return written, nil
@@ -295,6 +354,13 @@ func (w *Writer) writeLocked(p []byte) (int, error) {
 // WriteOwned transfers ownership of buf to the connection, suspending while the
 // outbound window has no room, and always releases buf on failure.
 func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
+	return w.WriteOwnedContext(context.Background(), buf)
+}
+
+// WriteOwnedContext transfers ownership of buf to the connection, suspending
+// while the outbound window has no room until space drains, the connection
+// closes, the write deadline expires, or ctx ends. Always consumes or releases buf.
+func (w *Writer) WriteOwnedContext(ctx context.Context, buf *bytebuf.Buffer) (int, error) {
 	if OnTurn() {
 		bytebuf.ReleaseBuffer(buf)
 		return 0, ErrBlockingOnTurn
@@ -303,9 +369,12 @@ func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 		bytebuf.ReleaseBuffer(buf)
 		return 0, nil
 	}
-	w.enterWrite()
+	if err := w.enterWrite(ctx); err != nil {
+		bytebuf.ReleaseBuffer(buf)
+		return 0, err
+	}
 	defer w.leaveWrite()
-	n, retained, err := w.writeOwnedPreserveLocked(buf)
+	n, retained, err := w.writeOwnedPreserveLocked(ctx, buf)
 	if retained {
 		bytebuf.ReleaseBuffer(buf)
 	}
@@ -313,15 +382,15 @@ func (w *Writer) WriteOwned(buf *bytebuf.Buffer) (int, error) {
 }
 
 func (w *Writer) writeOwnedPreserveOnAbort(buf *bytebuf.Buffer) (int, bool, error) {
-	w.enterWrite()
+	_ = w.enterWrite(nil)
 	defer w.leaveWrite()
-	return w.writeOwnedPreserveLocked(buf)
+	return w.writeOwnedPreserveLocked(nil, buf)
 }
 
-func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, bool, error) {
+func (w *Writer) writeOwnedPreserveLocked(ctx context.Context, buf *bytebuf.Buffer) (int, bool, error) {
 	size := buf.Len()
 	if size > w.window() {
-		n, err := w.writeLocked(buf.Bytes())
+		n, err := w.writeLocked(ctx, buf.Bytes())
 		if n > 0 {
 			buf.Discard(n)
 		}
@@ -336,6 +405,12 @@ func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, bool, error
 		if err := w.terminalErr(); err != nil {
 			w.waiter.cancelPrepare()
 			return 0, true, err
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				w.waiter.cancelPrepare()
+				return 0, true, err
+			}
 		}
 		if err := w.waiter.checkDeadline(); err != nil {
 			w.waiter.cancelPrepare()
@@ -357,7 +432,7 @@ func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, bool, error
 			// fall back to chunked writeLocked so it never hangs!
 			if buffered == 0 && buf.Len() > 1 {
 				w.waiter.cancelPrepare()
-				nw, werr := w.writeLocked(buf.Bytes())
+				nw, werr := w.writeLocked(ctx, buf.Bytes())
 				if nw > 0 {
 					buf.Discard(nw)
 				}
@@ -368,7 +443,9 @@ func (w *Writer) writeOwnedPreserveLocked(buf *bytebuf.Buffer) (int, bool, error
 				return n + nw, true, werr
 			}
 		}
-		w.waiter.wait(tok)
+		if err := w.waiter.waitContext(ctx, tok); err != nil {
+			return 0, true, err
+		}
 	}
 }
 
@@ -382,7 +459,7 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 	if wt, ok := r.(io.WriterTo); ok {
 		return wt.WriteTo(w)
 	}
-	w.enterWrite()
+	_ = w.enterWrite(nil)
 	defer w.leaveWrite()
 
 	var total int64
@@ -398,7 +475,7 @@ func (w *Writer) ReadFrom(r io.Reader) (int64, error) {
 		nr, rerr := r.Read(buf.AvailableBuffer()[:chunkCap])
 		if nr > 0 {
 			buf.CommitWrite(nr)
-			nw, retained, werr := w.writeOwnedPreserveLocked(buf)
+			nw, retained, werr := w.writeOwnedPreserveLocked(nil, buf)
 			if retained {
 				bytebuf.ReleaseBuffer(buf)
 			}

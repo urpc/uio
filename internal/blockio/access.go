@@ -130,18 +130,6 @@ func (s *State) ActiveReader() *Reader {
 	return s.reader.Load()
 }
 
-// HasWaitingWriter reports whether any blocking writer is currently active or
-// queued on wmu, preventing fast-path callers from barging ahead of it.
-func (s *State) HasWaitingWriter() bool {
-	if s == nil {
-		return false
-	}
-	if w := s.writer.Load(); w != nil {
-		return w.HasWaiters()
-	}
-	return false
-}
-
 // OnClose notifies any attached Reader and Writer that the underlying
 // connection closed. localClose is true when closed locally via Conn.Close().
 func (s *State) OnClose(localClose bool, err error) {

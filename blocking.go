@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"context"
 	"io"
 	"net"
 	"time"
@@ -140,13 +141,39 @@ func NewBlockingWriter(c Conn, opts ...BlockingOption) (*BlockingWriter, error) 
 // InternalWriter exposes the underlying blockio.Writer for zero-copy WriteTo relays.
 func (w *BlockingWriter) InternalWriter() *blockio.Writer { return w.w }
 
+// OnTurn reports whether the calling goroutine is currently executing inside an
+// event-loop or connection-turn callback, where blocking I/O must not block.
+func OnTurn() bool { return blockio.OnTurn() }
+
 // Write writes all of p to the connection, suspending while the outbound window
 // is full. Each call is atomic among BlockingWriter callers.
 func (w *BlockingWriter) Write(p []byte) (int, error) { return w.w.Write(p) }
 
+// WriteContext writes all of p to the connection, suspending until space is
+// available, the connection closes, the write deadline expires, or ctx ends.
+func (w *BlockingWriter) WriteContext(ctx context.Context, p []byte) (int, error) {
+	return w.w.WriteContext(ctx, p)
+}
+
+// Writev writes all segments of vec atomically among BlockingWriter callers.
+func (w *BlockingWriter) Writev(vec [][]byte) (int, error) { return w.w.Writev(vec) }
+
+// WritevContext writes all segments of vec atomically among BlockingWriter
+// callers, honoring ctx cancellation and deadlines while suspended.
+func (w *BlockingWriter) WritevContext(ctx context.Context, vec [][]byte) (int, error) {
+	return w.w.WritevContext(ctx, vec)
+}
+
 // WriteOwned transfers ownership of buf to the connection, suspending while the
 // outbound window is full, and always consumes or releases buf.
 func (w *BlockingWriter) WriteOwned(buf *Buffer) (int, error) { return w.w.WriteOwned(buf) }
+
+// WriteOwnedContext transfers ownership of buf to the connection, suspending
+// while the outbound window is full until space drains, the connection closes,
+// the write deadline expires, or ctx ends. Always consumes or releases buf.
+func (w *BlockingWriter) WriteOwnedContext(ctx context.Context, buf *Buffer) (int, error) {
+	return w.w.WriteOwnedContext(ctx, buf)
+}
 
 // ReadFrom copies from r into the connection using pooled zero-copy WriteOwned
 // buffers.
@@ -155,6 +182,10 @@ func (w *BlockingWriter) ReadFrom(r io.Reader) (int64, error) { return w.w.ReadF
 // Flush flushes queued outbound bytes and blocks until the outbound buffer
 // drains, the connection closes, or the write deadline expires.
 func (w *BlockingWriter) Flush() error { return w.w.Flush() }
+
+// FlushContext flushes queued outbound bytes and blocks until the outbound
+// buffer drains, the connection closes, the write deadline expires, or ctx ends.
+func (w *BlockingWriter) FlushContext(ctx context.Context) error { return w.w.FlushContext(ctx) }
 
 // SetWriteDeadline sets the deadline for blocked Write, ReadFrom, and Flush
 // calls without closing the underlying connection when it expires.
@@ -186,20 +217,24 @@ func NewBlockingConn(c Conn, opts ...BlockingOption) (*BlockingConn, error) {
 	return &BlockingConn{conn: c, r: r, w: w}, nil
 }
 
-func (bc *BlockingConn) Read(p []byte) (int, error)          { return bc.r.Read(p) }
-func (bc *BlockingConn) Write(p []byte) (int, error)         { return bc.w.Write(p) }
-func (bc *BlockingConn) ReadFrom(r io.Reader) (int64, error) { return bc.w.ReadFrom(r) }
-func (bc *BlockingConn) WriteTo(w io.Writer) (int64, error)  { return bc.r.WriteTo(w) }
-func (bc *BlockingConn) Flush() error                        { return bc.w.Flush() }
-func (bc *BlockingConn) Close() error                        { return bc.conn.Close() }
-func (bc *BlockingConn) CloseWrite() error                   { return bc.conn.CloseWrite() }
-func (bc *BlockingConn) Abort(cause error) error             { return bc.conn.Abort(cause) }
-func (bc *BlockingConn) LocalAddr() net.Addr                 { return bc.conn.LocalAddr() }
-func (bc *BlockingConn) RemoteAddr() net.Addr                { return bc.conn.RemoteAddr() }
-func (bc *BlockingConn) Unwrap() Conn                        { return bc.conn }
-func (bc *BlockingConn) Reader() *BlockingReader             { return bc.r }
-func (bc *BlockingConn) Writer() *BlockingWriter             { return bc.w }
-func (bc *BlockingConn) InternalWriter() *blockio.Writer     { return bc.w.w }
+func (bc *BlockingConn) Read(p []byte) (int, error)  { return bc.r.Read(p) }
+func (bc *BlockingConn) Write(p []byte) (int, error) { return bc.w.Write(p) }
+func (bc *BlockingConn) WriteContext(ctx context.Context, p []byte) (int, error) {
+	return bc.w.WriteContext(ctx, p)
+}
+func (bc *BlockingConn) ReadFrom(r io.Reader) (int64, error)    { return bc.w.ReadFrom(r) }
+func (bc *BlockingConn) WriteTo(w io.Writer) (int64, error)     { return bc.r.WriteTo(w) }
+func (bc *BlockingConn) Flush() error                           { return bc.w.Flush() }
+func (bc *BlockingConn) FlushContext(ctx context.Context) error { return bc.w.FlushContext(ctx) }
+func (bc *BlockingConn) Close() error                           { return bc.conn.Close() }
+func (bc *BlockingConn) CloseWrite() error                      { return bc.conn.CloseWrite() }
+func (bc *BlockingConn) Abort(cause error) error                { return bc.conn.Abort(cause) }
+func (bc *BlockingConn) LocalAddr() net.Addr                    { return bc.conn.LocalAddr() }
+func (bc *BlockingConn) RemoteAddr() net.Addr                   { return bc.conn.RemoteAddr() }
+func (bc *BlockingConn) Unwrap() Conn                           { return bc.conn }
+func (bc *BlockingConn) Reader() *BlockingReader                { return bc.r }
+func (bc *BlockingConn) Writer() *BlockingWriter                { return bc.w }
+func (bc *BlockingConn) InternalWriter() *blockio.Writer        { return bc.w.w }
 
 // SetDeadline sets both the read and write blocking wait deadlines without
 // closing the underlying connection when they expire.

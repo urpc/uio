@@ -389,6 +389,9 @@ func TestUmuxConfigBlockingWriteOption(t *testing.T) {
 	if err := bc2.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if err := bc2.Close(); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("second Stream.Close = %v, want net.ErrClosed", err)
+	}
 	select {
 	case rerr := <-readErrCh:
 		if !errors.Is(rerr, net.ErrClosed) {

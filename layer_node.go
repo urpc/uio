@@ -459,16 +459,8 @@ func (l *layerNode) roomMade() {
 // Write enters the layer, once it opened the layers above; the Handler's
 // writes are admitted against MaxOutboundBuffered first.
 func (l *layerNode) Write(p []byte) (int, error) {
-	if l.isTop() && l.stack.blockingWrite {
-		if l.hasWaitingBlockWriter() && !blockio.OnTurn() {
-			return l.ensureBlockWriter().Write(p)
-		}
-		n, err := l.writeNonBlocking(p)
-		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
-			n2, err2 := l.ensureBlockWriter().Write(p[n:])
-			return n + n2, err2
-		}
-		return n, err
+	if l.isTop() && l.stack.blockingWrite && !blockio.OnTurn() {
+		return l.ensureBlockWriter().Write(p)
 	}
 	return l.writeNonBlocking(p)
 }

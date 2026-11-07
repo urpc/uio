@@ -74,10 +74,6 @@ func (conn *fdConn) notifyBlockWriteSpace() {
 	}
 }
 
-func (conn *fdConn) hasWaitingBlockWriter() bool {
-	return conn.blockControl.Load().HasWaitingWriter()
-}
-
 func (conn *fdConn) ensureBlockWriter() *blockio.Writer {
 	st, _ := conn.connBlockState()
 	return st.Writer(0)

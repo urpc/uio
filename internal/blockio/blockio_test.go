@@ -18,6 +18,7 @@ package blockio
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -823,17 +824,9 @@ func (p *partialVecSource) Writev(vec [][]byte) (int, error) {
 	return p.fakeSource.Writev(vec)
 }
 
-func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
-	var nilState *State
-	if nilState.HasWaitingWriter() {
-		t.Fatal("nil State reported HasWaitingWriter")
-	}
-
+func TestWriterWritevAndFairness(t *testing.T) {
 	base := newFakeSource(64, 32)
 	base.hardCap = 32
-	if base.state.HasWaitingWriter() {
-		t.Fatal("fresh State reported HasWaitingWriter")
-	}
 	ps := &partialVecSource{fakeSource: base}
 	st := NewState(ps)
 	w := st.Writer(32)
@@ -856,8 +849,8 @@ func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
 	}
 	base.drainOut(32)
 
-	// Partial Writev continuation (like umux partial window accept) + HasWaiters!
-	ps.partial = 5
+	// Partial Writev continuation (like umux partial window accept, mid-segment split)!
+	ps.partial = 3
 	done := make(chan error, 1)
 	go func() {
 		n, err := w.Writev([][]byte{[]byte("ab"), []byte("cde"), []byte("fghij")})
@@ -871,7 +864,7 @@ func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
 		t.Fatalf("partial Writev = %v", err)
 	}
 
-	// Oversized multi-chunk Writev (> window) + HasWaitingWriter observed while blocked!
+	// Oversized multi-chunk Writev (> window)!
 	base.drainOut(32)
 	_, _ = w.Write(make([]byte, 32)) // fill window
 	bigDone := make(chan error, 1)
@@ -882,12 +875,7 @@ func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
 		}
 		bigDone <- err
 	}()
-	for deadline := time.Now().Add(time.Second); !st.HasWaitingWriter() && time.Now().Before(deadline); {
-		time.Sleep(time.Millisecond)
-	}
-	if !st.HasWaitingWriter() {
-		t.Fatal("expected HasWaitingWriter while Writev is parked")
-	}
+	time.Sleep(5 * time.Millisecond)
 	for range 10 {
 		base.drainOut(32)
 		select {
@@ -901,9 +889,6 @@ func TestWriterWritevAndHasWaitersFairness(t *testing.T) {
 	}
 	t.Fatal("chunked Writev did not finish")
 vecDone:
-	if st.HasWaitingWriter() {
-		t.Fatal("HasWaitingWriter remained true after Writev completed")
-	}
 
 	// Deadline & error & closed Writev guards
 	_ = w.SetWriteDeadline(time.Now().Add(-time.Millisecond))
@@ -950,5 +935,78 @@ vecDone:
 	}
 	if _, err := deadR.Read(make([]byte, 8)); !errors.Is(err, io.EOF) {
 		t.Fatalf("already-closing source Read = %v, want io.EOF", err)
+	}
+
+	// Verify WriteContext, WritevContext, WriteOwnedContext, and FlushContext per-call cancellation!
+	ctxSrc := newFakeSource(16, 16)
+	ctxW := ctxSrc.state.Writer(16)
+	if n, err := ctxW.WriteContext(context.Background(), make([]byte, 16)); err != nil || n != 16 {
+		t.Fatalf("fill WriteContext = %d, %v", n, err)
+	}
+	// Park G1 in WriteContext while G2 cancels via its own ctx while waiting on wsem!
+	g1Ctx, g1Cancel := context.WithCancel(context.Background())
+	g1Err := make(chan error, 1)
+	go func() {
+		_, err := ctxW.WriteContext(g1Ctx, make([]byte, 8))
+		g1Err <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	g2Ctx, g2Cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer g2Cancel()
+	if _, err := ctxW.WriteOwnedContext(g2Ctx, func() *bytebuf.Buffer { b := bytebuf.AcquireBuffer(4); _, _ = b.WriteString("ab"); return b }()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("contended WriteOwnedContext = %v, want DeadlineExceeded", err)
+	}
+	g1Cancel()
+	if err := <-g1Err; !errors.Is(err, context.Canceled) {
+		t.Fatalf("parked WriteContext cancel = %v, want Canceled", err)
+	}
+	fCtx, fCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer fCancel()
+	if err := ctxW.FlushContext(fCtx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("FlushContext timeout = %v, want DeadlineExceeded", err)
+	}
+	// Parked WriteOwnedContext canceled via ctx while waiting on full queue, plus background wsem wait!
+	bgDone := make(chan error, 1)
+	pOwnedCtx, pOwnedCancel := context.WithCancel(context.Background())
+	go func() {
+		b := bytebuf.AcquireBuffer(4)
+		_, _ = b.WriteString("abcd")
+		_, err := ctxW.WriteOwnedContext(pOwnedCtx, b)
+		bgDone <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	bgWait := make(chan error, 1)
+	go func() {
+		_, err := ctxW.Write([]byte("xy")) // waits on wsem with background ctx (ctx.Done() == nil)!
+		bgWait <- err
+	}()
+	time.Sleep(5 * time.Millisecond)
+	pOwnedCancel()
+	if err := <-bgDone; !errors.Is(err, context.Canceled) {
+		t.Fatalf("parked WriteOwnedContext = %v", err)
+	}
+	ctxSrc.drainOut(16)
+	if err := <-bgWait; err != nil {
+		t.Fatalf("background Write after drain = %v", err)
+	}
+	vCtx, vCancel := context.WithCancel(context.Background())
+	vCancel()
+	if _, err := ctxW.WritevContext(vCtx, [][]byte{[]byte("a")}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled WritevContext = %v", err)
+	}
+	if _, err := ctxW.WriteContext(vCtx, []byte("a")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled WriteContext = %v", err)
+	}
+	if err := ctxW.FlushContext(vCtx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("pre-canceled FlushContext = %v", err)
+	}
+	// Oversized WriteOwnedContext (> window 16) that transfers first 16B chunk and cancels on 2nd chunk!
+	ctxSrc.drainOut(16)
+	overCtx, overCancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer overCancel()
+	overBuf := bytebuf.AcquireBuffer(32)
+	_, _ = overBuf.Write(bytes.Repeat([]byte("z"), 32))
+	if nw, err := ctxW.WriteOwnedContext(overCtx, overBuf); nw != 16 || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("oversized WriteOwnedContext = %d, %v", nw, err)
 	}
 }

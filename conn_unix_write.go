@@ -48,15 +48,8 @@ func (conn *fdConn) WriteString(value string) (int, error) {
 }
 
 func (conn *fdConn) Write(data []byte) (int, error) {
-	if !conn.isDatagram() && !conn.directOwner() && conn.entry.directConsumer && conn.events().BlockingWrite {
-		if conn.hasWaitingBlockWriter() && !blockio.OnTurn() {
-			return conn.ensureBlockWriter().Write(data)
-		}
-		n, err := conn.writeNonBlocking(data)
-		if errors.Is(err, ErrOutboundOverflow) && !blockio.OnTurn() {
-			return conn.ensureBlockWriter().Write(data)
-		}
-		return n, err
+	if !conn.isDatagram() && !conn.directOwner() && conn.entry.directConsumer && conn.events().BlockingWrite && !blockio.OnTurn() {
+		return conn.ensureBlockWriter().Write(data)
 	}
 	return conn.writeNonBlocking(data)
 }
