@@ -174,6 +174,18 @@ func TestEncoderDecoderLifecycleAndInvalidInputs(t *testing.T) {
 	}
 	var nilEncoder *Encoder
 	nilEncoder.Commit(nil)
+	if _, ok := nilEncoder.StatelessDefaultWindow(); ok {
+		t.Fatal("nil encoder reported StatelessDefaultWindow")
+	}
+	if _, ok := NewEncoder(-1, false).StatelessDefaultWindow(); ok {
+		t.Fatal("stateful encoder reported StatelessDefaultWindow")
+	}
+	if _, ok := NewEncoderWithWindow(-1, true, 12).StatelessDefaultWindow(); ok {
+		t.Fatal("12-bit window encoder reported StatelessDefaultWindow")
+	}
+	if lvl, ok := NewEncoder(3, true).StatelessDefaultWindow(); !ok || lvl != 3 {
+		t.Fatalf("StatelessDefaultWindow = (%d, %v), want (3, true)", lvl, ok)
+	}
 
 	decoder := NewDecoderWithWindow(true, 20)
 	if decoder.windowBytes != 1<<DefaultWindowBits {

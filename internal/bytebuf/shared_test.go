@@ -26,7 +26,20 @@ func TestSharedBufferImmutabilityIsolationAndMisuseGuards(t *testing.T) {
 	assertPanics(t, "nil AcquireView", func() { _ = nilSB.AcquireView() })
 
 	emptyA := FreezeBuffer(nil)
-	emptyB := FreezeBuffer(AcquireBuffer(64))
+	emptyBuf := AcquireBuffer(64)
+	emptyB := FreezeBuffer(emptyBuf)
+	// Verify that AcquireBuffer after freezing an empty buffer never pops a zero-cap poisoned buffer!
+	reacquired := AcquireBuffer(64)
+	if reacquired.Cap() < 64 || len(reacquired.AvailableBuffer()[:64]) != 64 {
+		t.Fatalf("AcquireBuffer after empty FreezeBuffer returned poisoned buffer: cap=%d", reacquired.Cap())
+	}
+	ReleaseBuffer(reacquired)
+	var emptyStack SharedBuffer
+	emptyStack.InitOwned(nil)
+	emptyStack.Release()
+	var sbEmptyOwned SharedBuffer
+	sbEmptyOwned.InitOwned(AcquireBuffer(64))
+	sbEmptyOwned.Release()
 	emptyC := NewSharedBuffer(nil)
 	if emptyA.Len() != 0 || emptyB.Len() != 0 || emptyC.Len() != 0 {
 		t.Fatal("empty SharedBuffer non-zero")
@@ -37,6 +50,7 @@ func TestSharedBufferImmutabilityIsolationAndMisuseGuards(t *testing.T) {
 	emptyA.Release()
 	emptyB.Release()
 	emptyC.Release()
+	FreezeBuffer(&Buffer{}).Release()
 
 	// 2. Post-FreezeBuffer mutation or ReleaseBuffer on original *Buffer cannot touch frozen payload.
 	orig := AcquireBuffer(128)
@@ -69,6 +83,11 @@ func TestSharedBufferImmutabilityIsolationAndMisuseGuards(t *testing.T) {
 	assertPanics(t, "Write on sharedView", func() { _, _ = v1.Write([]byte("x")) })
 	assertPanics(t, "Truncate on sharedView", func() { v1.Truncate(2) })
 	assertPanics(t, "CommitWrite on sharedView", func() { v1.CommitWrite(1) })
+	assertPanics(t, "FreezeBuffer on sharedView", func() { _ = FreezeBuffer(v1) })
+	assertPanics(t, "InitOwned on sharedView", func() {
+		var tmp SharedBuffer
+		tmp.InitOwned(v1)
+	})
 
 	// Partial read on v1 does not move v2's cursor.
 	v1.Discard(6)

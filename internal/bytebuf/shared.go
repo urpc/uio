@@ -57,13 +57,30 @@ type SharedBuffer struct {
 // frozen broadcast bytes.
 func FreezeBuffer(buf *Buffer) *SharedBuffer {
 	sb := &SharedBuffer{}
+	sb.InitFreeze(buf)
+	return sb
+}
+
+// InitFreeze seals buf into sb in place and clears *buf so subsequent mutations
+// or ReleaseBuffer calls on buf cannot affect the frozen broadcast bytes.
+func (sb *SharedBuffer) InitFreeze(buf *Buffer) {
+	if buf != nil && buf.poolKind == sharedViewPool {
+		panic("bytebuf.Buffer: cannot freeze read-only shared view")
+	}
 	sb.refs.Store(1)
 	if buf == nil || buf.Len() == 0 {
-		if buf != nil {
-			ReleaseBuffer(buf)
+		if buf != nil && buf.Cap() > 0 {
+			backing := &Buffer{
+				buf:      buf.buf,
+				off:      buf.off,
+				poolKind: buf.poolKind,
+			}
+			*buf = Buffer{}
+			putBuffer(backing)
+		} else if buf != nil {
 			*buf = Buffer{}
 		}
-		return sb
+		return
 	}
 	raw := buf.Bytes()
 	n := len(raw)
@@ -75,20 +92,40 @@ func FreezeBuffer(buf *Buffer) *SharedBuffer {
 	*buf = Buffer{}
 	sb.backing = backing
 	sb.data = raw[:n:n]
-	return sb
+}
+
+// InitOwned initializes sb directly from an internal freshly-acquired *Buffer
+// that is never exposed to external callers, avoiding the extra *Buffer header
+// clone allocation.
+func (sb *SharedBuffer) InitOwned(buf *Buffer) {
+	if buf != nil && buf.poolKind == sharedViewPool {
+		panic("bytebuf.Buffer: cannot freeze read-only shared view")
+	}
+	sb.refs.Store(1)
+	if buf == nil || buf.Len() == 0 {
+		if buf != nil {
+			ReleaseBuffer(buf)
+		}
+		return
+	}
+	raw := buf.Bytes()
+	n := len(raw)
+	sb.backing = buf
+	sb.data = raw[:n:n]
 }
 
 // NewSharedBuffer copies p once into a pooled Buffer and freezes it into an
 // immutable SharedBuffer. The caller may freely mutate or reuse p afterward.
 func NewSharedBuffer(p []byte) *SharedBuffer {
+	sb := &SharedBuffer{}
 	if len(p) == 0 {
-		sb := &SharedBuffer{}
 		sb.refs.Store(1)
 		return sb
 	}
 	buf := AcquireBuffer(len(p))
 	_, _ = buf.Write(p)
-	return FreezeBuffer(buf)
+	sb.InitOwned(buf)
+	return sb
 }
 
 // Bytes returns the immutable payload slice with capacity capped to length.

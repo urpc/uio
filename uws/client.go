@@ -522,6 +522,12 @@ func (c *BlockingConn) WriteBinary(ctx context.Context, payload []byte) error {
 // WriteMessage sends one message of typ, suspending on outbound backpressure
 // until space drains, the connection closes, or ctx ends.
 func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payload []byte) error {
+	return c.writeBlocking(ctx, len(payload), func() error {
+		return c.Conn.send(typ, payload)
+	})
+}
+
+func (c *BlockingConn) writeBlocking(ctx context.Context, payloadLen int, sendFn func() error) error {
 	if blockio.OnTurn() {
 		return ErrBlockingOnTurn
 	}
@@ -536,8 +542,8 @@ func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payloa
 	defer c.wmu.Unlock()
 
 	if maxOut := c.Conn.maxOutbound(); maxOut > 0 && c.Conn.compression == nil {
-		if fragmentedWireSize(len(payload), c.Conn.maxFramePayload(), c.Conn.isClient()) > maxOut {
-			return ErrBackpressure
+		if fragmentedWireSize(payloadLen, c.Conn.maxFramePayload(), c.Conn.isClient()) > maxOut {
+			return c.Conn.errBackpressure()
 		}
 	}
 
@@ -561,7 +567,7 @@ func (c *BlockingConn) WriteMessage(ctx context.Context, typ MessageType, payloa
 		buffered := c.Conn.OutboundBuffered()
 		if buffered == 0 || buffered < limit {
 			wasEmpty := buffered == 0
-			err := c.Conn.send(typ, payload)
+			err := sendFn()
 			if err == nil {
 				c.outPark.Store(false)
 				return nil

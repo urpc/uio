@@ -292,9 +292,17 @@ func (job *dictWriterJob) encode(dictionary, payload []byte, use func([]byte) er
 	return use(data[:len(data)-len(syncFlushTail)])
 }
 
-// Commit advances the compression context after the encoded message has been
-// selected for transmission. A caller that falls back to an uncompressed
-// message must not commit the payload, otherwise the peer's context diverges.
+// StatelessDefaultWindow reports the configured level and true when the
+// encoder suppresses context takeover and uses the standard 32 KiB window,
+// allowing a single compressed frame to be shared across connections.
+func (e *Encoder) StatelessDefaultWindow() (level int, ok bool) {
+	if e == nil || !e.noContext || e.windowBits != DefaultWindowBits {
+		return 0, false
+	}
+	return e.level, true
+}
+
+// Commit advances the encoder's dictionary for context-takeover.
 func (e *Encoder) Commit(payload []byte) {
 	if e == nil || e.noContext {
 		return

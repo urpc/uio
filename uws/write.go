@@ -541,19 +541,6 @@ func (c *Conn) sendMessageLocked(opcode frame.OpCode, compressed bool, payload [
 	return nil
 }
 
-// sendFrame queues one frame and flushes it.
-func (c *Conn) sendFrame(f frame.Frame) error {
-	if !c.opened.Load() {
-		return ErrNotReady
-	}
-	c.writes.mu.Lock()
-	defer c.unlockWrite()
-	if err := c.sendFrameLocked(f); err != nil {
-		return err
-	}
-	return c.flushLocked()
-}
-
 // sendPong answers a Ping with a Pong carrying its payload.
 func (c *Conn) sendPong(payload []byte) error {
 	if !c.opened.Load() {
@@ -562,6 +549,19 @@ func (c *Conn) sendPong(payload []byte) error {
 	c.writes.mu.Lock()
 	defer c.unlockWrite()
 	if _, _, err := c.queueFrameLocked(frame.Frame{Fin: true, Opcode: frame.Pong, Payload: payload}); err != nil {
+		return err
+	}
+	return c.flushLocked()
+}
+
+// sendFrame queues one frame and flushes it.
+func (c *Conn) sendFrame(f frame.Frame) error {
+	if !c.opened.Load() {
+		return ErrNotReady
+	}
+	c.writes.mu.Lock()
+	defer c.unlockWrite()
+	if err := c.sendFrameLocked(f); err != nil {
 		return err
 	}
 	return c.flushLocked()
