@@ -175,6 +175,25 @@ func (w *BlockingWriter) WriteOwnedContext(ctx context.Context, buf *Buffer) (in
 	return w.w.WriteOwnedContext(ctx, buf)
 }
 
+// WriteShared writes sb to the connection using a zero-copy read-only view,
+// suspending while the outbound window is full.
+func (w *BlockingWriter) WriteShared(sb *SharedBuffer) (int, error) {
+	return w.WriteSharedContext(context.Background(), sb)
+}
+
+// WriteSharedContext writes sb to the connection using a zero-copy read-only
+// view, honoring ctx cancellation and deadlines while suspended.
+func (w *BlockingWriter) WriteSharedContext(ctx context.Context, sb *SharedBuffer) (int, error) {
+	if sb == nil {
+		return 0, nil
+	}
+	view := sb.AcquireView()
+	if view.Len() == 0 {
+		return 0, nil
+	}
+	return w.w.WriteOwnedContext(ctx, view)
+}
+
 // ReadFrom copies from r into the connection using pooled zero-copy WriteOwned
 // buffers.
 func (w *BlockingWriter) ReadFrom(r io.Reader) (int64, error) { return w.w.ReadFrom(r) }
@@ -221,6 +240,12 @@ func (bc *BlockingConn) Read(p []byte) (int, error)  { return bc.r.Read(p) }
 func (bc *BlockingConn) Write(p []byte) (int, error) { return bc.w.Write(p) }
 func (bc *BlockingConn) WriteContext(ctx context.Context, p []byte) (int, error) {
 	return bc.w.WriteContext(ctx, p)
+}
+func (bc *BlockingConn) WriteShared(sb *SharedBuffer) (int, error) {
+	return bc.w.WriteShared(sb)
+}
+func (bc *BlockingConn) WriteSharedContext(ctx context.Context, sb *SharedBuffer) (int, error) {
+	return bc.w.WriteSharedContext(ctx, sb)
 }
 func (bc *BlockingConn) ReadFrom(r io.Reader) (int64, error)    { return bc.w.ReadFrom(r) }
 func (bc *BlockingConn) WriteTo(w io.Writer) (int64, error)     { return bc.r.WriteTo(w) }

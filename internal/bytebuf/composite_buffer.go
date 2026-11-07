@@ -196,7 +196,7 @@ func (b *CompositeBuffer) AppendOwnedCoalesced(buffer *Buffer, targetCapacity in
 			return
 		}
 	}
-	if targetCapacity <= size {
+	if targetCapacity <= size || buffer.poolKind == sharedViewPool {
 		b.AppendOwned(buffer)
 		return
 	}

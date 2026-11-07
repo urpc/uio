@@ -599,6 +599,24 @@ func (l *layerNode) writeOwnedNonBlocking(buffer *Buffer) (int, error) {
 	if buffer == nil {
 		return 0, nil
 	}
+	if _, transparent := l.conn.(passThroughHandler); transparent && (l.index > 0 || !l.stack.packetBottom) {
+		size := buffer.Len()
+		if err := l.enter(size); err != nil {
+			if !errors.Is(err, ErrOutboundOverflow) {
+				ReleaseBuffer(buffer)
+			}
+			return 0, err
+		}
+		n, err := l.lower.WriteOwned(buffer)
+		if err != nil && l.isTop() {
+			l.stack.noteRefused(err)
+		}
+		l.leave(size)
+		if err == nil && n < size {
+			err = io.ErrShortWrite
+		}
+		return n, err
+	}
 	n, err := l.writeNonBlocking(buffer.Bytes())
 	if err == nil {
 		n = buffer.Len()

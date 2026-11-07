@@ -123,6 +123,9 @@ func (b *Buffer) Available() int { return cap(b.buf) - len(b.buf) }
 // but continues to use the same allocated storage.
 // It panics if n is negative or greater than the length of the buffer.
 func (b *Buffer) Truncate(n int) {
+	if b.poolKind == sharedViewPool {
+		panic("bytebuf.Buffer: cannot mutate read-only shared view")
+	}
 	if n == 0 {
 		b.Reset()
 		return
@@ -138,7 +141,11 @@ func (b *Buffer) Truncate(n int) {
 // but it retains the underlying storage for use by future writes.
 // Reset is the same as [Buffer.Truncate](0).
 func (b *Buffer) Reset() {
-	b.buf = b.buf[:0]
+	if b.poolKind == sharedViewPool {
+		b.buf = nil
+	} else {
+		b.buf = b.buf[:0]
+	}
 	b.off = 0
 	b.lastRead = opInvalid
 }
@@ -158,6 +165,9 @@ func (b *Buffer) tryGrowByReslice(n int) (int, bool) {
 // It returns the index where bytes should be written.
 // If the buffer can't grow it will panic with ErrTooLarge.
 func (b *Buffer) grow(n int) int {
+	if b.poolKind == sharedViewPool {
+		panic("bytebuf.Buffer: cannot mutate read-only shared view")
+	}
 	m := b.Len()
 	// If buffer is empty, reset to recover space.
 	if m == 0 && b.off != 0 {

@@ -29,6 +29,7 @@ type bufferPoolKind uint8
 const (
 	defaultBufferPool bufferPoolKind = iota
 	ownedBufferPool
+	sharedViewPool
 )
 
 // Ordinary copied payloads stay bounded at 64 KiB. Explicit owned buffers and
@@ -113,6 +114,10 @@ func AcquireBuffer(capacity int) *Buffer {
 }
 
 func putBuffer(buffer *Buffer) {
+	if buffer.poolKind == sharedViewPool {
+		releaseSharedView(buffer)
+		return
+	}
 	kind := buffer.poolKind
 	buffer.Reset()
 	capBytes := buffer.Cap()
