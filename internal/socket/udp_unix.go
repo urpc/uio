@@ -43,6 +43,8 @@ type UDPReceive struct {
 	// Len is the datagram's original length, which exceeds its buffer when
 	// the datagram was truncated.
 	Len int
+	// GROSize is the coalesced datagram size from a UDP_GRO control message.
+	GROSize uint16
 }
 
 // RecvUDP receives one datagram without allocating a Sockaddr interface.

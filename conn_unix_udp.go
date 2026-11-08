@@ -47,6 +47,7 @@ type unixUDPState struct {
 
 	family      uint8 // server only: the socket's address family, 4 or 6
 	moreInBatch bool  // true while additional datagrams for this peer wait in the active recvmmsg batch
+	groEnabled  bool  // true if UDP_GRO is enabled on this socket
 
 	// peerMu guards a server's peers, which its turns read for every
 	// datagram and DialPeer adds to from any goroutine, and its queues.
@@ -86,6 +87,9 @@ type unixUDPState struct {
 // children share this socket and its peer map, so their callbacks run here.
 func (conn *fdConn) onRecvUDP() error {
 	slot := conn.events().readBufSize
+	if conn.udp.groEnabled && slot < 64<<10 {
+		slot = 64 << 10
+	}
 	if slot <= 0 {
 		slot = 1
 	}
@@ -110,12 +114,26 @@ func (conn *fdConn) onRecvUDP() error {
 		for i := 0; i < got; i++ {
 			n := min(batch.recvs[i].Len, slot)
 			totalRead += n
-			packets++
 			addr := batch.recvs[i].Addr
-			more := i+1 < got && (conn.udp.peers == nil || batch.recvs[i+1].Addr == addr)
-			cachedConn, cachedAddr = conn.handleUDPPacketCached(batch.slots[i][:n], addr, more, cachedConn, cachedAddr)
-			if conn.isClosing() {
-				return nil
+			nextSamePeer := i+1 < got && (conn.udp.peers == nil || batch.recvs[i+1].Addr == addr)
+			rawPkt := batch.slots[i][:n]
+			gro := int(batch.recvs[i].GROSize)
+			if gro > 0 && n > gro {
+				for off := 0; off < n; off += gro {
+					end := min(off+gro, n)
+					packets++
+					more := end < n || nextSamePeer
+					cachedConn, cachedAddr = conn.handleUDPPacketCached(rawPkt[off:end], addr, more, cachedConn, cachedAddr)
+					if conn.isClosing() {
+						return nil
+					}
+				}
+			} else {
+				packets++
+				cachedConn, cachedAddr = conn.handleUDPPacketCached(rawPkt, addr, nextSamePeer, cachedConn, cachedAddr)
+				if conn.isClosing() {
+					return nil
+				}
 			}
 		}
 		if err != nil {

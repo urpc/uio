@@ -41,16 +41,17 @@ const acceptBatchSize = 64
 // listener keeps both the Go listener and the duplicated non-blocking fd used
 // by the native poller. Closing it must account for which object owns that fd.
 type listener struct {
-	network string         // network protocol
-	fd      int            // fd
-	addr    string         // address
-	tcp     bool           // a TCP stream listener: accepted peers are IP addresses
-	pair    *addrPair      // local listen address, shared by accepted connections
-	ln      net.Listener   // tcp/unix listener
-	file    *os.File       // file
-	udp     net.PacketConn // udp endpoint
-	udpSvr  *fdConn        // udp server
-	loop    *eventLoop     // the loop that accepts on a stream listener
+	network    string         // network protocol
+	fd         int            // fd
+	addr       string         // address
+	tcp        bool           // a TCP stream listener: accepted peers are IP addresses
+	pair       *addrPair      // local listen address, shared by accepted connections
+	ln         net.Listener   // tcp/unix listener
+	file       *os.File       // file
+	udp        net.PacketConn // udp endpoint
+	groEnabled bool           // udp GRO status
+	udpSvr     *fdConn        // udp server
+	loop       *eventLoop     // the loop that accepts on a stream listener
 
 	// userdata is every accepted connection's initial Userdata, and
 	// userdataBox the boxed value the connections share, so accepting one
@@ -219,6 +220,7 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 	group = append(group, l)
 
 	if l.udp != nil {
+		l.groEnabled = socket.EnableGRO(l.fd)
 		return group, nil
 	}
 
@@ -244,6 +246,9 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 				ld.closeListener(next)
 			}
 			return group, err
+		}
+		if next.udp != nil {
+			next.groEnabled = socket.EnableGRO(next.fd)
 		}
 		group = append(group, next)
 	}
@@ -288,9 +293,10 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			}
 			l.udpSvr.fd = int32(l.fd)
 			l.udpSvr.udp = &unixUDPState{
-				file:   l.file,
-				peers:  make(map[socket.UDPAddress]*fdConn),
-				family: family,
+				file:       l.file,
+				peers:      make(map[socket.UDPAddress]*fdConn),
+				family:     family,
+				groEnabled: l.groEnabled,
 			}
 			l.file = nil // The logical server owns the duplicated poller fd.
 			l.udpSvr.loop = ld.events.selectLoop()

@@ -194,6 +194,11 @@ func TestOptionsValidationAndOnClosingContracts(t *testing.T) {
 	}
 	cBatch.inReadTurn = false
 	cBatch.OnTurnEnd(ctxBatch)
+	ServerLayer(Options{}).(uio.PacketLayer).CarriesPackets()
+	for range maxStagedDatagrams + 2 {
+		cBatch.output(bytes.Repeat([]byte{'x'}, cBatch.opts.MTU), cBatch.opts.MTU)
+	}
+	cBatch.sendBatch()
 	// Test output multi-datagram prevStart (n > 1), publishState on ended, and BSD socket buffer clamping!
 	cFull.output(make([]byte, cFull.opts.MTU), cFull.opts.MTU)
 	cFull.output([]byte("d2a"), 3)

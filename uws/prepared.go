@@ -214,10 +214,6 @@ func (c *Conn) SendPrepared(m *PreparedMessage) error {
 	}
 
 	c.writes.mu.Lock()
-	if m.released.Load() {
-		c.unlockWrite()
-		panic("uws: PreparedMessage used after Release")
-	}
 	if !ok {
 		view := m.rawWire.AcquireView()
 		defer uio.ReleaseBuffer(view)

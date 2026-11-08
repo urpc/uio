@@ -20,10 +20,7 @@
 
 package kcp
 
-import (
-	"container/heap"
-	"time"
-)
+import "time"
 
 // mtuLimit is the size of the buffers defaultBufferPool hands out. Upstream
 // keeps the constant in sess.go, which ukcp does not vendor.
@@ -96,7 +93,7 @@ func (kcp *KCP) PopStreamSegment() (data []byte, ok bool) {
 	fastRecover := kcp.rcv_queue.Len() >= int(kcp.rcv_wnd)
 	seg, _ := kcp.rcv_queue.Pop()
 	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
-		next := heap.Pop(kcp.rcv_buf).(segment)
+		next := kcp.rcv_buf.PopSeg()
 		kcp.rcv_queue.Push(next)
 		kcp.rcv_nxt++
 	}

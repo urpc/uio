@@ -215,9 +215,6 @@ func (h *segmentHeap) PopSeg() segment {
 	return x
 }
 
-func (h *segmentHeap) Push(x any) { h.PushSeg(x.(segment)) }
-func (h *segmentHeap) Pop() any   { return h.PopSeg() }
-
 func (h *segmentHeap) Has(sn uint32) bool {
 	_, exists := h.marks[sn]
 	return exists

@@ -202,9 +202,6 @@ func (c *conn) output(buf []byte, size int) {
 		}
 		if c.packet && n >= maxStagedDatagrams {
 			c.sendBatch()
-			if c.ended || c.closed {
-				return
-			}
 		}
 	}
 	if c.packet && cap(c.out)-len(c.out) < size && cap(c.out) < 64<<10 {

@@ -195,14 +195,18 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	}
 	var hdrs [udpBatchBound]mmsghdr
 	var iovs [udpBatchBound]unix.Iovec
+	var cmsgs [udpBatchBound]udpGSOCmsg
 	for i := 0; i < count; i++ {
 		iovs[i] = unix.Iovec{Base: &packets[i][0], Len: uint64(len(packets[i]))}
 		receives[i].raw.Addr.Family = 0
+		receives[i].GROSize = 0
 		hdrs[i] = mmsghdr{Hdr: unix.Msghdr{
-			Name:    (*byte)(unsafe.Pointer(&receives[i].raw)),
-			Namelen: unix.SizeofSockaddrAny,
-			Iov:     &iovs[i],
-			Iovlen:  1,
+			Name:       (*byte)(unsafe.Pointer(&receives[i].raw)),
+			Namelen:    unix.SizeofSockaddrAny,
+			Iov:        &iovs[i],
+			Iovlen:     1,
+			Control:    (*byte)(unsafe.Pointer(&cmsgs[i])),
+			Controllen: uint64(unsafe.Sizeof(cmsgs[i])),
 		}}
 	}
 	got, err := recvmmsg(fd, hdrs[:count])
@@ -211,11 +215,22 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	}
 	for i := 0; i < got; i++ {
 		receives[i].Len = int(hdrs[i].Len)
+		if hdrs[i].Hdr.Flags&unix.MSG_CTRUNC == 0 &&
+			hdrs[i].Hdr.Controllen >= uint64(unix.CmsgLen(2)) &&
+			cmsgs[i].Hdr.Level == unix.SOL_UDP && cmsgs[i].Hdr.Type == unix.UDP_GRO {
+			receives[i].GROSize = cmsgs[i].Seg
+		}
 		if err := receives[i].parse(hdrs[i].Hdr.Namelen); err != nil {
 			return i, err
 		}
 	}
 	return got, nil
+}
+
+// EnableGRO enables UDP_GRO on the given socket and reports whether the kernel
+// accepted the option.
+func EnableGRO(fd int) bool {
+	return unix.SetsockoptInt(fd, unix.SOL_UDP, unix.UDP_GRO, 1) == nil
 }
 
 // sendmmsg and recvmmsg use the platform wrapper so large Linux hosts can

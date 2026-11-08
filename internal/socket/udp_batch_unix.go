@@ -20,6 +20,9 @@ package socket
 
 import "syscall"
 
+// EnableGRO reports false on platforms without Linux UDP_GRO support.
+func EnableGRO(int) bool { return false }
+
 // SendUDPBatch sends each packet as its own datagram to remote — nil for a
 // connected socket — one syscall each: this system has no sendmmsg. Empty
 // packets carry no datagram and are skipped.
