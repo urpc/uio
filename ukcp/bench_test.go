@@ -84,6 +84,12 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 		ReadBufferSize: 4 << 10,
 		BlockingWrite:  true,
 		Handler: uio.FuncHandler{
+			Open: func(c uio.Conn) {
+				if raw, ok := uio.SocketOf(c); ok {
+					_ = raw.SetReadBuffer(4 << 20)
+					_ = raw.SetWriteBuffer(4 << 20)
+				}
+			},
 			Read: func(c uio.Conn) error {
 				n, _ := c.Discard(-1)
 				if n > 0 {
@@ -125,7 +131,15 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 		ReadBufferSize:      4 << 10,
 		BlockingWrite:       true,
 		MaxOutboundBuffered: 2 << 20,
-		Handler:             uio.FuncHandler{Read: func(c uio.Conn) error { _, _ = c.Discard(-1); return nil }},
+		Handler: uio.FuncHandler{
+			Open: func(c uio.Conn) {
+				if raw, ok := uio.SocketOf(c); ok {
+					_ = raw.SetReadBuffer(4 << 20)
+					_ = raw.SetWriteBuffer(4 << 20)
+				}
+			},
+			Read: func(c uio.Conn) error { _, _ = c.Discard(-1); return nil },
+		},
 		Observer: uio.FuncHandler{
 			BytesWritten: func(_ uio.Conn, _ int) { cliPktsOut.Add(1) },
 			BytesRead:    func(_ uio.Conn, _ int) { cliPktsIn.Add(1) },
@@ -150,10 +164,14 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 	defer cli.Close()
 
 	payload := bytes.Repeat([]byte("U"), chunkSize)
-	if _, err := cli.Write([]byte("warmup")); err != nil {
-		b.Fatal(err)
+	// Warmup 32 chunks (1 MiB) so RingBuffer and bufferPool reach steady-state capacity before ResetTimer.
+	const warmChunks = 32
+	for range warmChunks {
+		if _, err := cli.Write(payload); err != nil {
+			b.Fatal(err)
+		}
 	}
-	for srvRecv.Load() < 6 {
+	for srvRecv.Load() < warmChunks*chunkSize {
 		<-wake
 	}
 	srvRecv.Store(0)

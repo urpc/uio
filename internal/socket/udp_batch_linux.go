@@ -34,16 +34,38 @@ type mmsghdr struct {
 	Len uint32
 }
 
-// udpBatchBound is the most datagrams one batched syscall carries here; the
-// kernel takes up to UIO_MAXIOV, and this keeps the stack arrays modest.
-const udpBatchBound = 64
+const (
+	// udpBatchBound is the most datagrams one batched syscall carries here; the
+	// kernel takes up to UIO_MAXIOV, and this keeps the stack arrays modest.
+	udpBatchBound = 64
+
+	// udpGSOMaxPayload bounds one UDP_SEGMENT super-datagram below the IPv4/IPv6
+	// 65535-byte total length limit minus maximum IP+UDP headers.
+	udpGSOMaxPayload = 64512
+
+	// udpGSOMaxSegments is the Linux kernel's UDP_MAX_SEGMENTS limit (64).
+	udpGSOMaxSegments = 64
+
+	// udpGSOMinSegment is the smallest datagram size coalesced into a GSO
+	// super-datagram: smaller packets stay in plain sendmmsg so tiny frames
+	// never pay skb_segment splitting overhead in the kernel.
+	udpGSOMinSegment = 512
+)
+
+// udpGSOCmsg is the 24-byte stack control message carrying a uint16
+// UDP_SEGMENT (SOL_UDP=17, UDP_SEGMENT=103) GSO segment size on 64-bit Linux.
+type udpGSOCmsg struct {
+	Hdr unix.Cmsghdr
+	Seg uint16
+	_   [6]byte
+}
 
 // SendUDPBatch sends each packet as its own datagram to remote — nil for a
-// connected socket — with sendmmsg, one syscall per batch of
-// udpBatchBound. It reports the bytes of the datagrams the socket accepted; a
-// batch the queue refused part-way reports what left before the refusal, and
-// the datagrams after it are not attempted. Empty packets carry no datagram
-// and are skipped.
+// connected socket — with sendmmsg, coalescing runs of equal-sized datagrams
+// (plus an optional shorter trailing datagram) into a single Linux UDP_SEGMENT
+// (GSO) super-datagram so the kernel traverses the UDP/IP/routing stack once
+// per run instead of once per MTU packet. If the socket or kernel does not
+// support UDP_SEGMENT, it transparently falls back to one mmsghdr per datagram.
 func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error) {
 	var storage unix.RawSockaddrAny
 	name, nameLen, err := sockaddrName(remote, &storage)
@@ -63,29 +85,88 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 		}
 		return 0, err
 	}
+
+	_, isUnix := remote.(*syscall.SockaddrUnix)
+	useGSO := !isUnix
+
 	var hdrs [udpBatchBound]mmsghdr
 	var iovs [udpBatchBound]unix.Iovec
-	var idx [udpBatchBound]int
+	var cmsgs [udpBatchBound]udpGSOCmsg
+	var msgBytes [udpBatchBound]int
+
 	sentBytes, cursor := 0, 0
 	for cursor < len(packets) {
-		batch := 0
-		for cursor < len(packets) && batch < udpBatchBound {
-			packet := packets[cursor]
+		roundStart := cursor
+		batch, iovUsed, usedGSO := 0, 0, false
+		for cursor < len(packets) && batch < udpBatchBound && iovUsed < udpBatchBound {
+			pkt := packets[cursor]
 			cursor++
-			if len(packet) == 0 {
+			if len(pkt) == 0 {
 				continue
 			}
-			idx[batch] = cursor - 1
-			iovs[batch] = unix.Iovec{Base: &packet[0], Len: uint64(len(packet))}
-			hdrs[batch] = mmsghdr{Hdr: unix.Msghdr{Name: name, Namelen: nameLen, Iov: &iovs[batch], Iovlen: 1}}
+			gsoSize := len(pkt)
+			iovStart := iovUsed
+			iovs[iovUsed] = unix.Iovec{Base: &pkt[0], Len: uint64(gsoSize)}
+			iovUsed++
+			totalBytes := gsoSize
+			segs := 1
+
+			if useGSO && gsoSize >= udpGSOMinSegment && gsoSize+gsoSize <= udpGSOMaxPayload {
+				for cursor < len(packets) && iovUsed < udpBatchBound && segs < udpGSOMaxSegments {
+					next := packets[cursor]
+					if len(next) == 0 {
+						cursor++
+						continue
+					}
+					if len(next) > gsoSize || totalBytes+len(next) > udpGSOMaxPayload {
+						break
+					}
+					cursor++
+					iovs[iovUsed] = unix.Iovec{Base: &next[0], Len: uint64(len(next))}
+					iovUsed++
+					totalBytes += len(next)
+					segs++
+					if len(next) < gsoSize {
+						// A shorter final segment terminates a GSO super-datagram.
+						break
+					}
+				}
+			}
+
+			hdr := unix.Msghdr{
+				Name:    name,
+				Namelen: nameLen,
+				Iov:     &iovs[iovStart],
+				Iovlen:  uint64(segs),
+			}
+			if segs > 1 {
+				usedGSO = true
+				cmsgs[batch] = udpGSOCmsg{
+					Hdr: unix.Cmsghdr{
+						Len:   uint64(unix.CmsgLen(2)),
+						Level: unix.SOL_UDP,
+						Type:  unix.UDP_SEGMENT,
+					},
+					Seg: uint16(gsoSize),
+				}
+				hdr.Control = (*byte)(unsafe.Pointer(&cmsgs[batch]))
+				hdr.Controllen = uint64(unsafe.Sizeof(cmsgs[batch]))
+			}
+			hdrs[batch] = mmsghdr{Hdr: hdr}
+			msgBytes[batch] = totalBytes
 			batch++
 		}
 		if batch == 0 {
 			break
 		}
 		sent, err := sendmmsg(fd, hdrs[:batch])
+		if sent == 0 && usedGSO && isGSOUnsupported(err) {
+			useGSO = false
+			cursor = roundStart
+			continue
+		}
 		for i := 0; i < sent; i++ {
-			sentBytes += len(packets[idx[i]])
+			sentBytes += msgBytes[i]
 		}
 		if err != nil {
 			return sentBytes, err
@@ -97,6 +178,10 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 		}
 	}
 	return sentBytes, nil
+}
+
+func isGSOUnsupported(err error) bool {
+	return err == unix.EINVAL || err == unix.EIO || err == unix.ENOPROTOOPT || err == unix.EOPNOTSUPP
 }
 
 // RecvUDPBatch receives up to min(len(packets), len(receives), udpBatchBound)

@@ -23,7 +23,6 @@
 package kcp
 
 import (
-	"container/heap"
 	"encoding/binary"
 	"time"
 )
@@ -154,18 +153,16 @@ func (seg *segment) encode(ptr []byte) []byte {
 	return ptr[IKCP_OVERHEAD:]
 }
 
-// segmentHeap is a min-heap of segments, used for receiving segments in order
+// segmentHeap is a typed zero-allocation min-heap of segments ordered by sn.
 type segmentHeap struct {
 	segments []segment
 	marks    map[uint32]struct{} // to avoid duplicates
 }
 
 func newSegmentHeap() *segmentHeap {
-	h := &segmentHeap{
+	return &segmentHeap{
 		marks: make(map[uint32]struct{}),
 	}
-	heap.Init(h)
-	return h
 }
 
 func (h *segmentHeap) Len() int { return len(h.segments) }
@@ -175,19 +172,51 @@ func (h *segmentHeap) Less(i, j int) bool {
 }
 
 func (h *segmentHeap) Swap(i, j int) { h.segments[i], h.segments[j] = h.segments[j], h.segments[i] }
-func (h *segmentHeap) Push(x any) {
-	h.segments = append(h.segments, x.(segment))
-	h.marks[x.(segment).sn] = struct{}{}
+
+func (h *segmentHeap) PushSeg(seg segment) {
+	h.segments = append(h.segments, seg)
+	h.marks[seg.sn] = struct{}{}
+	i := len(h.segments) - 1
+	for i > 0 {
+		parent := (i - 1) >> 1
+		if !h.Less(i, parent) {
+			break
+		}
+		h.Swap(i, parent)
+		i = parent
+	}
 }
 
-func (h *segmentHeap) Pop() any {
-	n := len(h.segments)
-	x := h.segments[n-1]
-	h.segments[n-1] = segment{} // clear reference to avoid memory leak
-	h.segments = h.segments[0 : n-1]
+func (h *segmentHeap) PopSeg() segment {
+	n := len(h.segments) - 1
+	if n > 0 {
+		h.Swap(0, n)
+		i := 0
+		for {
+			left := (i << 1) + 1
+			if left >= n {
+				break
+			}
+			smallest := left
+			if right := left + 1; right < n && h.Less(right, left) {
+				smallest = right
+			}
+			if !h.Less(smallest, i) {
+				break
+			}
+			h.Swap(i, smallest)
+			i = smallest
+		}
+	}
+	x := h.segments[n]
+	h.segments[n] = segment{}
+	h.segments = h.segments[:n]
 	delete(h.marks, x.sn)
 	return x
 }
+
+func (h *segmentHeap) Push(x any) { h.PushSeg(x.(segment)) }
+func (h *segmentHeap) Pop() any   { return h.PopSeg() }
 
 func (h *segmentHeap) Has(sn uint32) bool {
 	_, exists := h.marks[sn]
@@ -372,7 +401,7 @@ func (kcp *KCP) Recv(buffer []byte) (n int) {
 
 	// move available data from rcv_buf -> rcv_queue
 	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
+		seg := kcp.rcv_buf.PopSeg()
 		kcp.rcv_queue.Push(seg)
 		kcp.rcv_nxt++
 	}
@@ -584,7 +613,7 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		kcp.rcv_queue.Push(newseg)
 		kcp.rcv_nxt++
 		for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
-			seg := heap.Pop(kcp.rcv_buf).(segment)
+			seg := kcp.rcv_buf.PopSeg()
 			kcp.rcv_queue.Push(seg)
 			kcp.rcv_nxt++
 		}
@@ -596,13 +625,13 @@ func (kcp *KCP) parse_data(newseg segment) bool {
 		dataCopy := defaultBufferPool.Get()[:len(newseg.data)]
 		copy(dataCopy, newseg.data)
 		newseg.data = dataCopy
-		heap.Push(kcp.rcv_buf, newseg)
+		kcp.rcv_buf.PushSeg(newseg)
 	} else {
 		repeat = true
 	}
 
 	for kcp.rcv_buf.Len() > 0 && kcp.rcv_queue.Len() < int(kcp.rcv_wnd) && kcp.rcv_buf.segments[0].sn == kcp.rcv_nxt {
-		seg := heap.Pop(kcp.rcv_buf).(segment)
+		seg := kcp.rcv_buf.PopSeg()
 		kcp.rcv_queue.Push(seg)
 		kcp.rcv_nxt++
 	}

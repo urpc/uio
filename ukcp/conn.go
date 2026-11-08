@@ -177,7 +177,15 @@ func (c *conn) establish(conv uint32) {
 
 // output stages encoded segments and coalesces adjacent pieces that fit inside
 // one MTU datagram so control frames (ACK, WINS) and small writes share a
-// single packet instead of amplifying datagram and syscall counts.
+// maxStagedDatagrams bounds one UDP flush batch to 40 datagrams (~56 KiB at
+// 1400B MTU) so each batch fits within one 64 KiB Linux UDP_SEGMENT (GSO)
+// super-datagram and within releaseStaging's 64 KiB retained buffer cap.
+const maxStagedDatagrams = 40
+
+// output stages KCP segments and flushes them in a single batch at the end of
+// maintain / OnTurnEnd. Adjacent small segments (such as ACKs or control probes
+// followed by data) are coalesced up to MTU so they share a single packet
+// instead of amplifying datagram and syscall counts.
 func (c *conn) output(buf []byte, size int) {
 	if c.ended || c.closed || size <= 0 {
 		return
@@ -192,6 +200,17 @@ func (c *conn) output(buf []byte, size int) {
 			c.outEnds[n-1] = len(c.out)
 			return
 		}
+		if c.packet && n >= maxStagedDatagrams {
+			c.sendBatch()
+			if c.ended || c.closed {
+				return
+			}
+		}
+	}
+	if c.packet && cap(c.out)-len(c.out) < size && cap(c.out) < 64<<10 {
+		grown := make([]byte, len(c.out), 64<<10)
+		copy(grown, c.out)
+		c.out = grown
 	}
 	c.out = append(c.out, buf[:size]...)
 	c.outEnds = append(c.outEnds, len(c.out))

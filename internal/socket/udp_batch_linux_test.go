@@ -54,17 +54,17 @@ func BenchmarkUDPBatchRoundTrip(b *testing.B) {
 			receives := make([]UDPReceive, batchSize)
 			buffers := make([][]byte, batchSize)
 			for i := range packets {
-				packets[i] = make([]byte, 128)
-				buffers[i] = make([]byte, 128)
+				packets[i] = make([]byte, 1200)
+				buffers[i] = make([]byte, 1200)
 			}
 
-			b.SetBytes(int64(batchSize * 128))
+			b.SetBytes(int64(batchSize * 1200))
 			b.ReportAllocs()
 			b.ResetTimer()
 			for range b.N {
 				sent, err := SendUDPBatch(client, packets, remote)
-				if err != nil || sent != batchSize*128 {
-					b.Fatalf("sendmmsg sent %d/%d: %v", sent, batchSize*128, err)
+				if err != nil || sent != batchSize*1200 {
+					b.Fatalf("sendmmsg sent %d/%d: %v", sent, batchSize*1200, err)
 				}
 				got, err := RecvUDPBatch(server, buffers, receives)
 				if err != nil || got != batchSize {
@@ -218,5 +218,112 @@ func TestUDPBatchReportsTruncation(t *testing.T) {
 	}
 	if receives[0].Len != 10 {
 		t.Fatalf("the truncated datagram reports %d bytes, want its original 10", receives[0].Len)
+	}
+}
+
+func TestUDPBatchGSOCoalescingAndUnixgramFallback(t *testing.T) {
+	// 1. UDPv4 GSO run: 8 equal 1200B segments + 1 trailing 500B segment + 1 larger 1300B segment.
+	server, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(server) })
+	if err := unix.Bind(server, &unix.SockaddrInet4{Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.SetsockoptTimeval(server, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &unix.Timeval{Sec: 2}); err != nil {
+		t.Fatal(err)
+	}
+	bound, err := unix.Getsockname(server)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverAddr := bound.(*unix.SockaddrInet4)
+
+	client, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(client) })
+
+	var sendPkts [][]byte
+	wantTotal := 0
+	for i := range 8 {
+		b := make([]byte, 1200)
+		b[0], b[len(b)-1] = byte(i+1), byte(i+100)
+		sendPkts = append(sendPkts, b)
+		wantTotal += len(b)
+	}
+	sendPkts = append(sendPkts, nil) // empty packet inside GSO run should be skipped
+	tail := make([]byte, 500)
+	tail[0], tail[len(tail)-1] = 0xAA, 0xBB
+	sendPkts = append(sendPkts, tail)
+	wantTotal += len(tail)
+
+	after := make([]byte, 1300)
+	after[0], after[len(after)-1] = 0xCC, 0xDD
+	sendPkts = append(sendPkts, after)
+	wantTotal += len(after)
+
+	remote := &syscall.SockaddrInet4{Addr: serverAddr.Addr, Port: serverAddr.Port}
+	sent, err := SendUDPBatch(client, sendPkts, remote)
+	if err != nil || sent != wantTotal {
+		t.Fatalf("SendUDPBatch GSO sent=%d, err=%v; want %d", sent, err, wantTotal)
+	}
+
+	recvBufs := make([][]byte, 10)
+	recvs := make([]UDPReceive, 10)
+	for i := range recvBufs {
+		recvBufs[i] = make([]byte, 1500)
+	}
+	gotTotal := 0
+	var gotLens []int
+	for len(gotLens) < 10 {
+		rem := 10 - len(gotLens)
+		n, rerr := RecvUDPBatch(server, recvBufs[:rem], recvs[:rem])
+		if rerr != nil {
+			t.Fatalf("RecvUDPBatch after GSO: %v (got %d/10)", rerr, len(gotLens))
+		}
+		for i := range n {
+			gotTotal += recvs[i].Len
+			gotLens = append(gotLens, recvs[i].Len)
+		}
+	}
+	if gotTotal != wantTotal {
+		t.Fatalf("received %d bytes across %v, want %d", gotTotal, gotLens, wantTotal)
+	}
+
+	// 2. Real-kernel GSO fallback: when IP_PMTUDISC_DONT is set on an IPv4 UDP socket
+	// (or on a socket that rejects UDP_SEGMENT with EINVAL/EIO), the kernel refuses
+	// UDP_SEGMENT with EINVAL and SendUDPBatch must transparently retry without GSO!
+	noGSOClient, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = unix.Close(noGSOClient) })
+	_ = unix.SetsockoptInt(noGSOClient, unix.IPPROTO_IP, unix.IP_MTU_DISCOVER, unix.IP_PMTUDISC_DONT)
+
+	if !isGSOUnsupported(unix.EINVAL) || !isGSOUnsupported(unix.EIO) || isGSOUnsupported(nil) {
+		t.Fatal("isGSOUnsupported classification mismatch")
+	}
+	fbPkts := [][]byte{make([]byte, 600), make([]byte, 600)}
+	fbSent, err := SendUDPBatch(noGSOClient, fbPkts, remote)
+	if err != nil || fbSent != 1200 {
+		t.Fatalf("IP_PMTUDISC_DONT fallback sent=%d, err=%v; want 1200, nil", fbSent, err)
+	}
+	for gotFB := 0; gotFB < 2; {
+		n, rerr := RecvUDPBatch(server, recvBufs[:2-gotFB], recvs[:2-gotFB])
+		if rerr != nil {
+			t.Fatalf("RecvUDPBatch after fallback: %v", rerr)
+		}
+		gotFB += n
+	}
+
+	// Trigger EINVAL fallback branch on an AF_UNIX datagram socket given an IPv4 remote.
+	ufds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err == nil {
+		defer unix.Close(ufds[0])
+		defer unix.Close(ufds[1])
+		_, _ = SendUDPBatch(ufds[0], fbPkts, remote)
 	}
 }

@@ -15,6 +15,7 @@ type contractLower struct {
 	uio.Lower
 	inbound []byte
 	wire    [][]byte
+	more    bool
 }
 
 func (l *contractLower) PeekChunk() []byte { return l.inbound }
@@ -31,6 +32,7 @@ func (l *contractLower) Writev(p [][]byte) (int, error) {
 	return n, nil
 }
 func (*contractLower) PacketSource() bool   { return true }
+func (l *contractLower) MoreInBatch() bool  { return l.more }
 func (*contractLower) State() uio.ConnState { return 0 }
 
 type contractUp struct {
@@ -55,6 +57,7 @@ func (c *contractContext) Upper() uio.Upper              { return c.up }
 func (c *contractContext) Open()                         { c.up.opened = true }
 func (c *contractContext) Abort(err error) error         { c.cause = err; return nil }
 func (c *contractContext) SetTimer(when time.Time) error { c.deadline = when; return nil }
+func (c *contractContext) DeferTurnFlush() bool          { return c.lower.more }
 
 func newContractSession(t *testing.T, opts Options) (*conn, *contractContext) {
 	t.Helper()
@@ -182,6 +185,15 @@ func TestOptionsValidationAndOnClosingContracts(t *testing.T) {
 	}
 	cFull.turnDirty = true
 	cFull.OnTurnEnd(ctxFull)
+	cBatch, ctxBatch := newContractSession(t, Options{KeepAlive: -1})
+	cBatch.establish(12)
+	cBatch.inReadTurn = true
+	ctxBatch.lower.more = true
+	if n, err := cBatch.OnWrite(ctxBatch, []byte("deferred-turn-write")); n != 19 || err != nil || !cBatch.turnDirty {
+		t.Fatalf("in-turn deferred OnWrite = (%d, %v), turnDirty=%v", n, err, cBatch.turnDirty)
+	}
+	cBatch.inReadTurn = false
+	cBatch.OnTurnEnd(ctxBatch)
 	// Test output multi-datagram prevStart (n > 1), publishState on ended, and BSD socket buffer clamping!
 	cFull.output(make([]byte, cFull.opts.MTU), cFull.opts.MTU)
 	cFull.output([]byte("d2a"), 3)
