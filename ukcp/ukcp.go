@@ -39,16 +39,6 @@
 // sends frg=0 only; a segment in message mode ends the session with
 // ErrProtocol, since its sequence number could never be delivered in order.
 //
-// A standalone server and dialer wrap the layers: NewServer's Serve listens
-// on udp:// (or tcp://) addresses with Options.Handler receiving each
-// connection's callbacks, and Dialer.Dial — DialContext, when the dial needs a
-// bound; the package Dial uses DefaultDialer — returns the connection whose
-// events reach Options.Handler the same way. There is no built-in TLS: KCP has no such
-// standard, and what rides it is the wiring's to choose — put utls.ServerLayer or
-// utls.ClientLayer above ServerLayer/ClientLayer in a WithLayers chain, exactly as
-// over TCP. Both standalone endpoints need a Handler: reads arrive through
-// its OnRead, as they do for any uio connection.
-//
 // A session's stream ends in order: CloseWrite queues an empty push after the
 // data written before it, a marker the peer reads back as the end of the
 // stream (io.EOF at the Handler, or the end of the layer above). A graceful
@@ -67,7 +57,6 @@ package ukcp
 import (
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/urpc/uio"
@@ -109,11 +98,6 @@ const (
 	defaultMaxBuffered = 4 << 20
 )
 
-// DefaultSocketBuffer is the kernel socket buffer the standalone endpoints
-// size UDP sockets with when SocketReadBuffer or SocketWriteBuffer is zero:
-// a window's burst, with room to spare.
-const DefaultSocketBuffer = 4 << 20
-
 // kcpOverhead is the KCP segment header's size; the engine exports the same
 // as IKCP_OVERHEAD.
 const kcpOverhead = 24
@@ -148,15 +132,9 @@ var errMessageTooLarge = errors.New("ukcp: a message larger than the receive buf
 // larger than the engine can hold.
 var errSegmentTooLarge = errors.New("ukcp: segment larger than the engine can hold")
 
-// Options configures ServerLayer and ClientLayer — and, through them, the
-// standalone server and dialer — with the engine's parameters and the
-// transport's. The zero value runs the Fast profile {false, 30ms, 2, 1}.
+// Options configures ServerLayer and ClientLayer with the engine's parameters.
+// The zero value runs the Fast profile {false, 30ms, 2, 1}.
 type Options struct {
-	// Handler receives the connection callbacks of the standalone server and
-	// dialer. A layer hands its stream to the layer above instead, and
-	// refuses Handler with ErrInvalidOptions.
-	Handler uio.Handler
-
 	// MTU is the largest segment, header included. The engine's buffers hold
 	// 1500, so 24..1500; the default is 1400. It must not exceed the Events'
 	// ReadBufferSize (4 KiB by default) — on both ends: a segment from the
@@ -214,63 +192,6 @@ type Options struct {
 	// not yet handed to the socket; a write that would pass it returns
 	// ErrOutboundOverflow. Zero takes the default of 4 MiB.
 	MaxBuffered int
-
-	// ---- Standalone server and dialer settings ----
-	// A layer runs inside an Events it does not own and refuses Handler,
-	// Transport, SocketReadBuffer, and SocketWriteBuffer with ErrInvalidOptions.
-
-	// Transport configures the private uio.Events owned by a standalone Server
-	// or Dialer.
-	Transport TransportOptions
-
-	// SocketReadBuffer and SocketWriteBuffer size the UDP socket's kernel
-	// buffers: a KCP session bursts a whole window — about 1.4 MiB at the
-	// defaults — and a kernel default of a few hundred KiB drops much of it.
-	// Zero takes DefaultSocketBuffer; a negative value leaves the socket's
-	// buffers as they came. A layer endpoint sizes its own sockets through
-	// uio.WithListenControl and uio.WithDialControl, and refuses these two.
-	SocketReadBuffer  int
-	SocketWriteBuffer int
-}
-
-// TransportOptions configures the private [uio.Events] transport of a
-// standalone [Server] or [Dialer].
-type TransportOptions struct {
-	// ReadBufferSize is the Events' socket read size; it must be at least MTU
-	// (zero uses UIO's 4 KiB default).
-	ReadBufferSize         int
-	WriteBufferedThreshold int
-	MaxOutboundBuffered    int
-	BlockingWrite          bool
-	AllowHalfOpen          bool
-	Pollers                int
-	ReusePort              bool
-	Executor               uio.Executor
-}
-
-func (t TransportOptions) isZero() bool {
-	return t.ReadBufferSize == 0 &&
-		t.WriteBufferedThreshold == 0 &&
-		t.MaxOutboundBuffered == 0 &&
-		!t.BlockingWrite &&
-		!t.AllowHalfOpen &&
-		t.Pollers == 0 &&
-		!t.ReusePort &&
-		t.Executor == nil
-}
-
-func (t TransportOptions) events(handler uio.Handler) *uio.Events {
-	return &uio.Events{
-		Pollers:                t.Pollers,
-		ReusePort:              t.ReusePort,
-		Executor:               t.Executor,
-		ReadBufferSize:         t.ReadBufferSize,
-		WriteBufferedThreshold: t.WriteBufferedThreshold,
-		MaxOutboundBuffered:    t.MaxOutboundBuffered,
-		BlockingWrite:          t.BlockingWrite,
-		AllowHalfOpen:          t.AllowHalfOpen,
-		Handler:                handler,
-	}
 }
 
 // LayerOptions names the options a ServerLayer or ClientLayer runs with: the
@@ -350,70 +271,7 @@ func (o Options) resolve() (Options, error) {
 	case o.MaxBuffered == 0:
 		o.MaxBuffered = defaultMaxBuffered
 	}
-	// A negative socket buffer leaves the kernel's default; zero asks for
-	// DefaultSocketBuffer.
-	if o.SocketReadBuffer == 0 {
-		o.SocketReadBuffer = DefaultSocketBuffer
-	}
-	if o.SocketWriteBuffer == 0 {
-		o.SocketWriteBuffer = DefaultSocketBuffer
-	}
 	return o, nil
-}
-
-// socketControl sizes the sockets the standalone endpoints make; nil when
-// both buffers were left alone.
-func (o Options) socketControl() uio.SocketControl {
-	if o.SocketReadBuffer < 0 && o.SocketWriteBuffer < 0 {
-		return nil
-	}
-	return func(network, _ string, fd uintptr) error {
-		if network != "" && !strings.HasPrefix(network, "udp") {
-			return nil
-		}
-		if o.SocketReadBuffer > 0 {
-			if err := setSocketBuffer(fd, true, o.SocketReadBuffer); err != nil {
-				return err
-			}
-		}
-		if o.SocketWriteBuffer > 0 {
-			return setSocketBuffer(fd, false, o.SocketWriteBuffer)
-		}
-		return nil
-	}
-}
-
-// withKCPScheme gives an address that names no network the one KCP runs on
-// commonly: udp.
-func withKCPScheme(addr string) string {
-	if strings.Contains(addr, "://") {
-		return addr
-	}
-	return "udp://" + addr
-}
-
-// checkLayerOptions refuses what a standalone endpoint owns: a layer runs
-// inside an Events it does not own and hands its stream to the layer above,
-// so standalone settings would be silently inert under it.
-func (o Options) checkLayerOptions() error {
-	switch {
-	case o.Handler != nil:
-		return fmt.Errorf("%w: a layer hands its stream to the layer above, not to a Handler", ErrInvalidOptions)
-	case !o.Transport.isZero():
-		return fmt.Errorf("%w: Transport belongs to a standalone Server or Dialer, not to a layer", ErrInvalidOptions)
-	case o.SocketReadBuffer != 0, o.SocketWriteBuffer != 0:
-		return fmt.Errorf("%w: a layer sizes its sockets through uio.WithListenControl and uio.WithDialControl", ErrInvalidOptions)
-	}
-	return nil
-}
-
-// checkTransport refuses transport settings no session can run with.
-func (o Options) checkTransport() error {
-	if o.Transport.ReadBufferSize > 0 && o.Transport.ReadBufferSize < o.MTU {
-		return fmt.Errorf("%w: ReadBufferSize %d below the %d MTU: datagrams would truncate",
-			ErrInvalidOptions, o.Transport.ReadBufferSize, o.MTU)
-	}
-	return nil
 }
 
 // ServerLayer runs the server side of KCP as a [uio.Layer], for a chain of

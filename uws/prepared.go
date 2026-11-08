@@ -229,30 +229,15 @@ func (c *Conn) SendPrepared(m *PreparedMessage) error {
 		return ErrClosed
 	}
 	// Flush any earlier frames batched in this read round before checking
-	// outbound room or queueing wire so FIFO order and queue accounting hold.
+	// outboundRefuses or queueing wire so FIFO order and queue accounting hold.
 	if err := c.flushBatchLocked(); err != nil {
 		return err
 	}
-	if c.preparedOutboundRefuses(wire.Len()) {
+	if c.outboundRefuses(wire.Len()) {
 		return c.errBackpressure()
 	}
 	n, werr := uio.WriteShared(c.raw, wire)
 	return c.finishFrameWrite(m.opcode, n, wire.Len(), werr)
-}
-
-func (c *Conn) preparedOutboundRefuses(wireSize int) bool {
-	limit := c.maxOutbound()
-	if limit <= 0 {
-		return false
-	}
-	if wireSize > limit {
-		return true
-	}
-	if c.raw.OutboundBuffered()+wireSize <= limit {
-		return false
-	}
-	_ = c.raw.Flush()
-	return c.raw.OutboundBuffered()+wireSize > limit
 }
 
 // WritePrepared sends m on a blocking connection, suspending while the outbound

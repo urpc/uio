@@ -7,13 +7,13 @@
   <a href="https://github.com/urpc/uio/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"></a>
 </p>
 
-**ukcp** is KCP for Go, built on the [uio](https://github.com/urpc/uio) event
-engine: a reliable, ordered byte stream over an unreliable datagram transport.
-Every session runs in the connection's own turns on a shared worker pool — no
-goroutine and no timer of its own; its clock is the connection's turn timer.
-The protocol engine is the battle-tested one from
-[xtaci/kcp-go](https://github.com/xtaci/kcp-go), vendored file-for-file (see
-[License](#license)).
+**ukcp** is KCP for Go, built as a protocol layer on the
+[uio](https://github.com/urpc/uio) event engine: a reliable, ordered byte
+stream over an unreliable datagram transport. Every session runs in the
+connection's own turns on a shared worker pool — no goroutine and no timer of
+its own; its clock is the connection's turn timer. The protocol engine is the
+battle-tested one from [xtaci/kcp-go](https://github.com/xtaci/kcp-go),
+vendored file-for-file (see [License](#license)).
 
 ## Highlights
 
@@ -50,9 +50,8 @@ The package ships inside the [uio module](https://github.com/urpc/uio);
 
 ## Quick start
 
-KCP has no handshake and no connection of its own, so the server and the client
-take a `uio.Handler`, as every uio connection does: reads arrive in its
-callbacks, writes go through the connection a dial returns.
+`ServerLayer` and `ClientLayer` return a `uio.Layer` (and a `uio.PacketLayer`),
+installed on `uio.Events` through `uio.WithLayers`:
 
 ```go
 package main
@@ -65,30 +64,21 @@ import (
 )
 
 func main() {
-	server := ukcp.NewServer(ukcp.Options{Handler: uio.FuncHandler{
-		Read: func(c uio.Conn) error { _, err := c.WriteTo(c); return err },
-	}})
-	log.Fatal(server.Serve("udp://:9000"))
+	ev := &uio.Events{
+		Handler: uio.FuncHandler{
+			Read: func(c uio.Conn) error { _, err := c.WriteTo(c); return err },
+		},
+	}
+	log.Fatal(ev.Serve("udp://:9000", uio.WithLayers(ukcp.ServerLayer(ukcp.Options{}))))
 }
 ```
 
-The client half, in the same shape:
+The client half, dialing through `uio.WithLayers(ukcp.ClientLayer(...))`:
 
 ```go
-dialer := ukcp.NewDialer(ukcp.Options{Handler: uio.FuncHandler{
-	Read: func(c uio.Conn) error {
-		n := c.InboundBuffered()
-		if n == 0 {
-			return nil
-		}
-		buf := make([]byte, n)
-		log.Printf("from the peer: %q", c.Peek(buf))
-		_, err := c.Discard(n)
-		return err
-	},
-}})
-
-conn, err := dialer.Dial("udp://example.org:9000") // or DialContext, with a bound
+conn, err := client.DialContext(ctx, "udp://example.org:9000",
+	uio.WithLayers(ukcp.ClientLayer(ukcp.Options{})),
+)
 if err != nil {
 	log.Fatal(err)
 }
@@ -97,13 +87,11 @@ defer conn.Close()
 _, _ = conn.Write([]byte("hello"))
 ```
 
-`Serve` takes any number of addresses — `udp://`, `tcp://`, a bare `host:port`
-means UDP — and blocks until `Close`; `Dial` bounds nothing and `DialContext`
-bounds the dial by its context, as uio's own pair does. A dial returns once the
-session exists;
-its stream reaches you through `Handler`'s `OnRead`, and the returned `uio.Conn`
-is for writing, closing, deadlines and addressing. A client needs no
-acknowledgement to open: the first segments retransmit until the peer answers.
+A dial returns once the session exists; its stream reaches you through
+`Events.Handler`'s `OnRead` (or through `uio.NewBlockingConn(conn)`), and the
+returned `uio.Conn` is for writing, closing, deadlines and addressing. A client
+needs no acknowledgement to open: the first segments retransmit until the peer
+answers.
 
 ## How it works
 
@@ -125,12 +113,9 @@ acknowledgement to open: the first segments retransmit until the peer answers.
 
 ## Configuration
 
-`Options` holds every setting; `Server`, `Dialer` and the layers embed the same
-type (`LayerOptions` names it where a layer is built), the zero value is the
-defaults — KCP's **Fast profile** — and `LayerOptions.Validate` reports up
-front what a session would refuse. A layer refuses the settings only the
-standalone endpoints own — `Handler`, `Transport` and the socket buffers —
-with `ErrInvalidOptions`, since under a layer they would be silently inert.
+`Options` (`LayerOptions`) holds the protocol parameters. The zero value is the
+defaults — KCP's **Fast profile** — and `Options.Validate` reports up front
+what a session would refuse.
 
 | Field | Default | What it does |
 | --- | --- | --- |
@@ -144,12 +129,9 @@ with `ErrInvalidOptions`, since under a layer they would be silently inert.
 | `HandshakeTimeout` | 10 s | How long a server waits for the peer's first segment. KCP has no handshake, but a peer that never speaks must not hold a connection for ever: it ends with `ErrPeerSilent`. A negative value waits without a bound; a client never waits. |
 | `KeepAlive` | 10 s | An idle session probes the peer's window this often; silence for three periods ends it with `ErrKeepAliveTimeout`. A negative value disables keepalive. |
 | `MaxBuffered` | 4 MiB | Bytes a session holds for the writer; a write past it returns `ErrOutboundOverflow`. |
-| `Handler` | none | The connection callbacks. Required by `Server` and `Dialer`; a layer hands its stream to the layer above instead, and refuses Handler. |
-| `Transport` | zero (`TransportOptions{}`) | Configures the private `uio.Events` of a standalone `Server` or `Dialer` (`ReadBufferSize`, `WriteBufferedThreshold`, `MaxOutboundBuffered`, `BlockingWrite`, `AllowHalfOpen`, `Pollers`, `ReusePort`, `Executor`). |
-| `SocketReadBuffer` / `SocketWriteBuffer` | 4 MiB | Kernel socket buffers the standalone endpoints size their UDP sockets with. A session bursts a whole window and the kernel default — a few hundred KiB — drops much of it; a negative value leaves the socket alone. A layer endpoint sizes its own sockets with `uio.WithListenControl` and `uio.WithDialControl`. |
 
 Invalid combinations — an MTU past the engine's buffers, a window past 65535, an
-interval outside 10 ms..5 s — make `Serve` and `Dial` return `ErrInvalidOptions`.
+interval outside 10 ms..5 s — fail the connection with `ErrInvalidOptions`.
 
 **Backpressure.** A slow reader closes the receive window, the sender's queue
 fills, and `Write` returns `ErrOutboundOverflow` rather than blocking; when the
@@ -157,7 +139,7 @@ reader catches up the queued data leaves by itself. `MaxBuffered` and the send
 window bound what a session holds, `MaxOutboundBuffered` bounds the socket's
 queue, and a peer that stops acknowledging is found out by the dead-link bound.
 
-## As a protocol layer
+## Composing layers
 
 `ServerLayer` and `ClientLayer` return a `uio.Layer` — and a `uio.PacketLayer`,
 the marker a chain on a packet connection must start with, or the endpoint
@@ -183,22 +165,6 @@ uio.WithLayers(ukcp.ServerLayer(opts), utls.ServerLayer(utls.LayerOptions{TLSCon
 uio.WithLayers(ukcp.ServerLayer(opts), ukcp.ServerLayer(opts))
 ```
 
-The layer hands the layer above one byte stream, opens it when the peer's first
-segment names the conversation, and ends it on the peer's end of stream. A
-stream connection below that ends travels up as `io.EOF` at a segment boundary
-and `io.ErrUnexpectedEOF` inside one. The stream dialect frames with `frg=0`;
-a segment in message mode — which the dialect never sends — ends the session
-with `ErrProtocol`, because its sequence number could never be delivered in
-order. A datagram the Events' `ReadBufferSize` cannot hold would be truncated
-below the layer, so a session whose MTU exceeds it is refused with
-`ErrInvalidOptions` instead.
-
-There is deliberately no `TLSConfig` option. KCP has no standard TLS port or
-URL scheme as `wss` does, so the composition is yours: put `utls.ServerLayer` or
-`utls.ClientLayer` above `ServerLayer`/`ClientLayer` in the `WithLayers` chain and
-configure TLS there, exactly as over TCP. The standalone `Server`/`Dialer` are
-bare KCP; for TLS use the layer form above.
-
 A layered UDP listener refuses `DialPeer` with `uio.ErrUnsupported`: the peer's
 connection belongs to the stack, which only the stack opens, and a socket-level
 connection would bypass every layer.
@@ -218,36 +184,6 @@ if ok {
 `State` may be read from any goroutine, including from an `OnBytesWritten`
 observer inside a write; the snapshot is published, never taken under the
 engine's lock.
-
-## Rules of the road
-
-- **Reads are the Handler's.** As with every uio connection, inbound bytes
-  arrive in `OnRead` (`PeekChunk`/`Discard`); the `Conn` a dial returns is for
-  writing, closing and addressing. `Handler` is required —
-  `Serve` and `Dial` refuse a missing one.
-- **Accepted is not delivered.** A nil error from `Write` means the session took
-  the bytes — the writes below flushed at once — not that the peer has them;
-  KCP retransmits until it does. `ErrOutboundOverflow` means the session's
-  buffer is full: retry once the queue drains, or close.
-- **The server cannot speak first.** KCP has no handshake, so a session begins
-  with the client's first segment. A pure download must send a byte first;
-  a peer that never does is reclaimed when `HandshakeTimeout` passes, a
-  connection the Handler never heard of.
-- **Half-close.** `CloseWrite` ends this direction reliably and the session
-  goes on receiving; the peer reads `io.EOF` once the bytes before it arrived.
-  With the Events' `AllowHalfOpen` set, a peer's own end leaves this direction
-  writable just the same; without it the framework closes the connection when
-  the peer's stream ends. A graceful `Close` sends the end best effort — the
-  connection closes below it.
-- **Closing.** `Server.Close` and `Dialer.Close` request shutdown and return at
-  once; sessions the dialer made close with it, and a dial after `Close`
-  reports `net.ErrClosed`. A server serves once.
-- **Windows and MTU are bounded.** Windows at most 65535 segments, MTU at most
-  1500 bytes and at most the Events' read buffer; `Options.Validate` reports
-  what a session would refuse.
-
-The [API reference](https://pkg.go.dev/github.com/urpc/uio/ukcp) documents
-every type and method.
 
 ## License
 

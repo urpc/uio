@@ -2,10 +2,8 @@ package ukcp
 
 import (
 	"bytes"
-	"context"
 	"errors"
 	"net"
-	"runtime"
 	"testing"
 	"time"
 
@@ -60,12 +58,8 @@ func (c *contractContext) SetTimer(when time.Time) error { c.deadline = when; re
 
 func newContractSession(t *testing.T, opts Options) (*conn, *contractContext) {
 	t.Helper()
-	resolved, err := opts.resolve()
-	if err != nil {
-		t.Fatal(err)
-	}
 	ctx := &contractContext{lower: &contractLower{}, up: &contractUp{}}
-	engine := newResolvedLayer(resolved, false).Attach(ctx).(*conn)
+	engine := newLayer(opts, false).Attach(ctx).(*conn)
 	engine.OnOpen(ctx)
 	return engine, ctx
 }
@@ -132,54 +126,30 @@ func TestReopenedWindowPropagatesDeadLinkAndClearsHeldState(t *testing.T) {
 	}
 }
 
-func TestStandaloneValidationAndFailedListenCleanup(t *testing.T) {
-	for _, opts := range []Options{{MTU: -1}, {Interval: -time.Second}} {
+func TestOptionsValidationAndOnClosingContracts(t *testing.T) {
+	for _, opts := range []Options{
+		{MTU: -1},
+		{MTU: 20},
+		{MTU: 1600},
+		{SendWindow: -1},
+		{SendWindow: 70000},
+		{Interval: -time.Second},
+		{Interval: 5 * time.Millisecond},
+		{DeadLink: -1},
+		{MaxBuffered: -1},
+	} {
 		if err := opts.Validate(); !errors.Is(err, ErrInvalidOptions) {
-			t.Fatal(err)
+			t.Fatalf("opts %+v Validate = %v, want ErrInvalidOptions", opts, err)
 		}
 	}
-	saved := DefaultDialer
-	DefaultDialer = NewDialer(Options{})
-	defer func() { DefaultDialer = saved }()
-	if _, err := Dial("127.0.0.1:1"); !errors.Is(err, ErrInvalidOptions) {
+	if err := (Options{Resend: -1, HandshakeTimeout: -1, KeepAlive: -1}).Validate(); err != nil {
 		t.Fatal(err)
 	}
-	for _, opts := range []Options{{Handler: echoHandler, Transport: TransportOptions{ReadBufferSize: 1}}, {Handler: echoHandler, MTU: -1}} {
-		if _, err := NewDialer(opts).DialContext(context.Background(), "127.0.0.1:1"); !errors.Is(err, ErrInvalidOptions) {
-			t.Fatal(err)
-		}
-	}
-	d := NewDialer(Options{Handler: echoHandler})
-	if err := d.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.Dial("127.0.0.1:1"); !errors.Is(err, net.ErrClosed) {
-		t.Fatal(err)
-	}
-	s := NewServer(Options{Handler: echoHandler, SocketReadBuffer: -1, SocketWriteBuffer: -1})
-	if err := s.Serve("tcp://not-an-address"); err == nil {
-		t.Fatal("invalid listener unexpectedly started")
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	empty := NewServer(Options{})
-	if err := empty.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if control := (Options{SocketReadBuffer: -1, SocketWriteBuffer: -1}).socketControl(); control != nil {
-		t.Fatal("negative buffer settings did not leave the socket unchanged")
-	}
-	control := (Options{SocketReadBuffer: 1024, SocketWriteBuffer: -1}).socketControl()
-	if err := control("tcp4", "", ^uintptr(0)); err != nil {
-		t.Fatalf("tcp4 socketControl should skip UDP buffer sizing, got %v", err)
-	}
-	if runtime.GOOS != "windows" {
-		// Windows applies no kernel socket buffers, so it takes any
-		// descriptor and reports nothing to apply.
-		if err := control("udp", "", ^uintptr(0)); err == nil {
-			t.Fatal("invalid socket descriptor was accepted")
-		}
+	ServerLayer(Options{}).(uio.PacketLayer).CarriesPackets()
+	badCtx := &contractContext{lower: &contractLower{}, up: &contractUp{}}
+	ServerLayer(Options{MTU: -1}).Attach(badCtx).OnOpen(badCtx)
+	if !errors.Is(badCtx.cause, ErrInvalidOptions) {
+		t.Fatalf("invalid layer OnOpen cause = %v, want ErrInvalidOptions", badCtx.cause)
 	}
 
 	// Verify OnClosing flushes deferred ACKs when finQueued is already true, and skips FIN on Abort!
@@ -219,18 +189,4 @@ func TestStandaloneValidationAndFailedListenCleanup(t *testing.T) {
 	cFull.noteHeld()               // iterates outEnds in noteHeld!
 	cFull.OnClose(ctxFull, nil)
 	cFull.publishState()
-
-	if runtime.GOOS != "windows" {
-		pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
-		if err == nil {
-			defer pc.Close()
-			if uc, ok := pc.(*net.UDPConn); ok {
-				if raw, rerr := uc.SyscallConn(); rerr == nil {
-					_ = raw.Control(func(fd uintptr) {
-						_ = setSocketBuffer(fd, true, 1<<30) // exercises BSD ENOBUFS/EINVAL halving loop!
-					})
-				}
-			}
-		}
-	}
 }

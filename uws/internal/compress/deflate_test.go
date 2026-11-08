@@ -226,3 +226,39 @@ func FuzzDecompressNeverPanics(f *testing.F) {
 		_, _ = Decompress(data, 1<<20)
 	})
 }
+
+func FuzzContextTakeoverRoundTripAndLimit(f *testing.F) {
+	f.Add([]byte("first sliding window message"), []byte("second sliding window message"), false, uint8(15), uint16(512))
+	f.Add([]byte("short"), []byte(""), true, uint8(9), uint16(16))
+	f.Fuzz(func(t *testing.T, first, second []byte, noContext bool, winBits uint8, maxOut uint16) {
+		if len(first) > 16<<10 || len(second) > 16<<10 {
+			return
+		}
+		bits := int(winBits%8) + 8 // 8..15
+		enc := NewEncoderWithWindow(-1, noContext, bits)
+		dec := NewDecoderWithWindow(noContext, bits)
+		for _, msg := range [][]byte{first, second} {
+			encoded, err := enc.Encode(msg)
+			if err != nil {
+				t.Fatalf("Encode failed: %v", err)
+			}
+			enc.Commit(msg)
+			limit := int(maxOut) + len(msg) + 1
+			decoded, err := dec.Decode(encoded, limit)
+			if err != nil {
+				t.Fatalf("Decode failed: %v", err)
+			}
+			if !bytes.Equal(decoded, msg) {
+				t.Fatalf("round-trip mismatch: got %d bytes, want %d", len(decoded), len(msg))
+			}
+		}
+		if len(first) > 1 {
+			encoded, err := NewEncoder(-1, true).Encode(first)
+			if err == nil {
+				if _, derr := NewDecoder(true).Decode(encoded, len(first)-1); !errors.Is(derr, ErrTooLarge) {
+					t.Fatalf("Decode with bound %d = %v, want ErrTooLarge", len(first)-1, derr)
+				}
+			}
+		}
+	})
+}

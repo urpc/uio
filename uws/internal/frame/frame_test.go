@@ -624,6 +624,72 @@ func FuzzParserNeverPanics(f *testing.F) {
 	})
 }
 
+// FuzzParserChunkSplitAndAssembler exercises differential agreement between
+// whole-buffer Feed and arbitrary byte-split incremental Feed, as well as the
+// Assembler state machine across fragmented UTF-8 text and control frames.
+func FuzzParserChunkSplitAndAssembler(f *testing.F) {
+	f.Add([]byte{0x81, 0x82, 1, 2, 3, 4, 'o', 'k'}, uint8(1), true)
+	f.Add([]byte{0x01, 0x82, 0, 0, 0, 0, 0xe4, 0xb8, 0x89, 0x80, 0x80, 0x83, 0, 0, 0, 0, 0xad, 'a', 'b'}, uint8(3), true)
+	f.Add([]byte{0x88, 0x82, 1, 1, 1, 1, 0x03 ^ 1, 0xe8 ^ 1}, uint8(2), false)
+	f.Fuzz(func(t *testing.T, data []byte, splitSeed uint8, expectMask bool) {
+		cfg := ParserConfig{ExpectMask: expectMask, AllowRSV1: true, MaxFramePayload: 4096}
+		type recordedFrame struct {
+			fin, rsv1 bool
+			opcode    OpCode
+			payload   []byte
+		}
+		var wholeFrames []recordedFrame
+		wholeParser := NewParser(cfg)
+		_, wholeErr := wholeParser.Feed(append([]byte(nil), data...), func(fr Frame) error {
+			wholeFrames = append(wholeFrames, recordedFrame{
+				fin:     fr.Fin,
+				rsv1:    fr.RSV1,
+				opcode:  fr.Opcode,
+				payload: append([]byte(nil), fr.Payload...),
+			})
+			return nil
+		})
+
+		var splitFrames []recordedFrame
+		splitParser := NewParser(cfg)
+		asm := NewAssembler(4096)
+		step := int(splitSeed%16) + 1
+		var splitErr error
+		src := append([]byte(nil), data...)
+		for i := 0; i < len(src); i += step {
+			end := min(i+step, len(src))
+			_, err := splitParser.Feed(src[i:end], func(fr Frame) error {
+				splitFrames = append(splitFrames, recordedFrame{
+					fin:     fr.Fin,
+					rsv1:    fr.RSV1,
+					opcode:  fr.Opcode,
+					payload: append([]byte(nil), fr.Payload...),
+				})
+				_ = asm.Accept(fr, func(Frame) error { return nil }, func(Message) error { return nil })
+				return nil
+			})
+			if err != nil {
+				splitErr = err
+				break
+			}
+		}
+		if (wholeErr == nil) != (splitErr == nil) {
+			t.Fatalf("wholeErr=%v != splitErr=%v on %x", wholeErr, splitErr, data)
+		}
+		if len(wholeFrames) != len(splitFrames) {
+			t.Fatalf("whole frames=%d != split frames=%d", len(wholeFrames), len(splitFrames))
+		}
+		for i := range wholeFrames {
+			if wholeFrames[i].fin != splitFrames[i].fin ||
+				wholeFrames[i].rsv1 != splitFrames[i].rsv1 ||
+				wholeFrames[i].opcode != splitFrames[i].opcode ||
+				!bytes.Equal(wholeFrames[i].payload, splitFrames[i].payload) {
+				t.Fatalf("frame %d diverged between whole and split feed", i)
+			}
+		}
+	})
+}
+
 // FinishFrame completes only the frame a parser holds: it stops at the
 // boundary after it, takes all of src while the frame has not ended, and takes
 // nothing at a boundary, so a caller can parse the frames that follow its own

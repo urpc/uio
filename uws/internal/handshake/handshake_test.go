@@ -227,6 +227,21 @@ func FuzzParseServerRequestNeverPanics(f *testing.F) {
 	})
 }
 
+func FuzzValidateClientResponseNeverPanics(f *testing.F) {
+	accept := string(appendAcceptKey(nil, testKey))
+	f.Add([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\n\r\n"))
+	f.Add([]byte("HTTP/1.1 403 Forbidden\r\nContent-Length: 6\r\n\r\ndenied"))
+	f.Add([]byte("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + "\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\ntrailing"))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("client response validator panicked: %v", recovered)
+			}
+		}()
+		_, _, _, _ = ValidateClientResponse(data, testKey, []string{"chat"}, 4096)
+	})
+}
+
 func BenchmarkParseServerRequest(b *testing.B) {
 	request := []byte("GET /ws HTTP/1.1\r\n" +
 		"Host: 127.0.0.1:26001\r\n" +

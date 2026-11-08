@@ -67,12 +67,8 @@ func BenchmarkEngineStreamThroughput(b *testing.B) {
 
 func newBenchSession(tb testing.TB) (*conn, *contractContext) {
 	tb.Helper()
-	resolved, err := (Options{KeepAlive: -1, SendWindow: 1024, RecvWindow: 1024}).resolve()
-	if err != nil {
-		tb.Fatal(err)
-	}
 	ctx := &contractContext{lower: &contractLower{}, up: &contractUp{}}
-	engine := newResolvedLayer(resolved, false).Attach(ctx).(*conn)
+	engine := newLayer(Options{KeepAlive: -1, SendWindow: 1024, RecvWindow: 1024}, false).Attach(ctx).(*conn)
 	engine.OnOpen(ctx)
 	return engine, ctx
 }
@@ -82,27 +78,6 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 	var srvRecv atomic.Int64
 	var srvPktsIn, srvBytesOut atomic.Int64
 	wake := make(chan struct{}, 1)
-
-	srv := NewServer(Options{
-		KeepAlive:  -1,
-		SendWindow: 2048,
-		RecvWindow: 2048,
-		Handler: uio.FuncHandler{
-			Read: func(c uio.Conn) error {
-				n, _ := c.Discard(-1)
-				if n > 0 {
-					srvRecv.Add(int64(n))
-					select {
-					case wake <- struct{}{}:
-					default:
-					}
-				}
-				return nil
-			},
-		},
-	})
-	// Attach observer via custom server events? Use uio.Events directly with Observer to count exact UDP wire stats!
-	_ = srv
 
 	srvEv := &uio.Events{
 		Pollers:        1,
@@ -136,9 +111,7 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 		<-srvDone
 	}()
 
-	sockCtrl := (Options{SocketReadBuffer: DefaultSocketBuffer, SocketWriteBuffer: DefaultSocketBuffer}).socketControl()
 	ln, err := srvEv.Listen("udp://127.0.0.1:0",
-		uio.WithListenControl(sockCtrl),
 		uio.WithLayers(ServerLayer(Options{KeepAlive: -1, SendWindow: 2048, RecvWindow: 2048, MaxBuffered: 8 << 20})),
 	)
 	if err != nil {
@@ -169,7 +142,6 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 	}()
 
 	cli, err := cliEv.Dial("udp://"+ln.Addr().String(),
-		uio.WithDialControl(sockCtrl),
 		uio.WithLayers(ClientLayer(Options{KeepAlive: -1, SendWindow: 2048, RecvWindow: 2048, MaxBuffered: 8 << 20})),
 	)
 	if err != nil {
@@ -178,7 +150,6 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 	defer cli.Close()
 
 	payload := bytes.Repeat([]byte("U"), chunkSize)
-	// Warmup handshake
 	if _, err := cli.Write([]byte("warmup")); err != nil {
 		b.Fatal(err)
 	}
@@ -334,7 +305,6 @@ func BenchmarkUDPPipelinedEcho(b *testing.B) {
 				for {
 					n, err := c.Read(buf[:])
 					if n > 0 {
-						// Echo each small frame separately to exercise in-turn coalescing!
 						if _, werr := c.Write(buf[:n]); werr != nil {
 							return werr
 						}

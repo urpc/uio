@@ -1208,6 +1208,45 @@ func FuzzTextValidation(f *testing.F) {
 	})
 }
 
+func FuzzConnConsumeFramesNeverPanics(f *testing.F) {
+	f.Add([]byte{0x81, 0x82, 1, 2, 3, 4, 'h', 'i'}, uint8(8), false)
+	f.Add([]byte{0x82, 0x80, 9, 9, 9, 9, 0x89, 0x80, 1, 1, 1, 1, 0x88, 0x82, 0, 0, 0, 0, 0x03, 0xe8}, uint8(3), true)
+	f.Fuzz(func(t *testing.T, wire []byte, chunkSeed uint8, enableComp bool) {
+		opts, _ := (Options{
+			EnableCompression: enableComp,
+			MaxFramePayload:   2048,
+			MaxMessageSize:    4096,
+		}).resolve()
+		cfg := newServerConnConfig(opts, nil, nil)
+		raw := &echoPathConn{inbound: append([]byte(nil), wire...)}
+		c := &Conn{
+			raw:     raw,
+			config:  cfg,
+			handler: echoPathHandler{},
+		}
+		if enableComp {
+			c.compression = &compressionState{
+				encoder: compress.NewEncoder(cfg.compressionLevel, true),
+				decoder: compress.NewDecoder(true),
+			}
+		}
+		c.opened.Store(true)
+		defer c.releaseReadState()
+
+		step := int(chunkSeed%32) + 1
+		for len(raw.inbound) > 0 && !c.closed.Load() && !c.closing.Load() {
+			n := min(step, len(raw.inbound))
+			consumed, err := c.consumeFrames(raw.inbound[:n])
+			if consumed > 0 {
+				_, _ = raw.Discard(consumed)
+			}
+			if err != nil || consumed == 0 {
+				break
+			}
+		}
+	})
+}
+
 type peerCloseBehindHandler struct{ closed chan CloseEvent }
 
 func (*peerCloseBehindHandler) OnOpen(*Conn) {

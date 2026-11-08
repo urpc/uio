@@ -854,20 +854,3 @@ func TestLayerMTUFitsTheReadBuffer(t *testing.T) {
 		t.Fatalf("dial with a read buffer under the MTU: %v, want ErrInvalidOptions", err)
 	}
 }
-
-// A layer refuses the settings a standalone endpoint owns: under a layer
-// they would be silently inert, so they fail every connection instead.
-func TestLayerRefusesStandaloneOptions(t *testing.T) {
-	cases := map[string]Options{
-		"Handler":           {Handler: echoHandler},
-		"Transport":         {Transport: TransportOptions{Pollers: 2}},
-		"SocketReadBuffer":  {SocketReadBuffer: 1 << 20},
-		"SocketWriteBuffer": {SocketWriteBuffer: 1 << 20},
-	}
-	for name, opts := range cases {
-		layer, ok := ServerLayer(opts).(*kcpLayer)
-		if !ok || !errors.Is(layer.err, ErrInvalidOptions) {
-			t.Fatalf("%s: layer error = %v, want ErrInvalidOptions", name, layer.err)
-		}
-	}
-}
