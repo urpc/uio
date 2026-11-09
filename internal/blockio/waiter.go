@@ -62,7 +62,7 @@ func (w *waiter) cancelPrepare() {
 // notify advances the generation and wakes a parked caller if one is waiting.
 func (w *waiter) notify() {
 	w.gen.Add(1)
-	if w.parked.Swap(false) {
+	if w.parked.Load() && w.parked.Swap(false) {
 		select {
 		case w.sig <- struct{}{}:
 		default:

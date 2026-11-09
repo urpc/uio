@@ -21,6 +21,7 @@ package uio
 import (
 	"errors"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/bytebuf"
 )
 
@@ -77,4 +78,31 @@ func WriteShared(conn Lower, sb *SharedBuffer) (int, error) {
 		ReleaseBuffer(view)
 	}
 	return n, err
+}
+
+// TryWriteOwned submits buffer to conn without blocking even when
+// Events.BlockingWrite is enabled. If conn's outbound window is full or a
+// BlockingWriter is currently contended/parked on conn, it returns
+// ErrOutboundOverflow without releasing buffer so the caller can fall back to
+// BlockingWriter.WriteOwnedContext.
+func TryWriteOwned(conn Conn, buffer *Buffer) (int, error) {
+	if fdc, ok := conn.(*fdConn); ok {
+		if !fdc.hasBlockWriter() {
+			return fdc.writeOwnedNonBlocking(buffer)
+		}
+		n, err := fdc.ensureBlockWriter().TryWriteOwned(buffer)
+		if err == blockio.ErrOverflow {
+			return n, ErrOutboundOverflow
+		}
+		return n, err
+	}
+	if conn == nil {
+		ReleaseBuffer(buffer)
+		return 0, ErrUnsupported
+	}
+	bw, err := NewBlockingWriter(conn)
+	if err != nil {
+		return conn.WriteOwned(buffer)
+	}
+	return bw.TryWriteOwned(buffer)
 }

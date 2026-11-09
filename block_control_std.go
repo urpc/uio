@@ -78,3 +78,10 @@ func (conn *fdConn) ensureBlockWriter() *blockio.Writer {
 	st, _ := conn.connBlockState()
 	return st.Writer(0)
 }
+
+func (conn *fdConn) hasBlockWriter() bool {
+	if st := conn.blockControl.Load(); st != nil {
+		return st.HasWriter()
+	}
+	return false
+}

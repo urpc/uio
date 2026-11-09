@@ -207,6 +207,40 @@ func (b *CompositeBuffer) AppendOwnedCoalesced(buffer *Buffer, targetCapacity in
 	b.length += size
 }
 
+// AppendOwnedTailCoalesced appends buffer to b without ever mutating b.bufList[0]
+// (which sendOutboundBlock may be reading concurrently while submitMu is unlocked).
+// When b is empty, buffer becomes b.bufList[0] with zero copy; when b already has
+// at least one block, small buffers coalesce into b.bufList[1..] of targetCapacity.
+func (b *CompositeBuffer) AppendOwnedTailCoalesced(buffer *Buffer, targetCapacity int) {
+	if buffer == nil {
+		return
+	}
+	size := buffer.Len()
+	if size == 0 {
+		putBuffer(buffer)
+		return
+	}
+	count := len(b.bufList)
+	if count >= 2 && buffer.poolKind != sharedViewPool {
+		last := b.bufList[count-1]
+		if last.Available() >= size {
+			_, _ = last.Write(buffer.Bytes())
+			b.length += size
+			putBuffer(buffer)
+			return
+		}
+	}
+	if count < 4 || targetCapacity <= size || buffer.poolKind == sharedViewPool {
+		b.AppendOwned(buffer)
+		return
+	}
+	coalesced := getBuffer(targetCapacity)
+	_, _ = coalesced.Write(buffer.Bytes())
+	putBuffer(buffer)
+	b.bufList = append(b.bufList, coalesced)
+	b.length += size
+}
+
 // Reserve appends n bytes and returns them for the caller to fill in place.
 // They stay in the tail block when it has room; otherwise a new block is
 // started, exactly sized when the buffer is empty and at least blockSize

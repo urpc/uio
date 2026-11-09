@@ -37,7 +37,7 @@ type Writer struct {
 	waiter waiter
 
 	customWin atomic.Int64
-	closed    bool
+	closed    atomic.Bool
 	closeErr  error
 }
 
@@ -75,23 +75,23 @@ func (w *Writer) NotifySpace() { w.waiter.notify() }
 
 func (w *Writer) onClose(localClose bool, err error) {
 	w.mu.Lock()
-	if !w.closed {
-		w.closed = true
+	if !w.closed.Load() {
 		if localClose || err == nil || err == io.EOF {
 			w.closeErr = net.ErrClosed
 		} else {
 			w.closeErr = err
 		}
+		w.closed.Store(true)
 	}
 	w.mu.Unlock()
 	w.waiter.closeWake()
 }
 
 func (w *Writer) terminalErr() error {
-	w.mu.Lock()
-	closed, err := w.closed, w.closeErr
-	w.mu.Unlock()
-	if closed {
+	if w.closed.Load() {
+		w.mu.Lock()
+		err := w.closeErr
+		w.mu.Unlock()
 		return err
 	}
 	if w.src.WriteEnded() || w.src.ClosingOrClosed() {
@@ -349,6 +349,29 @@ func (w *Writer) writeLocked(ctx context.Context, p []byte) (int, error) {
 	nextWrite:
 	}
 	return written, nil
+}
+
+// TryWriteOwned attempts a fast non-blocking write when no writer is currently
+// contended or parked on w and no deadline has expired. If the outbound window
+// is full or contended, it returns ErrOverflow without releasing buf so the
+// caller can fall back to WriteOwnedContext.
+func (w *Writer) TryWriteOwned(buf *bytebuf.Buffer) (int, error) {
+	if buf == nil || buf.Len() == 0 {
+		bytebuf.ReleaseBuffer(buf)
+		return 0, nil
+	}
+	if len(w.wsem) == 0 && !w.waiter.parked.Load() && !w.closed.Load() && !w.waiter.expired.Load() {
+		if cw := int(w.customWin.Load()); cw <= 0 || w.src.OutboundBuffered()+buf.Len() <= cw {
+			n, err := w.src.WriteOwned(buf)
+			if err == nil {
+				return n, nil
+			}
+			if !w.src.IsOverflow(err) {
+				return n, w.resolveWriteErr(err)
+			}
+		}
+	}
+	return 0, ErrOverflow
 }
 
 // WriteOwned transfers ownership of buf to the connection, suspending while the

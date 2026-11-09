@@ -848,6 +848,29 @@ func TestWriterWritevAndFairness(t *testing.T) {
 		t.Fatalf("fast Writev = %d, %v", n, err)
 	}
 	base.drainOut(32)
+	if !st.HasWriter() {
+		t.Fatal("expected HasWriter to be true")
+	}
+	if n, err := w.TryWriteOwned(nil); n != 0 || err != nil {
+		t.Fatalf("TryWriteOwned(nil) = %d, %v", n, err)
+	}
+	tb := bytebuf.AcquireBuffer(4)
+	_, _ = tb.Write([]byte("ok"))
+	if n, err := w.TryWriteOwned(tb); n != 2 || err != nil {
+		t.Fatalf("TryWriteOwned = %d, %v", n, err)
+	}
+	overTryBuf := bytebuf.AcquireBuffer(64)
+	_, _ = overTryBuf.Write(bytes.Repeat([]byte{'z'}, 40))
+	if _, err := w.TryWriteOwned(overTryBuf); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("TryWriteOwned over customWin = %v, want ErrOverflow", err)
+	}
+	base.writeErr = io.ErrClosedPipe
+	if _, err := w.TryWriteOwned(overTryBuf); err != nil {
+		// expected
+	}
+	base.writeErr = nil
+	bytebuf.ReleaseBuffer(overTryBuf)
+	base.drainOut(32)
 
 	// Partial Writev continuation (like umux partial window accept, mid-segment split)!
 	ps.partial = 3

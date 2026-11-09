@@ -130,6 +130,11 @@ func (s *State) ActiveReader() *Reader {
 	return s.reader.Load()
 }
 
+// HasWriter reports whether a blocking Writer has been attached to s.
+func (s *State) HasWriter() bool {
+	return s != nil && s.writer.Load() != nil
+}
+
 // OnClose notifies any attached Reader and Writer that the underlying
 // connection closed. localClose is true when closed locally via Conn.Close().
 func (s *State) OnClose(localClose bool, err error) {

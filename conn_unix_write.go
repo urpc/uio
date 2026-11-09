@@ -287,7 +287,11 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 		conn.submitMu.Unlock()
 		return 0, conn.errOutboundOverflow()
 	}
-	conn.outbound.AppendOwned(owned)
+	if !conn.outbound.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
+		conn.outbound.AppendOwnedTailCoalesced(owned, conn.coalesceBlockSize())
+	} else {
+		conn.outbound.AppendOwned(owned)
+	}
 	conn.submitMu.Unlock()
 	conn.kickWriterOutside()
 	return size, nil

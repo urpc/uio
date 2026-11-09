@@ -164,6 +164,18 @@ func (w *BlockingWriter) WritevContext(ctx context.Context, vec [][]byte) (int, 
 	return w.w.WritevContext(ctx, vec)
 }
 
+// TryWriteOwned attempts a fast non-blocking write when no writer is currently
+// contended or parked on w. On overflow or contention it returns
+// ErrOutboundOverflow without releasing buf so the caller can fall back to
+// WriteOwnedContext.
+func (w *BlockingWriter) TryWriteOwned(buf *Buffer) (int, error) {
+	n, err := w.w.TryWriteOwned(buf)
+	if err == blockio.ErrOverflow {
+		return n, ErrOutboundOverflow
+	}
+	return n, err
+}
+
 // WriteOwned transfers ownership of buf to the connection, suspending while the
 // outbound window is full, and always consumes or releases buf.
 func (w *BlockingWriter) WriteOwned(buf *Buffer) (int, error) { return w.w.WriteOwned(buf) }
@@ -259,7 +271,7 @@ func (bc *BlockingConn) RemoteAddr() net.Addr                   { return bc.conn
 func (bc *BlockingConn) Unwrap() Conn                           { return bc.conn }
 func (bc *BlockingConn) Reader() *BlockingReader                { return bc.r }
 func (bc *BlockingConn) Writer() *BlockingWriter                { return bc.w }
-func (bc *BlockingConn) InternalWriter() *blockio.Writer        { return bc.w.w }
+func (bc *BlockingConn) InternalWriter() *blockio.Writer        { return bc.w.InternalWriter() }
 
 // SetDeadline sets both the read and write blocking wait deadlines without
 // closing the underlying connection when they expire.

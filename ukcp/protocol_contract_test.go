@@ -194,6 +194,9 @@ func TestOptionsValidationAndOnClosingContracts(t *testing.T) {
 	}
 	cBatch.inReadTurn = false
 	cBatch.OnTurnEnd(ctxBatch)
+	t0 := time.Now().Add(time.Second)
+	cBatch.armFor(t0)
+	cBatch.armFor(t0.Add(time.Second))
 	ServerLayer(Options{}).(uio.PacketLayer).CarriesPackets()
 	for range maxStagedDatagrams + 2 {
 		cBatch.output(bytes.Repeat([]byte{'x'}, cBatch.opts.MTU), cBatch.opts.MTU)

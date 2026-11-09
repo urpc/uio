@@ -822,6 +822,11 @@ func TestBlockingAttachToClosingConnAndLayerWriteToContracts(t *testing.T) {
 	_, _ = bc.Writer().WritevContext(cctx, [][]byte{[]byte("x")})
 	_, _ = bc.Writer().WriteOwnedContext(cctx, AcquireBuffer(4))
 	_ = bc.FlushContext(cctx)
+	_, _ = bc.Writer().TryWriteOwned(nil)
+	_, _ = TryWriteOwned(plainCli, nil)
+	_, _ = TryWriteOwned(&fdConn{}, nil)
+	_, _ = TryWriteOwned(overStack.layers[0], nil)
+	_, _ = TryWriteOwned(nil, nil)
 }
 
 type partialOverflowLayer struct{ PassThrough }
