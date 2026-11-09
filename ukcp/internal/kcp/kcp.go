@@ -300,7 +300,6 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.rmt_wnd = IKCP_WND_RCV
 	kcp.mtu = IKCP_MTU_DEF
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
-	kcp.buffer = make([]byte, (kcp.mtu+IKCP_OVERHEAD)*3)
 	kcp.rx_rto = IKCP_RTO_DEF
 	kcp.rx_minrto = IKCP_RTO_MIN
 	kcp.interval = IKCP_INTERVAL
@@ -308,9 +307,9 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.ssthresh = IKCP_THRESH_INIT
 	kcp.dead_link = IKCP_DEADLINK
 	kcp.output = output
-	kcp.snd_buf = NewRingBuffer[segment](IKCP_WND_SND * 2)
-	kcp.rcv_queue = NewRingBuffer[segment](IKCP_WND_RCV * 2)
-	kcp.snd_queue = NewRingBuffer[segment](IKCP_WND_SND * 2)
+	kcp.snd_buf = NewRingBuffer[segment](RINGBUFFER_MIN)
+	kcp.rcv_queue = NewRingBuffer[segment](RINGBUFFER_MIN)
+	kcp.snd_queue = NewRingBuffer[segment](RINGBUFFER_MIN)
 	kcp.rcv_buf = newSegmentHeap()
 	return kcp
 }
@@ -808,24 +807,11 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 	seg.una = kcp.rcv_nxt
 
 	buffer := kcp.buffer
-	ptr := buffer
-
-	// --- Phase 1: Flush pending ACKs ---
-	if flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL {
-		for i, ack := range kcp.acklist {
-			// filter jitters caused by bufferbloat: in-order ACKs already
-			// covered by seg.una (rcv_nxt) collapse into the single latest ACK.
-			if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
-				ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
-				seg.sn, seg.ts = ack.sn, ack.ts
-				ptr = seg.encode(ptr)
-				if kcpTrace {
-					kcp.debugLog(IKCP_LOG_OUT_ACK, "conv", seg.conv, "sn", seg.sn, "una", seg.una, "ts", seg.ts)
-				}
-			}
-		}
-		kcp.acklist = kcp.acklist[0:0]
+	if buffer == nil {
+		buffer = defaultBufferPool.Get()
+		defer defaultBufferPool.Put(buffer)
 	}
+	ptr := buffer
 
 	// --- Phase 2: Window probing (when remote window is zero) ---
 	if kcp.rmt_wnd == 0 {
@@ -999,6 +985,24 @@ func (kcp *KCP) flush(flushType FlushType) (nextUpdate uint32) {
 		}
 	}
 
+	// Emit pending ACKs after full-MTU data segments so a [1400B PUSH, 24B ACK]
+	// pair forms a valid Linux UDP_SEGMENT (GSO) super-datagram (full-MTU first,
+	// shorter tail last) and coalesces with any trailing partial segment.
+	if (flushType == IKCP_FLUSH_ACKONLY || flushType == IKCP_FLUSH_FULL) && len(kcp.acklist) > 0 {
+		seg.cmd = IKCP_CMD_ACK
+		for i, ack := range kcp.acklist {
+			if _itimediff(ack.sn, kcp.rcv_nxt) >= 0 || len(kcp.acklist)-1 == i {
+				ptr = kcp.makeSpace(buffer, ptr, IKCP_OVERHEAD)
+				seg.sn, seg.ts = ack.sn, ack.ts
+				ptr = seg.encode(ptr)
+				if kcpTrace {
+					kcp.debugLog(IKCP_LOG_OUT_ACK, "conv", seg.conv, "sn", seg.sn, "una", seg.una, "ts", seg.ts)
+				}
+			}
+		}
+		kcp.acklist = kcp.acklist[0:0]
+	}
+
 	// --- Phase 6: Update congestion window ---
 	if kcp.nocwnd == 0 {
 		// Update ssthresh after fast retransmit.
@@ -1155,7 +1159,7 @@ func (kcp *KCP) SetMtu(mtu int) int {
 		return -1
 	}
 
-	bufferSize := (mtu + IKCP_OVERHEAD) * 3
+	bufferSize := mtu + IKCP_OVERHEAD
 	for segment := range kcp.snd_buf.ForEach {
 		if size := IKCP_OVERHEAD + len(segment.data); size > bufferSize {
 			bufferSize = size
@@ -1169,7 +1173,11 @@ func (kcp *KCP) SetMtu(mtu int) int {
 
 	kcp.mtu = uint32(mtu)
 	kcp.mss = kcp.mtu - IKCP_OVERHEAD
-	kcp.buffer = make([]byte, bufferSize)
+	if bufferSize > mtu+IKCP_OVERHEAD {
+		kcp.buffer = make([]byte, bufferSize)
+	} else {
+		kcp.buffer = nil
+	}
 	return 0
 }
 

@@ -50,10 +50,11 @@ type wakeState struct {
 	// split: a due published with a stale period would consume the timer as
 	// a one-shot and stop an interval forever. Only conns that arm a wake
 	// timer pay for any of this. The user callback never runs under mu.
-	mu     sync.Mutex
-	armed  bool
-	due    int64 // unix nanos; 0 is a legal deadline, so armed says whether one is set
-	period int64
+	mu      sync.Mutex
+	dueNano atomic.Int64 // atomic mirror of due (0 when unarmed) for lock-free fireWakeTimer check
+	armed   bool
+	due     int64 // unix nanos; 0 is a legal deadline, so armed says whether one is set
+	period  int64
 	// drain bounds a graceful close's wait for its output to leave. It lives
 	// on this lazily-allocated state, not the connection, so a connection
 	// that never closes gracefully pays nothing. The pointer is set once, by
@@ -149,13 +150,13 @@ func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
 	if wake == nil {
 		return false, nil
 	}
-	wake.mu.Lock()
-	if !wake.armed {
-		wake.mu.Unlock()
+	due := wake.dueNano.Load()
+	if due == 0 || time.Now().UnixNano() < due {
 		return false, nil
 	}
+	wake.mu.Lock()
 	now := time.Now().UnixNano()
-	if now < wake.due {
+	if !wake.armed || now < wake.due {
 		wake.mu.Unlock()
 		return false, nil
 	}
@@ -163,8 +164,10 @@ func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
 		// Skip the missed periods arithmetically: a tight interval backed up
 		// behind a long stall must not loop them off one by one.
 		wake.due += ((now-wake.due)/wake.period + 1) * wake.period
+		wake.dueNano.Store(max(wake.due, 1))
 	} else {
 		wake.armed = false
+		wake.dueNano.Store(0)
 	}
 	wake.mu.Unlock()
 	if conn.isClosing() {
@@ -183,6 +186,7 @@ func (conn *fdConn) armWake(when time.Time, every time.Duration) {
 	w.mu.Lock()
 	conn.loop.wakeWheel().Arm(w.entry, when, every)
 	w.armed, w.due, w.period = true, when.UnixNano(), int64(every)
+	w.dueNano.Store(max(w.due, 1))
 	w.mu.Unlock()
 }
 
@@ -195,6 +199,7 @@ func (conn *fdConn) cancelWakeTimer() {
 	}
 	wake.mu.Lock()
 	wake.armed = false
+	wake.dueNano.Store(0)
 	conn.loop.wakeWheel().Cancel(wake.entry)
 	wake.mu.Unlock()
 }

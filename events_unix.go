@@ -65,7 +65,7 @@ func (ev *Events) newDialedConn(scheme string, conn net.Conn) (*fdConn, error) {
 	fdc.setLocalAddr(local)
 	fdc.setRemoteAddr(remote)
 	if strings.HasPrefix(scheme, "udp") {
-		fdc.udp = &unixUDPState{groEnabled: socket.EnableGRO(fd)}
+		fdc.udp = &unixUDPState{groEnabled: ev.ReadBufferSize >= 64<<10 && socket.EnableGRO(fd)}
 	}
 	return fdc, nil
 }

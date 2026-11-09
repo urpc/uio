@@ -116,7 +116,7 @@ func (conn *fdConn) onRecvUDP() error {
 			n := min(batch.recvs[i].Len, slot)
 			totalRead += n
 			addr := batch.recvs[i].Addr
-			nextSamePeer := i+1 < got && (conn.udp.peers == nil || batch.recvs[i+1].Addr == addr)
+			nextSamePeer := i+1 < got && (conn.udp.peers == nil || hasPeerInBatch(batch.recvs[i+1:got], addr))
 			rawPkt := batch.slots[i][:n]
 			gro := int(batch.recvs[i].GROSize)
 			if gro > 0 && n > gro {
@@ -176,6 +176,15 @@ func newUDPBatch(slotSize, count int) *udpBatch {
 		batch.slots[i] = batch.data[i*slotSize : (i+1)*slotSize]
 	}
 	return batch
+}
+
+func hasPeerInBatch(recvs []socket.UDPReceive, addr socket.UDPAddress) bool {
+	for i := range recvs {
+		if recvs[i].Addr.Port == addr.Port && recvs[i].Addr == addr {
+			return true
+		}
+	}
+	return false
 }
 
 func (conn *fdConn) moreInUDPBatch() bool {

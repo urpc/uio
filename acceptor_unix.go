@@ -576,7 +576,7 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	}
 
 	l.fd = int(l.file.Fd())
-	if l.udp != nil {
+	if l.udp != nil && ld.events != nil && ld.events.ReadBufferSize >= 64<<10 {
 		l.groEnabled = socket.EnableGRO(l.fd)
 	}
 	l.network = u.Scheme

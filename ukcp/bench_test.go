@@ -81,7 +81,7 @@ func BenchmarkUDPBulkThroughput(b *testing.B) {
 
 	srvEv := &uio.Events{
 		Pollers:        1,
-		ReadBufferSize: 4 << 10,
+		ReadBufferSize: 64 << 10,
 		BlockingWrite:  true,
 		Handler: uio.FuncHandler{
 			Open: func(c uio.Conn) {

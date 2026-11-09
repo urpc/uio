@@ -27,8 +27,10 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/urpc/uio"
+	"github.com/urpc/uio/internal/plocal"
 	"github.com/urpc/uio/ukcp/internal/kcp"
 )
 
@@ -164,7 +166,9 @@ func (c *conn) establish(conv uint32) {
 	k.SetStreamMode(true)
 	k.NoDelay(boolInt(c.opts.NoDelay), int(c.opts.Interval/time.Millisecond), c.opts.Resend, boolInt(!c.opts.CongestionControl))
 	k.WndSize(c.opts.SendWindow, c.opts.RecvWindow)
-	_ = k.SetMtu(c.opts.MTU)
+	if c.opts.MTU != kcp.IKCP_MTU_DEF {
+		_ = k.SetMtu(c.opts.MTU)
+	}
 	k.SetDeadLink(c.opts.DeadLink)
 	c.kcp, c.conv = k, conv
 	c.mss = c.opts.MTU - kcpOverhead
@@ -179,8 +183,18 @@ func (c *conn) establish(conv uint32) {
 // one MTU datagram so control frames (ACK, WINS) and small writes share a
 // maxStagedDatagrams bounds one UDP flush batch to 40 datagrams (~56 KiB at
 // 1400B MTU) so each batch fits within one 64 KiB Linux UDP_SEGMENT (GSO)
-// super-datagram and within releaseStaging's 64 KiB retained buffer cap.
+// super-datagram and within one pooled 64 KiB staging buffer.
 const maxStagedDatagrams = 40
+
+type outStagingBuf struct {
+	data [64 << 10]byte
+}
+
+var outStagingPool = func() *plocal.Cache[*outStagingBuf] {
+	c := &plocal.Cache[*outStagingBuf]{}
+	c.Init(func() *outStagingBuf { return new(outStagingBuf) })
+	return c
+}()
 
 // output stages KCP segments and flushes them in a single batch at the end of
 // maintain / OnTurnEnd. Adjacent small segments (such as ACKs or control probes
@@ -204,10 +218,8 @@ func (c *conn) output(buf []byte, size int) {
 			c.sendBatch()
 		}
 	}
-	if c.packet && cap(c.out)-len(c.out) < size && cap(c.out) < 64<<10 {
-		grown := make([]byte, len(c.out), 64<<10)
-		copy(grown, c.out)
-		c.out = grown
+	if c.packet && c.out == nil && size <= 64<<10 {
+		c.out = outStagingPool.Get().data[:0]
 	}
 	c.out = append(c.out, buf[:size]...)
 	c.outEnds = append(c.outEnds, len(c.out))
@@ -247,12 +259,15 @@ func (c *conn) sendBatch() {
 
 func (c *conn) releaseStaging() {
 	clear(c.outVec)
-	c.out, c.outEnds, c.outVec = c.out[:0], c.outEnds[:0], c.outVec[:0]
-	maxKeep := 64 << 10
-	if c.kcp != nil && c.kcp.WaitSnd() > 0 {
-		maxKeep = 512 << 10
+	if cap(c.out) == 64<<10 {
+		buf := c.out[:64<<10]
+		c.out = nil
+		outStagingPool.Put((*outStagingBuf)(unsafe.Pointer(&buf[0])))
+		c.outEnds, c.outVec = c.outEnds[:0], c.outVec[:0]
+		return
 	}
-	if cap(c.out) > maxKeep {
+	c.out, c.outEnds, c.outVec = c.out[:0], c.outEnds[:0], c.outVec[:0]
+	if cap(c.out) > 4<<10 {
 		c.out, c.outEnds, c.outVec = nil, nil, nil
 	}
 }
@@ -333,7 +348,7 @@ func (c *conn) OnTurnEnd(uio.LayerContext) {
 	if !c.turnDirty || c.closed || c.ended || c.kcp == nil {
 		return
 	}
-	if c.packet && morePacketsInBatch(c.ctx.Lower()) && c.kcp.PendingAckCount() < 128 && c.kcp.Queued() == 0 {
+	if c.packet && morePacketsInBatch(c.ctx.Lower()) && c.kcp.PendingAckCount() < 128 && c.kcp.Queued() < 32 {
 		return
 	}
 	c.turnDirty = false

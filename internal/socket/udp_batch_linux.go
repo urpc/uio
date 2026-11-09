@@ -77,18 +77,30 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 		if len(pkt) == 0 {
 			return 0, nil
 		}
-		iov := unix.Iovec{Base: &pkt[0], Len: uint64(len(pkt))}
-		hdr := [1]mmsghdr{{Hdr: unix.Msghdr{Name: name, Namelen: nameLen, Iov: &iov, Iovlen: 1}}}
-		sent, err := sendmmsg(fd, hdr[:])
-		if sent > 0 {
-			return len(pkt), err
+		for {
+			n, _, errno := syscall.RawSyscall6(
+				unix.SYS_SENDTO,
+				uintptr(fd),
+				uintptr(unsafe.Pointer(&pkt[0])),
+				uintptr(len(pkt)),
+				0,
+				uintptr(unsafe.Pointer(name)),
+				uintptr(nameLen),
+			)
+			if errno == syscall.EINTR {
+				continue
+			}
+			if errno != 0 {
+				return 0, errno
+			}
+			return int(n), nil
 		}
-		return 0, err
 	}
-
 	_, isUnix := remote.(*syscall.SockaddrUnix)
-	useGSO := !isUnix
+	return sendUDPBatchMmsg(fd, packets, name, nameLen, !isUnix)
+}
 
+func sendUDPBatchMmsg(fd int, packets [][]byte, name *byte, nameLen uint32, useGSO bool) (int, error) {
 	var hdrs [udpBatchBound]mmsghdr
 	var iovs [udpBatchBound]unix.Iovec
 	var cmsgs [udpBatchBound]udpGSOCmsg
@@ -195,19 +207,23 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	}
 	var hdrs [udpBatchBound]mmsghdr
 	var iovs [udpBatchBound]unix.Iovec
+	useGRO := len(packets[0]) >= 64<<10
 	var cmsgs [udpBatchBound]udpGSOCmsg
 	for i := 0; i < count; i++ {
 		iovs[i] = unix.Iovec{Base: &packets[i][0], Len: uint64(len(packets[i]))}
 		receives[i].raw.Addr.Family = 0
 		receives[i].GROSize = 0
-		hdrs[i] = mmsghdr{Hdr: unix.Msghdr{
-			Name:       (*byte)(unsafe.Pointer(&receives[i].raw)),
-			Namelen:    unix.SizeofSockaddrAny,
-			Iov:        &iovs[i],
-			Iovlen:     1,
-			Control:    (*byte)(unsafe.Pointer(&cmsgs[i])),
-			Controllen: uint64(unsafe.Sizeof(cmsgs[i])),
-		}}
+		hdr := unix.Msghdr{
+			Name:    (*byte)(unsafe.Pointer(&receives[i].raw)),
+			Namelen: unix.SizeofSockaddrAny,
+			Iov:     &iovs[i],
+			Iovlen:  1,
+		}
+		if useGRO {
+			hdr.Control = (*byte)(unsafe.Pointer(&cmsgs[i]))
+			hdr.Controllen = uint64(unsafe.Sizeof(cmsgs[i]))
+		}
+		hdrs[i] = mmsghdr{Hdr: hdr}
 	}
 	got, err := recvmmsg(fd, hdrs[:count])
 	if err != nil {
@@ -215,7 +231,7 @@ func RecvUDPBatch(fd int, packets [][]byte, receives []UDPReceive) (int, error) 
 	}
 	for i := 0; i < got; i++ {
 		receives[i].Len = int(hdrs[i].Len)
-		if hdrs[i].Hdr.Flags&unix.MSG_CTRUNC == 0 &&
+		if useGRO && hdrs[i].Hdr.Flags&unix.MSG_CTRUNC == 0 &&
 			hdrs[i].Hdr.Controllen >= uint64(unix.CmsgLen(2)) &&
 			cmsgs[i].Hdr.Level == unix.SOL_UDP && cmsgs[i].Hdr.Type == unix.UDP_GRO {
 			receives[i].GROSize = cmsgs[i].Seg

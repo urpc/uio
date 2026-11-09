@@ -37,7 +37,7 @@ import (
 func main() {
 	addr := flag.String("addr", ":9528", "UDP listen address")
 	pollers := flag.Int("pollers", 0, "event loop count; zero uses the uio default")
-	buffer := flag.Int("buffer", 64<<10, "maximum bytes read per socket read")
+	buffer := flag.Int("buffer", 2048, "maximum bytes read per socket read")
 	sockBuf := flag.Int("sockbuf", 4<<20, "kernel UDP socket read/write buffer size in bytes")
 	mtu := flag.Int("mtu", 1400, "KCP maximum transmission unit (24..1500)")
 	sndWnd := flag.Int("sndwnd", 1024, "KCP send window size in segments")

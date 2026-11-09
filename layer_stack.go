@@ -207,6 +207,7 @@ type stack struct {
 	// slot is stopped, so ordinary turns do not reacquire timerMu after a
 	// one-shot timer has fired or a timer is cancelled.
 	hasTimers atomic.Bool
+	armedNano atomic.Int64
 	timerMu   sync.Mutex
 	timers    []timerSlot
 	armed     time.Time
@@ -1061,6 +1062,11 @@ func (c *stack) aimLocked(fired time.Time) error {
 		return nil
 	}
 	c.armed = earliest
+	if earliest.IsZero() {
+		c.armedNano.Store(0)
+	} else {
+		c.armedNano.Store(max(earliest.UnixNano(), 1))
+	}
 	return c.socket.SetWakeDeadline(earliest)
 }
 
@@ -1082,6 +1088,9 @@ func (c *stack) reaim() {
 // re-aimed at what remains.
 func (c *stack) takeDue() uint64 {
 	if !c.hasTimers.Load() {
+		return 0
+	}
+	if dueNano := c.armedNano.Load(); dueNano == 0 || time.Now().UnixNano() < dueNano {
 		return 0
 	}
 	c.timerMu.Lock()
@@ -1137,5 +1146,6 @@ func (c *stack) stopTimers() {
 	c.timerMu.Lock()
 	c.timers = nil
 	c.hasTimers.Store(false)
+	c.armedNano.Store(0)
 	c.timerMu.Unlock()
 }
