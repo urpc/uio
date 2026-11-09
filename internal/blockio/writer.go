@@ -360,15 +360,21 @@ func (w *Writer) TryWriteOwned(buf *bytebuf.Buffer) (int, error) {
 		bytebuf.ReleaseBuffer(buf)
 		return 0, nil
 	}
-	if len(w.wsem) == 0 && !w.waiter.parked.Load() && !w.closed.Load() && !w.waiter.expired.Load() {
-		if cw := int(w.customWin.Load()); cw <= 0 || w.src.OutboundBuffered()+buf.Len() <= cw {
-			n, err := w.src.WriteOwned(buf)
-			if err == nil {
-				return n, nil
+	if !w.waiter.parked.Load() && !w.closed.Load() && !w.waiter.expired.Load() {
+		select {
+		case w.wsem <- struct{}{}:
+			defer w.leaveWrite()
+			if cw := int(w.customWin.Load()); cw <= 0 || w.src.OutboundBuffered()+buf.Len() <= cw {
+				n, err := w.src.WriteOwned(buf)
+				if err == nil {
+					return n, nil
+				}
+				if !w.src.IsOverflow(err) {
+					return n, w.resolveWriteErr(err)
+				}
+				return n, ErrOverflow
 			}
-			if !w.src.IsOverflow(err) {
-				return n, w.resolveWriteErr(err)
-			}
+		default:
 		}
 	}
 	return 0, ErrOverflow

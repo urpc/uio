@@ -110,7 +110,7 @@ func (pool *ioTaskPool) connClosed() {
 // rescueRounds is how many rounds a waiter collects between looks for turn
 // queues stalled behind a worker that has not arrived; the pool itself spaces
 // its scans by time (see shardpool.Pool.Rescue).
-const rescueRounds = 16
+const rescueRounds = 128
 
 // rescueEpoch is the origin of the monotonic clock rescue passes the pool.
 var rescueEpoch = time.Now()

@@ -224,12 +224,9 @@ func (conn *fdConn) closeInTurn() {
 
 func (conn *fdConn) closeUnregistered() {
 	if conn.close.abandon() {
-		switch {
-		case conn.internal:
+		if conn.internal {
 			conn.releaseSocket()
-		case conn.udp != nil && conn.udp.file != nil:
-			_ = conn.udp.file.Close()
-		default:
+		} else {
 			_ = syscall.Close(int(conn.fd))
 		}
 	}
@@ -473,12 +470,14 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	if conn.udp != nil && conn.udp.server != nil {
 		// A child only leaves the peer map; its server owns the shared fd.
 		// DialPeer may have replaced it there already.
-		server := conn.udp.server.udp
-		server.peerMu.Lock()
-		if server.peers[conn.udp.key] == conn {
-			delete(server.peers, conn.udp.key)
+		members := lockUDPGroup(conn.udp.server)
+		conn.udp.forwarded = nil
+		for _, m := range members {
+			if m.udp.peers[conn.udp.key] == conn {
+				delete(m.udp.peers, conn.udp.key)
+			}
 		}
-		server.peerMu.Unlock()
+		unlockUDPGroup(members)
 	} else {
 		if conn.udp != nil && conn.udp.peers != nil {
 			conn.udp.peerMu.Lock()
@@ -490,6 +489,9 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 			conn.udp.waking = nil
 			conn.udp.peerMu.Unlock()
 			for _, child := range children {
+				if child.udp.server != conn {
+					continue
+				}
 				if childErr, ok := child.teardown(finalErr); ok {
 					child.scheduleCloseCallback(childErr)
 				}
@@ -510,9 +512,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 			conn.loop.forget(conn)
 		} else {
 			conn.loop.forget(conn)
-			if conn.udp != nil && conn.udp.file != nil {
-				_ = conn.udp.file.Close()
-			} else if !conn.closesOffTurn() || !conn.loop.deferClose(int(conn.fd)) {
+			if !conn.closesOffTurn() || !conn.loop.deferClose(int(conn.fd)) {
 				_ = syscall.Close(int(conn.fd))
 			}
 		}

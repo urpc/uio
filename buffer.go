@@ -96,13 +96,16 @@ func TryWriteOwned(conn Conn, buffer *Buffer) (int, error) {
 		}
 		return n, err
 	}
-	if conn == nil {
-		ReleaseBuffer(buffer)
-		return 0, ErrUnsupported
+	if ln, ok := conn.(*layerNode); ok {
+		if st := ln.stack.block.Load(); st == nil || !st.HasWriter() {
+			return ln.writeOwnedPreservePartial(buffer)
+		}
+		n, err := ln.ensureBlockWriter().TryWriteOwned(buffer)
+		if err == blockio.ErrOverflow {
+			return n, ErrOutboundOverflow
+		}
+		return n, err
 	}
-	bw, err := NewBlockingWriter(conn)
-	if err != nil {
-		return conn.WriteOwned(buffer)
-	}
-	return bw.TryWriteOwned(buffer)
+	ReleaseBuffer(buffer)
+	return 0, ErrUnsupported
 }

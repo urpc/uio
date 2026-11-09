@@ -30,7 +30,6 @@ import (
 	"github.com/urpc/uio"
 	_ "github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/plocal"
-	"github.com/urpc/uio/internal/writecontrol"
 	"github.com/urpc/uio/uws/internal/frame"
 )
 
@@ -465,7 +464,7 @@ func (c *Conn) send(typ MessageType, payload []byte) error {
 			return err
 		}
 	} else if sent, err := c.sendShortLocked(opcode, payload); sent {
-		c.unlockWrite()
+		c.writes.mu.Unlock()
 		return err
 	}
 	return c.sendLocked(opcode, payload)
@@ -737,11 +736,8 @@ func (c *Conn) sendShortLocked(opcode frame.OpCode, payload []byte) (bool, error
 	if size > 125 {
 		wireSize, head = size+4, 4
 	}
-	if c.outboundRefuses(wireSize) {
-		return true, c.errBackpressure()
-	}
-	if reserver, ok := c.raw.(writecontrol.TurnReserver); ok {
-		if dst, reserved, err := reserver.ReserveTurnWrite(wireSize); reserved {
+	if c.reserver != nil {
+		if dst, reserved, err := c.reserver.ReserveTurnWrite(wireSize); reserved {
 			if err != nil {
 				return true, c.finishFrameWrite(opcode, 0, wireSize, err)
 			}

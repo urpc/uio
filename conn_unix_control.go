@@ -187,11 +187,7 @@ func (server *fdConn) releaseSocket() <-chan struct{} {
 		}
 		server.loop.fdMap.DeleteValue(int(server.fd), server)
 		_ = server.loop.poller.Remove(int(server.fd), server.currentInterest())
-		if server.udp.file != nil {
-			_ = server.udp.file.Close()
-		} else {
-			_ = syscall.Close(int(server.fd))
-		}
+		_ = syscall.Close(int(server.fd))
 	}()
 	return done
 }

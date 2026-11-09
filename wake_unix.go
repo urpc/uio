@@ -184,9 +184,9 @@ func (conn *fdConn) fireWakeTimer() (skipRead bool, err error) {
 func (conn *fdConn) armWake(when time.Time, every time.Duration) {
 	w := conn.wakeState()
 	w.mu.Lock()
-	conn.loop.wakeWheel().Arm(w.entry, when, every)
 	w.armed, w.due, w.period = true, when.UnixNano(), int64(every)
 	w.dueNano.Store(max(w.due, 1))
+	conn.loop.wakeWheel().Arm(w.entry, when, every)
 	w.mu.Unlock()
 }
 

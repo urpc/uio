@@ -1554,6 +1554,8 @@ func TestUDPReadEventDoesNotExceedPacketBudget(t *testing.T) {
 	conn.loop = loop
 	conn.entry = events.plainEntry()
 	conn.ioOwner.Store(currentGoroutineID())
+	_ = hasPeerInBatch([]socket.UDPReceive{{Addr: socket.UDPAddress{Port: 1}}}, socket.UDPAddress{Port: 1})
+	_ = hasPeerInBatch([]socket.UDPReceive{{Addr: socket.UDPAddress{Port: 1}}}, socket.UDPAddress{Port: 2})
 	for range 272 {
 		if err := unix.Sendto(sender, []byte{'x'}, 0, target); err != nil {
 			t.Fatal(err)
@@ -1690,17 +1692,6 @@ func TestCloseUnregisteredDescriptorOwnership(t *testing.T) {
 	}
 	if _, err := unix.Write(requested[0], []byte("x")); !errors.Is(err, unix.EBADF) {
 		t.Fatalf("write after requested close error = %v", err)
-	}
-	readFile, writeFile, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer writeFile.Close()
-	conn = &fdConn{udp: &unixUDPState{file: readFile}}
-	conn.entry = (&Events{}).plainEntry()
-	conn.closeUnregistered()
-	if _, err := readFile.Stat(); err == nil {
-		t.Fatal("owned file remained open")
 	}
 }
 

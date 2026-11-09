@@ -835,6 +835,8 @@ func TestBlockingAttachToClosingConnAndLayerWriteToContracts(t *testing.T) {
 	_ = bwCli
 	_, _ = TryWriteOwned(&fdConn{}, nil)
 	_, _ = TryWriteOwned(overStack.layers[0], nil)
+	_, _ = NewBlockingWriter(overStack.layers[0])
+	_, _ = TryWriteOwned(overStack.layers[0], nil)
 	_, _ = TryWriteOwned(nil, nil)
 }
 

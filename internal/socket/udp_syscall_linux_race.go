@@ -27,6 +27,28 @@ import (
 
 // Race builds keep runtime-accounted syscalls so the race detector's syscall
 // synchronization annotations remain intact.
+func sendtoSyscall(fd int, pkt []byte, name *byte, nameLen uint32) (int, error) {
+	for {
+		n, _, errno := unix.Syscall6(
+			unix.SYS_SENDTO,
+			uintptr(fd),
+			uintptr(unsafe.Pointer(&pkt[0])),
+			uintptr(len(pkt)),
+			0,
+			uintptr(unsafe.Pointer(name)),
+			uintptr(nameLen),
+		)
+		runtime.KeepAlive(pkt)
+		if errno == unix.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return 0, errno
+		}
+		return int(n), nil
+	}
+}
+
 func sendmmsgSyscall(fd int, messages []mmsghdr) (int, error) {
 	sent, _, errno := unix.Syscall6(unix.SYS_SENDMMSG, uintptr(fd), uintptr(unsafe.Pointer(&messages[0])), uintptr(len(messages)), 0, 0, 0)
 	runtime.KeepAlive(messages)

@@ -5,6 +5,7 @@ package uio
 import (
 	"net"
 
+	"github.com/urpc/uio/internal/bytebuf"
 	"github.com/urpc/uio/internal/writecontrol"
 )
 
@@ -28,23 +29,43 @@ func (conn *fdConn) ensureWriteControl() *writecontrol.Control {
 }
 
 func (conn *fdConn) ReserveTurnWrite(n int) ([]byte, bool, error) {
-	if n <= 0 || conn.isDatagram() || conn.ioOwner.Load() != currentGoroutineID() || conn.scratch == nil || conn.turn&turnFlushing != 0 {
+	if n <= 0 || conn.isDatagram() || !conn.directOwner() || conn.scratch == nil || conn.turn&turnFlushing != 0 {
 		return nil, false, nil
 	}
+	holder := conn.scratch
 	if conn.outputClosed() {
 		return nil, true, net.ErrClosed
 	}
-	if !conn.turnHoldsWrite() && !conn.tryClaimWrite(writeTurnHeldFlag) {
+	took := !conn.turnHoldsWrite()
+	if took && !conn.tryClaimWrite(writeTurnHeldFlag) {
 		return nil, false, nil
 	}
-	out, _, err := conn.prepareScratch(n)
+	reserved, err := conn.reservePendingAfterFlush(int64(n))
+	if err == nil && !reserved {
+		err = conn.errOutboundOverflow()
+	}
 	if err != nil {
+		if took {
+			conn.releaseWriteAndKick()
+		}
 		return nil, true, err
 	}
+	out := holder.out
+	used := 0
 	if out != nil {
-		dst := out.AvailableBuffer()[:n:n]
-		out.CommitWrite(n)
-		return dst, true, nil
+		used = out.Len()
+	}
+	if conn.pending.Load() == int64(used+n) {
+		if out == nil {
+			out = bytebuf.AcquireBuffer(conn.coalesceBlockSize())
+			holder.out = out
+		}
+		if out.Available() >= n {
+			dst := out.AvailableBuffer()[:n:n]
+			out.CommitWrite(n)
+			return dst, true, nil
+		}
+		conn.handOverScratch()
 	}
 	conn.submitMu.Lock()
 	dst := conn.outbound.Reserve(n, conn.coalesceBlockSize())

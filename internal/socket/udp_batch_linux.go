@@ -77,24 +77,7 @@ func SendUDPBatch(fd int, packets [][]byte, remote syscall.Sockaddr) (int, error
 		if len(pkt) == 0 {
 			return 0, nil
 		}
-		for {
-			n, _, errno := syscall.RawSyscall6(
-				unix.SYS_SENDTO,
-				uintptr(fd),
-				uintptr(unsafe.Pointer(&pkt[0])),
-				uintptr(len(pkt)),
-				0,
-				uintptr(unsafe.Pointer(name)),
-				uintptr(nameLen),
-			)
-			if errno == syscall.EINTR {
-				continue
-			}
-			if errno != 0 {
-				return 0, errno
-			}
-			return int(n), nil
-		}
+		return sendtoSyscall(fd, pkt, name, nameLen)
 	}
 	_, isUnix := remote.(*syscall.SockaddrUnix)
 	return sendUDPBatchMmsg(fd, packets, name, nameLen, !isUnix)

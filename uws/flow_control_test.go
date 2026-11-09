@@ -1164,7 +1164,8 @@ func TestReadPausedAndStartupGuardContracts(t *testing.T) {
 	watchConn.ensureCloseWatch() // idempotent
 
 	trMock := &turnReserveMock{}
-	trConn := &Conn{raw: trMock, config: testServerConfig(nil)}
+	trConn := &Conn{config: testServerConfig(nil)}
+	trConn.setRaw(trMock)
 	trConn.opened.Store(true)
 	if err := trConn.SendBinary([]byte("fast")); err != nil {
 		t.Fatalf("TurnReserver SendBinary = %v", err)

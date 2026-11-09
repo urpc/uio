@@ -219,14 +219,12 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 	}
 	group = append(group, l)
 
-	if l.udp != nil && (!ld.events.ReusePort || !reusePortBalances) {
-		return group, nil
-	}
-
 	count := 1
 	if ld.events.ReusePort {
 		if l.tcp {
 			count = reusePortListeners(runtime.GOMAXPROCS(0), len(ld.events.loops))
+		} else if listenersOverride > 0 {
+			count = listenersOverride
 		} else if reusePortBalances {
 			count = max(1, runtime.GOMAXPROCS(0))
 		}
@@ -293,13 +291,11 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			}
 			l.udpSvr.fd = int32(l.fd)
 			l.udpSvr.udp = &unixUDPState{
-				file:       l.file,
 				peers:      make(map[socket.UDPAddress]*fdConn),
 				family:     family,
 				groEnabled: l.groEnabled,
 				shardKey:   uint32(i),
 			}
-			l.file = nil // The logical server owns the duplicated poller fd.
 			l.udpSvr.loop = ld.events.selectLoop()
 			l.udpSvr.internal = true
 			l.udpSvr.addr = l.pair
@@ -324,7 +320,20 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 			l.acceptLocal = true
 		}
 	}
+	if len(group) > 1 && group[0].udp != nil {
+		linkUDPGroup(group)
+	}
 	return nil
+}
+
+func linkUDPGroup(group []*listener) {
+	servers := make([]*fdConn, len(group))
+	for i, l := range group {
+		servers[i] = l.udpSvr
+	}
+	for _, s := range servers {
+		s.udp.group = servers
+	}
 }
 
 // listenGroup adds addr while Serve runs: it records its listeners and starts
@@ -466,6 +475,8 @@ func (ld *acceptor) closeListener(l *listener) {
 	}
 	if l.file != nil && l.udpSvr == nil {
 		_ = l.file.Close()
+	} else if l.udp != nil && l.udpSvr == nil && l.fd > 0 {
+		_ = syscall.Close(l.fd)
 	}
 	if l.ln != nil {
 		if _, ok := l.ln.(*net.UnixListener); ok {
@@ -555,10 +566,13 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 
 	switch ln := l.ln.(type) {
 	case nil:
-		// udp listener
+		// udp listener: duplicate the raw descriptor via SyscallConn and close
+		// the net.UDPConn wrapper immediately so the socket is removed from the
+		// Go runtime's global netpoller instead of waking it on every datagram.
 		switch pc := l.udp.(type) {
 		case *net.UDPConn:
-			l.file, err = pc.File()
+			l.fd, err = socket.DupNetConn(pc)
+			_ = pc.Close()
 		default:
 			err = fmt.Errorf("unsupported udp connection type: %T", l.udp)
 		}
@@ -575,8 +589,10 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 		return nil, err
 	}
 
-	l.fd = int(l.file.Fd())
-	if l.udp != nil && ld.events != nil && ld.events.ReadBufferSize >= 64<<10 {
+	if l.file != nil {
+		l.fd = int(l.file.Fd())
+	}
+	if l.udp != nil && ld.events != nil && max(ld.events.readBufSize, ld.events.ReadBufferSize) >= 64<<10 {
 		l.groEnabled = socket.EnableGRO(l.fd)
 	}
 	l.network = u.Scheme

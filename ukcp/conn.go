@@ -214,7 +214,7 @@ func (c *conn) output(buf []byte, size int) {
 			c.outEnds[n-1] = len(c.out)
 			return
 		}
-		if c.packet && n >= maxStagedDatagrams {
+		if c.packet && (n >= maxStagedDatagrams || len(c.out)+size > 64<<10) {
 			c.sendBatch()
 		}
 	}
@@ -259,7 +259,7 @@ func (c *conn) sendBatch() {
 
 func (c *conn) releaseStaging() {
 	clear(c.outVec)
-	if cap(c.out) == 64<<10 {
+	if c.packet && cap(c.out) == 64<<10 {
 		buf := c.out[:64<<10]
 		c.out = nil
 		outStagingPool.Put((*outStagingBuf)(unsafe.Pointer(&buf[0])))
@@ -267,7 +267,7 @@ func (c *conn) releaseStaging() {
 		return
 	}
 	c.out, c.outEnds, c.outVec = c.out[:0], c.outEnds[:0], c.outVec[:0]
-	if cap(c.out) > 4<<10 {
+	if cap(c.out) > 64<<10 {
 		c.out, c.outEnds, c.outVec = nil, nil, nil
 	}
 }
@@ -689,6 +689,7 @@ func (c *conn) OnClose(_ uio.LayerContext, cause error) {
 	c.closed, c.ended = true, true
 	c.kcp = nil
 	c.pending = nil
+	c.releaseStaging()
 	c.out, c.outEnds, c.outVec = nil, nil, nil
 	c.held.Store(0)
 	c.stateLive.Store(false)

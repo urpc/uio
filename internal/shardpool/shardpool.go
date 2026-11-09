@@ -109,7 +109,7 @@ const (
 	// rescueEvery spaces Rescue's scans, and rescueStalls is how many scans
 	// in a row must find a queue stalled before Rescue brings it a worker.
 	rescueEvery  = int64(time.Millisecond)
-	rescueStalls = 2
+	rescueStalls = 4
 	idleTicks    = int64(MaxIdle / janitorTick)
 )
 

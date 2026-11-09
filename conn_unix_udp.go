@@ -24,7 +24,6 @@ package uio
 import (
 	"net"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -39,16 +38,17 @@ import (
 // to them; a child closed or woken from elsewhere is queued for the server's
 // next turn.
 type unixUDPState struct {
-	file   *os.File // owns a duplicated UDP listener fd when non-nil
 	remote syscall.Sockaddr
 	server *fdConn
 	peers  map[socket.UDPAddress]*fdConn
 	key    socket.UDPAddress
 
-	family      uint8  // server only: the socket's address family, 4 or 6
-	moreInBatch bool   // true while additional datagrams for this peer wait in the active recvmmsg batch
-	groEnabled  bool   // true if UDP_GRO is enabled on this socket
-	shardKey    uint32 // server only: 1-to-1 shard index in a ReusePort UDP group
+	family      uint8     // server only: the socket's address family, 4 or 6
+	moreInBatch bool      // true while additional datagrams for this peer wait in the active recvmmsg batch
+	groEnabled  bool      // true if UDP_GRO is enabled on this socket
+	shardKey    uint32    // server only: 1-to-1 shard index in a ReusePort UDP group
+	group       []*fdConn // server only: all sibling servers in a ReusePort UDP group
+	forwarded   [][]byte  // dialed child only: datagrams received on sibling ReusePort sockets
 
 	// peerMu guards a server's peers, which its turns read for every
 	// datagram and DialPeer adds to from any goroutine, and its queues.
@@ -229,6 +229,10 @@ func (conn *fdConn) handleUDPPacketCached(packet []byte, source socket.UDPAddres
 			if packetConn == nil {
 				return nil, socket.UDPAddress{}
 			}
+			if packetConn.udp.server != conn {
+				forwardPacketToOwner(packetConn, packet)
+				return nil, socket.UDPAddress{}
+			}
 			if created || packetConn.udp.openOwed.CompareAndSwap(true, false) {
 				packetConn.fireOnOpen()
 			}
@@ -237,6 +241,14 @@ func (conn *fdConn) handleUDPPacketCached(packet []byte, source socket.UDPAddres
 	if packetConn.isClosing() {
 		return nil, socket.UDPAddress{}
 	}
+	if err := packetConn.deliverUDPPacket(packet, more); err != nil {
+		packetConn.requestClose(err)
+		return nil, socket.UDPAddress{}
+	}
+	return packetConn, source
+}
+
+func (packetConn *fdConn) deliverUDPPacket(packet []byte, more bool) error {
 	packetConn.udp.moreInBatch = more
 	packetConn.inboundTail = packet
 	packetConn.events().onSocketBytesRead(packetConn, len(packet))
@@ -251,11 +263,38 @@ func (conn *fdConn) handleUDPPacketCached(packet []byte, source socket.UDPAddres
 		}()
 		err = packetConn.fireOnRead()
 	}()
-	if err != nil {
-		packetConn.requestClose(err)
-		return nil, socket.UDPAddress{}
+	return err
+}
+
+func forwardPacketToOwner(child *fdConn, packet []byte) {
+	owner := child.udp.server
+	owner.udp.peerMu.Lock()
+	if owner.udp.peers == nil || child.isClosing() || owner.isClosing() {
+		owner.udp.peerMu.Unlock()
+		return
 	}
-	return packetConn, source
+	child.udp.forwarded = append(child.udp.forwarded, append([]byte(nil), packet...))
+	owner.udp.waking = append(owner.udp.waking, child)
+	owner.udp.peerMu.Unlock()
+	owner.scheduleIO(ioEventPeers)
+}
+
+func lockUDPGroup(server *fdConn) []*fdConn {
+	group := server.udp.group
+	if len(group) <= 1 {
+		server.udp.peerMu.Lock()
+		return []*fdConn{server}
+	}
+	for _, s := range group {
+		s.udp.peerMu.Lock()
+	}
+	return group
+}
+
+func unlockUDPGroup(group []*fdConn) {
+	for i := len(group) - 1; i >= 0; i-- {
+		group[i].udp.peerMu.Unlock()
+	}
 }
 
 // dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
@@ -269,20 +308,21 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 		return nil, err
 	}
 	sockaddr := key.Sockaddr()
-	udp.peerMu.Lock()
+	members := lockUDPGroup(server)
 	if udp.peers == nil || server.isClosing() || server.events().closing.Load() {
-		udp.peerMu.Unlock()
+		unlockUDPGroup(members)
 		return nil, net.ErrClosed
 	}
-	if existing := udp.peers[key]; existing != nil {
-		if !existing.isClosing() {
-			udp.peerMu.Unlock()
+	for _, m := range members {
+		if existing := m.udp.peers[key]; existing != nil && !existing.isClosing() {
+			unlockUDPGroup(members)
 			return existing, ErrPeerExists
 		}
-		// Transfer ownership before replacing the address entry. The old
-		// closer may still be between marking closing and queuePeer, so the
-		// server must retain it even if shutdown wins before that hand-off.
-		udp.closing = append(udp.closing, existing)
+	}
+	for _, m := range members {
+		if existing := m.udp.peers[key]; existing != nil && existing.udp.server == m {
+			m.udp.closing = append(m.udp.closing, existing)
+		}
 	}
 	child := &fdConn{fd: server.fd, udp: &unixUDPState{remote: sockaddr, server: server, key: key}}
 	child.entry = server.entry
@@ -290,11 +330,13 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	child.addr, child.remoteAddr = server.addr, key.NetAddr().AddrPort()
 	child.SetUserdata(userdata)
 	child.udp.openOwed.Store(true)
-	// A closing child still in the map is replaced: its release leaves the
-	// new one there.
-	udp.peers[key] = child
+	for _, m := range members {
+		if m.udp.peers != nil {
+			m.udp.peers[key] = child
+		}
+	}
 	udp.opening = append(udp.opening, child)
-	udp.peerMu.Unlock()
+	unlockUDPGroup(members)
 	server.scheduleIO(ioEventPeers)
 	return child, nil
 }
@@ -382,13 +424,29 @@ func (server *fdConn) settlePeers() {
 			udp.peerMu.Unlock()
 			break
 		}
+		var fwdPkt []byte
+		hasFwd := false
+		if wake && len(child.udp.forwarded) != 0 {
+			fwdPkt, hasFwd = child.udp.forwarded[0], true
+			child.udp.forwarded[0] = nil
+			child.udp.forwarded = child.udp.forwarded[1:]
+		}
 		udp.peerMu.Unlock()
 		if !wake {
 			if finalErr, ok := child.teardown(nil); ok {
 				child.deliverClose(finalErr)
 			}
 		} else if !child.isClosing() {
-			if err := child.fireOnRead(); err != nil {
+			if hasFwd {
+				if child.udp.openOwed.CompareAndSwap(true, false) {
+					child.fireOnOpen()
+				}
+				if !child.isClosing() {
+					if err := child.deliverUDPPacket(fwdPkt, false); err != nil {
+						child.requestClose(err)
+					}
+				}
+			} else if err := child.fireOnRead(); err != nil {
 				child.requestClose(err)
 			}
 		}

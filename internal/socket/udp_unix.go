@@ -55,29 +55,23 @@ func RecvUDP(fd int, packet []byte, receive *UDPReceive) (int, error) {
 	if len(packet) > 0 {
 		data = unsafe.Pointer(&packet[0])
 	}
-	for {
-		n, _, errno := syscall.RawSyscall6(
-			unix.SYS_RECVFROM,
-			uintptr(fd),
-			uintptr(data),
-			uintptr(len(packet)),
-			0,
-			uintptr(unsafe.Pointer(&receive.raw)),
-			uintptr(unsafe.Pointer(&addrLen)),
-		)
-		if errno == syscall.EINTR {
-			addrLen = uint32(unix.SizeofSockaddrAny)
-			continue
-		}
-		if errno != 0 {
-			return int(n), errno
-		}
-		if err := receive.parse(addrLen); err != nil {
-			return int(n), err
-		}
-		receive.Len = int(n)
-		return int(n), nil
+	n, _, errno := unix.Syscall6(
+		unix.SYS_RECVFROM,
+		uintptr(fd),
+		uintptr(data),
+		uintptr(len(packet)),
+		0,
+		uintptr(unsafe.Pointer(&receive.raw)),
+		uintptr(unsafe.Pointer(&addrLen)),
+	)
+	if errno != 0 {
+		return int(n), errno
 	}
+	if err := receive.parse(addrLen); err != nil {
+		return int(n), err
+	}
+	receive.Len = int(n)
+	return int(n), nil
 }
 
 // parse converts kernel sockaddr storage into a comparable allocation-free key.

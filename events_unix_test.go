@@ -12,6 +12,7 @@ import (
 	"golang.org/x/sys/unix"
 	"io"
 	"net"
+	"net/netip"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -602,6 +603,44 @@ func TestListenReusePortGroup(t *testing.T) {
 	}
 	_ = ln.Close()
 	waitRefused(t, addr)
+
+	events.ReadBufferSize = 64 << 10
+	udpLn, err := events.Listen("udp://127.0.0.1:0", WithUserdata("udp-group"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpLn.Close()
+	pktLn := udpLn.(PacketListener)
+	for range 8 {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		raddr := netip.MustParseAddrPort(pc.LocalAddr().String())
+		peerConn, err := pktLn.DialPeer(raddr, "dialed-peer")
+		if err != nil {
+			_ = pc.Close()
+			t.Fatal(err)
+		}
+		if _, err := pktLn.DialPeer(raddr, "dup"); !errors.Is(err, ErrPeerExists) {
+			_ = pc.Close()
+			t.Fatalf("second DialPeer = %v, want ErrPeerExists", err)
+		}
+		_, _ = pc.WriteTo([]byte("ping"), udpLn.Addr())
+		buf := make([]byte, 32)
+		_ = pc.SetReadDeadline(time.Now().Add(2 * time.Second))
+		n, _, err := pc.ReadFrom(buf)
+		_ = pc.Close()
+		_ = peerConn.Close()
+		if err != nil || string(buf[:n]) != "ping" || peerConn.Userdata() != "dialed-peer" {
+			t.Fatalf("UDP ReusePort DialPeer reply = %q (%v), err = %v", buf[:n], peerConn.Userdata(), err)
+		}
+	}
+	for _, ud := range h.userdata()[6:] {
+		if ud != "dialed-peer" {
+			t.Fatalf("server OnRead saw userdata = %v, want dialed-peer", ud)
+		}
+	}
 }
 
 func eachWaitMode(t *testing.T, test func(t *testing.T)) {

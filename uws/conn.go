@@ -39,6 +39,7 @@ import (
 // as the struct's size class allows.
 type Conn struct {
 	raw         uio.Lower
+	reserver    writecontrol.TurnReserver
 	config      *connConfig
 	handler     Handler
 	parser      *frame.Parser    // retained only while a frame spans input reads
@@ -75,6 +76,7 @@ type Conn struct {
 // writecontrol progress notifications on layered transports.
 func (c *Conn) setRaw(raw uio.Lower) {
 	c.raw = raw
+	c.reserver, _ = raw.(writecontrol.TurnReserver)
 	_, asLayer := c.handler.(layerSink)
 	if !asLayer && uio.LayerOf(raw) == nil {
 		return
