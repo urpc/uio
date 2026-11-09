@@ -212,6 +212,9 @@ func (turn *writeTurn) ShardKey() uint32 { return (*fdConn)(turn).turnKey() }
 // the loops pick connections in turn (see Events.loopAt), a closed-loop echo's
 // p99 at 512 connections rose by 60%.
 func (conn *fdConn) turnKey() uint32 {
+	if conn.internal && conn.udp != nil {
+		return conn.udp.shardKey
+	}
 	if conn.loop == nil {
 		return uint32(conn.fd)
 	}

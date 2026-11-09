@@ -824,6 +824,15 @@ func TestBlockingAttachToClosingConnAndLayerWriteToContracts(t *testing.T) {
 	_ = bc.FlushContext(cctx)
 	_, _ = bc.Writer().TryWriteOwned(nil)
 	_, _ = TryWriteOwned(plainCli, nil)
+	bwCli, _ := NewBlockingWriter(plainCli, WithBufferSize(2))
+	_, _ = TryWriteOwned(plainCli, nil)
+	bigTry := AcquireBuffer(8)
+	_, _ = bigTry.Write([]byte("123456"))
+	if _, err := TryWriteOwned(plainCli, bigTry); !errors.Is(err, ErrOutboundOverflow) {
+		t.Fatalf("TryWriteOwned over customWin = %v, want ErrOutboundOverflow", err)
+	}
+	ReleaseBuffer(bigTry)
+	_ = bwCli
 	_, _ = TryWriteOwned(&fdConn{}, nil)
 	_, _ = TryWriteOwned(overStack.layers[0], nil)
 	_, _ = TryWriteOwned(nil, nil)

@@ -865,10 +865,17 @@ func TestWriterWritevAndFairness(t *testing.T) {
 		t.Fatalf("TryWriteOwned over customWin = %v, want ErrOverflow", err)
 	}
 	base.writeErr = io.ErrClosedPipe
-	if _, err := w.TryWriteOwned(overTryBuf); err != nil {
-		// expected
+	smallErrBuf := bytebuf.AcquireBuffer(4)
+	_, _ = smallErrBuf.Write([]byte("er"))
+	if _, err := w.TryWriteOwned(smallErrBuf); err == nil {
+		t.Fatal("expected error from TryWriteOwned")
 	}
 	base.writeErr = nil
+	w.waiter.parked.Store(true)
+	if _, err := w.TryWriteOwned(overTryBuf); !errors.Is(err, ErrOverflow) {
+		t.Fatalf("TryWriteOwned while parked = %v, want ErrOverflow", err)
+	}
+	w.waiter.parked.Store(false)
 	bytebuf.ReleaseBuffer(overTryBuf)
 	base.drainOut(32)
 

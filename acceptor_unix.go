@@ -219,14 +219,17 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 	}
 	group = append(group, l)
 
-	if l.udp != nil {
-		l.groEnabled = socket.EnableGRO(l.fd)
+	if l.udp != nil && (!ld.events.ReusePort || !reusePortBalances) {
 		return group, nil
 	}
 
 	count := 1
-	if ld.events.ReusePort && l.tcp {
-		count = reusePortListeners(runtime.GOMAXPROCS(0), len(ld.events.loops))
+	if ld.events.ReusePort {
+		if l.tcp {
+			count = reusePortListeners(runtime.GOMAXPROCS(0), len(ld.events.loops))
+		} else if reusePortBalances {
+			count = max(1, runtime.GOMAXPROCS(0))
+		}
 	}
 	// The others bind the concrete address l resolved, so a port of zero
 	// still yields one shared port. The scheme goes along: without it the
@@ -236,7 +239,7 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 	if mark := strings.Index(addr, "://"); mark >= 0 {
 		scheme = addr[:mark]
 	}
-	resolved := scheme + "://" + l.ln.Addr().String()
+	resolved := scheme + "://" + l.pair.local.String()
 	for range count - 1 {
 		next, err := ld.listen(resolved, true, control)
 		if err != nil {
@@ -246,9 +249,6 @@ func (ld *acceptor) bindGroup(addr string, control SocketControl) (group []*list
 				ld.closeListener(next)
 			}
 			return group, err
-		}
-		if next.udp != nil {
-			next.groEnabled = socket.EnableGRO(next.fd)
 		}
 		group = append(group, next)
 	}
@@ -273,7 +273,7 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 	if ld.listeners == nil {
 		ld.listeners = make(map[int]*listener)
 	}
-	for _, l := range group {
+	for i, l := range group {
 		l.userdata = userdata
 		if userdata != nil {
 			box := userdata
@@ -297,6 +297,7 @@ func (ld *acceptor) addGroupLocked(group []*listener, userdata any) (err error) 
 				peers:      make(map[socket.UDPAddress]*fdConn),
 				family:     family,
 				groEnabled: l.groEnabled,
+				shardKey:   uint32(i),
 			}
 			l.file = nil // The logical server owns the duplicated poller fd.
 			l.udpSvr.loop = ld.events.selectLoop()
@@ -575,6 +576,9 @@ func (ld *acceptor) listen(addr string, reusePort bool, control SocketControl) (
 	}
 
 	l.fd = int(l.file.Fd())
+	if l.udp != nil {
+		l.groEnabled = socket.EnableGRO(l.fd)
+	}
 	l.network = u.Scheme
 	l.tcp = strings.HasPrefix(u.Scheme, "tcp")
 	return &l, syscall.SetNonblock(l.fd, true)

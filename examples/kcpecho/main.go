@@ -27,7 +27,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
-	"sync"
+	"syscall"
 	"time"
 
 	"github.com/urpc/uio"
@@ -47,7 +47,7 @@ func main() {
 	resend := flag.Int("resend", 2, "KCP fast retransmit duplicate ACK threshold (-1 disables)")
 	cc := flag.Bool("cc", false, "enable KCP congestion window")
 	lockOS := flag.Bool("lockos", false, "lock each event loop to its OS thread")
-	reusePort := flag.Bool("reuseport", false, "set SO_REUSEPORT on the listener")
+	reusePort := flag.Bool("reuseport", true, "set SO_REUSEPORT to scale UDP queues across CPU cores")
 	flag.Parse()
 
 	listenAddr := *addr
@@ -69,7 +69,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	var tuneOnce sync.Once
 	started := make(chan struct{})
 	events := &uio.Events{
 		Pollers:        *pollers,
@@ -80,16 +79,6 @@ func main() {
 			Start: func(*uio.Events) { close(started) },
 		},
 		Handler: uio.FuncHandler{
-			Open: func(c uio.Conn) {
-				if *sockBuf > 0 {
-					tuneOnce.Do(func() {
-						if raw, ok := uio.SocketOf(c); ok {
-							_ = raw.SetReadBuffer(*sockBuf)
-							_ = raw.SetWriteBuffer(*sockBuf)
-						}
-					})
-				}
-			},
 			Read: func(c uio.Conn) error {
 				_, err := c.WriteTo(c)
 				return err
@@ -103,7 +92,15 @@ func main() {
 	}()
 	<-started
 
-	ln, err := events.Listen(listenAddr, uio.WithLayers(ukcp.ServerLayer(kcpOpts)))
+	listenOpts := []uio.ListenOption{uio.WithLayers(ukcp.ServerLayer(kcpOpts))}
+	if *sockBuf > 0 {
+		listenOpts = append(listenOpts, uio.WithListenControl(func(_, _ string, fd uintptr) error {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, *sockBuf)
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, *sockBuf)
+			return nil
+		}))
+	}
+	ln, err := events.Listen(listenAddr, listenOpts...)
 	if err != nil {
 		_ = events.Close(err)
 		fmt.Println("listen failed:", err)
@@ -118,8 +115,8 @@ func main() {
 		_ = events.Close(nil)
 	}()
 
-	fmt.Printf("kcpecho listening on udp://%s (mtu=%d sndwnd=%d rcvwnd=%d nodelay=%v cc=%v)\n",
-		ln.Addr().String(), *mtu, *sndWnd, *rcvWnd, *noDelay, *cc)
+	fmt.Printf("kcpecho listening on udp://%s (mtu=%d sndwnd=%d rcvwnd=%d nodelay=%v cc=%v reuseport=%v)\n",
+		ln.Addr().String(), *mtu, *sndWnd, *rcvWnd, *noDelay, *cc, *reusePort)
 	if err := <-serveErr; err != nil {
 		fmt.Println("server exited with error:", err)
 		os.Exit(1)

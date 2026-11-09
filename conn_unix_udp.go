@@ -45,9 +45,10 @@ type unixUDPState struct {
 	peers  map[socket.UDPAddress]*fdConn
 	key    socket.UDPAddress
 
-	family      uint8 // server only: the socket's address family, 4 or 6
-	moreInBatch bool  // true while additional datagrams for this peer wait in the active recvmmsg batch
-	groEnabled  bool  // true if UDP_GRO is enabled on this socket
+	family      uint8  // server only: the socket's address family, 4 or 6
+	moreInBatch bool   // true while additional datagrams for this peer wait in the active recvmmsg batch
+	groEnabled  bool   // true if UDP_GRO is enabled on this socket
+	shardKey    uint32 // server only: 1-to-1 shard index in a ReusePort UDP group
 
 	// peerMu guards a server's peers, which its turns read for every
 	// datagram and DialPeer adds to from any goroutine, and its queues.
