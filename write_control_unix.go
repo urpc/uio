@@ -68,7 +68,7 @@ func (conn *fdConn) ReserveTurnWrite(n int) ([]byte, bool, error) {
 		conn.handOverScratch()
 	}
 	conn.submitMu.Lock()
-	dst := conn.outbound.Reserve(n, conn.coalesceBlockSize())
+	dst := conn.outboundTargetLocked().Reserve(n, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return dst, true, nil
 }

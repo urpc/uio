@@ -426,7 +426,7 @@ Everything is optional; the zero `Events` is ready to use.
 | `ReadBufferSize` | 4 KiB | Bytes read per socket read. |
 | `WriteBufferedThreshold` | off | Native backend: callback writes smaller than this are queued for the end of the turn instead of sent at once. Replies written in `OnRead` are batched either way. |
 | `MaxOutboundBuffered` | off | Per-connection limit on unsent bytes; a write past it returns `ErrOutboundOverflow` (unless `BlockingWrite` suspends off-turn callers). |
-| `BlockingWrite` | off | Suspends off-turn stream `Write`/`Writev`/`WriteOwned` callers when the outbound window is full instead of returning `ErrOutboundOverflow` (defaults an unset `MaxOutboundBuffered` to 64 KiB; on-turn callbacks stay non-blocking). `NewBlockingConn`/`NewBlockingReader`/`NewBlockingWriter` offer explicit pull/blocking wrappers. |
+| `BlockingWrite` | off | Suspends off-turn stream `Write`/`Writev`/`WriteOwned`/`SendFile` callers when the outbound window is full instead of returning `ErrOutboundOverflow` (defaults an unset `MaxOutboundBuffered` to 64 KiB; on-turn callbacks stay non-blocking). `NewBlockingConn`/`NewBlockingReader`/`NewBlockingWriter` offer explicit pull/blocking wrappers. |
 | `MaxInboundBuffered` | off | Per-connection limit on read but not yet consumed bytes. Once callbacks leave this much unconsumed, the connection stops reading its socket and TCP flow control slows the peer; a `Wake` whose `OnRead` consumes below the limit reads on. A `ReserveInbound` larger than the limit returns `ErrInboundOverflow`. A packet connection keeps no buffer to hold and is never paced by it: its bottom `PacketLayer` carries whatever backpressure its protocol provides. |
 | `AllowHalfOpen` | off | Keeps a stream connection open after the peer shuts its writing half: `OnRead` runs once more, `Read` reports `io.EOF` once the buffered bytes are consumed, and the connection can still write until `CloseWrite` shuts this side's half too; it closes once both halves are shut and the bytes the peer sent have been consumed. |
 | `ReusePort` | off | Sets `SO_REUSEPORT` on listeners. |
@@ -566,6 +566,33 @@ if _, err := c.WriteOwned(buf); err == uio.ErrOutboundOverflow {
 	uio.ReleaseBuffer(buf) // overflow is the only error that hands it back
 }
 ```
+
+**Send files with sendfile(2).** `uio.SendFile(c, f, offset, count)` sends a
+file range in order with the connection's other output, on the native
+backend with `sendfile(2)` (Linux, macOS, FreeBSD, DragonFly). A range the
+socket does not take at once is queued as a duplicate descriptor, not as
+memory, so `f` may be closed as soon as the call returns; ranges of 16 KiB or
+less are read into memory instead. A range is admitted whole while the queue
+is under `MaxOutboundBuffered`. Through protocol layers, on the stdio backend
+and on platforms without `sendfile(2)` the range is read into memory, within
+the queue's room or 4 MiB without a limit; a `BlockingWriter`'s `SendFile`
+streams any length with backpressure, and `io.Copy(bw, f)` takes the same path.
+
+```go
+func onRead(c uio.Conn) error {
+	c.Discard(-1)
+	c.Write(header)
+	_, err := uio.SendFile(c, file, 0, -1) // the whole file, behind the header
+	return err
+}
+```
+
+**Move a stream with splice(2).** `uio.Splice(ctx, dst, src, count)` moves
+`src`'s stream into `dst` — another connection, a `BlockingWriter`, a
+`BlockingConn` or an `*os.File` — and on Linux, between native connections and
+files, through a kernel pipe without copying it into user space. It reads `src` in pull mode
+(see `NewBlockingReader`), so `src`'s `OnRead` runs no more. `ubridge.Bridge`
+relays its pairs the same way from their own turns.
 
 ## Rules of the road
 

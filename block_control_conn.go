@@ -2,8 +2,10 @@ package uio
 
 import (
 	"errors"
+	"os"
 
 	"github.com/urpc/uio/internal/blockio"
+	"github.com/urpc/uio/internal/filerange"
 	"github.com/urpc/uio/internal/readcontrol"
 	"github.com/urpc/uio/internal/writecontrol"
 )
@@ -50,6 +52,11 @@ func (s fdBlockSource) Wake() error                       { return s.conn.Wake()
 func (s fdBlockSource) NewReadPause() *readcontrol.Pause  { return readcontrol.NewPause(s.conn) }
 func (s fdBlockSource) WatchWrite(fn func(int)) bool      { return writecontrol.Watch(s.conn, fn) }
 func (s fdBlockSource) IsOverflow(err error) bool         { return errors.Is(err, ErrOutboundOverflow) }
+func (s fdBlockSource) HasNativeSendFile() bool           { return s.conn.hasNativeSendFile() }
+func (s fdBlockSource) SendFile(f *os.File, r filerange.Range, owner uint64) (int64, error) {
+	return s.conn.sendFileRange(f, r, owner)
+}
+func (s fdBlockSource) CancelQueuedFiles(owner uint64) int64 { return s.conn.cancelQueuedFiles(owner) }
 
 // stackBlockSource adapts the top *layerNode of a protocol stack to blockio.Source.
 type stackBlockSource struct{ top *layerNode }

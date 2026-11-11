@@ -149,6 +149,11 @@ type Events struct {
 	// treat overflow as overload — defer, drop, or close — and bound the
 	// receive side with MaxInboundBuffered. Zero disables the limit.
 	//
+	// A file range SendFile queues on a native connection holds no memory: it
+	// is admitted whole while the queue is under the limit, and counts toward
+	// it until sent. A range of 16 KiB or less, and every SendFile on the
+	// backends without sendfile(2), is read into memory instead.
+	//
 	// With layers installed it bounds what the Handler writes: a write is
 	// refused before it enters the top layer when the queue below has no room
 	// for it, and what a layer writes below is never refused for size — a TLS
@@ -159,12 +164,13 @@ type Events struct {
 	// layers' own control output, a handshake or a ping.
 	MaxOutboundBuffered int
 
-	// BlockingWrite makes stream Conn.Write, WriteString, WriteByte, Writev and
-	// WriteOwned suspend calling application goroutines when the outbound queue
-	// is full (or chunk writes larger than MaxOutboundBuffered) instead of
-	// returning ErrOutboundOverflow, providing standard-library net.Conn write
-	// backpressure semantics. When enabled with MaxOutboundBuffered == 0, the
-	// outbound window defaults to DefaultBlockingBuffer (64 KiB).
+	// BlockingWrite makes stream Conn.Write, WriteString, WriteByte, Writev,
+	// WriteOwned and SendFile suspend calling application goroutines when the
+	// outbound queue is full (or chunk writes larger than MaxOutboundBuffered)
+	// instead of returning ErrOutboundOverflow, providing standard-library
+	// net.Conn write backpressure semantics. When enabled with
+	// MaxOutboundBuffered == 0, the outbound window defaults to
+	// DefaultBlockingBuffer (64 KiB).
 	//
 	// Event-loop and connection-turn callbacks (OnOpen, OnRead, OnTimer,
 	// OnBytesWritten) never block: if an on-turn write overflows the outbound

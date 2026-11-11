@@ -28,6 +28,7 @@ import (
 
 	"github.com/urpc/uio"
 	"github.com/urpc/uio/internal/readcontrol"
+	"github.com/urpc/uio/internal/relay"
 	"github.com/urpc/uio/internal/writecontrol"
 )
 
@@ -254,6 +255,7 @@ func (b *Bridge) Pair(a, c uio.Conn) error {
 	}
 	writecontrol.Watch(a, func(int) { b.resumeSource(a) })
 	writecontrol.Watch(c, func(int) { b.resumeSource(c) })
+	relay.EnableSplicePair(a, c)
 	// Bytes either leg received before the pairing wait for a turn.
 	_ = a.Wake()
 	_ = c.Wake()
@@ -389,7 +391,10 @@ func (b *Bridge) OnRead(c uio.Conn) error {
 	high := b.inboundLimit()
 	drains := own.drains.Load()
 	if peer.OutboundBuffered() < high {
-		n, err := c.WriteTo(peer)
+		n, handled, err := relay.TrySplice(peer, c, high-peer.OutboundBuffered())
+		if !handled {
+			n, err = c.WriteTo(peer)
+		}
 		if n == 0 && errors.Is(err, uio.ErrOutboundOverflow) && peer.OutboundBuffered() == 0 {
 			// A chunk larger than the empty destination's whole budget:
 			// forward a prefix it takes, the rest on its drains.

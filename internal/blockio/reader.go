@@ -17,6 +17,7 @@
 package blockio
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -28,6 +29,26 @@ import (
 	"github.com/urpc/uio/internal/readcontrol"
 )
 
+// SpliceSource is an optional capability of native stream sources whose socket
+// input SpliceTo can take over with Linux splice(2).
+type SpliceSource interface {
+	// RequestSplice asks the connection to stop reading its socket and to
+	// hand what it already read to the Reader; false when it cannot be
+	// spliced.
+	RequestSplice() bool
+	// SpliceGranted reports whether the connection handed its socket over,
+	// and whether its input ended or it is closing, so it never will.
+	SpliceGranted() (granted, ended bool)
+	// SpliceIn moves up to n bytes from the granted socket into the pipe
+	// whose write end is pipeW. It reports 0 and no error at the end of the
+	// stream, which the connection's turns read again and pass on once the
+	// socket is theirs, and net.ErrClosed once the connection closed it. A
+	// failed socket closes the connection with its error.
+	SpliceIn(pipeW, n int) (int, error)
+	// EndSplice gives the socket back to the connection's turns.
+	EndSplice()
+}
+
 // Reader is a stream connection's pull-mode blocking inbound endpoint.
 type Reader struct {
 	src     Source
@@ -36,10 +57,11 @@ type Reader struct {
 	mu      sync.Mutex // guards pipe, direct handoff, pause, and close state
 	waiter  waiter
 
-	customWin atomic.Int64
-	pipe      bytebuf.CompositeBuffer
-	pause     *readcontrol.Pause
-	paused    bool
+	customWin    atomic.Int64
+	spliceActive atomic.Bool
+	pipe         bytebuf.CompositeBuffer
+	pause        *readcontrol.Pause
+	paused       bool
 
 	directDst   []byte
 	directN     int
@@ -118,6 +140,15 @@ func (r *Reader) resumeTransport() {
 // Pump runs on the connection's turn in place of Handler.OnRead, moving inbound
 // bytes directly into a parked reader's slice or into the bounded pipe.
 func (r *Reader) Pump() {
+	if r.spliceActive.Load() && r.src.InboundBuffered() == 0 {
+		if r.src.ReadEnded() {
+			r.mu.Lock()
+			r.peerEOF = true
+			r.mu.Unlock()
+		}
+		r.waiter.notify()
+		return
+	}
 	for {
 		chunk := r.src.PeekChunk()
 		if len(chunk) == 0 {
@@ -175,6 +206,14 @@ func (r *Reader) Pump() {
 		}
 	}
 }
+
+// testHookPipeDrained, when set, runs as SpliceTo found the pipe drained and
+// is about to look at the end of the stream.
+var testHookPipeDrained atomic.Pointer[func()]
+
+// Notify wakes a goroutine blocked in Read or SpliceTo so it looks at its
+// source again.
+func (r *Reader) Notify() { r.waiter.notify() }
 
 func (r *Reader) onClose(localClose bool, err error) {
 	r.mu.Lock()
@@ -248,7 +287,6 @@ func (r *Reader) Read(p []byte) (int, error) {
 			r.directReady = false
 			err := r.closeErr
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			return 0, err
 		}
 		if r.directReady {
@@ -256,13 +294,11 @@ func (r *Reader) Read(p []byte) (int, error) {
 			r.directReady = false
 			r.directN = 0
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			return n, nil
 		}
 		if err := r.waiter.checkDeadline(); err != nil {
 			r.directDst = nil
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			return 0, err
 		}
 		if !r.pipe.Empty() {
@@ -270,7 +306,6 @@ func (r *Reader) Read(p []byte) (int, error) {
 			n, _ := r.pipe.Read(p)
 			resume := r.checkResumeLocked()
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			if resume {
 				r.resumeTransport()
 			}
@@ -279,14 +314,12 @@ func (r *Reader) Read(p []byte) (int, error) {
 		if r.peerEOF {
 			r.directDst = nil
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			return 0, io.EOF
 		}
 		if r.closed {
 			r.directDst = nil
 			err := r.closeErr
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
 			return 0, err
 		}
 		r.directDst = p
@@ -302,6 +335,16 @@ func (r *Reader) Read(p []byte) (int, error) {
 // *Writer (or unwraps to one via InternalWriter), pooled blocks transfer with
 // zero intermediate copying.
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
+	return r.SpliceTo(context.Background(), w, -1)
+}
+
+// SpliceTo transfers count bytes from r into w, or the stream up to EOF when
+// count < 0, honoring ctx cancellation and read deadlines. A stream that ends
+// before count bytes fails as io.ReadFull does: io.EOF when nothing moved,
+// io.ErrUnexpectedEOF otherwise. On Linux, when r's source and w — a Writer
+// of a native connection, or an *os.File — both take splice(2), the stream
+// moves through a pooled kernel pipe without being copied into user space.
+func (r *Reader) SpliceTo(ctx context.Context, w io.Writer, count int64) (int64, error) {
 	if OnTurn() {
 		return 0, ErrBlockingOnTurn
 	}
@@ -316,81 +359,142 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 	r.rmu.Lock()
 	defer r.rmu.Unlock()
 
-	var total int64
 	var scratch []byte
-	for {
+	// What the Reader holds goes first, then the native splice moves the rest
+	// of the stream where it can; whatever it leaves is copied.
+	total, done, err := r.drainPipeTo(ctx, w, dstWriter, &scratch, count, 0)
+	if err != nil || done {
+		return total, err
+	}
+	var fallback bool
+	total, fallback, err = r.trySpliceNative(ctx, w, dstWriter, &scratch, count, total)
+	if !fallback {
+		return total, err
+	}
+	for count < 0 || total < count {
 		tok := r.waiter.prepare()
+		total, done, err = r.drainPipeTo(ctx, w, dstWriter, &scratch, count, total)
+		if err != nil || done {
+			return total, err
+		}
+		if hook := testHookPipeDrained.Load(); hook != nil {
+			(*hook)()
+		}
 		r.mu.Lock()
-		if r.closed && r.localAbort {
-			err := r.closeErr
-			r.mu.Unlock()
-			r.waiter.cancelPrepare()
-			return total, err
-		}
-		if err := r.waiter.checkDeadline(); err != nil {
-			r.mu.Unlock()
-			r.waiter.cancelPrepare()
-			return total, err
-		}
 		if !r.pipe.Empty() {
-			if dstWriter != nil {
-				block := r.pipe.PopBlock()
-				resume := r.checkResumeLocked()
-				r.mu.Unlock()
-				r.waiter.cancelPrepare()
-				if resume {
-					r.resumeTransport()
-				}
-				if block != nil {
-					nw, retained, werr := dstWriter.writeOwnedPreserveOnAbort(block)
-					total += int64(nw)
-					if werr != nil {
-						if retained {
-							r.mu.Lock()
-							if !r.closed || !r.localAbort {
-								r.pipe.PrependOwned(block)
-							} else {
-								bytebuf.ReleaseBuffer(block)
-							}
-							r.mu.Unlock()
-						}
-						return total, werr
-					}
-				}
-				continue
-			}
-			if scratch == nil {
-				scratch = make([]byte, 32<<10)
-			}
-			n, _ := r.pipe.Read(scratch)
-			resume := r.checkResumeLocked()
+			// A Pump added bytes since the drain looked: they come before the
+			// end it may have noted.
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
-			if resume {
-				r.resumeTransport()
-			}
-			nw, werr := w.Write(scratch[:n])
-			total += int64(nw)
-			if werr != nil {
-				return total, werr
-			}
-			if nw != n {
-				return total, io.ErrShortWrite
-			}
 			continue
 		}
 		if r.peerEOF {
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
+			if count >= 0 && total < count {
+				if total == 0 {
+					return 0, io.EOF
+				}
+				return total, io.ErrUnexpectedEOF
+			}
 			return total, nil
 		}
 		if r.closed {
-			err := r.closeErr
+			cerr := r.closeErr
 			r.mu.Unlock()
-			r.waiter.cancelPrepare()
-			return total, err
+			return total, cerr
 		}
 		r.mu.Unlock()
-		r.waiter.wait(tok)
+		if err := r.waiter.waitContext(ctx, tok); err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (r *Reader) drainPipeTo(
+	ctx context.Context,
+	w io.Writer,
+	dstWriter *Writer,
+	scratch *[]byte,
+	count int64,
+	total int64,
+) (int64, bool, error) {
+	for {
+		r.mu.Lock()
+		if r.closed && r.localAbort {
+			err := r.closeErr
+			r.mu.Unlock()
+			return total, true, err
+		}
+		if ctx != nil {
+			if err := ctx.Err(); err != nil {
+				r.mu.Unlock()
+				return total, true, err
+			}
+		}
+		if err := r.waiter.checkDeadline(); err != nil {
+			r.mu.Unlock()
+			return total, true, err
+		}
+		if count >= 0 && total >= count {
+			r.mu.Unlock()
+			return total, true, nil
+		}
+		if r.pipe.Empty() {
+			r.mu.Unlock()
+			return total, false, nil
+		}
+		if dstWriter != nil {
+			block := r.pipe.PopBlock()
+			if block != nil && count >= 0 && int64(block.Len()) > count-total {
+				want := int(count - total)
+				head := bytebuf.CloneBuffer(block.Bytes()[:want])
+				block.Discard(want)
+				r.pipe.PrependOwned(block)
+				block = head
+			}
+			resume := r.checkResumeLocked()
+			r.mu.Unlock()
+			if resume {
+				r.resumeTransport()
+			}
+			if block != nil {
+				nw, retained, werr := dstWriter.writeOwnedPreserveContext(ctx, block)
+				total += int64(nw)
+				if werr != nil {
+					if retained {
+						r.mu.Lock()
+						if !r.closed || !r.localAbort {
+							r.pipe.PrependOwned(block)
+						} else {
+							bytebuf.ReleaseBuffer(block)
+						}
+						r.mu.Unlock()
+					}
+					return total, true, werr
+				}
+			}
+			continue
+		}
+		if *scratch == nil {
+			*scratch = make([]byte, 32<<10)
+		}
+		maxRead := len(*scratch)
+		if count >= 0 && int64(maxRead) > count-total {
+			maxRead = int(count - total)
+		}
+		n, _ := r.pipe.Read((*scratch)[:maxRead])
+		resume := r.checkResumeLocked()
+		r.mu.Unlock()
+		if resume {
+			r.resumeTransport()
+		}
+		nw, werr := w.Write((*scratch)[:n])
+		total += int64(nw)
+		if werr != nil {
+			return total, true, werr
+		}
+		if nw != n {
+			return total, true, io.ErrShortWrite
+		}
 	}
 }

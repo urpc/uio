@@ -105,10 +105,6 @@ func NewBlockingReader(c Conn, opts ...BlockingOption) (*BlockingReader, error) 
 // arrives, EOF is reached, the connection closes, or the read deadline expires.
 func (r *BlockingReader) Read(p []byte) (int, error) { return r.r.Read(p) }
 
-// WriteTo copies stream data to w until EOF or error, transferring pooled
-// buffers with zero intermediate copies when w is a *BlockingWriter or *BlockingConn.
-func (r *BlockingReader) WriteTo(w io.Writer) (int64, error) { return r.r.WriteTo(w) }
-
 // SetReadDeadline sets the deadline for blocked Read and WriteTo calls without
 // closing the underlying connection when it expires.
 func (r *BlockingReader) SetReadDeadline(t time.Time) error { return r.r.SetReadDeadline(t) }
@@ -206,8 +202,12 @@ func (w *BlockingWriter) WriteSharedContext(ctx context.Context, sb *SharedBuffe
 	return w.w.WriteOwnedContext(ctx, view)
 }
 
-// ReadFrom copies from r into the connection using pooled zero-copy WriteOwned
-// buffers.
+// ReadFrom copies from r into the connection, waiting for room in its queue.
+// A file — r itself, an *io.LimitedReader of one, or what io.Copy hands over
+// for one — is sent as SendFile sends it, with sendfile(2) on a native
+// connection, for the part fstat sizes; the rest of it, and any other
+// reader, is read through pooled buffers. A reader that writes itself, a
+// BlockingReader say, does.
 func (w *BlockingWriter) ReadFrom(r io.Reader) (int64, error) { return w.w.ReadFrom(r) }
 
 // Flush flushes queued outbound bytes and blocks until the outbound buffer

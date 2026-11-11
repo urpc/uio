@@ -101,7 +101,9 @@ func (s *State) Reader(window int) (*Reader, error) {
 }
 
 // Writer returns the connection's single blocking Writer, creating it and
-// subscribing to write-progress notifications on the first call.
+// subscribing to write-progress notifications on the first call. The
+// subscription comes before the Writer is published: a Writer another
+// goroutine finds already hears the progress it may wait for.
 func (s *State) Writer(window int) *Writer {
 	s.mu.Lock()
 	if w := s.writer.Load(); w != nil {
@@ -115,10 +117,9 @@ func (s *State) Writer(window int) *Writer {
 	if s.closed {
 		w.onClose(s.localClose, s.closeErr)
 	}
+	s.src.WatchWrite(func(int) { w.NotifySpace() })
 	s.writer.Store(w)
 	s.mu.Unlock()
-
-	s.src.WatchWrite(func(int) { w.NotifySpace() })
 	return w
 }
 

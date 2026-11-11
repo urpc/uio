@@ -287,10 +287,11 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 		conn.submitMu.Unlock()
 		return 0, conn.errOutboundOverflow()
 	}
-	if !conn.outbound.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
-		conn.outbound.AppendOwnedTailCoalesced(owned, conn.coalesceBlockSize())
+	out := conn.outboundTargetLocked()
+	if !out.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
+		out.AppendOwnedTailCoalesced(owned, conn.coalesceBlockSize())
 	} else {
-		conn.outbound.AppendOwned(owned)
+		out.AppendOwned(owned)
 	}
 	conn.submitMu.Unlock()
 	conn.kickWriterOutside()
@@ -493,10 +494,11 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		}
 		conn.handOverScratch()
 		conn.submitMu.Lock()
-		if conn.turn&turnCorked != 0 && !conn.outbound.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
-			conn.outbound.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
+		out := conn.outboundTargetLocked()
+		if conn.turn&turnCorked != 0 && !out.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
+			out.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
 		} else {
-			conn.outbound.AppendOwned(owned)
+			out.AppendOwned(owned)
 		}
 		conn.submitMu.Unlock()
 		return size, nil
@@ -737,43 +739,66 @@ func (conn *fdConn) flushOnLoop() (int, error) {
 // A longer queue is detached into inflight in one step instead, so its sends
 // and the release of its sent blocks also run without the lock while producers
 // start the next batch; inflight goes out ahead of everything accepted since.
-// EAGAIN leaves the bytes queued and sets writeBlocked until a writable edge.
+// Queued file ranges go out once both are empty, within fileFlushBudget for
+// the whole flush. EAGAIN leaves the bytes queued and sets writeBlocked until
+// a writable edge. A failed stream sends nothing more.
 func (conn *fdConn) flushWrite() (int, error) {
 	if conn.pending.Load() == 0 {
 		return 0, nil
 	}
-	if conn.writeBlocked() {
+	if state := conn.writeState.Load(); state&(writeBlockedFlag|writeFailedFlag) != 0 {
 		// Once EAGAIN is observed, only a Writable event should retry the fd.
 		return 0, nil
 	}
 	var totalWritten int
 	var writeErr error
-	if conn.inflight == nil {
-		conn.submitMu.Lock()
-		if conn.outbound.Blocks() == 1 {
-			totalWritten, writeErr = conn.sendOutboundBlock()
-		}
-		if writeErr != nil || conn.writeBlocked() || conn.outbound.Empty() {
+	for {
+		if conn.inflight == nil {
+			conn.submitMu.Lock()
+			if conn.outbound.Blocks() == 1 {
+				var n int
+				n, writeErr = conn.sendOutboundBlock()
+				totalWritten += n
+			}
+			if writeErr != nil || conn.writeBlocked() {
+				conn.submitMu.Unlock()
+				return conn.retireFlush(totalWritten, writeErr)
+			}
+			if conn.outbound.Empty() {
+				conn.submitMu.Unlock()
+				if conn.writeState.Load()&writeFileTailFlag != 0 && totalWritten < fileFlushBudget {
+					var fn int
+					var more bool
+					fn, more, writeErr = conn.sendQueuedFiles(fileFlushBudget - totalWritten)
+					totalWritten += fn
+					if more && writeErr == nil && !conn.writeBlocked() && totalWritten < fileFlushBudget {
+						continue
+					}
+				}
+				return conn.retireFlush(totalWritten, writeErr)
+			}
+			batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
+			// batch is empty, so the swap leaves outbound empty for producers.
+			conn.outbound, *batch = *batch, conn.outbound
 			conn.submitMu.Unlock()
-			return conn.retireFlush(totalWritten, writeErr)
+			conn.inflight = batch
 		}
-		batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
-		// batch is empty, so the swap leaves outbound empty for producers.
-		conn.outbound, *batch = *batch, conn.outbound
-		conn.submitMu.Unlock()
-		conn.inflight = batch
+		var written int
+		if conn.inflight.Blocks() == 1 {
+			written, writeErr = conn.sendInflightBlock()
+		} else {
+			written, writeErr = conn.sendInflightVec()
+		}
+		totalWritten += written
+		if conn.inflight.Empty() {
+			conn.releaseInflight()
+			if writeErr == nil && !conn.writeBlocked() && conn.writeState.Load()&writeFileTailFlag != 0 &&
+				totalWritten < fileFlushBudget {
+				continue
+			}
+		}
+		return conn.retireFlush(totalWritten, writeErr)
 	}
-	var written int
-	if conn.inflight.Blocks() == 1 {
-		written, writeErr = conn.sendInflightBlock()
-	} else {
-		written, writeErr = conn.sendInflightVec()
-	}
-	totalWritten += written
-	if conn.inflight.Empty() {
-		conn.releaseInflight()
-	}
-	return conn.retireFlush(totalWritten, writeErr)
 }
 
 // retireFlush accounts what a flush sent and reports it.
@@ -939,7 +964,7 @@ func (conn *fdConn) writeQueuedOnLoop(data []byte) (int, error) {
 		return n, nil
 	}
 	conn.submitMu.Lock()
-	conn.outbound.WriteCoalesced(data, conn.coalesceBlockSize())
+	conn.outboundTargetLocked().WriteCoalesced(data, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return n, nil
 }
@@ -959,7 +984,7 @@ func (conn *fdConn) writevQueuedOnLoop(vec [][]byte, total int) (int, error) {
 		return total, nil
 	}
 	conn.submitMu.Lock()
-	conn.outbound.WritevCoalesced(vec, conn.coalesceBlockSize())
+	conn.outboundTargetLocked().WritevCoalesced(vec, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return total, nil
 }

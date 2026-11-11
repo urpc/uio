@@ -423,9 +423,9 @@ func (conn *fdConn) teardown(cause error) (error, bool) {
 		return nil, false
 	}
 	// Close gets one bounded flush attempt; a slow peer cannot delay shutdown.
+	// What sends and splices outside the turns moved is reported first.
 	var flushErr error
-	if !conn.isDatagram() && !conn.writeFailed() {
-		conn.setWriteBlocked(false)
+	if !conn.isDatagram() {
 		flushed := false
 		defer func() {
 			if !flushed {
@@ -435,7 +435,17 @@ func (conn *fdConn) teardown(cause error) (error, bool) {
 				conn.scheduleCloseCallback(conn.releaseResources(cause, nil))
 			}
 		}()
-		_, flushErr = conn.flushWrite()
+		if zc := conn.loadZeroCopy(); zc != nil {
+			// A splice(2) in progress counts what it reads inside the gate:
+			// close the gate first, so nothing is read after the report.
+			zc.closeSpliceGate()
+			conn.reportUnread(zc)
+			conn.reportUnwritten(zc)
+		}
+		if !conn.writeFailed() {
+			conn.setWriteBlocked(false)
+			_, flushErr = conn.flushWrite()
+		}
 		flushed = true
 	}
 	return conn.releaseResources(cause, flushErr), true
@@ -511,6 +521,11 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 			conn.releaseSocket()
 			conn.loop.forget(conn)
 		} else {
+			if zc := conn.loadZeroCopy(); zc != nil {
+				// A blocking SpliceTo may be in a splice(2) on the socket: the
+				// descriptor closes once it left, never under it.
+				zc.spliceGate.retire()
+			}
 			conn.loop.forget(conn)
 			if !conn.closesOffTurn() || !conn.loop.deferClose(int(conn.fd)) {
 				_ = syscall.Close(int(conn.fd))
@@ -518,6 +533,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 		}
 	}
 	conn.submitMu.Lock()
+	conn.clearFilesLocked()
 	conn.outbound.Reset()
 	conn.submitMu.Unlock()
 	conn.stopDrainTimer()

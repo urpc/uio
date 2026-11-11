@@ -31,13 +31,6 @@ func (conn *fdConn) enablePullRead() (bool, error) {
 	return onConnTurn, nil
 }
 
-func (conn *fdConn) hasPullReader() bool {
-	if w := conn.wake.Load(); w != nil {
-		return w.pullRead.Load()
-	}
-	return false
-}
-
 func (conn *fdConn) writeSideClosed() bool {
 	return conn.outputClosed()
 }

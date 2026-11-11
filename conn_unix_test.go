@@ -752,6 +752,11 @@ func TestUnixConnectionColdStateIsLazy(t *testing.T) {
 		if size := unsafe.Sizeof(fdConn{}); size > maximum {
 			t.Fatalf("fdConn size = %d bytes, want at most %d", size, maximum)
 		}
+		// Every connection with a timer, a control or a blocking endpoint
+		// holds one; what SendFile and splice need hangs off it.
+		if size := unsafe.Sizeof(wakeState{}); size > 96 {
+			t.Fatalf("wakeState size = %d bytes, want at most 96", size)
+		}
 	}
 	conn := &fdConn{}
 	conn.entry = (&Events{}).plainEntry()

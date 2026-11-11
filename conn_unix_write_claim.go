@@ -233,8 +233,10 @@ func (turn *writeTurn) RunTask() {
 }
 
 // runWriteTurn sends output from other goroutines while the connection's turn
-// reads. It holds the write claim and one of its loop's turn counts, which
-// shutdown joins. It never runs callbacks other than OnBytesWritten.
+// reads, after reporting what a send outside the turns that handed it the
+// claim put on the wire. It holds the write claim and one of its loop's turn
+// counts, which shutdown joins. It never runs callbacks other than
+// OnBytesWritten.
 func (conn *fdConn) runWriteTurn() {
 	handedOn := false
 	defer func() {
@@ -246,6 +248,9 @@ func (conn *fdConn) runWriteTurn() {
 			conn.finishWriteTurn()
 		}
 	}()
+	if zc := conn.loadZeroCopy(); zc != nil {
+		conn.reportUnwritten(zc)
+	}
 	for flushes := 0; ; flushes++ {
 		if conn.isClosing() || conn.pending.Load() == 0 || conn.writeBlocked() {
 			return

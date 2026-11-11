@@ -72,12 +72,17 @@ const (
 	offTurnCloseFlag
 	// localCloseFlag records a close requested locally via Close() or Abort().
 	localCloseFlag
+	// spliceReadFlag routes read rounds through readRoundSplice: a splice
+	// owns, or owned until the next read round, the socket's input (see
+	// zeroCopyState.spliceMode). Only the connection's turn clears it.
+	spliceReadFlag
 )
 
 type fdConn struct {
 	readControlAccess
 	writeControlAccess
 	blockControlAccess
+	relayAccess
 	fd int32
 	// taskState coalesces readiness and synthetic events in its low bits and
 	// carries, in its top bit, the claim that exactly one task is queued or
@@ -85,7 +90,7 @@ type fdConn struct {
 	// submits, and the running turn keeps the bit while it takes the events.
 	taskState atomic.Uint32
 	pollTag   atomic.Uint32 // registration generation echoed by the poller
-	flags     atomic.Uint32 // readHeldFlag, readEOFFlag, controlAliasFlag, offTurnCloseFlag
+	flags     atomic.Uint32 // readHeldFlag and the other flags above
 	close     connCloseState
 	commonConn
 
@@ -163,6 +168,10 @@ const (
 	writeShutFlag
 	// writeShutDoneFlag records that the writing half is shut.
 	writeShutDoneFlag
+	// writeFileTailFlag records queued file ranges: bytes accepted now go
+	// behind the last of them (see outboundTargetLocked). It changes under
+	// submitMu, with the ranges.
+	writeFileTailFlag
 )
 
 // Bits in fdConn.turn, read and written only by the running turn. The cork
@@ -188,6 +197,9 @@ const (
 	// would-block, end of stream or an error — so a hangup this turn needs
 	// no separate look at the socket error.
 	turnReadDrained
+	// turnRelayed records a relay that took care of a read round's input
+	// with splice(2), which ends the round (see readRoundSplice).
+	turnRelayed
 )
 
 // writeClaimerMask holds the low bits of the goroutine id a write turn's claim
@@ -977,6 +989,14 @@ func (conn *fdConn) ReserveInbound(n int) error {
 // borrowed read buffer is exposed directly during OnRead; only a callback that
 // leaves bytes unread pays the copy into the persistent inbound buffer.
 func (conn *fdConn) onRead() error {
+	if conn.ReadPaused() {
+		return nil
+	}
+	if conn.flags.Load()&spliceReadFlag != 0 {
+		if done, err := conn.readRoundSplice(conn.loadZeroCopy()); done || err != nil {
+			return err
+		}
+	}
 	holder := conn.events().readPool.Get()
 	conn.scratch = holder
 	// A read round is corked: its replies accumulate in scratch/outbound and are
@@ -1004,11 +1024,6 @@ func (conn *fdConn) onRead() error {
 // readRound is onRead's body. It has many exits, which would keep deferred
 // cleanup from being open-coded, so onRead does the cleanup around it.
 func (conn *fdConn) readRound(buffer []byte) error {
-	// A pause stops reading the socket; within the round the callbacks' own
-	// pauses are checked as they return.
-	if conn.ReadPaused() {
-		return nil
-	}
 	totalRead := 0
 	for calls := 0; calls < 256 && totalRead < 1<<20; calls++ {
 		n, err := socket.Recv(int(conn.fd), buffer)

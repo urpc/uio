@@ -118,20 +118,14 @@ func (conn *fdConn) onRecvUDP() error {
 			addr := batch.recvs[i].Addr
 			nextSamePeer := i+1 < got && (conn.udp.peers == nil || hasPeerInBatch(batch.recvs[i+1:got], addr))
 			rawPkt := batch.slots[i][:n]
-			gro := int(batch.recvs[i].GROSize)
-			if gro > 0 && n > gro {
-				for off := 0; off < n; off += gro {
-					end := min(off+gro, n)
-					packets++
-					more := end < n || nextSamePeer
-					cachedConn, cachedAddr = conn.handleUDPPacketCached(rawPkt[off:end], addr, more, cachedConn, cachedAddr)
-					if conn.isClosing() {
-						return nil
-					}
-				}
-			} else {
+			step := int(batch.recvs[i].GROSize)
+			if step <= 0 || step > n {
+				step = max(n, 1)
+			}
+			for off := 0; off < max(n, 1); off += step {
+				end := min(off+step, n)
 				packets++
-				cachedConn, cachedAddr = conn.handleUDPPacketCached(rawPkt, addr, nextSamePeer, cachedConn, cachedAddr)
+				cachedConn, cachedAddr = conn.handleUDPPacketCached(rawPkt[off:end], addr, end < n || nextSamePeer, cachedConn, cachedAddr)
 				if conn.isClosing() {
 					return nil
 				}

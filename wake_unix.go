@@ -30,20 +30,24 @@ import (
 	"github.com/urpc/uio/internal/writecontrol"
 )
 
-// wakeState is a connection's wake timer: one entry on its loop's wheel. The
-// wheel's own membership is the timer's validity — Arm detaches before it
-// re-arms, so a due entry the wheel reports is the deadline that was armed —
-// and the wake turn's existing guards (isClosing, the held-read pause) carry
-// the rest. The wheel's mutex serializes its lists; an atomic publication
-// shares the cold allocation with optional flow-control state. A setter that
-// loses the race with the close path — armed after the close's cancel ran —
-// undoes itself by re-checking isClosing after the arm.
+// wakeState is a connection's cold state: its wake timer — one entry on its
+// loop's wheel — and the optional controls, blocking endpoints and zero-copy
+// state that share the allocation. The wheel's own membership is the timer's
+// validity — Arm detaches before it re-arms, so a due entry the wheel reports
+// is the deadline that was armed — and the wake turn's existing guards
+// (isClosing, the held-read pause) carry the rest. The wheel's mutex
+// serializes its lists; an atomic publication shares the cold allocation with
+// optional flow-control state. A setter that loses the race with the close
+// path — armed after the close's cancel ran — undoes itself by re-checking
+// isClosing after the arm.
 type wakeState struct {
 	readControl  atomic.Pointer[readcontrol.Control]  // optional read control; shares cold allocation
 	writeControl atomic.Pointer[writecontrol.Control] // optional write control; shares cold allocation
 	block        atomic.Pointer[blockio.State]        // optional blocking I/O state; shares cold allocation
 	pullRead     atomic.Bool                          // true when switched to BlockingReader pull mode
+	armed        bool                                 // guarded by mu; see due
 	driver       atomic.Pointer[any]                  // optional endpoint driver state
+	zeroCopy     atomic.Pointer[zeroCopyState]        // SendFile and splice state, built on first use
 	entry        *timewheel.Entry[*fdConn]
 	// mu holds the wheel's arm and the mirror — armed, due and period — as
 	// one step, so a setter and a consuming turn can never see the pair
@@ -52,8 +56,7 @@ type wakeState struct {
 	// timer pay for any of this. The user callback never runs under mu.
 	mu      sync.Mutex
 	dueNano atomic.Int64 // atomic mirror of due (0 when unarmed) for lock-free fireWakeTimer check
-	armed   bool
-	due     int64 // unix nanos; 0 is a legal deadline, so armed says whether one is set
+	due     int64        // unix nanos; 0 is a legal deadline, so armed says whether one is set
 	period  int64
 	// drain bounds a graceful close's wait for its output to leave. It lives
 	// on this lazily-allocated state, not the connection, so a connection

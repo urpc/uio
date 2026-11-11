@@ -20,7 +20,6 @@ package blockio
 
 import (
 	"errors"
-	"sync"
 	"sync/atomic"
 
 	"github.com/petermattis/goid"
@@ -33,30 +32,61 @@ var ErrBlockingOnTurn = errors.New("uio: blocking I/O cannot run on a connection
 // ErrOverflow matches the underlying transport's outbound overflow sentinel.
 var ErrOverflow = errors.New("outbound buffer overflow")
 
-var turnGoroutines sync.Map // int64 -> *atomic.Int32
+const turnBuckets = 256
+
+type turnEntry struct {
+	goid  atomic.Int64
+	depth atomic.Int32
+	next  atomic.Pointer[turnEntry]
+}
+
+var turnTable [turnBuckets]struct {
+	head atomic.Pointer[turnEntry]
+	_    [56]byte
+}
 
 // EnterTurn marks the calling goroutine as executing event-loop or connection-turn
 // work. Nested EnterTurn/LeaveTurn pairs on the same goroutine are reference-counted.
 func EnterTurn() {
 	id := goid.Get()
-	if v, ok := turnGoroutines.Load(id); ok {
-		if v.(*atomic.Int32).Add(1) > 1 {
+	b := &turnTable[uint64(id)%turnBuckets]
+	var free *turnEntry
+	for e := b.head.Load(); e != nil; e = e.next.Load() {
+		if oid := e.goid.Load(); oid == id {
+			e.depth.Add(1)
+			return
+		} else if oid == 0 && free == nil {
+			free = e
+		}
+	}
+	for e := free; e != nil; e = e.next.Load() {
+		if e.goid.CompareAndSwap(0, id) {
+			e.depth.Store(1)
 			return
 		}
 	}
-	ref := &atomic.Int32{}
-	ref.Store(1)
-	if actual, loaded := turnGoroutines.LoadOrStore(id, ref); loaded {
-		actual.(*atomic.Int32).Add(1)
+	e := &turnEntry{}
+	e.goid.Store(id)
+	e.depth.Store(1)
+	for {
+		old := b.head.Load()
+		e.next.Store(old)
+		if b.head.CompareAndSwap(old, e) {
+			return
+		}
 	}
 }
 
 // LeaveTurn unmarks one EnterTurn call on the calling goroutine.
 func LeaveTurn() {
 	id := goid.Get()
-	if v, ok := turnGoroutines.Load(id); ok {
-		if v.(*atomic.Int32).Add(-1) <= 0 {
-			turnGoroutines.Delete(id)
+	b := &turnTable[uint64(id)%turnBuckets]
+	for e := b.head.Load(); e != nil; e = e.next.Load() {
+		if e.goid.Load() == id {
+			if e.depth.Add(-1) <= 0 {
+				e.goid.Store(0)
+			}
+			return
 		}
 	}
 }
@@ -64,8 +94,12 @@ func LeaveTurn() {
 // OnTurn reports whether the calling goroutine is registered as a turn or
 // event-loop goroutine.
 func OnTurn() bool {
-	if v, ok := turnGoroutines.Load(goid.Get()); ok {
-		return v.(*atomic.Int32).Load() > 0
+	id := goid.Get()
+	b := &turnTable[uint64(id)%turnBuckets]
+	for e := b.head.Load(); e != nil; e = e.next.Load() {
+		if e.goid.Load() == id {
+			return true
+		}
 	}
 	return false
 }

@@ -47,16 +47,10 @@ func newWaiter() waiter {
 	}
 }
 
-// prepare arms parked and snapshots the current generation before the caller
-// checks its condition, preventing lost wakeups.
+// prepare snapshots the current generation before the caller checks its
+// readiness condition.
 func (w *waiter) prepare() uint64 {
-	tok := w.gen.Load()
-	w.parked.Store(true)
-	return tok
-}
-
-func (w *waiter) cancelPrepare() {
-	w.parked.Store(false)
+	return w.gen.Load()
 }
 
 // notify advances the generation and wakes a parked caller if one is waiting.
@@ -77,6 +71,7 @@ func (w *waiter) wait(tok uint64) {
 }
 
 func (w *waiter) waitContext(ctx context.Context, tok uint64) error {
+	w.parked.Store(true)
 	if w.gen.Load() != tok {
 		w.parked.Store(false)
 		return nil
