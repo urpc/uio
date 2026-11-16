@@ -664,12 +664,21 @@ func testAcceptRunnerTakesEveryConnectionOfABurst(t *testing.T) {
 	if events.loops[0].accepts == nil {
 		t.Fatal("a loop has no accept runner")
 	}
-	const n = 256
+	// A burst longer than the listen queue overflows it, and the overflow
+	// never reaches the server: macOS resets it, Linux drops its SYN. Cap the
+	// burst there, keeping it well past one accept batch.
+	n := 256
+	if capacity := listenQueueCap(); capacity > 0 && capacity < n {
+		n = capacity
+	}
+	if n <= acceptBatchSize {
+		t.Skipf("a listen queue of %d connections is one accept batch", n)
+	}
 	clients := make([]net.Conn, n)
 	var wg sync.WaitGroup
 	for i := range clients {
 		wg.Go(func() {
-			c, err := net.Dial("tcp", addr)
+			c, err := dialBurst(addr)
 			if err != nil {
 				t.Error(err)
 				return
@@ -686,12 +695,30 @@ func testAcceptRunnerTakesEveryConnectionOfABurst(t *testing.T) {
 		}
 	}()
 	deadline := time.Now().Add(5 * time.Second)
-	for opened.Load() < n && time.Now().Before(deadline) {
+	for opened.Load() < int32(n) && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := opened.Load(); got != n {
+	if got := opened.Load(); got != int32(n) {
 		t.Fatalf("%d of %d connections opened", got, n)
 	}
+}
+
+// dialBurst dials addr, retrying a reset or a refusal: a queue that fills for
+// an instant refuses a dial that way on some platforms, and drains as the
+// server accepts.
+func dialBurst(addr string) (net.Conn, error) {
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		var c net.Conn
+		if c, err = net.Dial("tcp", addr); err == nil {
+			return c, nil
+		}
+		if !errors.Is(err, unix.ECONNRESET) && !errors.Is(err, unix.ECONNREFUSED) {
+			return nil, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, err
 }
 
 func TestAcceptRunnerDrainsAgainForALateEdge(t *testing.T) {

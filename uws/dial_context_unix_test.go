@@ -68,6 +68,14 @@ func saturatedTCPListener(t *testing.T) string {
 			return addr
 		}
 		if dialErr != nil {
+			if errors.Is(dialErr, unix.ECONNRESET) || errors.Is(dialErr, unix.ECONNREFUSED) {
+				// A full listen queue drops the connection here instead of
+				// leaving the connect in flight: macOS resets it (syncookies
+				// accept it in the kernel and it never reaches the queue), so
+				// the hanging connect this test bounds cannot be made. The
+				// bound itself is covered where a full queue drops SYNs.
+				t.Skipf("a full listen queue resets a connect on this platform: %v", dialErr)
+			}
 			t.Fatalf("saturate listener: %v", dialErr)
 		}
 		held = append(held, conn)

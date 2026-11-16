@@ -110,8 +110,9 @@ type Events struct {
 	// connection's events stay within one cluster of cores. The count
 	// follows GOMAXPROCS rather than NumCPU, so a process whose Ps are fewer
 	// than the machine's CPUs — a prefork child or a cgroup-limited container
-	// — sizes its loops to the Ps it runs on. On the stdio and Windows
-	// backend the loops only order registration and close.
+	// — sizes its loops to the Ps it runs on. An explicit value is clamped to
+	// GOMAXPROCS the same way. On the stdio and Windows backend the loops only
+	// order registration and close.
 	Pollers int
 
 	// Executor supplies the native connection-round scheduler. When nil, UIO

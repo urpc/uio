@@ -3,6 +3,7 @@
 package poller
 
 import (
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -66,14 +67,39 @@ func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
 			t.Fatal(err)
 		}
 		returned := make(chan struct{})
+		waitErr := make(chan error, 1)
 		go func() {
-			_, _ = p.WaitBatch(&Batch{}, make([]Event, 8), -1)
+			_, err := p.WaitBatch(&Batch{}, make([]Event, 8), -1)
+			waitErr <- err
 			close(returned)
 		}()
-		for registered := 0; registered == 0; {
+		// The waiter registers before it enters the kernel. One that returned
+		// first met an error where it registers — no descriptor for its wake
+		// eventfd, say — and no close can ever release it, so waiting for its
+		// registration without a bound would hang instead of failing.
+		deadline := time.Now().Add(5 * time.Second)
+		registered := 0
+		for registered == 0 {
 			p.mu.Lock()
 			registered = p.waiters
 			p.mu.Unlock()
+			if registered != 0 {
+				break
+			}
+			select {
+			case <-returned:
+				err := <-waitErr
+				_ = p.Close(nil)
+				if errors.Is(err, unix.EMFILE) || errors.Is(err, unix.ENFILE) {
+					t.Skipf("attempt %d: no descriptor for the waiter's wake event: %v", attempt, err)
+				}
+				t.Fatalf("attempt %d: the waiter returned before registering: %v", attempt, err)
+			default:
+			}
+			if time.Now().After(deadline) {
+				_ = p.Close(nil)
+				t.Fatalf("attempt %d: no waiter registered in %v", attempt, 5*time.Second)
+			}
 			time.Sleep(10 * time.Microsecond)
 		}
 		// Let the registered waiter block in epoll_wait.
@@ -84,6 +110,11 @@ func TestLateWaiterLeavesDescriptorsToRegisteredWaiters(t *testing.T) {
 		}
 		select {
 		case <-returned:
+			// A waiter woken by the close reports no error, as the late one
+			// above does.
+			if err := <-waitErr; err != nil {
+				t.Fatalf("attempt %d: the registered waiter returned %v", attempt, err)
+			}
 		case <-time.After(2 * time.Second):
 			t.Fatalf("attempt %d: the waiter registered before Close never returned", attempt)
 		}

@@ -3,6 +3,7 @@ package uio
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -63,7 +64,8 @@ func TestEventsStatsLifecycleOverflowAndZeroAlloc(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 	st := ev.Stats()
-	if st.Pollers != 2 || st.ActiveConnections != 2 || st.TotalConnections != 2 {
+	// initConfig clamps Pollers to GOMAXPROCS, however it was set.
+	if want := min(2, runtime.GOMAXPROCS(0)); st.Pollers != want || st.ActiveConnections != 2 || st.TotalConnections != 2 {
 		t.Fatalf("Stats with 2 open conns = %+v", st)
 	}
 
