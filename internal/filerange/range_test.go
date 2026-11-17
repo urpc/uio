@@ -150,3 +150,15 @@ func TestResolveEmptyAndWrappingRanges(t *testing.T) {
 		t.Fatalf("Resolve(990, 10) = %+v, %v; want the last 10 bytes", r, err)
 	}
 }
+
+// A file whose Stat fails reports the error before any range is formed.
+func TestResolveStatError(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "closed-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	if _, err := Resolve(f, 0, 1); err == nil {
+		t.Fatal("Resolve on a closed file succeeded, want a Stat error")
+	}
+}
