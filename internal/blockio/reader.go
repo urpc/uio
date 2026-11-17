@@ -29,26 +29,6 @@ import (
 	"github.com/urpc/uio/internal/readcontrol"
 )
 
-// SpliceSource is an optional capability of native stream sources whose socket
-// input SpliceTo can take over with Linux splice(2).
-type SpliceSource interface {
-	// RequestSplice asks the connection to stop reading its socket and to
-	// hand what it already read to the Reader; false when it cannot be
-	// spliced.
-	RequestSplice() bool
-	// SpliceGranted reports whether the connection handed its socket over,
-	// and whether its input ended or it is closing, so it never will.
-	SpliceGranted() (granted, ended bool)
-	// SpliceIn moves up to n bytes from the granted socket into the pipe
-	// whose write end is pipeW. It reports 0 and no error at the end of the
-	// stream, which the connection's turns read again and pass on once the
-	// socket is theirs, and net.ErrClosed once the connection closed it. A
-	// failed socket closes the connection with its error.
-	SpliceIn(pipeW, n int) (int, error)
-	// EndSplice gives the socket back to the connection's turns.
-	EndSplice()
-}
-
 // Reader is a stream connection's pull-mode blocking inbound endpoint.
 type Reader struct {
 	src     Source

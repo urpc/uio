@@ -30,6 +30,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -503,4 +504,107 @@ func TestSpliceToLeavesTheEndOfStreamToTheTurns(t *testing.T) {
 	}
 	got, _ := os.ReadFile(out.Name())
 	checkOffsetPattern(t, "SpliceTo to the end", got, want)
+}
+
+// A SpliceTo cut short with bytes already in the kernel pipe hands them back to
+// the Reader, which delivers them ahead of the rest: the destination receives
+// the whole stream in order. The destination is a connection (the sink path),
+// the only one where a cut can leave bytes in the pipe — a file forward always
+// drains it.
+func TestSpliceToRescuesItsPipeWhenCutShort(t *testing.T) {
+	const size = 4 << 20
+	want := offsetPattern(size)
+	moved := countSpliceReads(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var fired atomic.Bool
+	hook := func() {
+		if fired.CompareAndSwap(false, true) {
+			cancel()
+		}
+	}
+	testHookSpliceFilled.Store(&hook)
+	defer testHookSpliceFilled.Store(nil)
+	var rescued atomic.Int64
+	rhook := func() { rescued.Add(1) }
+	testHookSpliceRescue.Store(&rhook)
+	defer testHookSpliceRescue.Store(nil)
+
+	// The destination collects everything it receives.
+	var dstBuf bytes.Buffer
+	var dstOnce sync.Once
+	dstDone := make(chan struct{})
+	dstEv := &Events{Handler: FuncHandler{Open: func(c Conn) {
+		br, err := NewBlockingReader(c)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		go func() {
+			_, _ = io.Copy(&dstBuf, br)
+			dstOnce.Do(func() { close(dstDone) })
+			_ = c.Close()
+		}()
+	}}}
+	dstStop := startBlockingEvents(t, dstEv)
+	defer dstStop()
+	dstLn, err := dstEv.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dstAddr := dstLn.Addr().String()
+
+	spliced := make(chan error, 1)
+	var srcEv *Events
+	srcEv = &Events{Handler: FuncHandler{Open: func(c Conn) {
+		if c.Userdata() == "out" {
+			return // the dialed destination, not a new source
+		}
+		br, err := NewBlockingReader(c)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		go func() {
+			dst, err := srcEv.DialContext(context.Background(), "tcp://"+dstAddr, WithUserdata("out"))
+			if err != nil {
+				spliced <- err
+				return
+			}
+			bw, err := NewBlockingWriter(dst)
+			if err != nil {
+				spliced <- err
+				return
+			}
+			// The cut leaves the batch in the pipe; the engine hands it back to
+			// the reader, which delivers it before the rest of the stream.
+			_, err = br.SpliceTo(ctx, bw, -1)
+			spliced <- err
+			_, _ = br.WriteTo(bw)
+			_ = bw.Flush()
+			_ = dst.CloseWrite()
+		}()
+	}}}
+	cli := dialServed(t, srcEv)
+	if _, err := cli.Write(want); err != nil {
+		t.Fatal(err)
+	}
+	_ = cli.(*net.TCPConn).CloseWrite()
+	select {
+	case <-dstDone:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the destination never received the end of the stream")
+	}
+	serr := <-spliced
+	moved.require(t, 0)
+	if !errors.Is(serr, context.Canceled) {
+		t.Fatalf("SpliceTo = %v, want context.Canceled", serr)
+	}
+	if rescued.Load() == 0 {
+		t.Fatal("the cut never handed the pipe's bytes back to the reader")
+	}
+	checkOffsetPattern(t, "relay after a splice cut", dstBuf.Bytes(), want)
+	if dstBuf.Len() != size {
+		t.Fatalf("the stream lost bytes: %d of %d", dstBuf.Len(), size)
+	}
 }

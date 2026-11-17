@@ -19,9 +19,13 @@
 package uio
 
 import (
+	"errors"
+	"io"
 	"net"
+	"os"
 	"runtime"
 	"sync/atomic"
+	"syscall"
 
 	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/bytebuf"
@@ -62,11 +66,14 @@ const (
 // connection's socket into a pipe.
 var testHookSpliceRead atomic.Pointer[func(*fdConn, int)]
 
-func (s fdBlockSource) RequestSplice() bool                  { return s.conn.requestSplice() }
-func (s fdBlockSource) SpliceGranted() (granted, ended bool) { return s.conn.spliceGranted() }
-func (s fdBlockSource) SpliceIn(pipeW, n int) (int, error)   { return s.conn.spliceIn(pipeW, n) }
-func (s fdBlockSource) EndSplice()                           { s.conn.endSplice() }
+func (s fdBlockSource) TransferSplice(req blockio.SpliceRequest) (int64, bool, error) {
+	return s.conn.transferSplice(req)
+}
 func (s fdBlockSource) SpliceFromPipe(p, n int) (int, error) { return s.conn.spliceFromPipe(p, n) }
+
+// testHookSpliceFilled, when set, runs as a blocking splice has moved a batch
+// into its pipe and is about to forward it.
+var testHookSpliceFilled atomic.Pointer[func()]
 
 // readRoundSplice is the read round of a connection whose spliceReadFlag is
 // set. It reports whether the round is over.
@@ -486,4 +493,279 @@ func (zc *zeroCopyState) closeSpliceGate() {
 		zc.spliceGate.markClosed()
 		zc.spliceGate.waitDrain(0)
 	}
+}
+
+// transferSplice moves the socket's input into req's destination with
+// splice(2). It owns the whole transfer — the request/grant handshake, the
+// kernel pipe, the syscalls, the byte accounting and the hand-back of the
+// socket — while the Reader supplies, through req.Hooks, what only it knows:
+// how to park, and how to drain and rescue its own buffered bytes. It reports
+// fallback when the caller should go on with user-space copies: the stream
+// ended, which the connection's turns take up, or splice(2) cannot serve the
+// descriptors.
+func (conn *fdConn) transferSplice(req blockio.SpliceRequest) (int64, bool, error) {
+	// Exactly one destination: a connection sink or a file. Anything else is
+	// not a native splice; the caller copies.
+	if (req.Sink == nil) == (req.File == nil) {
+		return req.Total, true, nil
+	}
+	e := spliceEngine{conn: conn, req: req, total: req.Total}
+	if req.File != nil {
+		rc, err := req.File.SyscallConn()
+		if err != nil {
+			return req.Total, true, nil
+		}
+		e.fileConn = rc
+	}
+	return e.run()
+}
+
+// spliceEngine is one blocking SpliceTo moving a socket's input into a native
+// connection or a file through a kernel pipe.
+type spliceEngine struct {
+	conn     *fdConn
+	req      blockio.SpliceRequest
+	fileConn syscall.RawConn
+	pipe     *socket.SplicePipe
+	inPipe   int // bytes in the pipe not yet forwarded
+	total    int64
+}
+
+func (e *spliceEngine) run() (int64, bool, error) {
+	conn, req, h := e.conn, e.req, e.req.Hooks
+	if !conn.requestSplice() {
+		return e.total, true, nil
+	}
+	defer e.releasePipe()
+	defer conn.endSplice()
+	granted := false
+	for req.Count < 0 || e.total < req.Count {
+		tok := h.Prepare()
+		total, more, ended, err := h.Drain(e.total)
+		e.total = total
+		if err != nil {
+			return e.total, false, err
+		}
+		if req.Count >= 0 && e.total >= req.Count {
+			return e.total, false, nil
+		}
+		if more {
+			// A Pump added bytes since the drain looked: they go first.
+			continue
+		}
+		if ended {
+			return spliceEOF(e.total, req.Count)
+		}
+		if !granted {
+			var grantEnded bool
+			if granted, grantEnded = conn.spliceGranted(); !granted {
+				if grantEnded {
+					// No grant comes: the turns deliver the rest.
+					return e.total, true, nil
+				}
+				if err := h.Wait(tok); err != nil {
+					return e.total, false, err
+				}
+			}
+			// The round that granted the socket handed what it held to the
+			// Reader's pipe after the drain above: that goes first.
+			continue
+		}
+		if e.pipe == nil {
+			pipe, err := socket.AcquireSplicePipe()
+			if err != nil {
+				return e.total, true, nil
+			}
+			e.pipe = pipe
+		}
+		eof, rerr := e.fill()
+		if e.inPipe > 0 {
+			if hook := testHookSpliceFilled.Load(); hook != nil {
+				(*hook)()
+			}
+			fallback, err := e.forward()
+			if err != nil || fallback {
+				return e.total, fallback, err
+			}
+			// EAGAIN may only mean the pipe filled: read on until the socket
+			// itself has nothing.
+			if !eof && (rerr == nil || isWouldBlock(rerr)) {
+				continue
+			}
+		}
+		if eof {
+			// The connection's turns read the end of the stream again once the
+			// socket is theirs, and pass it on.
+			return e.total, true, nil
+		}
+		if rerr != nil && !isWouldBlock(rerr) && !errors.Is(rerr, net.ErrClosed) {
+			if socket.IsSpliceUnsupported(rerr) {
+				return e.total, true, nil
+			}
+			return e.total, false, rerr
+		}
+		// Drained, or the socket was closed and its notice is on its way:
+		// either wakes this wait, which holds no pipe.
+		e.releasePipe()
+		if err := h.Wait(tok); err != nil {
+			return e.total, false, err
+		}
+	}
+	return e.total, false, nil
+}
+
+// fill moves socket bytes into the pipe, one batch at most: no more than the
+// destination's window, so what it cannot send at once queues within it. A
+// window of 0 means no bound.
+func (e *spliceEngine) fill() (eof bool, err error) {
+	batch := spliceStepMax
+	if e.req.Sink != nil {
+		if win := e.req.Sink.Window(); win > 0 {
+			batch = min(batch, win)
+		}
+	}
+	if e.req.Count >= 0 {
+		batch = min(batch, int(e.req.Count-e.total))
+	}
+	for e.inPipe < batch {
+		n, err := e.conn.spliceIn(e.pipe.W, batch-e.inPipe)
+		e.inPipe += n
+		if err != nil {
+			return false, err
+		}
+		if n == 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// forward sends the pipe's bytes on to the destination. fallback reports a
+// file splice(2) cannot write, which took the rest with write(2).
+func (e *spliceEngine) forward() (fallback bool, err error) {
+	if e.req.Sink != nil {
+		n, taken, err := e.req.Sink.SpliceFromPipe(e.pipe.R, e.inPipe)
+		e.total += int64(n)
+		if taken {
+			e.inPipe = 0
+		}
+		return false, err
+	}
+	n, fallback, err := splicePipeToFile(e.pipe.R, e.req.File, e.fileConn, e.inPipe)
+	e.inPipe = 0
+	e.total += int64(n)
+	return fallback, err
+}
+
+// testHookSpliceRescue, when set, runs as a splice hands bytes its pipe still
+// holds back to the Reader.
+var testHookSpliceRescue atomic.Pointer[func()]
+
+// releasePipe returns the pipe, handing what it still holds back to the Reader
+// first: a pipe that may hold bytes still is closed, not pooled.
+func (e *spliceEngine) releasePipe() {
+	if e.pipe == nil {
+		return
+	}
+	if e.inPipe > 0 {
+		buf, complete := readSplicePipeBuf(e.pipe.R, e.inPipe)
+		if complete {
+			socket.ReleaseSplicePipe(e.pipe)
+		} else {
+			socket.CloseSplicePipe(e.pipe)
+		}
+		if buf != nil {
+			if hook := testHookSpliceRescue.Load(); hook != nil {
+				(*hook)()
+			}
+			e.req.Hooks.Rescue(buf)
+		}
+	} else {
+		socket.ReleaseSplicePipe(e.pipe)
+	}
+	e.inPipe = 0
+	e.pipe = nil
+}
+
+// spliceEOF reports an end of stream that came after total bytes: a bounded
+// transfer it cut short fails as io.ReadFull does.
+func spliceEOF(total, count int64) (int64, bool, error) {
+	if count >= 0 && total < count {
+		if total == 0 {
+			return 0, false, io.EOF
+		}
+		return total, false, io.ErrUnexpectedEOF
+	}
+	return total, false, nil
+}
+
+// readSplicePipeBuf reads the count bytes a pipe holds into a pooled buffer,
+// reporting whether it took them all.
+func readSplicePipeBuf(pipeR, count int) (*bytebuf.Buffer, bool) {
+	buf := bytebuf.AcquireBuffer(count)
+	dst := buf.AvailableBuffer()[:count]
+	nr, err := socket.ReadSplicePipe(pipeR, dst)
+	if nr <= 0 {
+		bytebuf.ReleaseBuffer(buf)
+		return nil, false
+	}
+	buf.CommitWrite(nr)
+	return buf, err == nil && nr == count
+}
+
+// splicePipeToFile moves count bytes from the pipe into dstFile, inside Control
+// so the file's descriptor cannot close under the syscalls. A file splice(2)
+// cannot write takes the rest with write(2), and reports true: the caller goes
+// on in user space. Whatever it returns, the pipe is empty.
+func splicePipeToFile(pipeR int, dstFile *os.File, dstConn syscall.RawConn, count int) (int, bool, error) {
+	rem := count
+	written := 0
+	userspace := false
+	var serr error
+	if cerr := dstConn.Control(func(fd uintptr) {
+		for rem > 0 {
+			n, err := socket.Splice(pipeR, nil, int(fd), nil, rem)
+			if n > 0 {
+				written += n
+				rem -= n
+			}
+			if n == 0 || socket.IsSpliceUnsupported(err) || isWouldBlock(err) {
+				userspace = true
+				return
+			}
+			if err != nil {
+				serr = err
+				return
+			}
+		}
+	}); cerr != nil {
+		serr = cerr
+	}
+	if serr != nil {
+		_, _ = drainPipeToWriter(pipeR, io.Discard, rem)
+		return written, false, serr
+	}
+	if userspace && rem > 0 {
+		nw, ferr := drainPipeToWriter(pipeR, dstFile, rem)
+		return written + nw, ferr == nil, ferr
+	}
+	return written, false, nil
+}
+
+func drainPipeToWriter(pipeR int, w io.Writer, count int) (int, error) {
+	if count <= 0 {
+		return 0, nil
+	}
+	buf := bytebuf.AcquireBuffer(count)
+	defer bytebuf.ReleaseBuffer(buf)
+	dst := buf.AvailableBuffer()[:count]
+	readTotal, err := socket.ReadSplicePipe(pipeR, dst)
+	if err != nil {
+		return 0, err
+	}
+	nw, werr := w.Write(dst[:readTotal])
+	if werr == nil && nw != readTotal {
+		werr = io.ErrShortWrite
+	}
+	return nw, werr
 }
