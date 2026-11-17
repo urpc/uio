@@ -1147,7 +1147,7 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 	_ = conn.sendScratch(holder)
 	conn.setWriteBlocked(false)
 	conn.submitMu.Lock()
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.submitMu.Unlock()
 	conn.pending.Store(0)
 	conn.releaseWrite()
@@ -1172,7 +1172,7 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 	}
 	conn.scratch = nil
 	conn.submitMu.Lock()
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.submitMu.Unlock()
 	conn.pending.Store(0)
 	conn.releaseWrite()
@@ -1192,7 +1192,7 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 	conn.scratch = nil
 	_ = conn.sendScratch(holderFull) // hits EAGAIN + queueDirectSuffix!
 	conn.submitMu.Lock()
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.submitMu.Unlock()
 	conn.pending.Store(0)
 	conn.releaseWrite()
@@ -1209,7 +1209,7 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 		t.Fatal("expected EBADF from sendScratch on fd -1")
 	}
 	badConn.submitMu.Lock()
-	badConn.outbound.Reset()
+	badConn.out.bytes.Reset()
 	badConn.submitMu.Unlock()
 	badConn.pending.Store(0)
 	badConn.releaseWrite()
@@ -1220,7 +1220,7 @@ func TestUnixTurnScratchReserveSendHandOverAndDrop(t *testing.T) {
 	_, _ = conn.Write([]byte("fallback1"))
 	_, _ = conn.Writev([][]byte{[]byte("fb"), []byte("2")})
 	conn.submitMu.Lock()
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.submitMu.Unlock()
 	conn.pending.Store(0)
 

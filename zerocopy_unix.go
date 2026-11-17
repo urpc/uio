@@ -23,7 +23,6 @@ import (
 	"sync/atomic"
 
 	"github.com/urpc/uio/internal/blockio"
-	"github.com/urpc/uio/internal/bytebuf"
 )
 
 // zeroCopyState is what a connection's SendFile and splice paths keep, built
@@ -45,81 +44,6 @@ type zeroCopyState struct {
 	// unread counts bytes a SpliceTo took from the socket, which the
 	// connection's next read round reports.
 	unread atomic.Int64
-}
-
-// fileSegment is a file range queued behind the bytes accepted before it.
-// trailing holds what was written after it, so it leaves after the range.
-type fileSegment struct {
-	fd       int
-	offset   int64
-	remain   int64
-	dev, ino uint64 // the file's identity, to extend the range a later SendFile continues
-	// owner is the SendFileContext call that queued the range, which may
-	// withdraw it; 0 for SendFile, which never does.
-	owner uint64
-	// sending is the part of the range a sendfile(2) is reading now: a
-	// withdrawal leaves it queued, since it may be on the wire already.
-	sending int64
-	// reads marks a range sendfile(2) refused, sent with reads instead.
-	reads    bool
-	trailing bytebuf.CompositeBuffer
-}
-
-// fileQueue holds the file ranges queued behind a connection's output, oldest
-// first. Sending the front one advances head rather than moving the rest, so
-// a long queue costs no more per range than a short one.
-type fileQueue struct {
-	segs []fileSegment
-	head int
-}
-
-func (q *fileQueue) len() int { return len(q.segs) - q.head }
-
-func (q *fileQueue) front() *fileSegment { return &q.segs[q.head] }
-
-func (q *fileQueue) back() *fileSegment { return &q.segs[len(q.segs)-1] }
-
-func (q *fileQueue) pushBack(seg fileSegment) {
-	if q.head > 0 && len(q.segs) == cap(q.segs) {
-		// Reuse the room sent ranges left before growing.
-		n := copy(q.segs, q.segs[q.head:])
-		clear(q.segs[n:])
-		q.segs, q.head = q.segs[:n], 0
-	}
-	q.segs = append(q.segs, seg)
-}
-
-func (q *fileQueue) pushFront(seg fileSegment) {
-	if q.head > 0 {
-		q.head--
-		q.segs[q.head] = seg
-		return
-	}
-	q.segs = append(q.segs, fileSegment{})
-	copy(q.segs[1:], q.segs)
-	q.segs[0] = seg
-}
-
-// popFront drops the front range, whose trailing bytes its caller moved.
-func (q *fileQueue) popFront() {
-	q.segs[q.head] = fileSegment{fd: -1}
-	q.head++
-	if q.head == len(q.segs) {
-		q.segs, q.head = q.segs[:0], 0
-	}
-}
-
-// moveBlocks moves src's blocks to the end of dst.
-func moveBlocks(dst, src *bytebuf.CompositeBuffer) {
-	if dst.Empty() {
-		*dst, *src = *src, *dst
-		return
-	}
-	for !src.Empty() {
-		if blk := src.PopBlock(); blk != nil {
-			dst.AppendOwned(blk)
-		}
-	}
 }
 
 // loadZeroCopy returns the connection's zero-copy state, nil when it has none.

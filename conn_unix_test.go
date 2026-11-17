@@ -374,7 +374,7 @@ func TestNativeProducerBudgetPreflightPreservesAcceptedPayload(t *testing.T) {
 		t.Run(api, func(t *testing.T) {
 			conn := &fdConn{fd: -1}
 			conn.loop, conn.entry = &eventLoop{}, (&Events{MaxOutboundBuffered: 8}).plainEntry()
-			defer conn.outbound.Reset()
+			defer conn.out.bytes.Reset()
 			write := func(data []byte) (int, error) {
 				if api == "Writev" {
 					return conn.Writev([][]byte{data[:1], data[1:]})
@@ -392,7 +392,7 @@ func TestNativeProducerBudgetPreflightPreservesAcceptedPayload(t *testing.T) {
 			if n, err := write([]byte("x")); n != 0 || !errors.Is(err, ErrOutboundOverflow) {
 				t.Fatalf("full producer=%d,%v", n, err)
 			}
-			if conn.OutboundBuffered() != 8 || !bytes.Equal(conn.outbound.Peek(make([]byte, 8)), []byte("accepted")) {
+			if conn.OutboundBuffered() != 8 || !bytes.Equal(conn.out.bytes.Peek(make([]byte, 8)), []byte("accepted")) {
 				t.Fatal("rejected producer changed earlier accepted bytes")
 			}
 		})
@@ -1799,14 +1799,14 @@ func TestCorkedOwnedWritesCoalesceInRound(t *testing.T) {
 		}
 	}
 	writeOwned('a')
-	vec, _ := conn.outbound.PeekVecN(nil, 8)
+	vec, _ := conn.out.bytes.PeekVecN(nil, 8)
 	if len(vec) != 1 {
 		t.Fatalf("first write segment count = %d, want 1", len(vec))
 	}
 	first := &vec[0][0]
 	writeOwned('b')
 	writeOwned('c')
-	vec, length := conn.outbound.PeekVecN(nil, 8)
+	vec, length := conn.out.bytes.PeekVecN(nil, 8)
 	if len(vec) != 2 {
 		t.Fatalf("coalesced segment count = %d, want 2", len(vec))
 	}
@@ -1816,7 +1816,7 @@ func TestCorkedOwnedWritesCoalesceInRound(t *testing.T) {
 	if length != 3*payloadSize || len(vec[1]) != 2*payloadSize {
 		t.Fatalf("coalesced lengths = %d, %d", length, len(vec[1]))
 	}
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.pending.Store(0)
 }
 
@@ -1844,7 +1844,7 @@ func TestUnixWriteFailureAndRejectedQueues(t *testing.T) {
 	}
 	conn = &fdConn{fd: -1}
 	conn.entry = (&Events{}).plainEntry()
-	_, _ = conn.outbound.WriteString("x")
+	_, _ = conn.out.bytes.WriteString("x")
 	conn.pending.Store(1)
 	if n, err := conn.flushOnLoop(); n != 0 || err == nil {
 		t.Fatalf("invalid-fd flush = %d, %v", n, err)

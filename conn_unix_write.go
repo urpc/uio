@@ -287,12 +287,7 @@ func (conn *fdConn) queueOwnedWrite(owned *bytebuf.Buffer, size int) (int, error
 		conn.submitMu.Unlock()
 		return 0, conn.errOutboundOverflow()
 	}
-	out := conn.outboundTargetLocked()
-	if !out.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
-		out.AppendOwnedTailCoalesced(owned, conn.coalesceBlockSize())
-	} else {
-		out.AppendOwned(owned)
-	}
+	conn.outAppendOwnedTailCoalesced(owned, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	conn.kickWriterOutside()
 	return size, nil
@@ -494,7 +489,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 		}
 		conn.handOverScratch()
 		conn.submitMu.Lock()
-		out := conn.outboundTargetLocked()
+		out := conn.outTargetLocked()
 		if conn.turn&turnCorked != 0 && !out.Empty() && coalesceOwned(owned, size, conn.coalesceBlockSize()) {
 			out.AppendOwnedCoalesced(owned, conn.coalesceBlockSize())
 		} else {
@@ -554,7 +549,7 @@ func (conn *fdConn) writeOwnedOnLoop(owned *bytebuf.Buffer, size int) (int, erro
 // would land inside a half-sent payload or ahead of replies accepted first.
 func (conn *fdConn) queueDirectSuffix(owned *bytebuf.Buffer) {
 	conn.submitMu.Lock()
-	conn.outbound.PrependOwned(owned)
+	conn.outPrependRest(owned)
 	conn.submitMu.Unlock()
 }
 
@@ -755,7 +750,7 @@ func (conn *fdConn) flushWrite() (int, error) {
 	for {
 		if conn.inflight == nil {
 			conn.submitMu.Lock()
-			if conn.outbound.Blocks() == 1 {
+			if conn.out.bytes.Blocks() == 1 {
 				var n int
 				n, writeErr = conn.sendOutboundBlock()
 				totalWritten += n
@@ -764,7 +759,7 @@ func (conn *fdConn) flushWrite() (int, error) {
 				conn.submitMu.Unlock()
 				return conn.retireFlush(totalWritten, writeErr)
 			}
-			if conn.outbound.Empty() {
+			if conn.out.bytes.Empty() {
 				conn.submitMu.Unlock()
 				if conn.writeState.Load()&writeFileTailFlag != 0 && totalWritten < fileFlushBudget {
 					var fn int
@@ -779,7 +774,7 @@ func (conn *fdConn) flushWrite() (int, error) {
 			}
 			batch := inflightPool.Get().(*bytebuf.CompositeBuffer)
 			// batch is empty, so the swap leaves outbound empty for producers.
-			conn.outbound, *batch = *batch, conn.outbound
+			conn.out.bytes, *batch = *batch, conn.out.bytes
 			conn.submitMu.Unlock()
 			conn.inflight = batch
 		}
@@ -831,8 +826,8 @@ func (conn *fdConn) retireSent(n int) {
 // each send, and stops once producers have queued a second block.
 func (conn *fdConn) sendOutboundBlock() (int, error) {
 	totalWritten := 0
-	for calls := 0; calls < 16 && conn.outbound.Blocks() == 1; calls++ {
-		chunk := conn.outbound.PeekChunk()
+	for calls := 0; calls < 16 && conn.out.bytes.Blocks() == 1; calls++ {
+		chunk := conn.out.bytes.PeekChunk()
 		conn.submitMu.Unlock()
 		written, err := socket.Send(int(conn.fd), chunk)
 		conn.submitMu.Lock()
@@ -845,7 +840,7 @@ func (conn *fdConn) sendOutboundBlock() (int, error) {
 			}
 			return totalWritten, nil
 		}
-		conn.outbound.Discard(written)
+		conn.out.bytes.Discard(written)
 		totalWritten += written
 	}
 	return totalWritten, nil
@@ -964,7 +959,7 @@ func (conn *fdConn) writeQueuedOnLoop(data []byte) (int, error) {
 		return n, nil
 	}
 	conn.submitMu.Lock()
-	conn.outboundTargetLocked().WriteCoalesced(data, conn.coalesceBlockSize())
+	conn.outWriteCoalesced(data, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return n, nil
 }
@@ -984,7 +979,7 @@ func (conn *fdConn) writevQueuedOnLoop(vec [][]byte, total int) (int, error) {
 		return total, nil
 	}
 	conn.submitMu.Lock()
-	conn.outboundTargetLocked().WritevCoalesced(vec, conn.coalesceBlockSize())
+	conn.outWritevCoalesced(vec, conn.coalesceBlockSize())
 	conn.submitMu.Unlock()
 	return total, nil
 }

@@ -212,7 +212,7 @@ func (conn *fdConn) queueRangeFirst(file *os.File, r filerange.Range, owner uint
 			return net.ErrClosed
 		}
 		conn.pending.Add(r.Len)
-		conn.outbound.PrependOwned(buf)
+		conn.outPrependRest(buf)
 		conn.submitMu.Unlock()
 		return nil
 	}
@@ -232,7 +232,7 @@ func (conn *fdConn) queueRangeFirst(file *os.File, r filerange.Range, owner uint
 		return net.ErrClosed
 	}
 	conn.pending.Add(r.Len)
-	moveBlocks(&seg.trailing, &conn.outbound)
+	moveBlocks(&seg.trailing, &conn.out.bytes)
 	zc.files.pushFront(seg)
 	conn.writeState.Or(writeFileTailFlag)
 	conn.submitMu.Unlock()
@@ -259,7 +259,7 @@ func (conn *fdConn) queueRange(file *os.File, r filerange.Range, owner uint64, k
 			return 0, err
 		}
 		conn.pending.Add(r.Len)
-		conn.outboundTargetLocked().AppendOwned(buf)
+		conn.outAppendOwned(buf)
 		conn.submitMu.Unlock()
 	} else {
 		zc := conn.zeroCopyState()
@@ -388,15 +388,6 @@ func readFileRange(file *os.File, off, n int64) (*bytebuf.Buffer, error) {
 	return buf, nil
 }
 
-// outboundTargetLocked is where bytes accepted now are queued: behind the last
-// queued file range once there is one, so they leave after it.
-func (conn *fdConn) outboundTargetLocked() *bytebuf.CompositeBuffer {
-	if conn.writeState.Load()&writeFileTailFlag != 0 {
-		return &conn.loadZeroCopy().files.back().trailing
-	}
-	return &conn.outbound
-}
-
 // cancelQueuedFiles withdraws the ranges owner queued that have not been sent
 // and reports the bytes they still held.
 func (conn *fdConn) cancelQueuedFiles(owner uint64) int64 {
@@ -461,7 +452,7 @@ func (conn *fdConn) dropRangesLocked(zc *zeroCopyState, owner uint64, all bool) 
 			if seg.fd >= 0 {
 				_ = syscall.Close(seg.fd)
 			}
-			before := &conn.outbound
+			before := &conn.out.bytes
 			if kept > q.head {
 				before = &q.segs[kept-1].trailing
 			}
@@ -508,7 +499,7 @@ func (conn *fdConn) recordWithdrawalLocked(zc *zeroCopyState, owner uint64, n in
 func (conn *fdConn) popRangeLocked(zc *zeroCopyState) int {
 	seg := zc.files.front()
 	fd := seg.fd
-	moveBlocks(&conn.outbound, &seg.trailing)
+	moveBlocks(&conn.out.bytes, &seg.trailing)
 	zc.files.popFront()
 	if zc.files.len() == 0 {
 		conn.writeState.And(^writeFileTailFlag)
@@ -531,8 +522,8 @@ func (conn *fdConn) sendQueuedFiles(budget int) (written int, more bool, err err
 	}
 	for calls := 0; ; calls++ {
 		conn.submitMu.Lock()
-		if !conn.outbound.Empty() || zc.files.len() == 0 {
-			more = !conn.outbound.Empty()
+		if !conn.out.bytes.Empty() || zc.files.len() == 0 {
+			more = !conn.out.bytes.Empty()
 			conn.submitMu.Unlock()
 			return written, more, nil
 		}

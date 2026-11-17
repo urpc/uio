@@ -97,11 +97,11 @@ type fdConn struct {
 	ioOwner atomic.Int64 // current task goroutine, zero while idle
 	pending atomic.Int64 // accepted payload not yet written
 
-	// submitMu orders cross-goroutine submissions and protects outbound while a
-	// worker round and an external producer overlap.
+	// submitMu orders cross-goroutine submissions and protects the outbound
+	// queue while a worker round and an external producer overlap.
 	submitMu sync.Mutex
-	outbound bytebuf.CompositeBuffer // protected by submitMu
-	udp      *unixUDPState           // nil for stream connections
+	out      outQueue      // the outbound FIFO; protected by submitMu
+	udp      *unixUDPState // nil for stream connections
 
 	// inflight holds a multi-block batch a flush detached from outbound, so
 	// its sends and the release of its sent blocks run without submitMu.
@@ -169,7 +169,7 @@ const (
 	// writeShutDoneFlag records that the writing half is shut.
 	writeShutDoneFlag
 	// writeFileTailFlag records queued file ranges: bytes accepted now go
-	// behind the last of them (see outboundTargetLocked). It changes under
+	// behind the last of them (see outTargetLocked). It changes under
 	// submitMu, with the ranges.
 	writeFileTailFlag
 )

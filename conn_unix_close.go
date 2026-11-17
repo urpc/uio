@@ -534,7 +534,7 @@ func (conn *fdConn) releaseResources(cause, flushErr error) error {
 	}
 	conn.submitMu.Lock()
 	conn.clearFilesLocked()
-	conn.outbound.Reset()
+	conn.out.bytes.Reset()
 	conn.submitMu.Unlock()
 	conn.stopDrainTimer()
 	conn.releaseInflight()

@@ -20,7 +20,7 @@ func TestUnixWriteOwnedReusesAllocation(t *testing.T) {
 		if _, err := conn.WriteOwned(buffer); err != nil {
 			panic(err)
 		}
-		conn.outbound.Reset()
+		conn.out.bytes.Reset()
 		conn.pending.Store(0)
 	}
 	write()

@@ -76,8 +76,8 @@ func TestWithdrawingRangesKeepsOtherOwnersInOrder(t *testing.T) {
 	// Once nothing reads it, a withdrawn head's bytes go to outbound.
 	zc.files.front().sending = 0
 	zc.files.front().owner = 3
-	if got := c.cancelQueuedFiles(3); got != 30 || zc.files.len() != 0 || c.outbound.Len() != 4 {
-		t.Fatalf("withdrawal of an idle head = %d, %d ranges, %d bytes in outbound", got, zc.files.len(), c.outbound.Len())
+	if got := c.cancelQueuedFiles(3); got != 30 || zc.files.len() != 0 || c.out.bytes.Len() != 4 {
+		t.Fatalf("withdrawal of an idle head = %d, %d ranges, %d bytes in outbound", got, zc.files.len(), c.out.bytes.Len())
 	}
 	if c.writeState.Load()&writeFileTailFlag != 0 {
 		t.Fatal("writeFileTailFlag outlived the last queued range")

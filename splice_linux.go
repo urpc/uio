@@ -290,7 +290,7 @@ func (conn *fdConn) queuePipeFirst(pipeR int, rest int) error {
 		return net.ErrClosed
 	}
 	conn.pending.Add(int64(buf.Len()))
-	conn.outbound.PrependOwned(buf)
+	conn.outPrependRest(buf)
 	conn.submitMu.Unlock()
 	return nil
 }
@@ -308,7 +308,7 @@ func (conn *fdConn) queuePipe(pipeR int, count int) (int, error) {
 		return 0, net.ErrClosed
 	}
 	conn.pending.Add(int64(buf.Len()))
-	conn.outboundTargetLocked().AppendOwned(buf)
+	conn.outAppendOwned(buf)
 	conn.submitMu.Unlock()
 	if conn.kickWriter() && !blockio.OnTurn() {
 		runtime.Gosched()

@@ -55,12 +55,12 @@ func BenchmarkCallbackWrite(b *testing.B) {
 				if _, err = conn.Write(payload); err != nil {
 					b.Fatal(err)
 				}
-				for !conn.outbound.Empty() {
+				for !conn.out.bytes.Empty() {
 					conn.setWriteBlocked(false)
 					if _, err = conn.flushOnLoop(); err != nil {
 						b.Fatal(err)
 					}
-					if !conn.outbound.Empty() {
+					if !conn.out.bytes.Empty() {
 						runtime.Gosched()
 					}
 				}
