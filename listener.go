@@ -17,6 +17,7 @@
 package uio
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"strings"
@@ -49,19 +50,33 @@ type PacketListener interface {
 	// DialPeer adds a peer connection addressed at raddr, on the listener's
 	// own socket: what it sends leaves from the listener's address, and the
 	// datagrams raddr answers with are delivered to it — as they would be
-	// had raddr spoken first. It is the entry point for hole punching. The
-	// returned Conn is writable at once, before OnOpen, which runs once in a
-	// turn of its own and is always followed by OnClose. A peer that spoke
-	// first already has its connection: it is returned with ErrPeerExists,
-	// keeping the userdata it opened with. userdata is the new connection's
-	// initial Userdata. Before any datagram from raddr arrives, a closed
-	// child is replaced: a peer whose old connection is closing can be dialed
-	// again.
+	// had raddr spoken first. It is the entry point for hole punching.
 	//
-	// A listener that carries a layer chain refuses DialPeer with
-	// ErrUnsupported: the peer's connection is the stack's, which only the
-	// stack opens, and the Conn returned here would bypass every layer.
+	// On a listener without a layer chain the returned Conn is the socket's
+	// peer, writable at once, before OnOpen, which runs once in a turn of its
+	// own and is always followed by OnClose.
+	//
+	// On a listener that carries a layer chain the peer is the stack's, so
+	// DialPeer is DialPeerContext with a background context: it opens the
+	// chain on the peer's turn and returns the stack's top Conn once the
+	// Handler's OnOpen ran — the same connection an accepted peer gets, never
+	// the socket below it. That Conn is writable once the stack opened; a
+	// write before then reports net.ErrClosed. Because it waits for a turn,
+	// it refuses to run on a turn or event loop itself (ErrDialOnEventLoop),
+	// the way the blocking write APIs do; dial from a goroutine of your own.
+	//
+	// A peer that spoke first already has its connection: it is returned with
+	// ErrPeerExists, keeping the userdata it opened with — on a layered
+	// listener its stack's top Conn, or nil until that stack has opened.
+	// userdata is the new connection's initial Userdata. Before any datagram
+	// from raddr arrives, a closed child is replaced: a peer whose old
+	// connection is closing can be dialed again.
 	DialPeer(raddr netip.AddrPort, userdata any) (Conn, error)
+
+	// DialPeerContext is DialPeer with ctx bounding the wait for a layered
+	// peer's stack to open; a cancelled ctx aborts the peer and reports its
+	// cause. On a listener without a chain there is no wait and ctx is unused.
+	DialPeerContext(ctx context.Context, raddr netip.AddrPort, userdata any) (Conn, error)
 
 	// WriteTo sends one datagram to raddr from the listener's socket, from
 	// the listener's own address, without a connection. It reports the bytes
@@ -119,7 +134,11 @@ func (g *listenerGroup) Close() error {
 // *listenerGroup the PacketListener method set: only packetListener has it,
 // so a stream listener's Listener asserts to no more than Listener.
 func (g *listenerGroup) dialPeerAt(raddr netip.AddrPort, userdata any) (Conn, error) {
-	return g.members[0].udpSvr.dialPeer(raddr, userdata)
+	return g.members[0].udpSvr.dialPeerContext(context.Background(), raddr, userdata)
+}
+
+func (g *listenerGroup) dialPeerContextAt(ctx context.Context, raddr netip.AddrPort, userdata any) (Conn, error) {
+	return g.members[0].udpSvr.dialPeerContext(ctx, raddr, userdata)
 }
 
 func (g *listenerGroup) writeToPeerAt(b []byte, raddr netip.AddrPort) (int, error) {
@@ -136,6 +155,10 @@ func (p packetListener) DialPeer(raddr netip.AddrPort, userdata any) (Conn, erro
 	return p.group.dialPeerAt(raddr, userdata)
 }
 
+func (p packetListener) DialPeerContext(ctx context.Context, raddr netip.AddrPort, userdata any) (Conn, error) {
+	return p.group.dialPeerContextAt(ctx, raddr, userdata)
+}
+
 func (p packetListener) WriteTo(b []byte, raddr netip.AddrPort) (int, error) {
 	return p.group.writeToPeerAt(b, raddr)
 }
@@ -147,4 +170,16 @@ func (g *listenerGroup) asListener() Listener {
 		return packetListener{group: g}
 	}
 	return g
+}
+
+// peerStackConn is the Conn a layered DialPeer reports for a peer that already
+// exists: its stack's top once the stack has opened — the same face the Handler
+// holds, safe to use off-turn. Until then it is nil: the stack is published
+// before its layers attach, so a top read mid-open would race the attach. A
+// bare peer never reaches here; its dial returns the socket itself.
+func peerStackConn(peer Conn) Conn {
+	if c := stackOf(peer); c != nil && c.topOpen.Load() {
+		return c.topConn()
+	}
+	return nil
 }

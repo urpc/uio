@@ -22,12 +22,14 @@
 package uio
 
 import (
+	"context"
 	"net"
 	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
 
+	"github.com/urpc/uio/internal/blockio"
 	"github.com/urpc/uio/internal/socket"
 )
 
@@ -291,10 +293,16 @@ func unlockUDPGroup(group []*fdConn) {
 	}
 }
 
-// dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
-func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
-	if server.entry != nil && !server.entry.directConsumer {
-		return nil, ErrUnsupported
+// dialPeerContext adds a child for addr to a UDP server; see
+// PacketListener.DialPeerContext. A bare child is returned at once; a layered
+// one opens its chain on the server's turn and is returned once the stack's
+// top opened, through the same probe a dial settles.
+func (server *fdConn) dialPeerContext(ctx context.Context, addr netip.AddrPort, userdata any) (Conn, error) {
+	layered := server.entry != nil && !server.entry.directConsumer
+	if layered && blockio.OnTurn() {
+		// Opening the stack waits for a turn of this server; running on one
+		// would wait for itself. The blocking write APIs refuse the same way.
+		return nil, ErrDialOnEventLoop
 	}
 	udp := server.udp
 	key, err := socket.UDPAddressFor(udp.family, addr)
@@ -310,6 +318,9 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	for _, m := range members {
 		if existing := m.udp.peers[key]; existing != nil && !existing.isClosing() {
 			unlockUDPGroup(members)
+			if layered {
+				return peerStackConn(existing), ErrPeerExists
+			}
 			return existing, ErrPeerExists
 		}
 	}
@@ -324,6 +335,12 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	child.addr, child.remoteAddr = server.addr, key.NetAddr().AddrPort()
 	child.SetUserdata(userdata)
 	child.udp.openOwed.Store(true)
+	// The probe goes in before the child is visible to the server's turn, so
+	// stackDriver.OnOpen finds it and settles the opened stack top to the wait.
+	var waitDial func(context.Context) (Conn, error)
+	if layered {
+		waitDial = server.entry.dial(child)
+	}
 	for _, m := range members {
 		if m.udp.peers != nil {
 			m.udp.peers[key] = child
@@ -332,6 +349,9 @@ func (server *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) 
 	udp.opening = append(udp.opening, child)
 	unlockUDPGroup(members)
 	server.scheduleIO(ioEventPeers)
+	if waitDial != nil {
+		return waitDial(ctx)
+	}
 	return child, nil
 }
 

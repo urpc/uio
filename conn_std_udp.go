@@ -22,6 +22,7 @@
 package uio
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
@@ -144,15 +145,17 @@ func peerKey(addr netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(addr.Addr().Unmap(), addr.Port())
 }
 
-// dialPeer adds a child for addr to a UDP server; see Listener.DialPeer.
-// The child is published under the server's mutex, and its OnOpen runs on a
-// goroutine of its own serialized with the reader by the child's callback
-// mutex; a datagram from the peer that arrives first runs it there instead.
-func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
-	if fc.entry != nil && !fc.entry.directConsumer {
-		// A chain's peer connection is the stack's: the socket-level Conn
-		// returned here would bypass every layer. Dial is the way in.
-		return nil, ErrUnsupported
+// dialPeerContext adds a child for addr to a UDP server; see
+// PacketListener.DialPeerContext. The child is published under the server's
+// mutex, and its OnOpen runs on a goroutine of its own serialized with the
+// reader by the child's callback mutex; a datagram from the peer that arrives
+// first runs it there instead.
+func (fc *fdConn) dialPeerContext(ctx context.Context, addr netip.AddrPort, userdata any) (Conn, error) {
+	layered := fc.entry != nil && !fc.entry.directConsumer
+	if layered && blockio.OnTurn() {
+		// Opening the stack waits for the peer's open turn; running on a turn
+		// or loop would wait for itself, as the blocking write APIs refuse.
+		return nil, ErrDialOnEventLoop
 	}
 	// The open joins the lifecycle before the peer is visible to any cleanup,
 	// in one section with the shutdown publication: either the Events is
@@ -180,6 +183,9 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	if existing := fc.udp.peers[rAddr]; existing != nil && !existing.isClosing() {
 		fc.mux.Unlock()
 		events.callbackWG.Done()
+		if layered {
+			return peerStackConn(existing), ErrPeerExists
+		}
 		return existing, ErrPeerExists
 	}
 	// A closing peer's counted task owns its end even after replacement.
@@ -191,6 +197,12 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 	child.loop = fc.loop
 	child.SetUserdata(userdata)
 	child.retainLifecycle()
+	// The probe goes in before the open goroutine runs, so stackDriver.OnOpen
+	// finds it and settles the opened stack top to the wait below.
+	var waitDial func(context.Context) (Conn, error)
+	if layered {
+		waitDial = fc.entry.dial(child)
+	}
 	fc.udp.peers[rAddr] = child
 	fc.mux.Unlock()
 	go func() {
@@ -199,6 +211,9 @@ func (fc *fdConn) dialPeer(addr netip.AddrPort, userdata any) (Conn, error) {
 		defer events.callbackWG.Done()
 		child.openOnReader()
 	}()
+	if waitDial != nil {
+		return waitDial(ctx)
+	}
 	return child, nil
 }
 

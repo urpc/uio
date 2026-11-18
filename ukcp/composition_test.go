@@ -18,6 +18,7 @@ package ukcp
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -352,22 +353,52 @@ func TestNestedKCP(t *testing.T) {
 	}
 }
 
-// A listener with a chain refuses DialPeer: the socket-level connection would
-// bypass every layer.
-func TestLayeredDialPeerRefused(t *testing.T) {
-	server := newServer(t, echoHandler, ServerLayer(Options{}))
-	ln, err := server.Listen("udp://127.0.0.1:0")
+// A layered listener dials a peer on its own socket: the returned Conn is the
+// stack's top, the chain opens as a client toward the peer, and an echo crosses
+// the full KCP+TLS stack — the hole-punching client role, from the bound port.
+func TestLayeredDialPeer(t *testing.T) {
+	serverTLS, clientTLS := testTLSConfigs(t)
+	// The echo peer accepts with a server chain.
+	echo := newServer(t, echoHandler, ServerLayer(Options{}), utls.ServerLayer(utls.LayerOptions{TLSConfig: serverTLS}))
+	echoLn, err := echo.Listen("udp://127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
+	t.Cleanup(func() { _ = echoLn.Close() })
 
-	packets, ok := ln.(uio.PacketListener)
+	// The dialing peer's listener carries a client chain: DialPeer opens it
+	// toward the echo peer, and the replies route back to the dialed stack.
+	client := newCollector()
+	dialer := newServer(t, client.handler(), ClientLayer(Options{}), utls.ClientLayer(utls.LayerOptions{TLSConfig: clientTLS}))
+	dialLn, err := dialer.Listen("udp://127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = dialLn.Close() })
+
+	packets, ok := dialLn.(uio.PacketListener)
 	if !ok {
 		t.Fatal("a UDP listener is not a PacketListener")
 	}
-	addr := ln.Addr().(*net.UDPAddr).AddrPort()
-	if _, err := packets.DialPeer(addr, nil); !errors.Is(err, uio.ErrUnsupported) {
-		t.Fatalf("layered DialPeer = %v, want ErrUnsupported", err)
+	ctx, cancel := context.WithTimeout(context.Background(), testWait)
+	defer cancel()
+	top, err := packets.DialPeerContext(ctx, echoLn.Addr().(*net.UDPAddr).AddrPort(), nil)
+	if err != nil {
+		t.Fatalf("layered DialPeer: %v", err)
+	}
+	if uio.LayerOf(top) == nil {
+		t.Fatal("DialPeer returned the socket, not the stack top")
+	}
+	t.Cleanup(func() { _ = top.Close() })
+
+	payload := payloadBytes(16 << 10)
+	for off := 0; off < len(payload); off += 1024 {
+		if _, err := top.Write(payload[off : off+1024]); err != nil {
+			t.Fatalf("write at %d: %v", off, err)
+		}
+	}
+	waitUntil(t, "the echo through the dialed stack", func() bool { return client.count() >= len(payload) })
+	if got := client.bytes(); !bytes.Equal(got[:len(payload)], payload) {
+		t.Fatalf("echo corrupted: %d bytes", len(got))
 	}
 }
