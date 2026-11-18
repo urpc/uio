@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="188" viewBox="0 0 960 188">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#0B1220"/><stop offset="1" stop-color="#0F1A2E"/>
+  </linearGradient>
+  <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#22D3EE" stop-opacity="0.35"/>
+    <stop offset="1" stop-color="#22D3EE" stop-opacity="0"/>
+  </radialGradient>
+  <radialGradient id="glow2" cx="0.5" cy="0.5" r="0.5">
+    <stop offset="0" stop-color="#818CF8" stop-opacity="0.22"/>
+    <stop offset="1" stop-color="#818CF8" stop-opacity="0"/>
+  </radialGradient>
+  <linearGradient id="word" x1="0" y1="0" x2="1" y2="1">
+    <stop offset="0" stop-color="#FFFFFF"/><stop offset="1" stop-color="#A5F3FC"/>
+  </linearGradient>
+  <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+    <circle cx="1" cy="1" r="1" fill="#22304A"/>
+  </pattern>
+</defs>
+<rect width="960" height="188" rx="16" fill="url(#bg)"/>
+<rect width="960" height="188" rx="16" fill="url(#dots)" opacity="0.55"/>
+<rect x="0.5" y="0.5" width="959" height="187" rx="15.5" fill="none" stroke="#22304A"/>
+<circle cx="695" cy="94.0" r="96" fill="url(#glow)"/>
+<circle cx="575" cy="94.0" r="70" fill="url(#glow2)"/>
+<!-- client -> proxy -> target relay flow -->
+<rect x="520" y="60" width="56" height="24" rx="6" fill="#0B1220" stroke="#94A3B8" stroke-opacity="0.85"/>
+<text x="548" y="76" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="600">client</text>
+<rect x="630" y="60" width="64" height="24" rx="6" fill="#0B1220" stroke="#22D3EE" stroke-opacity="0.9"/>
+<text x="662" y="76" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#22D3EE" text-anchor="middle" font-weight="600">usocks</text>
+<rect x="750" y="60" width="62" height="24" rx="6" fill="#0B1220" stroke="#94A3B8" stroke-opacity="0.85"/>
+<text x="781" y="76" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="600">target</text>
+<line x1="578" y1="72" x2="628" y2="72" stroke="#22D3EE" stroke-width="1.2" opacity="0.6"/>
+<path d="M626,72 l-7,-4 v8 z" fill="#22D3EE" opacity="0.85"/>
+<line x1="696" y1="72" x2="748" y2="72" stroke="#22D3EE" stroke-width="1.2" opacity="0.6"/>
+<path d="M746,72 l-7,-4 v8 z" fill="#22D3EE" opacity="0.85"/>
+<text x="603" y="54" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="9" fill="#8A9BB4" text-anchor="middle">CONNECT</text>
+<line x1="812" y1="120" x2="578" y2="120" stroke="#818CF8" stroke-width="1.2" opacity="0.55"/>
+<path d="M576,120 l7,-4 v8 z" fill="#818CF8" opacity="0.8"/>
+<text x="695" y="112" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#C7D2FE" text-anchor="middle" font-weight="600">splice(2) relay</text>
+<text x="695" y="146" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10" fill="#8A9BB4" text-anchor="middle">zero-copy both ways</text>
+<!-- feature tags -->
+<rect x="840" y="49.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="64.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">RFC 1928/1929</text>
+<rect x="840" y="83.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="98.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">UDP ASSOCIATE</text>
+<rect x="840" y="117.0" width="88" height="22" rx="6" fill="#0B1220" stroke="#22304A"/>
+<text x="884.0" y="132.0" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="10.5" fill="#CBD5E1" text-anchor="middle" font-weight="400">proxy chain</text>
+<!-- wordmark + tagline + import -->
+<text x="52.0" y="92.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="64" fill="url(#word)" text-anchor="start" font-weight="700" letter-spacing="-2">usocks</text>
+<text x="280.0" y="66.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="19" fill="#E6EDF6" text-anchor="start" font-weight="500">SOCKS5 for Go, on uio</text>
+<text x="280.0" y="90.0" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13.5" fill="#8A9BB4" text-anchor="start" font-weight="400">CONNECT &amp; UDP ASSOCIATE proxy.</text>
+<rect x="56" y="122" width="300" height="30" rx="8" fill="#0A1628" stroke="#22304A"/>
+<text x="70.0" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#22D3EE" text-anchor="start" font-weight="400">import</text>
+<text x="122.5" y="141.5" font-family="'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#CBD5E1" text-anchor="start" font-weight="400">"github.com/urpc/uio/usocks"</text>
+<text x="372.0" y="141.5" font-family="Inter, -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12.5" fill="#8A9BB4" text-anchor="start" font-weight="400">TCP · UDP · chain</text>
+</svg>

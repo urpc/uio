@@ -116,6 +116,12 @@ type Bridge struct {
 	// watermark of its destination's queue (default 256 KiB). It also
 	// becomes the Events' MaxInboundBuffered.
 	InboundLimit int
+	// GracefulDialError closes the client leg gracefully when Dial fails,
+	// draining whatever the Dial hook queued (a protocol error reply) before
+	// the end, instead of resetting it. The default false resets the client,
+	// as a plain tunnel does. A proxy that answers a refusal before closing
+	// sets it true so the reply reaches the peer.
+	GracefulDialError bool
 
 	mu           sync.Mutex
 	events       *uio.Events
@@ -351,7 +357,11 @@ func (b *Bridge) OnOpen(c uio.Conn) {
 	}
 	if err != nil {
 		if b.pairOf(c) == nil {
-			bridgeAbort(c, err)
+			if b.GracefulDialError {
+				_ = c.Close() // drain the Dial hook's reply, then end
+			} else {
+				bridgeAbort(c, err)
+			}
 		} // else the override paired it elsewhere: that pair owns it now.
 		if up != c && (!errors.Is(err, ErrAlreadyPaired) || b.pairOf(up) == nil) {
 			bridgeAbort(up, err)
