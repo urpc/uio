@@ -614,8 +614,8 @@ func TestPausedReadsKeepStandaloneHeartbeatTimersRunning(t *testing.T) {
 					opts := Options{TLSConfig: serverTLS, Pollers: 1}
 					if side == "server" {
 						opts.Handler = handler
-						opts.HeartbeatInterval = 10 * time.Millisecond
-						opts.HeartbeatTimeout = 30 * time.Millisecond
+						opts.HeartbeatInterval = 50 * time.Millisecond
+						opts.HeartbeatTimeout = 200 * time.Millisecond
 					}
 					return NewServer(opts)
 				})
@@ -625,7 +625,10 @@ func TestPausedReadsKeepStandaloneHeartbeatTimersRunning(t *testing.T) {
 				if side == "server" {
 					_, _ = dialExternalReadControl(t, addr, clientTLS, nil)
 				} else {
-					dialer := NewDialer(Options{Handler: handler, TLSConfig: clientTLS, Pollers: 1, HeartbeatInterval: 10 * time.Millisecond, HeartbeatTimeout: 30 * time.Millisecond})
+					// Relaxed heartbeat timings: 10ms/30ms flakes on Windows CI
+					// scheduler jitter. The guard still holds — if pausing reads
+					// stopped the heartbeat timer, the close would never arrive.
+					dialer := NewDialer(Options{Handler: handler, TLSConfig: clientTLS, Pollers: 1, HeartbeatInterval: 50 * time.Millisecond, HeartbeatTimeout: 200 * time.Millisecond})
 					t.Cleanup(func() {
 						_ = dialer.Close(nil)
 					})

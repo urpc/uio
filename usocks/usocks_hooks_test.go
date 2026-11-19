@@ -21,8 +21,10 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -227,24 +229,24 @@ func TestHandshakeTimeout(t *testing.T) {
 	}
 }
 
-// A refused target dial answers connection-refused, and the reply drains
-// (graceful close) rather than arriving as a reset.
+// A failed target dial answers with the mapped SOCKS reply and drains it
+// (graceful close) rather than resetting the client. The refusal is injected
+// through the Dial hook so the test is deterministic on every platform: a
+// released-port dial races with port reuse and yields a different errno on
+// Windows (general failure instead of connection-refused).
 func TestDialFailureReplyDrains(t *testing.T) {
-	// Grab a port then release it so the dial is refused.
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, port := splitAddr(t, probe.Addr().String())
-	_ = probe.Close()
-
-	socks := startSocks(t)
-	_, rep := socksRequest(t, socks, "127.0.0.1", port, AtypIPv4, CmdConnect)
-	if rep == RepSuccess {
-		t.Skip("released port was reused before the dial; cannot exercise refusal")
-	}
+	refused := &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}
+	socks := startSocksOpts(t, Options{
+		Dial: func(context.Context, string) (net.Conn, error) { return nil, refused },
+	})
+	c, rep := socksRequest(t, socks, "127.0.0.1", 1, AtypIPv4, CmdConnect)
 	if rep != RepConnectionRefused {
 		t.Fatalf("CONNECT rep = %d, want connection-refused", rep)
+	}
+	// The reply drained: the connection ends with a clean EOF, not a reset.
+	_ = c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("read after refusal reply = %v, want io.EOF (graceful drain)", err)
 	}
 }
 

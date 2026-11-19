@@ -108,6 +108,21 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 		}
 	}()
 	time.Sleep(50 * time.Millisecond)
+	// The Go runtime may close a startup descriptor right after the table is
+	// filled, letting a backlog connection sneak through (seen on macOS CI).
+	// Close each stray and re-fill so accept is genuinely stalled; every stray
+	// consumes one backlog client, tracked so the resume check below expects
+	// the remaining count rather than the full backlog.
+	consumed := 0
+	for retry := 0; len(opened) > 0 && retry < waiting; retry++ {
+		for len(opened) > 0 {
+			(<-opened).Close()
+			consumed++
+		}
+		state.restore()
+		state.restore = exhaustDescriptors(t)
+		time.Sleep(50 * time.Millisecond)
+	}
 	cpuBefore, wallBefore := processCPUTime(), time.Now()
 	time.Sleep(300 * time.Millisecond)
 	cpu, wall := processCPUTime()-cpuBefore, time.Since(wallBefore)
@@ -125,11 +140,11 @@ func TestAcceptSurvivesDescriptorExhaustion(t *testing.T) {
 		t.Errorf("the process used %v of CPU in %v while accepting could not proceed", cpu, wall)
 	}
 	if runtime.GOOS == "linux" {
-		for i := range waiting {
+		for i := 0; i < waiting-consumed; i++ {
 			select {
 			case <-opened:
 			case <-time.After(5 * time.Second):
-				t.Fatalf("%d of %d waiting connections opened once descriptors were free", i, waiting)
+				t.Fatalf("%d of %d waiting connections opened once descriptors were free", i, waiting-consumed)
 			}
 		}
 	}
